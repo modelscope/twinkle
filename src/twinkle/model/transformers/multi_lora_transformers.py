@@ -2,6 +2,8 @@
 import os
 import torch.distributed as dist
 import transformers
+from contextlib import contextmanager
+from copy import deepcopy
 from peft import LoraConfig, PeftConfig, PeftModel, load_peft_weights
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -16,7 +18,7 @@ from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from ..multi_lora import MultiLora
-from .transformers import OptimizerGroup, TransformersModel
+from .transformers import CHECKPOINT_ADAPTER_NAME, OptimizerGroup, TransformersModel
 
 
 @remote_class()
@@ -46,7 +48,12 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
-        self._ddp_config = ddp_config or {}
+        if self._fsdp_config.get('reshard_after_forward', True) is not True:
+            raise ValueError('Multi-LoRA FSDP requires reshard_after_forward=True for safe adapter switching.')
+        self._ddp_config = dict(ddp_config or {})
+        if self._ddp_config.get('find_unused_parameters') is False or self._ddp_config.get('static_graph', False):
+            raise ValueError('Multi-LoRA DDP requires find_unused_parameters=True and static_graph=False.')
+        self._ddp_config.setdefault('find_unused_parameters', True)
         self._memory_efficient_init = memory_efficient_init
         self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
         self._router_replay_applied = False
@@ -82,8 +89,12 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
-        self.model.gradient_checkpointing_enable()
+        self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
         self.model = self.multi_adapter.patch(self.model, target_modules=target_modules, lora_config=self.lora_config)
+        # PEFT creates LoRA parameters in FP32 even when the base model uses a
+        # lower-precision dtype. Align the preallocated slots before FSDP2
+        # records their parameter and gradient dtypes.
+        self._ensure_lora_dtype(self.model)
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None
@@ -114,7 +125,15 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         pass
 
     def _lazy_wrap_model(self):
-        return super()._lazy_wrap_model()
+        if self._model_wrapped:
+            return
+        # PEFT freezes inactive slots. DDP must nevertheless register all slots,
+        # since a later tenant may activate any of them on this resident model.
+        with self.multi_adapter.trainable_slots():
+            super()._lazy_wrap_model()
+            # Reset must restore the synchronized (and possibly sharded) basis,
+            # not the rank-local initialization captured before model wrapping.
+            self.multi_adapter.save_initial_weights()
 
     def _maybe_apply_expert_parallel(self):
         if self._memory_efficient_init:
@@ -132,6 +151,17 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             # self._maybe_apply_expert_parallel()   # 各rank广播之前不能对moe层进行分片, 没有实际权重时不能分片
         self.multi_adapter.patch_target_parameters(self.model, target_parameters)
 
+    @contextmanager
+    def _adapter_context(self, adapter_name: str, disable_lora: bool = False):
+        """Activate a tenant while keeping FSDP2's trainable parameter set stable."""
+        try:
+            with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora) as slot_name:
+                self.multi_adapter.enable_slot_gradients()
+                yield slot_name
+        finally:
+            # Leaving a disable_lora context re-enables adapter layers, which flips the flags again.
+            self.multi_adapter.enable_slot_gradients()
+
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
@@ -145,7 +175,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                 inputs = [inputs]
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         self.multi_adapter.check_length(inputs)
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+        with self._adapter_context(kwargs.get('adapter_name')):
             return super().forward(inputs=inputs, **kwargs)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -163,25 +193,25 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                 inputs = [inputs]
             inputs = optimizer_config.template.batch_encode(inputs)  # noqa
         self.multi_adapter.check_length(inputs)
-        with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora):
+        with self._adapter_context(adapter_name, disable_lora=disable_lora):
             return super().forward_only(inputs=inputs, **kwargs)
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+        with self._adapter_context(kwargs.get('adapter_name')):
             return super().calculate_loss(**kwargs)
 
     @remote_function()
     def backward(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+        with self._adapter_context(kwargs.get('adapter_name')):
             super().backward(**kwargs)
 
     @remote_function()
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+        with self._adapter_context(kwargs.get('adapter_name')):
             return super().clip_grad_norm(max_grad_norm, norm_type=norm_type, **kwargs)
 
     def _create_param_group(self, adapter_name: str, lr: float = 1e-5, weight_decay: float = 0.01, **kwargs):
@@ -190,19 +220,19 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     @remote_function()
     def step(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+        with self._adapter_context(kwargs.get('adapter_name')):
             super().step(**kwargs)
 
     @remote_function()
     def zero_grad(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+        with self._adapter_context(kwargs.get('adapter_name')):
             super().zero_grad(**kwargs)
 
     @remote_function()
     def lr_step(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+        with self._adapter_context(kwargs.get('adapter_name')):
             super().lr_step(**kwargs)
 
     @remote_function()
@@ -213,35 +243,52 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     @remote_function()
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.adapter(kwargs.get('adapter_name')):
+        with self._adapter_context(kwargs.get('adapter_name')):
             super().set_optimizer(optimizer_cls, **kwargs)
 
     @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
-        # prevent opening requires_grad of the base model
-        # prevent loading malicious code
-        assert not isinstance(
-            config_or_dir, str
-        ), 'config_or_dir does not support str, because loading config from modelhub may causing unexpected behavior'
-        assert isinstance(config_or_dir, LoraConfig), 'config_or_dir must be a LoraConfig instance'
-        config_or_dir = self.strategy.prepare_adapter_config(
-            config_or_dir,
+        adapter_mode = kwargs.pop('adapter_mode', 'lora')
+        if adapter_mode != 'lora':
+            raise ValueError(f'MultiLoraTransformersModel only supports LoRA adapters, got {adapter_mode!r}.')
+        config = self._copy_lora_config(config_or_dir)
+        if config.modules_to_save:
+            raise ValueError('modules_to_save is not supported for a multi-tenant LoRA adapter.')
+        self.multi_adapter.validate_tenant_target_modules(config.target_modules,
+                                                          getattr(config, 'target_parameters', None))
+        self._register_adapter(adapter_name, config, **kwargs)
+
+    @staticmethod
+    def _copy_lora_config(config_or_dir: Union[PeftConfig, str]) -> LoraConfig:
+        """Validate and copy a client-provided LoRA config before normalizing it."""
+        if isinstance(config_or_dir, str):
+            raise ValueError('Loading an adapter config from a model path or hub is not supported.')
+        if not isinstance(config_or_dir, LoraConfig):
+            raise TypeError('config_or_dir must be a LoraConfig instance.')
+        return deepcopy(config_or_dir)
+
+    def _register_adapter(self, adapter_name: str, config: LoraConfig, **kwargs) -> None:
+        """Register an already validated LoRA configuration in a free slot."""
+        config = self.strategy.prepare_adapter_config(
+            config,
             enable_ep=getattr(self, '_enable_expert_parallel', False),
         )
         # Limit the max peft version in pyproject.toml, in case any newer version opens some untested module grad.
-        config_or_dir.modules_to_save = None
-        config_or_dir.bias = 'none'
-        config_or_dir.init_lora_weights = False
-        config_or_dir.modules_to_save = None
-        config_or_dir.trainable_token_indices = None
+        config.bias = 'none'
+        config.init_lora_weights = False
+        config.trainable_token_indices = None
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name
-        self.optimizer_group[adapter_name].adapter_config = config_or_dir
+        self.optimizer_group[adapter_name].adapter_config = config
         _gas_default = kwargs.get('gradient_accumulation_steps', 1)
         self.optimizer_group[adapter_name].gradient_accumulation_steps = _gas_default
         self._default_tokenizer = self.optimizer_group[adapter_name].template.processor
-        self._ensure_target_parameter_lora_installed(config_or_dir)
-        self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config_or_dir)
+        self._ensure_target_parameter_lora_installed(config)
+        try:
+            self.multi_adapter.acquire_lora(tenant_adapter_name=adapter_name, config=config)
+        except Exception:
+            self.optimizer_group.pop(adapter_name, None)
+            raise
 
     @remote_function()
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str], **kwargs):
@@ -267,10 +314,25 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         adapter_state = self.multi_adapter.get_state_dict(adapter_name)
         return {key: torch_util.to_local_tensor(value).cpu() for key, value in adapter_state.items()}
 
+    def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
+        """Map the tenant's physical LoRA slot to the PEFT ``default`` name."""
+        tenant = self.multi_adapter.find_lora_by_tenant(adapter_name)
+        physical_token = f'.{tenant.adapter_name}.'
+        checkpoint_token = f'.{CHECKPOINT_ADAPTER_NAME}.'
+        mapping = {}
+        for group in optimizer.param_groups:
+            for name in group.get('param_names', []):
+                checkpoint_name = name.replace(physical_token, checkpoint_token)
+                if checkpoint_name != name:
+                    mapping[name] = checkpoint_name
+        return mapping
+
     @remote_function(collect='first')
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
-        self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.save_context(kwargs.get('adapter_name')):
+        adapter_name = kwargs.get('adapter_name')
+        self._check_adapter_valid(adapter_name)
+        self._lazy_wrap_model()
+        with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
         if dist.is_initialized():
             dist.barrier()
@@ -280,7 +342,10 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         adapter_name = kwargs.get('adapter_name')
         self._check_adapter_valid(adapter_name)
-        with self.multi_adapter.save_context(kwargs.get('adapter_name')):
+        # Establish the synchronized reset basis before checkpoint weights can
+        # replace it, including when load is the first model operation.
+        self._lazy_wrap_model()
+        with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             load_optimizer = kwargs.get('load_optimizer', False)
             if output_dir is None:
                 if os.path.exists(name):
@@ -323,18 +388,13 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.multi_adapter.release_lora(adapter_name)
 
     def _get_nb_trainable_parameters(self, adapter_name, model):
-        with self.multi_adapter.adapter(adapter_name):
+        with self._adapter_context(adapter_name):
             return self.multi_adapter.get_nb_trainable_parameters(adapter_name)
 
     def _get_trainable_parameters_example(self, adapter_name, model):
-        with self.multi_adapter.adapter(adapter_name):
+        with self._adapter_context(adapter_name):
             return self.multi_adapter.get_trainable_parameters_example(adapter_name)
 
     def _get_trainable_parameters(self, adapter_name):
         with self.multi_adapter.adapter(adapter_name) as real_adapter_name:
-            params = super()._get_trainable_parameters(real_adapter_name)
-            # Note: experts have registered LoraWrapper as a submodule, so its internal LoRA parameters
-            # are already captured automatically. Duplicating parameter capture here will cause
-            # optimizer errors due to duplicate keys.
-            # params.update(self.multi_adapter.get_target_parameter_trainable_parameters(adapter_name))
-            return params
+            return super()._get_trainable_parameters(real_adapter_name)

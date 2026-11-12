@@ -261,3 +261,65 @@ def test_fused_kernel_success_does_not_mark_broken():
     assert fused._fused_broken is False
 
 
+# ── CPU: fused-path bookkeeping with a pure-torch stand-in for the Liger kernel ──
+
+
+class _TorchFusedLinearCE:
+    """Reference semantics of liger_kernel's LigerFusedLinearCrossEntropyLoss."""
+
+    def __init__(self, ignore_index=-100, reduction='mean', label_smoothing=0.0, softcap=None):
+        self.ignore_index, self.reduction, self.softcap = ignore_index, reduction, softcap
+
+    def __call__(self, weight, hidden, target):
+        logits = F.linear(hidden, weight)
+        if self.softcap is not None:
+            logits = self.softcap * torch.tanh(logits / self.softcap)
+        return F.cross_entropy(logits, target, ignore_index=self.ignore_index, reduction=self.reduction)
+
+
+@pytest.fixture
+def torch_fused_kernel(monkeypatch):
+    import twinkle.loss.liger_fused_linear_cross_entropy as mod
+    monkeypatch.setattr(mod, '_LigerFLCEModule', _TorchFusedLinearCE)
+
+
+def _make_hidden_batch(seed=3, bs=2, seq=6, hidden=8, vocab=14):
+    torch.manual_seed(seed)
+    hidden_states = torch.randn(bs, seq, hidden)
+    lm_head = torch.nn.Linear(hidden, vocab, bias=False)
+    labels = torch.randint(0, vocab, (bs, seq))
+    labels[:, -2:] = -100
+    return hidden_states, lm_head, labels
+
+
+@pytest.mark.parametrize('reduction', ['mean', 'sum'])
+def test_fused_path_num_tokens_matches_cross_entropy(torch_fused_kernel, reduction):
+    """``num_tokens`` drives gradient normalization; a 'mean' loss must not be divided again."""
+    hidden_states, lm_head, labels = _make_hidden_batch()
+    with torch.no_grad():
+        logits = lm_head(hidden_states)
+    ref = CrossEntropyLoss(reduction=reduction)({'labels': labels}, {'logits': logits})
+    out = LigerFusedLinearCrossEntropyLoss(reduction=reduction)({'labels': labels}, {
+        'logits': hidden_states,
+        'lm_head': lm_head
+    })
+    torch.testing.assert_close(out['loss'], ref['loss'])
+    assert float(out['num_tokens']) == float(ref['num_tokens'])
+
+
+@pytest.mark.parametrize('reduction', ['mean', 'sum'])
+def test_micro_batch_scale_matches_cross_entropy(torch_fused_kernel, reduction):
+    inputs = [{'labels': torch.tensor([1, 2, -100])}, {'labels': torch.tensor([3, -100, -100])}]
+    fused = LigerFusedLinearCrossEntropyLoss(reduction=reduction)
+    ce = CrossEntropyLoss(reduction=reduction)
+    for indices in ([0], [1], [0, 1]):
+        assert fused.micro_batch_scale(inputs, indices) == ce.micro_batch_scale(inputs, indices)
+
+
+def test_materialised_fallback_applies_softcap(torch_fused_kernel):
+    hidden_states, lm_head, labels = _make_hidden_batch()
+    fused = LigerFusedLinearCrossEntropyLoss(reduction='sum', softcap=2.0)
+    outputs = {'logits': hidden_states, 'lm_head': lm_head}
+    expected = fused({'labels': labels}, outputs)['loss']
+    fused._fused_broken = True  # e.g. the kernel raised on an earlier call
+    torch.testing.assert_close(fused({'labels': labels}, outputs)['loss'], expected)

@@ -37,8 +37,9 @@ def ensure_telemetry_initialized() -> None:
         return
 
     try:
-        from twinkle.server.telemetry import TelemetryConfig, init_telemetry
+        from twinkle.server.config.telemetry import TelemetryConfig
         from twinkle.server.telemetry.metrics import MetricsRegistry
+        from twinkle.server.telemetry.provider import init_telemetry
 
         config = TelemetryConfig(
             enabled=True,
@@ -82,7 +83,7 @@ def flush_telemetry_safely() -> None:
     so every error here is swallowed.
     """
     try:
-        from twinkle.server.telemetry import shutdown_telemetry
+        from twinkle.server.telemetry.provider import shutdown_telemetry
         shutdown_telemetry()
     except Exception as e:  # pragma: no cover - defensive
         logger.warning(f'Telemetry shutdown failed: {e}')

@@ -140,7 +140,7 @@ class TwinkleCompatMockModel:
         return {'loss': 0.5, 'grad_norm': 0.1}
 
     @remote_function()
-    def tinker_load(self, checkpoint_dir: str, **kwargs: Any) -> None:
+    def tinker_load(self, *, checkpoint_name: str, output_dir: str | None = None, **kwargs: Any) -> None:
         return None
 
     # ----- Configuration setters ----------------------------------------- #
@@ -181,7 +181,7 @@ class TwinkleCompatMockModel:
 
         The real backend creates ``<output_dir>/<name>/`` on disk and returns its
         path. Tinker /asample later does ``os.path.exists(...)`` on a symlink
-        pointing here (see ``sampler/tinker_handlers.py:72``), so the directory
+        pointing here (see ``sampler/tinker_handlers.py``), so the directory
         has to really exist for the mock path to clear.
         """
         target = os.path.join(output_dir or '/tmp/twinkle_mock_ckpt', name)
@@ -240,7 +240,7 @@ class TwinkleCompatMockModel:
     def has_adapter(self, adapter_name: str) -> bool:
         return adapter_name in self._adapters
 
-    @remote_function(collect='first', lazy_collect=False)
+    @remote_function(collect='first', lazy_collect=False, sync=True, timeout=4)
     def ping(self) -> bool:
         """Lightweight liveness probe for watchdog health checks."""
         return True

@@ -1,17 +1,23 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import TYPE_CHECKING
 
-from twinkle.utils.import_utils import _LazyModule
+from twinkle._lazy_module import _LazyModule
 
 if TYPE_CHECKING:
     from .base import TwinkleModel
     from .megatron import MegatronModel, MultiLoraMegatronModel
-    from .transformers import MultiLoraTransformersModel, TransformersModel, TransformersValueModel
+    from .micro_batch import MicroBatchConfig
+    from .transformers import (MultiLoraTransformersModel, SpectralHybridTransformersModel, TransformersModel,
+                               TransformersValueModel)
 
 else:
     _import_structure = {
         'base': ['TwinkleModel'],
-        'transformers': ['TransformersModel', 'MultiLoraTransformersModel', 'TransformersValueModel'],
+        'micro_batch': ['MicroBatchConfig'],
+        'transformers': [
+            'TransformersModel', 'MultiLoraTransformersModel', 'SpectralHybridTransformersModel',
+            'TransformersValueModel'
+        ],
         'megatron': ['MegatronModel', 'MultiLoraMegatronModel'],
     }
 

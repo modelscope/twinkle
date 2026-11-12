@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
+from twinkle.utils.rl_tensor_utils import align_per_token_values
 from twinkle.utils.torch_utils import selective_log_softmax
 
 if TYPE_CHECKING:
@@ -144,49 +145,6 @@ class DPOLoss(PreferenceLossBase):
         self.reference_free = reference_free
         self.sft_weight = sft_weight
 
-    def _align_logps(
-        self,
-        logps: 'torch.Tensor',
-        target_shape: tuple,
-        device: 'torch.device',
-        dtype: 'torch.dtype',
-    ) -> 'torch.Tensor':
-        """Align log probabilities to target shape.
-
-        Args:
-            logps: Input log probabilities tensor
-            target_shape: Target (batch, seq_len) shape
-            device: Target device
-            dtype: Target dtype
-
-        Returns:
-            Aligned tensor of shape target_shape
-        """
-        import torch
-
-        if not torch.is_tensor(logps):
-            raise TypeError(f'Expected torch.Tensor, got {type(logps)}')
-
-        if logps.dim() == 1:
-            logps = logps.unsqueeze(0)
-
-        if logps.shape == target_shape:
-            return logps.to(device=device, dtype=dtype)
-
-        # Handle tensor with different sequence length
-        if logps.dim() == 2 and logps.shape[0] == target_shape[0]:
-            batch_size, target_seq_len = target_shape
-            src_seq_len = logps.shape[1]
-            logps = logps.to(device=device, dtype=dtype)
-            if src_seq_len > target_seq_len:
-                # Truncate right (keep left part) - may happen in Ray result merging
-                return logps[:, :target_seq_len]
-            else:
-                raise ValueError(f'ref_logps seq_len ({src_seq_len}) < target seq_len ({target_seq_len}). '
-                                 f'This should not happen when both models process the same batch.')
-
-        raise ValueError(f'Cannot align ref_logps shape {logps.shape} to target shape {target_shape}')
-
     def _compute_dpo_loss(
         self,
         policy_chosen_logps: 'torch.Tensor',
@@ -311,13 +269,18 @@ class DPOLoss(PreferenceLossBase):
         # Handle reference log probs
         if ref_chosen_logps is not None and ref_rejected_logps is not None:
             # Pre-computed sequence-level reference log probs provided
-            reference_chosen_logps = ref_chosen_logps.to(device=device, dtype=dtype)
-            reference_rejected_logps = ref_rejected_logps.to(device=device, dtype=dtype)
+            reference_chosen_logps = torch.as_tensor(ref_chosen_logps, device=device, dtype=dtype)
+            reference_rejected_logps = torch.as_tensor(ref_rejected_logps, device=device, dtype=dtype)
         elif ref_logps is not None:
             # Per-token reference log probs provided, need to align and sum
-            if not torch.is_tensor(ref_logps):
-                ref_logps = torch.as_tensor(ref_logps)
-            ref_logps_aligned = self._align_logps(ref_logps, labels.shape, device, dtype)
+            ref_logps_aligned = align_per_token_values(
+                ref_logps,
+                tuple(labels.shape),
+                device=device,
+                dtype=dtype,
+                name='ref_logps',
+                valid_mask=labels != self.ignore_index,
+            )
             ref_chosen, ref_rejected = self._split_chosen_rejected(ref_logps_aligned)
             reference_chosen_logps = self._compute_sequence_logps(ref_chosen, chosen_labels)
             reference_rejected_logps = self._compute_sequence_logps(ref_rejected, rejected_labels)

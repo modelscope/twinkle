@@ -1,6 +1,6 @@
 import re
 import torch
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from twinkle import torch_util
 from twinkle.data_format import InputFeature
 from twinkle.utils import get_logger
-from .multi_lora_target_parameters import TargetParameterLoraManager
+from .multi_lora_target_parameters import TargetParameterLoraManager, TargetParameterLoraWrapper
 
 logger = get_logger()
 
@@ -38,6 +38,7 @@ class MultiLora:
         self._active_adapters = []
         self.max_length = max_length
         self.target_parameter_manager = TargetParameterLoraManager(max_loras=max_loras, max_r=max_r)
+        self.lora_layer_names: List[str] = []
 
     def _get_available_lora(self) -> Optional[LoraTenant]:
         for _lora in self.loras:
@@ -123,6 +124,54 @@ class MultiLora:
         else:
             self.module.set_adapter('lora_0')
 
+    def _named_slot_parameters(self, module):
+        """Identify owned adapter parameters through their actual layer containers."""
+        slots = {tenant.adapter_name for tenant in self.loras}
+        for layer_name, layer in module.named_modules():
+            if isinstance(layer, LoraLayer):
+                containers = layer.adapter_layer_names
+            elif isinstance(layer, TargetParameterLoraWrapper):
+                containers = ('lora_A', 'lora_B')
+            else:
+                continue
+            for container_name in containers:
+                container = getattr(layer, container_name)
+                for slot in slots & container.keys():
+                    value = container[slot]
+                    prefix = '.'.join(part for part in (layer_name, container_name, slot) if part)
+                    if isinstance(value, torch.nn.Parameter):
+                        yield prefix, value
+                    else:
+                        for name, parameter in value.named_parameters():
+                            yield prefix + '.' + name, parameter
+
+    def enable_slot_gradients(self):
+        """Keep owned adapter slots visible to reducers without unfreezing the base."""
+        modules = self.module if isinstance(self.module, list) else [self.module]
+        for module in modules:
+            for _, parameter in self._named_slot_parameters(module):
+                parameter.requires_grad_(True)
+
+    @contextmanager
+    def trainable_slots(self):
+        """Expose all slots while wrapping DDP/FSDP, then restore the active mask.
+
+        Reducers discover parameters once during wrapping. The mask is restored
+        by adapter path because FSDP can replace the Parameter objects themselves.
+        """
+        modules = self.module if isinstance(self.module, list) else [self.module]
+        masks = [{
+            name: parameter.requires_grad
+            for name, parameter in self._named_slot_parameters(module)
+        } for module in modules]
+        try:
+            self.enable_slot_gradients()
+            yield
+        finally:
+            for module, mask in zip(modules, masks):
+                for name, parameter in self._named_slot_parameters(module):
+                    parameter.requires_grad_(mask[name])
+
     def activate_adapter(self, tenant_adapter_name: str, call_enable=False):
         if not self.has_lora(tenant_adapter_name):
             raise ValueError(f'Adapter {tenant_adapter_name} does not exist')
@@ -151,6 +200,19 @@ class MultiLora:
     def patch_target_parameters(self, module, target_parameters):
         self.target_parameter_manager.patch(module, target_parameters)
 
+    @staticmethod
+    def _autocast_adapter_dtype(peft_model, adapter_name: str) -> None:
+        """Apply PEFT's own adapter dtype autocast to one preallocated slot.
+
+        ``PeftModel.__init__`` runs ``_cast_adapter_dtype`` (fp16/bf16 -> fp32) for the
+        slot created at construction time, but ``PeftModel.add_adapter`` does not. Calling
+        it explicitly keeps every preallocated slot on the same dtype PEFT would produce,
+        instead of forcing fp32 ourselves. It is a no-op for an fp32 base.
+        """
+        base = getattr(peft_model, 'base_model', None)
+        if base is not None and hasattr(base, '_cast_adapter_dtype'):
+            base._cast_adapter_dtype(adapter_name=adapter_name, autocast_adapter_dtype=True)
+
     @contextmanager
     def adapter(self, tenant_adapter_name: str, disable_lora: bool = False):
         self.activate_adapter(tenant_adapter_name)
@@ -165,8 +227,10 @@ class MultiLora:
     @contextmanager
     def _disable_lora_context(self, tenant_adapter_name):
         self.deactivate_adapter()
-        yield
-        self.activate_adapter(tenant_adapter_name, call_enable=True)
+        try:
+            yield
+        finally:
+            self.activate_adapter(tenant_adapter_name, call_enable=True)
 
     @contextmanager
     def save_context(self, tenant_adapter_name: str):
@@ -193,18 +257,28 @@ class MultiLora:
                 _before(_module)
         else:
             _before(self.module)
-        yield adapter_name
-        if isinstance(self.module, list):
-            for _module in self.module:
-                _after(_module)
-        else:
-            _after(self.module)
+        try:
+            yield adapter_name
+        finally:
+            if isinstance(self.module, list):
+                for _module in self.module:
+                    _after(_module)
+            else:
+                _after(self.module)
         # self.deactivate_adapter()
 
-    def check_length(self, inputs: InputFeature):
-        total_length = sum(len(_input['input_ids']) for _input in inputs)
-        if total_length > self.max_length:
-            raise ValueError(f'Max length exceeds {self.max_length}')
+    def check_length(
+        self,
+        inputs: Union[InputFeature, List[InputFeature]],
+    ):
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        for index, item in enumerate(inputs):
+            if 'input_ids' not in item:
+                continue
+            length = len(item['input_ids'])
+            if length > self.max_length:
+                raise ValueError(f'Input length {length} exceeds max_length {self.max_length} at sample {index}')
 
     def acquire_lora(self, tenant_adapter_name: str, config: LoraConfig) -> str:
         if self.has_lora(tenant_adapter_name):
@@ -253,6 +327,23 @@ class MultiLora:
         else:
             raise ValueError(f'No lora found for real adapter_name {adapter_name}')
 
+    def validate_tenant_target_modules(self, target_modules, target_parameters=None) -> None:
+        """Ensure every requested target resolves inside the preallocated LoRA layers."""
+        if not target_modules and target_parameters:
+            return
+        layers = [name for name, layer in self.module.named_modules() if isinstance(layer, LoraLayer)]
+        if target_modules == 'all-linear' or (isinstance(target_modules,
+                                                         (list, set)) and 'all-linear' in target_modules):
+            return
+        if isinstance(target_modules, (list, set)):
+            missing = [target for target in target_modules if not any(name.endswith(target) for name in layers)]
+            if missing:
+                raise ValueError(f'LoRA target_modules are outside the preallocated range: {sorted(missing)}')
+            return
+        if isinstance(target_modules, str) and any(self.match_target_modules(name, target_modules) for name in layers):
+            return
+        raise ValueError(f'LoRA target_modules do not resolve inside the preallocated range: {target_modules!r}')
+
     @staticmethod
     def match_target_modules(
         module_name: str,
@@ -264,8 +355,7 @@ class MultiLora:
         if isinstance(target_modules, (list, set)) and len(target_modules) == 0:
             return False
 
-        if isinstance(target_modules,
-                      (list, set)) and len(target_modules) == 1 and next(iter(target_modules)) == 'all-linear':
+        if isinstance(target_modules, (list, set)) and 'all-linear' in target_modules:
             return True
 
         if target_modules == 'all-linear':
@@ -371,8 +461,6 @@ class MultiLora:
             def _megatron_forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
                 from megatron.core.extensions.transformer_engine import (TEGroupedLinear,
                                                                          TELayerNormColumnParallelLinear, TELinear)
-                from megatron.core.tensor_parallel import (gather_from_sequence_parallel_region,
-                                                           scatter_to_sequence_parallel_region)
                 from megatron.core.transformer.moe.router import TopKRouter
 
                 previous_dtype = x.dtype
@@ -398,9 +486,6 @@ class MultiLora:
                     raise ValueError(f'Unsupported base layer type: {type(self.base_layer)}')
 
                 if not isinstance(self.base_layer, TopKRouter) and not self.disable_adapters and not self.merged:
-                    if self.sequence_parallel and self.base_layer.parallel_mode == 'column':
-                        x = gather_from_sequence_parallel_region(x)
-
                     for active_adapter in self.active_adapters:
                         if active_adapter not in self.lora_A.keys():
                             continue
@@ -416,55 +501,30 @@ class MultiLora:
                         scaling = _lora.tenant_config.lora_alpha / (
                             _lora.tenant_config.r**0.5 if _lora.tenant_config.use_rslora else _lora.tenant_config.r)
 
-                        def _lora_A(x, *args, **kwargs):
-                            if isinstance(lora_A, TEGroupedLinear):
-
-                                def _get_weight_tensors(self):
-                                    tensors = self._get_weight_tensors_origin()
-                                    return [t[:_lora.tenant_config.r, :].contiguous() for t in tensors]
-
-                                lora_A._get_weight_tensors_origin = lora_A._get_weight_tensors
-                                lora_A._get_weight_tensors = MethodType(_get_weight_tensors, lora_A)
-                                output = lora_A(x, *args, **kwargs)
-                                lora_A._get_weight_tensors = lora_A._get_weight_tensors_origin
-                                delattr(lora_A, '_get_weight_tensors_origin')
-                                return output
-                            else:
-                                return torch.nn.functional.linear(
-                                    x, lora_A.weight[:_lora.tenant_config.r, :], bias=None)
-
-                        def _lora_B(x, *args, **kwargs):
-                            if isinstance(lora_B, TEGroupedLinear):
-
-                                def _get_weight_tensors(self):
-                                    tensors = self._get_weight_tensors_origin()
-                                    return [t[:, :_lora.tenant_config.r].contiguous() for t in tensors]
-
-                                lora_B._get_weight_tensors_origin = lora_B._get_weight_tensors
-                                lora_B._get_weight_tensors = MethodType(_get_weight_tensors, lora_B)
-                                output = lora_B(x, *args, **kwargs)
-                                lora_B._get_weight_tensors = lora_B._get_weight_tensors_origin
-                                delattr(lora_B, '_get_weight_tensors_origin')
-                                return output
-                            else:
-                                return torch.nn.functional.linear(
-                                    x, lora_B.weight[:, :_lora.tenant_config.r], bias=None)
-
                         dtype = lora_A.weight0.dtype if isinstance(lora_A, TEGroupedLinear) else lora_A.weight.dtype
                         x = x.to(dtype)
 
-                        lora_result = _lora_A(dropout(x), *args, **kwargs)
-                        if isinstance(lora_result, tuple):
-                            lora_result = lora_result[0]
-
-                        lora_result = _lora_B(lora_result, *args, **kwargs)
-                        if isinstance(lora_result, tuple):
-                            lora_result = lora_result[0]
-
+                        fp8_context = nullcontext()
+                        if getattr(self.config, 'fp8_param', False):
+                            import transformer_engine.pytorch as te
+                            fp8_context = te.fp8_autocast(enabled=False)
+                        with fp8_context:
+                            # Keep the backend layer's TP/SP communication and parameter
+                            # identities. Mask inactive ranks between A and B instead of
+                            # replacing parallel layers with local linear operations.
+                            lora_result = (
+                                lora_A(dropout(x), *args, **kwargs) if isinstance(lora_A, TEGroupedLinear) else lora_A(
+                                    dropout(x)))
+                            if isinstance(lora_result, tuple):
+                                lora_result = lora_result[0]
+                            lora_result = torch.nn.functional.pad(lora_result[..., :_lora.tenant_config.r],
+                                                                  (0, _self.max_r - _lora.tenant_config.r))
+                            lora_result = (
+                                lora_B(lora_result, *args, **kwargs)
+                                if isinstance(lora_B, TEGroupedLinear) else lora_B(lora_result))
+                            if isinstance(lora_result, tuple):
+                                lora_result = lora_result[0]
                         lora_result = lora_result * scaling
-
-                        if self.sequence_parallel and self.base_layer.parallel_mode == 'row':
-                            lora_result = scatter_to_sequence_parallel_region(lora_result)
 
                         result = result + lora_result
 
@@ -487,8 +547,9 @@ class MultiLora:
             module_device = next(first_module.parameters()).device
         low_cpu_mem_usage = module_device.type == 'meta'
 
+        base_config = kwargs.get('lora_config', None)
         for i in range(self.max_loras):
-            config = kwargs.get('lora_config', None)
+            config = deepcopy(base_config) if base_config is not None else None
             if config is None:
                 config = LoraConfig(
                     r=self.max_r,
@@ -502,6 +563,7 @@ class MultiLora:
             def _patch_peft(_module):
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, config, low_cpu_mem_usage=low_cpu_mem_usage)
+                    self._autocast_adapter_dtype(_module, lora_tenant.adapter_name)
                 else:
                     _peft_model: PeftModel = get_peft_model(
                         _module, config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
@@ -518,6 +580,7 @@ class MultiLora:
                 _config = deepcopy(config)
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, _config, low_cpu_mem_usage=low_cpu_mem_usage)
+                    self._autocast_adapter_dtype(_module, lora_tenant.adapter_name)
                 else:
                     # TODO first wrap needs parse target_modules, need to fix later
                     if _config.target_modules:
@@ -544,18 +607,14 @@ class MultiLora:
         # PEFT's add_adapter calls set_adapter(active_adapters) which only keeps the
         # first adapter's requires_grad=True.  We need ALL LoRA params to be trainable
         # so that MegatronDDP registers them all in its gradient buffers (main_grad).
-        def _enable_all_lora_grad(_module):
-            for name, param in _module.named_parameters():
-                if 'lora_' in name and not param.requires_grad:
-                    param.requires_grad_(True)
-
-        if isinstance(module, list):
-            for _m in module:
-                _enable_all_lora_grad(_m)
-        else:
-            _enable_all_lora_grad(module)
-
         self.module = module
+        modules = module if isinstance(module, list) else [module]
+        for chunk in modules:
+            for _, parameter in self._named_slot_parameters(chunk):
+                parameter.requires_grad_(True)
+
+        if not isinstance(module, list):
+            self.lora_layer_names = [name for name, layer in module.named_modules() if isinstance(layer, Linear)]
         return module
 
     def save_initial_weights(self):
@@ -699,7 +758,8 @@ class MultiLora:
                 _load_weights(_module)
         else:
             _load_weights(self.module)
-        self.target_parameter_manager.set_state_dict(tenant_adapter_name, state_dict)
+        if getattr(_lora.tenant_config, 'target_parameters', None):
+            self.target_parameter_manager.set_state_dict(tenant_adapter_name, state_dict)
 
     def get_state_dict(self, tenant_adapter_name):
         state_dict = {}
@@ -724,11 +784,12 @@ class MultiLora:
                 state_dict.update(_get_weights(_module))
         else:
             state_dict = _get_weights(self.module)
-        target_state_dict = self.target_parameter_manager.get_state_dict(tenant_adapter_name)
-        overlap = state_dict.keys() & target_state_dict.keys()
-        if overlap:
-            raise ValueError(f'Duplicate LoRA state keys: {sorted(overlap)[:5]}')
-        state_dict.update(target_state_dict)
+        if getattr(_lora.tenant_config, 'target_parameters', None):
+            target_state_dict = self.target_parameter_manager.get_state_dict(tenant_adapter_name)
+            overlap = state_dict.keys() & target_state_dict.keys()
+            if overlap:
+                raise ValueError(f'Duplicate LoRA state keys: {sorted(overlap)[:5]}')
+            state_dict.update(target_state_dict)
         return state_dict
 
     def _load_initial_weights(self, origin_adapter_name):
@@ -756,6 +817,25 @@ class MultiLora:
         else:
             _load_initial_weights(self.module)
 
+    @staticmethod
+    def _active_lora_numel(name, parameter, r: int) -> int:
+        """Count the active LoRA rank from shape without slicing the tensor."""
+        shape = parameter.shape
+        if len(shape) != 2:
+            return parameter.numel()
+        if 'embedding_A' in name:
+            rank_dim = 1
+        elif 'embedding_B' in name or '_A' in name:
+            rank_dim = 0
+        elif '_B' in name:
+            rank_dim = 1
+        else:
+            return parameter.numel()
+
+        dims = [int(shape[0]), int(shape[1])]
+        dims[rank_dim] = min(r, dims[rank_dim])
+        return dims[0] * dims[1]
+
     def get_nb_trainable_parameters(self, tenant_adapter_name) -> tuple[int, int]:
         r"""
         Returns the number of trainable parameters and the number of all parameters in the model.
@@ -776,16 +856,9 @@ class MultiLora:
                     continue
 
                 if pattern.search(name):
-                    if 'embedding_A' in name:
-                        param = param[:, :_lora.tenant_config.r]
-                    elif 'embedding_B' in name:
-                        param = param[:_lora.tenant_config.r, :]
-                    elif '_A' in name:
-                        param = param[:_lora.tenant_config.r, :]
-                    elif '_B' in name:
-                        param = param[:, :_lora.tenant_config.r]
-
-                num_params = param.numel()
+                    num_params = self._active_lora_numel(name, param, _lora.tenant_config.r)
+                else:
+                    num_params = param.numel()
                 if num_params == 0 and hasattr(param, 'ds_numel'):
                     num_params = param.ds_numel
 

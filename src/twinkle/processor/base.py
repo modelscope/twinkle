@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
 from twinkle.data_format import InputFeature
+from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
 
 @dataclass
@@ -75,7 +76,7 @@ class InputProcessor:
             self.collate_fn,
             self.to_transformers_dict,
             self.add_extra_padding_free_args,
-            self.prepare_transformers_padding_free_patch,
+            self.prepare_gdn_padding_free_args,
             self.drop_causal_4d_mask,
             self.split_cp,
             self.apply_transformers_sp,
@@ -416,28 +417,19 @@ class InputProcessor:
                 _inp['packed_seq_params'] = self._get_packed_seq_params(_inp['position_ids'])
         return inputs
 
-    def prepare_transformers_padding_free_patch(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-        if self.framework != 'transformers':
-            return inputs
-        model = kwargs.get('model')
-        if model is None:
+    def prepare_gdn_padding_free_args(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+        if self.framework != 'transformers' or not kwargs.get('gdn_padding_free_enabled', False):
             return inputs
         padding_free = bool(self.padding_free or self._any_packing(inputs))
         if not padding_free or bool(kwargs.get('enable_sp', False)):
             return inputs
 
-        if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
-            from twinkle.patch import apply_patch
-            from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
-
-            apply_patch(
-                model,
-                GatedDeltaNetPaddingFreePatch,
-                hf_config=kwargs.get('hf_config'),
-                enable_sp=False,
-            )
-            if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
-                return inputs
+        hf_config = kwargs.get('hf_config')
+        attn_implementation = getattr(hf_config, '_attn_implementation', None)
+        if not is_flash_attention_implementation(attn_implementation):
+            raise RuntimeError('Transformers padding_free/packed batches require a FlashAttention backend; '
+                               f'got attn_implementation={attn_implementation!r}. SDPA/eager attention cannot isolate '
+                               'logical sequences after they are concatenated into one physical row.')
 
         for _inp in inputs:
             position_ids = _inp.get('position_ids')
@@ -450,13 +442,19 @@ class InputProcessor:
             _inp['max_length_k'] = int(packed_seq_params.max_seqlen_kv)
         return inputs
 
+    @staticmethod
+    def _backend_builds_causal_mask(attention_mask_type: Optional[str]) -> bool:
+        """True when the accelerator synthesises its own causal mask.
+
+        MindSpeed rebuilds a compressed causal mask for FlashAttention, so
+        handing it the generic dense ``[B, 1, S, S]`` mask is both redundant and
+        expensive at long sequence lengths.
+        """
+        return attention_mask_type == 'causal' and Platform.device_prefix() == 'npu'
+
     def drop_causal_4d_mask(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-        """On NPU, drop the generic 4D dense mask so MindSpeed can build
-        its own compressed causal mask for FlashAttention."""
-        if Platform.device_prefix() != 'npu':
-            return inputs
-        attention_mask_type = kwargs.get('attention_mask_type')
-        if attention_mask_type != 'causal':
+        """Drop a generic dense mask when the accelerator builds its causal mask."""
+        if not self._backend_builds_causal_mask(kwargs.get('attention_mask_type')):
             return inputs
         for _inp in inputs:
             attention_mask = _inp.get('attention_mask')
@@ -600,9 +598,10 @@ class InputProcessor:
         """Unpack packed (padding_free) sequences into per-sequence batch format.
 
         Called after SP gather / CP gather, before loss computation.
-        Unpacks ``labels`` and any present output keys (``logps``, ``logits``)
-        from ``[1, total_tokens, ...]`` to ``[num_sequences, max_seq_len, ...]``.
-        Keys that are ``None`` are silently skipped.
+        Unpacks ``labels``, ``completion_mask`` and any present output keys
+        (``logps``, ``logits``) from ``[1, total_tokens, ...]`` to
+        ``[num_sequences, max_seq_len, ...]``. Keys that are ``None`` are silently
+        skipped.
 
         For ``task='embedding'`` the outputs are already pooled to ``[n_seqs, H]``
         by ``postprocess_tensor_sp``, so this is a no-op.
@@ -619,23 +618,29 @@ class InputProcessor:
 
         from copy import copy
 
-        # Collect output keys to unpack: (key, pad_value)
-        output_keys = []
-        for key, pad_val in [('logps', 0), ('values', 0), ('entropies', 0), ('logits', 0)]:
-            if outputs and outputs.get(key) is not None:
-                output_keys.append((key, pad_val))
+        # (key, tensor, pad_value) for everything that must come back as
+        # [num_sequences, max_seq_len]. completion_mask shares the labels' index
+        # space, so leaving it packed would hand the loss two differently shaped
+        # views of the same sequence.
+        input_specs = [('labels', labels, -100)]
+        if inputs.get('completion_mask') is not None:
+            input_specs.append(('completion_mask', inputs['completion_mask'], self.padding_map['completion_mask']))
+        output_specs = [(key, outputs[key], 0) for key in ('logps', 'values', 'entropies', 'logits')
+                        if outputs and outputs.get(key) is not None]
 
-        all_tensors = [labels] + [outputs[k] for k, _ in output_keys]
-        all_pads = [-100] + [p for _, p in output_keys]
-        unpacked = self._unpack_by_position_ids(position_ids, *all_tensors, padding_values=all_pads)
+        specs = input_specs + output_specs
+        unpacked = iter(
+            self._unpack_by_position_ids(
+                position_ids, *[tensor for _, tensor, _ in specs], padding_values=[pad for _, _, pad in specs]))
 
         inputs = copy(inputs)
-        inputs['labels'] = unpacked[0]
+        for key, _, _ in input_specs:
+            inputs[key] = next(unpacked)
 
-        if output_keys:
+        if output_specs:
             outputs = copy(outputs)
-            for i, (key, _) in enumerate(output_keys):
-                outputs[key] = unpacked[i + 1]
+            for key, _, _ in output_specs:
+                outputs[key] = next(unpacked)
 
         return inputs, outputs
 
@@ -702,12 +707,23 @@ class InputProcessor:
                 # accelerator, and a CPU fill would break the cat inside the collate below.
                 reference = input_ids if isinstance(input_ids, torch.Tensor) else None
                 length = reference.shape[-1] if reference is not None else len(input_ids)
-                feat[key] = torch.full((length, ),
-                                       pad_value,
-                                       dtype=torch.long,
-                                       device=reference.device if reference is not None else None)
+                device = reference.device if reference is not None else None
+                # completion_mask is the one field with a derivation rule: every other layer
+                # (template, grpo, metric, ledger) reads "absent" as "whatever is scored is the
+                # policy's own completion", so a zero fill would silently drop the row from the
+                # loss instead of aligning it with the rest of the batch.
+                labels = feat.get('labels') if key == 'completion_mask' else None
+                if labels is not None:
+                    labels = labels if isinstance(labels, torch.Tensor) else torch.as_tensor(np.asarray(labels))
+                    if labels.shape[-1] == length:
+                        feat[key] = (labels.reshape(-1) != -100).to(dtype=torch.long, device=device)
+                        continue
+                feat[key] = torch.full((length, ), pad_value, dtype=torch.long, device=device)
 
-    def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
+    def _collate_macro_batch(self,
+                             inputs: List[InputFeature],
+                             *,
+                             omit_megatron_attention_mask: bool = False) -> InputFeature:
         # Work on local copies so squeezing doesn't mutate the caller's original samples.
         squeezed = []
         for _input in inputs:
@@ -759,7 +775,7 @@ class InputProcessor:
             for key in text_keys:
                 values = [item[key] for item in text_inputs]
                 if self.framework == 'megatron' and key == 'attention_mask':
-                    result[key] = self._create_4d_attention_mask(values)
+                    result[key] = (None if omit_megatron_attention_mask else self._create_4d_attention_mask(values))
                 elif key == 'position_ids' and is_mm_position_ids(values[0]):
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
                     num_axes = values[0].shape[0]
@@ -799,9 +815,11 @@ class InputProcessor:
                    **kwargs) -> List[InputFeature]:
         if len(inputs) == 1 and self.framework != 'megatron':
             return inputs
+        omit_megatron_attention_mask = (
+            self.framework == 'megatron' and self._backend_builds_causal_mask(kwargs.get('attention_mask_type')))
         if micro_batch_size is None:
             # normal collate
-            outputs = self._collate_macro_batch(inputs)
+            outputs = self._collate_macro_batch(inputs, omit_megatron_attention_mask=omit_megatron_attention_mask)
             for key in outputs:
                 if key in self.VLM_CONCAT_FIELDS:
                     outputs[key] = torch.cat(outputs[key], dim=0)
@@ -812,7 +830,8 @@ class InputProcessor:
             assert len(inputs) >= micro_batch_size
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
-                _output = self._collate_macro_batch(inputs[i:i + micro_batch_size])
+                _output = self._collate_macro_batch(
+                    inputs[i:i + micro_batch_size], omit_megatron_attention_mask=omit_megatron_attention_mask)
                 for key in _output:
                     if key in self.VLM_CONCAT_FIELDS:
                         _output[key] = torch.cat(_output[key], dim=0)
@@ -820,14 +839,16 @@ class InputProcessor:
             return outputs
         else:
             # each macro batch shares the same length
-            res = self._collate_macro_batch(inputs)
+            res = self._collate_macro_batch(inputs, omit_megatron_attention_mask=omit_megatron_attention_mask)
             keys = list(res.keys())
             outputs = []
             for i in range(0, len(inputs), micro_batch_size):
                 end = i + micro_batch_size
                 output = {}
                 for key in keys:
-                    if key == 'position_ids' and res[key].dim() > 2:
+                    if res[key] is None:
+                        output[key] = None
+                    elif key == 'position_ids' and res[key].dim() > 2:
                         output[key] = res[key][:, i:end, :]
                     elif key in self.VLM_CONCAT_FIELDS:
                         output[key] = torch.cat(res[key][i:end], dim=0)

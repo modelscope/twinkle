@@ -23,6 +23,7 @@ from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from twinkle.utils import get_logger
+from twinkle.utils.safetensors import load_state_dict, save_state_dict
 from ..multi_lora import MultiLora
 from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .megatron import MegatronModel
@@ -213,7 +214,7 @@ class MultiLoraMegatronModel(MegatronModel):
     @staticmethod
     def _rank_local_optimizer_path(checkpoint_dir: str) -> str:
         rank = dist.get_rank() if dist.is_initialized() else 0
-        return os.path.join(checkpoint_dir, f'optimizer_rank_{rank}.pt')
+        return os.path.join(checkpoint_dir, f'optimizer_rank_{rank}.safetensors')
 
     @staticmethod
     def _save_local_training_rng_state():
@@ -257,7 +258,7 @@ class MultiLoraMegatronModel(MegatronModel):
         if optimizer_config.lr_scheduler is not None:
             state_dict['opt_param_scheduler'] = optimizer_config.lr_scheduler.state_dict()
 
-        torch.save(state_dict, self._rank_local_optimizer_path(checkpoint_dir))
+        save_state_dict(state_dict, self._rank_local_optimizer_path(checkpoint_dir))
 
         if dist.is_initialized():
             dist.barrier()
@@ -266,13 +267,13 @@ class MultiLoraMegatronModel(MegatronModel):
         no_load_optim = kwargs.pop('no_load_optim', False)
         no_load_rng = kwargs.pop('no_load_rng', True)
         optimizer_config = self.optimizer_group.get(adapter_name)
-        state_dict = torch.load(self._rank_local_optimizer_path(checkpoint_dir), map_location='cpu', weights_only=False)
+        state_dict = load_state_dict(self._rank_local_optimizer_path(checkpoint_dir))
 
         if not no_load_optim and optimizer_config is not None:
             if optimizer_config.optimizer is not None and 'optimizer' in state_dict:
                 optimizer_config.optimizer.load_state_dict(state_dict['optimizer'])
                 device = Platform.get_local_device()
-                for group_state in optimizer_config.optimizer.state.values():
+                for _, group_state in optimizer_config.optimizer.state.items():
                     if not isinstance(group_state, dict):
                         continue
                     for k, v in group_state.items():
@@ -290,7 +291,7 @@ class MultiLoraMegatronModel(MegatronModel):
         if optimizer_config is not None and 'iteration' in state_dict:
             optimizer_config.cur_step = state_dict['iteration']
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -364,6 +365,9 @@ class MultiLoraMegatronModel(MegatronModel):
                 adapter_name=real_adapter_name,
                 converter=self.multi_adapter.load_lora_converter)
 
+        optimizer_config = self.optimizer_group.get(adapter_name)
+        if optimizer_config is not None and optimizer_config.optimizer is not None:
+            optimizer_config.optimizer.reload_model_params()
         if load_optimizer:
             with self.optimizer_context(real_adapter_name):
                 self._load_multi_lora_optimizer(checkpoint_dir, adapter_name=adapter_name, **kwargs)
@@ -371,7 +375,7 @@ class MultiLoraMegatronModel(MegatronModel):
         if dist.is_initialized():
             dist.barrier()
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -402,7 +406,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         return self.multi_adapter.get_state_dict(**kwargs)
 
-    @remote_function(dispatch='all', sync=True)
+    @remote_function(dispatch='all', sync=True, timeout=3600)
     def add_adapter_to_model(
         self,
         adapter_name: str,

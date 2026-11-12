@@ -164,6 +164,12 @@ class DeepseekV4Template(Template):
     def _tool_calls_end(self) -> str:
         return f'</{self._encoding.dsml_token}{self._encoding.tool_calls_block_name}>'
 
+    @property
+    def tool_call_stop(self) -> Optional[str]:
+        # DSML closes the block, not each call inside it, so this bounds a reply
+        # to one block rather than to one call -- the nearest stop the format has.
+        return self._tool_calls_end
+
     def __init__(
         self,
         model_id: str,

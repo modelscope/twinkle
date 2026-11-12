@@ -12,10 +12,9 @@ http_options:
 
 persistence:
   # Gateway and Model run as separate Ray Serve replicas (separate
-  # processes); the tinker future flow needs cross-process visibility.
-  # ``memory`` mode is per-process; file (or redis) is required.
-  mode: file
-  file_path: /tmp/twinkle_state_mock.json
+  # processes); the tinker future flow needs cross-process visibility, which
+  # ``memory`` provides via a detached Ray named actor.
+  mode: memory
 
 applications:
 
@@ -43,6 +42,8 @@ applications:
     args:
       backend: mock
       model_id: mock-model
+      min_replicas: 1
+      max_replicas: 1
       nproc_per_node: 1
       device_group:
         name: model

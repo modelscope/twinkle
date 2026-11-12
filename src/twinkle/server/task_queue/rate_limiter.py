@@ -1,0 +1,183 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""
+Rate Limiter for Tinker Server.
+
+This module provides a sliding window rate limiter that supports both
+requests-per-second (rps) and tokens-per-second (tps) limits with automatic
+memory cleanup to prevent unbounded memory growth.
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+
+from twinkle.utils.logger import get_logger
+
+logger = get_logger()
+
+
+class RateLimiter:
+    """Sliding window rate limiter supporting both rps and tps limits.
+
+    This rate limiter tracks request history per user token and enforces
+    both requests-per-second (rps) and tokens-per-second (tps) limits.
+
+    To prevent unbounded memory growth, inactive tokens are automatically
+    removed after token_cleanup_multiplier * window_seconds of inactivity.
+
+    Attributes:
+        rps_limit: Maximum requests per second.
+        tps_limit: Maximum input tokens per second.
+        window_seconds: Time window for rate calculations.
+        token_cleanup_multiplier: Multiplier for token cleanup threshold.
+        token_cleanup_interval: How often to run cleanup task (seconds).
+    """
+
+    def __init__(
+        self,
+        rps_limit: float,
+        tps_limit: float,
+        window_seconds: float = 1.0,
+        token_cleanup_multiplier: float = 10.0,
+        token_cleanup_interval: float = 60.0,
+        active_tokens_gauge=None,
+        deployment_name: str = '',
+        replica_id: str = '',
+    ):
+        """Initialize the rate limiter.
+
+        Args:
+            rps_limit: Maximum requests per second per user token, per replica.
+                ``0`` disables the RPS limit.
+            tps_limit: Maximum input tokens per second per user token, per replica.
+                ``0`` disables the TPS limit.
+            window_seconds: Time window for rate limiting (default 1.0s).
+            token_cleanup_multiplier: Multiplier for token cleanup threshold.
+                Tokens inactive for window_seconds * token_cleanup_multiplier
+                will be removed. Default is 10.0 (10x the window).
+            token_cleanup_interval: How often to run the cleanup task in seconds.
+                Default is 60.0 (every minute).
+            active_tokens_gauge: Optional gauge adapter (see twinkle.server.telemetry.metrics)
+                for tracking the active token count.
+            deployment_name: Deployment name for metrics labels.
+            replica_id: Replica identifier for metrics labels.
+        """
+        self.rps_limit = rps_limit
+        self.tps_limit = tps_limit
+        self.window_seconds = window_seconds
+        self.token_cleanup_multiplier = token_cleanup_multiplier
+        self.token_cleanup_interval = token_cleanup_interval
+
+        # Dict mapping user token -> list of (timestamp, token_count) tuples
+        self._token_requests: dict[str, list[tuple[float, int]]] = {}
+        # Track last activity time for each token
+        self._last_activity: dict[str, float] = {}
+
+        # Async lock for rate limiting operations
+        self._lock = asyncio.Lock()
+
+        # Cleanup tasks
+        self._cleanup_task: asyncio.Task | None = None
+        self._cleanup_started = False
+
+        # Metrics gauge for active token count
+        self._active_tokens_gauge = active_tokens_gauge
+        self._metric_tags = {}
+        if deployment_name:
+            self._metric_tags['deployment'] = deployment_name
+        if replica_id:
+            self._metric_tags['replica'] = replica_id
+
+    def _cleanup_old_requests(self, token: str, current_time: float) -> None:
+        """Remove requests outside the sliding window."""
+        if token not in self._token_requests:
+            return
+        cutoff_time = current_time - self.window_seconds
+        self._token_requests[token] = [(ts, count) for ts, count in self._token_requests[token] if ts > cutoff_time]
+
+        # Remove token completely if it has no requests in the current window
+        if not self._token_requests[token]:
+            del self._token_requests[token]
+            if token in self._last_activity:
+                del self._last_activity[token]
+
+    async def _cleanup_inactive_tokens(self) -> None:
+        """Background task that periodically removes inactive tokens."""
+        logger.debug(f'[RateLimiter] Cleanup task started (interval={self.token_cleanup_interval}s)')
+        while True:
+            try:
+                await asyncio.sleep(self.token_cleanup_interval)
+
+                async with self._lock:
+                    current_time = time.time()
+                    inactive_threshold = current_time - (self.window_seconds * self.token_cleanup_multiplier)
+
+                    tokens_to_remove = [
+                        token for token, last_time in self._last_activity.items() if last_time < inactive_threshold
+                    ]
+
+                    for token in tokens_to_remove:
+                        if token in self._token_requests:
+                            del self._token_requests[token]
+                        if token in self._last_activity:
+                            del self._last_activity[token]
+
+                    if tokens_to_remove:
+                        logger.debug(f'[RateLimiter] Cleaned up {len(tokens_to_remove)} inactive tokens. '
+                                     f'Active tokens remaining: {len(self._token_requests)}')
+
+                    if self._active_tokens_gauge is not None:
+                        self._active_tokens_gauge.set(len(self._token_requests), tags=self._metric_tags)
+
+            except asyncio.CancelledError:
+                logger.debug('[RateLimiter] Cleanup task cancelled')
+                break
+            except Exception as e:
+                logger.warning(f'[RateLimiter] Error in cleanup task: {e}')
+                continue
+
+    def start_cleanup_task(self) -> None:
+        """Start the background cleanup task. Safe to call multiple times."""
+        if not self._cleanup_started:
+            self._cleanup_task = asyncio.create_task(self._cleanup_inactive_tokens())
+            self._cleanup_started = True
+            logger.debug('[RateLimiter] Background cleanup task started')
+
+    async def stop_cleanup_task(self) -> None:
+        """Stop the background cleanup task."""
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            logger.debug('[RateLimiter] Background cleanup task stopped')
+
+    async def check_and_record(self, token: str, input_tokens: int) -> tuple[bool, str | None]:
+        """Check if request is allowed and record it if so.
+
+        Returns:
+            Tuple of (allowed: bool, reason: Optional[str]).
+        """
+        async with self._lock:
+            current_time = time.time()
+            self._cleanup_old_requests(token, current_time)
+
+            if token not in self._token_requests:
+                self._token_requests[token] = []
+            self._last_activity[token] = current_time
+
+            requests = self._token_requests[token]
+            request_count = len(requests)
+            token_count = sum(count for _, count in requests)
+
+            if self.rps_limit > 0 and request_count >= self.rps_limit:
+                return False, f'RPS limit exceeded: {request_count}/{self.rps_limit} requests/s'
+
+            if self.tps_limit > 0 and token_count + input_tokens > self.tps_limit:
+                return False, f'TPS limit exceeded: {token_count + input_tokens}/{self.tps_limit} tokens/s'
+
+            self._token_requests[token].append((current_time, input_tokens))
+            if self._active_tokens_gauge is not None:
+                self._active_tokens_gauge.set(len(self._token_requests), tags=self._metric_tags)
+            return True, None

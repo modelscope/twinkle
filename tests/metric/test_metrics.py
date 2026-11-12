@@ -271,6 +271,26 @@ class TestDPOMetric:
         assert 'rewards/chosen' in result
         assert 'rewards/accuracies' in result
 
+    def test_dpo_metric_accepts_json_ref_logps(self):
+        labels = torch.tensor([[1, 2, -100], [3, 4, -100]])
+        logps = torch.randn(2, 3)
+        ref_logps = torch.randn(2, 3)
+        tensor_metric = _no_dist_metric(DPOMetric, beta=0.1)
+        json_metric = _no_dist_metric(DPOMetric, beta=0.1)
+
+        tensor_metric.accumulate(
+            {'labels': labels},
+            {'logps': logps},
+            ref_outputs={'logps': ref_logps},
+        )
+        json_metric.accumulate(
+            {'labels': labels},
+            {'logps': logps},
+            ref_outputs={'logps': ref_logps.tolist()},
+        )
+
+        assert json_metric.calculate() == pytest.approx(tensor_metric.calculate())
+
     def test_dpo_metric_no_logps_skips(self):
         m = _no_dist_metric(DPOMetric, beta=0.1)
         m.accumulate({'labels': torch.tensor([[1, 2]])}, {})
@@ -333,6 +353,35 @@ class TestGRPOMetric:
         m.accumulate({'labels': labels}, {'logps': logps, 'entropies': entropies})
         result = m.calculate()
         assert 'train/entropy' in result
+
+    def test_grpo_metric_old_logps_wider_than_logps(self):
+        """old_logps 来自 forward_only，序列维 pad 到整个 micro batch 的最大长度（dp split 之前），
+        而 logps 只 pad 到本 rank 的最大长度 —— old 比 new 宽是常态，不能因此丢掉 ratio/kl。
+        取值必须落在 mask 位上（不是行首 N 个），所以 mean_old_logp 是错位的判据。
+        """
+        m = _no_dist_metric(GRPOMetric)
+        labels = torch.tensor([[-100, -100, 10, 11, 12, 13],
+                               [-100, -100, -100, -100, 20, 21]])
+        logps = torch.zeros(2, 6)
+        logps[0, 2:6] = torch.tensor([-1.1, -2.1, -3.1, -4.1])
+        logps[1, 4:6] = torch.tensor([-5.1, -6.1])
+        old_logps = torch.zeros(2, 9)   # 右 pad 到 9 > 6
+        old_logps[0, 2:6] = torch.tensor([-1.0, -2.0, -3.0, -4.0])
+        old_logps[1, 4:6] = torch.tensor([-5.0, -6.0])
+        m.accumulate({'labels': labels}, {'logps': logps}, old_logps=old_logps)
+        result = m.calculate()
+        assert 'train/approx_kl' in result
+        assert abs(result['train/mean_old_logp'] - (-3.5)) < 1e-6
+        assert abs(result['train/logp_diff_mean'] - (-0.1)) < 1e-6
+
+    def test_grpo_metric_old_logps_row_mismatch_skipped(self):
+        """行数不匹配是另一类真 bug（凭空 pad 出的假样本行），必须继续被丢弃而不是硬对齐。"""
+        m = _no_dist_metric(GRPOMetric)
+        labels = torch.tensor([[-100, 10, 11, 12]])
+        logps = torch.randn(1, 4)
+        m.accumulate({'labels': labels}, {'logps': logps}, old_logps=torch.zeros(3, 4))
+        result = m.calculate()
+        assert 'train/approx_kl' not in result
 
     def test_grpo_metric_reset(self):
         m = _no_dist_metric(GRPOMetric)

@@ -8,8 +8,6 @@ from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, PPOLoss, 
 from .infonce import InfonceLoss
 from .liger_fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 from .mse import MSELoss
-from .gold import GOLDLoss
-from .cross_token import CrossTokenLoss
 from .value import PPOValueLoss
 
 torch_loss_mapping = {
@@ -28,6 +26,8 @@ torch_loss_mapping = {
     'cispo': CISPOLoss,
     'bnpo': BNPOLoss,
     'dr_grpo': DRGRPOLoss,
+    # Self-distillation losses
+    'opsd': OPSDLoss,
     # DPO family losses
     'dpo': DPOLoss,
     'simpo': SimPOLoss,

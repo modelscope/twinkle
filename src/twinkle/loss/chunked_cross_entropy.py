@@ -74,8 +74,10 @@ def _get_chunked_ce_func():
                 scale = grad_output
 
             n = logits.shape[0]
-            # Write gradients in-place into logits to avoid allocating a
-            # second [N, V] tensor (halves peak backward memory).
+            # Gradients go to a fresh buffer: ``logits`` is the model output the caller
+            # keeps (train metrics such as Accuracy read it after backward), so it must not
+            # be overwritten. Only one chunk's fp32 log_softmax is ever live.
+            grad_logits = torch.empty_like(logits)
             for start in range(0, n, chunk_size):
                 end = min(start + chunk_size, n)
                 logits_chunk = logits[start:end].detach().requires_grad_(True)
@@ -90,10 +92,10 @@ def _get_chunked_ce_func():
                     loss_chunk = (per_token * mask).sum()
 
                 grad_chunk = torch.autograd.grad(loss_chunk, logits_chunk, retain_graph=False)[0]
-                logits.data[start:end] = grad_chunk * scale
+                grad_logits[start:end] = grad_chunk * scale
 
             # logits, labels, chunk_size, ignore_index, reduction, dft
-            return logits, None, None, None, None, None
+            return grad_logits, None, None, None, None, None
 
     _CHUNKED_CE_FUNC = _ChunkedCrossEntropyFunc
     return _CHUNKED_CE_FUNC
@@ -128,6 +130,21 @@ class ChunkedCrossEntropyLoss(Loss):
         self.ignore_index = ignore_index
         self.reduction = reduction
         self.dft = dft
+
+    def micro_batch_scale(self, inputs, indices):
+        if self.reduction == 'sum':
+            return 1.0
+        token_counts = []
+        for model_input in inputs:
+            labels = model_input['labels']
+            if hasattr(labels, 'ne'):
+                token_counts.append(int(labels.ne(self.ignore_index).sum().item()))
+            else:
+                token_counts.append(sum(int(token != self.ignore_index) for token in labels))
+        total_tokens = sum(token_counts)
+        if total_tokens == 0:
+            return 0.0
+        return sum(token_counts[index] for index in indices) / total_tokens
 
     def __call__(self, inputs, outputs, **kwargs):
         labels = inputs['labels']

@@ -1,4 +1,5 @@
 import socket
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Union
 
@@ -58,6 +59,72 @@ def pad_sequence_to_length(
     return F.pad(tensor, pad_tuple, mode='constant', value=pad_value)
 
 
+_CHUNKED_SELECTIVE_LOG_SOFTMAX = None
+
+
+def _chunked_selective_log_softmax_function():
+    """Lazily build the autograd function used by :func:`selective_log_softmax`.
+
+    ``torch`` is imported lazily throughout this module, so the ``Function``
+    subclass cannot live at module scope. It is built once and cached.
+    """
+    global _CHUNKED_SELECTIVE_LOG_SOFTMAX
+    if _CHUNKED_SELECTIVE_LOG_SOFTMAX is not None:
+        return _CHUNKED_SELECTIVE_LOG_SOFTMAX
+    import torch
+
+    class ChunkedSelectiveLogSoftmax(torch.autograd.Function):
+        """One chunk of ``selective_log_softmax`` that recomputes in backward.
+
+        The wide FP32 upcast is a forward-only temporary: only the original
+        dtype chunk and its labels are saved, so no full-vocab FP32 copy of the
+        activation stays resident until the backward pass.
+        """
+
+        @staticmethod
+        def forward(ctx, logits, labels, compute_dtype, return_entropy):
+            chunk = logits.to(compute_dtype)
+            logsumexp = torch.logsumexp(chunk, dim=-1)
+            selected = torch.gather(chunk, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+            logps = selected - logsumexp
+            ctx.save_for_backward(logits, labels)
+            ctx.compute_dtype = compute_dtype
+            ctx.return_entropy = return_entropy
+            if not return_entropy:
+                return logps
+            probabilities = torch.softmax(chunk, dim=-1)
+            return logps, logsumexp - (probabilities * chunk).sum(dim=-1)
+
+        @staticmethod
+        def backward(ctx, *grad_outputs):
+            logits, labels = ctx.saved_tensors
+            compute_dtype = ctx.compute_dtype
+            chunk = logits.to(compute_dtype)
+            probabilities = torch.softmax(chunk, dim=-1)
+            grad_logits = torch.zeros_like(chunk)
+
+            grad_logps = grad_outputs[0]
+            if grad_logps is not None:
+                grad_logps = grad_logps.to(compute_dtype).unsqueeze(-1)
+                # d/dz (z[label] - logsumexp(z)) = onehot(label) - softmax(z)
+                grad_logits.scatter_add_(dim=-1, index=labels.unsqueeze(-1), src=grad_logps)
+                grad_logits.sub_(probabilities * grad_logps)
+
+            if ctx.return_entropy:
+                grad_entropy = grad_outputs[1]
+                if grad_entropy is not None:
+                    grad_entropy = grad_entropy.to(compute_dtype).unsqueeze(-1)
+                    # H(z) = logsumexp(z) - sum(softmax(z) * z)
+                    # dH/dz = softmax(z) * (E_p[z] - z)
+                    expected = (probabilities * chunk).sum(dim=-1, keepdim=True)
+                    grad_logits.add_(probabilities * (grad_entropy * (expected - chunk)))
+
+            return grad_logits.to(logits.dtype), None, None, None
+
+    _CHUNKED_SELECTIVE_LOG_SOFTMAX = ChunkedSelectiveLogSoftmax
+    return _CHUNKED_SELECTIVE_LOG_SOFTMAX
+
+
 def selective_log_softmax(logits, index, return_entropy: bool = False):
     """
     refer: trl/trainer/utils
@@ -80,11 +147,13 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
             site avoids materializing a second full-vocab tensor later).
 
     Returns:
-        Gathered log probabilities with the same shape as ``index``.
+        Gathered log probabilities with the same shape as ``index``. The dtype is
+        float32 (float64 for float64 input) whatever the input dtype: the softmax is
+        computed wide and the result is not narrowed back, because a peaked row
+        reaches log-probs whose bfloat16 ULP is 0.5.
         If ``return_entropy`` is True, returns ``(per_token_logps, per_token_entropy)``.
     """
     import torch
-    import torch.nn.functional as F
 
     try:
         from megatron.core import parallel_state as mpu
@@ -99,41 +168,195 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
     except (ImportError, AssertionError, OSError):
         pass
 
-    if logits.dtype in [torch.float32, torch.float64]:
-        selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+    vocab_size = logits.shape[-1]
+    flat_logits = logits.reshape(-1, vocab_size)
+    flat_index = index.reshape(-1)
+    compute_dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
+    element_size = torch.empty((), dtype=compute_dtype).element_size()
+    temporary_bytes = 32 << 20 if return_entropy else 64 << 20
+    chunk_rows = max(1, temporary_bytes // (vocab_size * element_size))
+    chunk_function = _chunked_selective_log_softmax_function()
+
+    logps = []
+    entropies = []
+    for start in range(0, flat_logits.shape[0], chunk_rows):
+        stop = min(start + chunk_rows, flat_logits.shape[0])
+        result = chunk_function.apply(
+            flat_logits[start:stop],
+            flat_index[start:stop],
+            compute_dtype,
+            return_entropy,
+        )
         if return_entropy:
-            # Per-row loop mirrors the logsumexp path below, to keep peak memory bounded.
-            logsumexp_values = []
-            per_token_entropy = []
-            for row_logits in logits:
-                row_lse = torch.logsumexp(row_logits, dim=-1)
-                logsumexp_values.append(row_lse)
-                # H = lse - E_p[x] = lse - sum(exp(x - lse) * x)
-                row_p = torch.exp(row_logits - row_lse.unsqueeze(-1))
-                per_token_entropy.append(row_lse - (row_p * row_logits).sum(dim=-1))
-            logsumexp_values = torch.stack(logsumexp_values)
-            per_token_entropy = torch.stack(per_token_entropy)
-            per_token_logps = selected_logits - logsumexp_values
-            return per_token_logps, per_token_entropy
-        # loop to reduce peak mem consumption
-        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
-        per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
-    else:
-        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
-        per_token_logps = []
-        per_token_entropy = [] if return_entropy else None
-        for row_logits, row_labels in zip(logits, index, strict=True):  # loop to reduce peak mem consumption
-            row_logps = F.log_softmax(row_logits, dim=-1)
-            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
-            per_token_logps.append(row_per_token_logps)
-            if return_entropy:
-                # row_logps is already stable; softmax reuses the same numerics.
-                row_p = torch.exp(row_logps)
-                per_token_entropy.append(-(row_p * row_logps).sum(dim=-1))
-        per_token_logps = torch.stack(per_token_logps)
-        if return_entropy:
-            return per_token_logps, torch.stack(per_token_entropy)
+            chunk_logps, chunk_entropies = result
+            logps.append(chunk_logps)
+            entropies.append(chunk_entropies)
+        else:
+            logps.append(result)
+    per_token_logps = torch.cat(logps).reshape(index.shape)
+    if return_entropy:
+        return per_token_logps, torch.cat(entropies).reshape(index.shape)
     return per_token_logps
+
+
+@dataclass(frozen=True)
+class ReplayedLogSoftmaxMetadata:
+    """Validated, flattened CSR metadata used by sampling replay."""
+    token_ids: tuple[int, ...]
+    offsets: tuple[int, ...]
+
+
+def prepare_replayed_selective_log_softmax(
+    labels: 'torch.Tensor',
+    loss_mask: 'torch.Tensor',
+    sampling_masks,
+    temperature: float,
+    vocab_size: int,
+    allow_packed_masks: bool = False,
+) -> ReplayedLogSoftmaxMetadata:
+    """Align and flatten sampling masks before the model forward.
+
+    When ``allow_packed_masks`` is true, a padding-free batch may concatenate
+    multiple logical masks into one tensor row. Their sampler-validated CSR
+    rows are flattened in logical-sample order.
+    """
+    import math
+    import torch
+
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError('temperature must be greater than 0 for sampling replay')
+    if not torch.is_tensor(labels) or labels.dim() != 2:
+        shape = tuple(labels.shape) if torch.is_tensor(labels) else type(labels)
+        raise ValueError(f'labels must have shape [batch, seq_len], got {shape}')
+    if loss_mask.shape != labels.shape:
+        raise ValueError('loss_mask must have the same shape as labels')
+    if not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise ValueError(f'vocab_size must be a positive integer, got {vocab_size!r}')
+    if not sampling_masks:
+        raise ValueError('sampling mask batch has 0 samples')
+
+    batch_size = labels.shape[0]
+    if len(sampling_masks) == batch_size:
+        mask_groups = [[sampling_mask] for sampling_mask in sampling_masks]
+    elif batch_size == 1 and allow_packed_masks:
+        # padding_free/packing collapses multiple logical samples into batch=1.
+        mask_groups = [list(sampling_masks)]
+    else:
+        raise ValueError(f'sampling mask batch has {len(sampling_masks)} samples, expected {batch_size}')
+
+    flat_token_ids = []
+    global_offsets = [0]
+    for batch_idx, mask_group in enumerate(mask_groups):
+        sampled_labels = labels[batch_idx][loss_mask[batch_idx]].tolist()
+        parsed_masks = []
+        group_rows = 0
+        for sampling_mask in mask_group:
+            if sampling_mask is None:
+                raise ValueError(f'sampling mask is missing for sample {batch_idx}')
+            token_ids = [int(token_id) for token_id in sampling_mask.token_ids]
+            offsets = [int(offset) for offset in sampling_mask.offsets]
+            invalid_token_id = next(
+                (token_id for token_id in token_ids if token_id < 0 or token_id >= vocab_size),
+                None,
+            )
+            if invalid_token_id is not None:
+                raise ValueError(f'sampling mask token ID {invalid_token_id} is outside vocabulary [0, {vocab_size})')
+
+            base_offset = global_offsets[-1]
+            flat_token_ids.extend(token_ids)
+            global_offsets.extend(base_offset + offset for offset in offsets[1:])
+            group_rows += len(offsets) - 1
+            parsed_masks.append((token_ids, offsets))
+
+        num_train_tokens = len(sampled_labels)
+        if group_rows != num_train_tokens:
+            raise ValueError(f'sampling mask for sample {batch_idx} has {group_rows} rows but '
+                             f'{num_train_tokens} training tokens')
+        row_idx = 0
+        for token_ids, offsets in parsed_masks:
+            for start, end in zip(offsets, offsets[1:]):
+                sampled_label = sampled_labels[row_idx]
+                if sampled_label < 0 or sampled_label >= vocab_size:
+                    raise ValueError(f'sampled label {sampled_label} is outside vocabulary [0, {vocab_size})')
+                try:
+                    token_ids.index(sampled_label, start, end)
+                except ValueError as e:
+                    raise ValueError(f'sampled label {sampled_label} is absent from sampling mask row {row_idx}') from e
+                row_idx += 1
+
+    return ReplayedLogSoftmaxMetadata(tuple(flat_token_ids), tuple(global_offsets))
+
+
+# Re-normalize trainer logits over each rollout-time top-p/top-k support set
+# before reading the sampled token's log probability. Replaying the sampler's
+# action space removes the sampling/training distribution mismatch in GRPO.
+def replayed_selective_log_softmax(
+    logits: 'torch.Tensor',
+    labels: 'torch.Tensor',
+    loss_mask: 'torch.Tensor',
+    sampling_masks,
+    temperature: float,
+    metadata: Optional[ReplayedLogSoftmaxMetadata] = None,
+    allow_packed_masks: bool = False,
+) -> 'torch.Tensor':
+    """Compute selected log probabilities on rollout-time CSR support sets."""
+    import torch
+
+    if logits.dim() != 3:
+        raise ValueError(f'logits must have shape [batch, seq_len, vocab], got {tuple(logits.shape)}')
+    if labels.shape != logits.shape[:2] or loss_mask.shape != labels.shape:
+        raise ValueError('labels and loss_mask must match the first two logits dimensions')
+    if metadata is None:
+        metadata = prepare_replayed_selective_log_softmax(
+            labels=labels,
+            loss_mask=loss_mask,
+            sampling_masks=sampling_masks,
+            temperature=temperature,
+            vocab_size=logits.shape[-1],
+            allow_packed_masks=allow_packed_masks,
+        )
+
+    # CSR rows are ordered exactly like the masked training-token positions.
+    positions = loss_mask.nonzero(as_tuple=False)
+    num_rows = positions.shape[0]
+    result = torch.zeros(labels.shape, dtype=torch.float32, device=logits.device)
+    if num_rows == 0:
+        return result
+
+    offsets_tensor = torch.tensor(metadata.offsets, dtype=torch.long, device=logits.device)
+    lengths = offsets_tensor[1:] - offsets_tensor[:-1]
+    row_ids = torch.repeat_interleave(
+        torch.arange(num_rows, device=logits.device),
+        lengths,
+    )
+    kept_token_ids = torch.tensor(metadata.token_ids, dtype=torch.long, device=logits.device)
+    sampled_labels = labels[positions[:, 0], positions[:, 1]].long()
+
+    # Gather only logits retained by the rollout sampler, then normalize per CSR row.
+    kept_logits = logits[
+        positions[row_ids, 0],
+        positions[row_ids, 1],
+        kept_token_ids,
+    ].float() / temperature
+    selected_logits = logits[
+        positions[:, 0],
+        positions[:, 1],
+        sampled_labels,
+    ].float() / temperature
+
+    # Use max-shifted log-sum-exp for numerically stable restricted softmax.
+    row_max = torch.full(
+        (num_rows, ),
+        -torch.inf,
+        dtype=torch.float32,
+        device=logits.device,
+    )
+    row_max.scatter_reduce_(0, row_ids, kept_logits, reduce='amax', include_self=True)
+    row_exp_sums = torch.zeros(num_rows, dtype=torch.float32, device=logits.device)
+    row_exp_sums.scatter_add_(0, row_ids, torch.exp(kept_logits - row_max[row_ids]))
+    flat_logps = selected_logits - (row_max + torch.log(row_exp_sums))
+    result[positions[:, 0], positions[:, 1]] = flat_logps
+    return result
 
 
 def _vocab_parallel_selective_log_softmax(
@@ -247,17 +470,22 @@ def pad_and_stack_tensors(tensors: List['torch.Tensor'], pad_value: float = -200
             t = t.unsqueeze(0)
         expanded_tensors.append(t)
 
-    max_shape = []
-    for dim in range(max_ndim):
-        max_shape.append(max(t.shape[dim] for t in expanded_tensors))
+    # dim 0 是 concat 的拼接维，torch.cat 本来就不要求它对齐 —— 把它也 pad 到最大值会**凭空造出
+    # 不存在的样本行**（例如 dp rank0 收 3 行、rank1 收 2 行时，结果是 3+3=6 行而不是 5 行，多出来
+    # 的那行全是 pad_value）。这些假行流进下游后：损失侧 GRPOLoss._pad_and_align_to_batch 靠
+    # `data[i] for i in range(batch_size)` 把它们丢掉所以侥幸无害，但指标侧 align_logps_to_mask 是
+    # 严格判等，行数一多就整步跳过 ratio/kl/clip（日志里的 `old_logps shape (3, N) does not match
+    # logps_mb shape (2, N)` 就是它）。所以 concat 时只对齐 dim>=1，stack 时才需要全维对齐。
+    pad_from = 1 if concat else 0
+    max_shape = [max(t.shape[dim] for t in expanded_tensors) for dim in range(max_ndim)]
 
     padded_tensors = []
     for t in expanded_tensors:
-        if list(t.shape) == max_shape:
+        if all(t.shape[dim] == max_shape[dim] for dim in range(pad_from, max_ndim)):
             padded_tensors.append(t)
         else:
             pad_params = []
-            for dim in range(max_ndim - 1, -1, -1):
+            for dim in range(max_ndim - 1, pad_from - 1, -1):
                 pad_params.extend([0, max_shape[dim] - t.shape[dim]])
             padded = torch.nn.functional.pad(t, pad_params, value=pad_value)
             padded_tensors.append(padded)

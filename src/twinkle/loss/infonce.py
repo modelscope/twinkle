@@ -63,8 +63,8 @@ def _parse_multi_negative_sentences(sentences: torch.Tensor,
             if negatives > hard_negatives:
                 split_part = split_part[:hard_negatives + 2]
             elif negatives < hard_negatives:
-                # upsample negatives with replacement; skip index 0 (positive)
-                selected = np.random.choice(list(range(negatives)), size=hard_negatives - negatives, replace=True) + 1
+                # upsample negatives with replacement; skip index 0 (anchor) and 1 (positive)
+                selected = np.random.choice(list(range(negatives)), size=hard_negatives - negatives, replace=True) + 2
                 split_part = torch.cat((split_part, split_part[selected]), dim=0)
         split_tensors.append(split_part)
     return split_tensors

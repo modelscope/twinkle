@@ -11,7 +11,7 @@ advantage_fn = GRPOAdvantage()
 
 # Assume 2 prompts, each generating 4 samples
 rewards = [0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]  # 8 reward values
-advantages = advantage_fn(rewards, num_generations=4, scale='group')
+advantages = advantage_fn(rewards, num_generations=4, scale='none')
 
 # Advantages will be each group minus the group mean:
 # Group 1: [0.0-0.5, 1.0-0.5, 0.0-0.5, 1.0-0.5] = [-0.5, 0.5, -0.5, 0.5]
@@ -30,38 +30,8 @@ This method:
 - Performs relative comparisons within groups, better aligned with relative nature of human preferences
 - Avoids the impact of reward scale
 
-## Complete Training Example
+## Training Integration
 
-Using the advantage function in GRPO training:
+Set `SamplingParams(num_samples=N, logprobs=1)` and read completions from each response's `sequences`. Training also requires aligned labels and old policy logprobs; advantages alone are insufficient.
 
-```python
-from twinkle.advantage import GRPOAdvantage
-from twinkle.model import TransformersModel
-from twinkle.sampler import vLLMSampler
-
-# Create components
-actor = TransformersModel(model_id='ms://Qwen/Qwen3.5-4B')
-sampler = vLLMSampler(model_id='ms://Qwen/Qwen3.5-4B')
-reward_fn = ...
-advantage_fn = GRPOAdvantage()
-
-# Training loop
-for batch in dataloader:
-    # Sample generation
-    sample_response = sampler.sample(batch, num_samples=4)
-    input_data = [seq.new_input_feature for response in sample_response for seq in response.sequences]
-    ...
-    rewards = reward_fn(...)
-
-    # Calculate advantages
-    advantages = advantage_fn(rewards, num_generations=4)
-
-    # 4. Policy optimization
-    loss = actor.forward_backward(
-        inputs=input_data,
-        advantages=advantages
-    )
-    actor.clip_grad_and_step()
-```
-
-> The GRPO method is simple and efficient, suitable for most RLHF training scenarios.
+See the maintained [GRPO training example](https://github.com/modelscope/twinkle/blob/main/cookbook/rl/grpo/short_math_grpo.py) for the complete sampling, reward, and optimizer loop. To use RLOO, replace the advantage function with `RLOOAdvantage` and generate at least two samples per prompt.

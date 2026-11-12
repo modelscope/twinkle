@@ -8,25 +8,86 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import uuid
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import TYPE_CHECKING, Any
 
-from twinkle_client.http.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
+from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
 
 if TYPE_CHECKING:
     from .app import GatewayServer
 
 import httpx
 
+import twinkle.protocol.types as types
+from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
 from .openai_bridge import make_error, translate_chat_request, translate_response, translate_stream_chunk
+from .use_cases import poll_future
 
 logger = get_logger()
+
+TWINKLE_SAMPLE = 'twinkle/sample'
+TWINKLE_SAMPLE_STREAM = 'twinkle/sample_stream'
+TWINKLE_SET_TEMPLATE = 'twinkle/set_template'
+
+_OPENAI_SAMPLE_TIMEOUT_ENV = 'TWINKLE_OPENAI_SAMPLE_TIMEOUT'
+_DEFAULT_OPENAI_SAMPLE_TIMEOUT = 1800.0
+
+
+class SamplerWaitTimeoutError(TimeoutError):
+    """The sampler task did not reach a terminal state inside the gateway's budget."""
+
+
+def _sample_wait_timeout() -> float:
+    return float(os.environ.get(_OPENAI_SAMPLE_TIMEOUT_ENV, str(_DEFAULT_OPENAI_SAMPLE_TIMEOUT)))
+
+
+async def _resolve_sampler_envelope(gateway: GatewayServer, sampler_data: dict[str, Any],
+                                    request: Request) -> types.TaskEnvelope | None:
+    """Resolve the sampler's TaskEnvelope to a terminal state.
+
+    ``/twinkle/sample`` always answers with a TaskEnvelope; a slow sample is
+    still ``queued``/``running`` when the proxy returns. Polling the shared
+    state backend is the only way to obtain its result without changing the
+    upstream wire contract. Returns ``None`` when the future record was lost.
+
+    ``TWINKLE_OPENAI_SAMPLE_TIMEOUT`` bounds the entire terminal-state wait,
+    including state reads. Client disconnection is checked between long polls.
+    """
+    envelope = types.TaskEnvelope.model_validate(sampler_data)
+    if envelope.status in types.TERMINAL_STATUSES:
+        return envelope
+
+    async def wait_for_terminal(envelope: types.TaskEnvelope) -> types.TaskEnvelope | None:
+        while envelope.status not in types.TERMINAL_STATUSES:
+            if await request.is_disconnected():
+                raise SamplerWaitTimeoutError('Client disconnected while waiting for the sampling task.')
+            # ``poll_future`` waits out its whole window before reporting a missing
+            # record, so check once here: a lost record is a terminal answer, not a
+            # reason to keep the coroutine alive.
+            if await gateway.state.get_future(envelope.request_id) is None:
+                return None
+            outcome = await poll_future(gateway.state, envelope.request_id)
+            if outcome.record is None:
+                return None
+            envelope = envelope_from_record(envelope.request_id, outcome.record)
+        return envelope
+
+    timeout = _sample_wait_timeout()
+    try:
+        return await asyncio.wait_for(wait_for_terminal(envelope), timeout=timeout)
+    except SamplerWaitTimeoutError:
+        raise
+    except asyncio.TimeoutError:
+        raise SamplerWaitTimeoutError(
+            f'Sampling task {envelope.request_id} did not finish within {timeout:g}s.') from None
 
 
 def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:
@@ -87,7 +148,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             # Non-streaming: proxy to /twinkle/sample, translate response
             response = await self.proxy.proxy_request(
                 request,
-                endpoint='twinkle/sample',
+                endpoint=TWINKLE_SAMPLE,
                 base_model=base_model,
                 service_type='sampler',
                 body_override=body_bytes,
@@ -104,8 +165,43 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 )
 
             sampler_data = json.loads(response.body)
+            try:
+                envelope = await _resolve_sampler_envelope(self, sampler_data, request)
+            except SamplerWaitTimeoutError as e:
+                return JSONResponse(
+                    status_code=504,
+                    content=make_error(message=str(e), error_type='timeout'),
+                )
+            if envelope is None:
+                return JSONResponse(
+                    status_code=500,
+                    content=make_error(
+                        message=f'Sampling task {sampler_data.get("request_id")} was lost by the server',
+                        error_type='server_error',
+                    ),
+                )
+            if envelope.status != 'completed':
+                error = envelope.error
+                message = error.error if error is not None else f'Sampling task {envelope.status}'
+                error_type = ('invalid_request_error'
+                              if error is not None and error.category.value == 'user' else 'server_error')
+                return JSONResponse(
+                    status_code=error.error_code if error is not None else 500,
+                    content=make_error(message=message, error_type=error_type),
+                )
+
+            sampler_result = envelope.result or {}
+            if not sampler_result.get('samples'):
+                return JSONResponse(
+                    status_code=502,
+                    content=make_error(
+                        message='Sampler completed without returning any samples',
+                        error_type='server_error',
+                    ),
+                )
+
             request_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
-            openai_response = translate_response(sampler_data, model, request_id)
+            openai_response = translate_response(sampler_result, model, request_id)
             resp_headers = {}
             replica_id = response.headers.get('x-twinkle-replica-id')
             if replica_id:
@@ -121,7 +217,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 try:
                     async for line in self.proxy.proxy_request_stream(
                             request,
-                            endpoint='twinkle/sample_stream',
+                            endpoint=TWINKLE_SAMPLE_STREAM,
                             base_model=base_model,
                             service_type='sampler',
                             body_override=body_bytes,
@@ -195,12 +291,12 @@ async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
         pass
 
     # Check if it's directly a supported base model
-    if model in gateway._supported_model_names:
+    if model in gateway.supported_model_names:
         return model
 
     # Fallback: if there's exactly one supported model, use it
-    if len(gateway._supported_model_names) == 1:
-        return next(iter(gateway._supported_model_names))
+    if len(gateway.supported_model_names) == 1:
+        return next(iter(gateway.supported_model_names))
 
     return None
 
@@ -211,10 +307,6 @@ def _build_sticky_headers(sticky_key: str, request: Request) -> dict[str, str]:
     return build_routing_headers(sticky_key, auth)
 
 
-# Per-process cache; each Ray Serve worker holds its own instance.
-_template_initialized: set[str] = set()
-
-
 async def _ensure_template(
     gateway: GatewayServer,
     base_model: str,
@@ -223,30 +315,32 @@ async def _ensure_template(
 ) -> None:
     """Ensure the sampler has a chat template set for encoding Trajectory inputs.
 
-    Called once per base_model (cached in-process). On failure, logs a warning
-    but doesn't block — the sampler will return its own error if needed.
+    Called once per base_model (cached on the ``GatewayServer`` instance). On failure,
+    logs a warning but doesn't block -- the sampler will return its own error if needed.
     """
-    if base_model in _template_initialized:
+    if base_model in gateway._template_initialized:
         return
 
     template_cls = get_template_for_model(base_model)
+    # The sampler's strict schema accepts only template_cls / adapter_name /
+    # init_kwargs. It already knows its own model_id and injects it when the
+    # template constructor needs one, so sending model_id here is rejected 422.
     set_template_body = json.dumps({
         'template_cls': template_cls,
-        'model_id': base_model,
         'adapter_name': '',
     }).encode()
 
     try:
         resp = await gateway.proxy.proxy_request(
             request,
-            endpoint='twinkle/set_template',
+            endpoint=TWINKLE_SET_TEMPLATE,
             base_model=base_model,
             service_type='sampler',
             body_override=set_template_body,
             extra_headers=sticky_headers,
         )
         if resp.status_code == 200:
-            _template_initialized.add(base_model)
+            gateway._template_initialized.add(base_model)
         else:
             logger.warning('set_template failed: %s', resp.body.decode()[:200])
     except Exception as e:

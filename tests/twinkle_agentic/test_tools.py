@@ -157,6 +157,35 @@ class TestToolManager:
         assert 'unknown tool' in result
         assert 'Available:' in result
 
+    def test_unqualified_name_is_refused_with_the_qualified_one(self):
+        # Measured over 5793 RSI calls: 201 bare 'shell_executor' and 30 filed
+        # under the wrong server, all naming a tool that does exist. The call
+        # still fails -- silently resolving it would train a name that no serving
+        # deployment accepts -- but the reply says which name to use.
+        tm = ToolManager({'code_executor---shell_executor': MockTool()})
+        for wrong in ('shell_executor', 'file_system---shell_executor'):
+            result = tm({'function': {'name': wrong, 'arguments': {}}})
+            assert 'unknown tool' in result
+            assert "Did you mean 'code_executor---shell_executor'" in result
+
+    def test_no_guess_when_the_bare_name_is_ambiguous(self):
+        # Two servers exporting the same verb: any guess would be a coin toss.
+        tm = ToolManager({
+            'a---read_file': MockTool('a---read_file'),
+            'b---read_file': MockTool('b---read_file'),
+        })
+        result = tm({'function': {'name': 'read_file', 'arguments': {}}})
+        assert 'Did you mean' not in result
+
+    def test_no_guess_when_nothing_resembles_the_name(self):
+        # file_system---list_directory, 107 times: the model wants a tool this
+        # line-up does not have. The available list is the only useful answer.
+        tm = ToolManager({'file_system---glob': MockTool('file_system---glob')})
+        result = tm({'function': {'name': 'file_system---list_directory', 'arguments': {}}})
+        assert 'Did you mean' not in result
+        assert 'file_system---glob' in result
+        assert 'Available:' in result
+
     def test_call_missing_function(self):
         tm = ToolManager({'mock': MockTool()})
         result = tm({})

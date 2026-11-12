@@ -4,6 +4,7 @@ from collections import Counter
 from typing import Any, Dict, List, Tuple
 
 from twinkle.reward import Reward
+from twinkle_agentic.utils.message_utils import assistant_text
 
 _BOXED_MARKER = '\\boxed{'
 
@@ -33,17 +34,6 @@ def _extract_final_answer(completion: str) -> str:
             # Unbalanced trailing marker — stop, keep last good match.
             break
     return out
-
-
-def _last_assistant_text(traj: Dict[str, Any]) -> str:
-    for msg in reversed(traj.get('messages', [])):
-        if msg.get('role') != 'assistant':
-            continue
-        content = msg.get('content') or ''
-        if isinstance(content, str):
-            return content
-        return '\n'.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
-    return ''
 
 
 def _stem(tok: str) -> str:
@@ -137,7 +127,7 @@ class F1Reward(Reward):
         rewards = []
         for traj in trajectories:
             golds = [val for key, val in traj.get('user_data', []) or [] if key == 'ground_truth' and val]
-            pred = self._extract(_last_assistant_text(traj))
+            pred = self._extract(assistant_text(traj))
             if golds:
                 f1 = max(_f1_score(pred, g)[0] for g in golds)
             else:
@@ -157,16 +147,16 @@ class CoTReward(Reward):
 
             # Newline-joined so ``^`` line anchors work even when
             # multiple assistant turns exist.
-            assistant_text = '\n'.join(
+            all_assistant_text = '\n'.join(
                 m.get('content', '') or '' for m in msgs
                 if m.get('role') == 'assistant' and isinstance(m.get('content'), str))
 
-            if not self._HAS_BOXED_RE.search(assistant_text):
+            if not self._HAS_BOXED_RE.search(all_assistant_text):
                 rewards.append(0.0)
                 continue
 
             steps: set = set()
-            for match in self._STEP_LINE_RE.finditer(assistant_text):
+            for match in self._STEP_LINE_RE.finditer(all_assistant_text):
                 try:
                     steps.add(int(match.group(1)))
                 except ValueError:
@@ -207,7 +197,7 @@ class ToolExploreReward(Reward):
 
     def _trajectory_f1(self, traj: Dict[str, Any]) -> float:
         golds = [val for key, val in traj.get('user_data', []) or [] if key == 'ground_truth' and val]
-        pred = self._extract(_last_assistant_text(traj))
+        pred = self._extract(assistant_text(traj))
         if golds:
             return max(_f1_score(pred, g)[0] for g in golds)
         f1, _ = _f1_score(pred, '')

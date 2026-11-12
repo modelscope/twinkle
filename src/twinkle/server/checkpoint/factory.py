@@ -36,10 +36,9 @@ def create_checkpoint_manager(token: str, client_type: str = 'twinkle'):
         token: User authentication token.
         client_type: 'tinker' or 'twinkle' (default 'twinkle').
     """
+    run_manager = create_training_run_manager(token, client_type)
     if client_type == 'tinker':
-        from .tinker import TinkerCheckpointManager, TinkerTrainingRunManager
-        run_mgr = TinkerTrainingRunManager(token)
-        return TinkerCheckpointManager(token, run_mgr)
-    from .twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
-    run_mgr = TwinkleTrainingRunManager(token)
-    return TwinkleCheckpointManager(token, run_mgr)
+        from .tinker import TinkerCheckpointManager
+        return TinkerCheckpointManager(token, run_manager)
+    from .twinkle import TwinkleCheckpointManager
+    return TwinkleCheckpointManager(token, run_manager)

@@ -1,34 +1,5 @@
 # TorchSampler
 
-TorchSampler uses native PyTorch and transformers for inference, suitable for small-scale sampling or debugging.
+The current release does not provide `TorchSampler`. The former `from twinkle.sampler import TorchSampler` example is unavailable, and `sampler_type: torch` is rejected by server configuration validation.
 
-## Usage Example
-
-```python
-from twinkle.sampler import TorchSampler
-from twinkle import DeviceMesh
-
-sampler = TorchSampler(
-    model_id='ms://Qwen/Qwen3.5-4B',
-    device_mesh=DeviceMesh.from_sizes(dp_size=1),
-)
-
-responses = sampler.sample(trajectories, sampling_params=params)
-```
-
-## Features
-
-- **Easy to Use**: Based on transformers' standard interface
-- **High Flexibility**: Easy to customize and extend
-- **Low Memory Footprint**: Suitable for small-scale sampling
-
-## Use Cases
-
-TorchSampler is particularly suitable for:
-
-- **Debugging and Development**: Simple and straightforward, easy to debug
-- **Small-Scale Experiments**: Scenarios that don't require high throughput
-- **Custom Requirements**: Scenarios that need to modify sampling logic
-- **Resource-Constrained**: Environments with limited memory or GPU resources
-
-> For production environments or large-scale training, it's recommended to use [vLLMSampler](vLLMSampler.md) for better performance.
+Use [vLLMSampler](vLLMSampler.md) for sampling. For server-side async RL, use `sampler_type: vllm_async`; see the [client-orchestrated async RL example](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/README.md).

@@ -828,7 +828,7 @@ rt.finish(status='completed')
 ### Example 5: Sampling / Inference Only
 
 ```python
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 from twinkle_client.sampler import vLLMSampler
 
 # 1. Init

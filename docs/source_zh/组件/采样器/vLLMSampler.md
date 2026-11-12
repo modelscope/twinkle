@@ -5,34 +5,38 @@ vLLMSampler 使用 vLLM 引擎进行高效推理,支持高吞吐量的批量采�
 ## 使用示例
 
 ```python
+import twinkle
 from twinkle.sampler import vLLMSampler
-from twinkle.data_format import SamplingParams
+from twinkle.data_format import SamplingParams, Trajectory
 from twinkle import DeviceMesh
+
+twinkle.initialize(mode='local', nproc_per_node=1)
+trajectories = [Trajectory(messages=[{'role': 'user', 'content': 'What is 2 + 3?'}])]
 
 # 创建采样器
 sampler = vLLMSampler(
     model_id='ms://Qwen/Qwen3.5-4B',
-    device_mesh=DeviceMesh.from_sizes(dp_size=2, tp_size=2),
-    remote_group='sampler_group'
+    engine_args={'enable_lora': True, 'max_lora_rank': 16},
+    device_mesh=DeviceMesh.from_sizes(dp_size=1),
 )
 
-# 添加 LoRA
-sampler.add_adapter_to_model('my_lora', 'path/to/lora')
+# 使用模型模板编码聊天消息
+sampler.set_template('Qwen3_5Template')
 
 # 设置采样参数
 params = SamplingParams(
     max_tokens=512,
     temperature=0.7,
     top_p=0.9,
-    top_k=50
+    top_k=50,
+    num_samples=4,
 )
 
 # 进行采样
 responses = sampler.sample(
     trajectories,
     sampling_params=params,
-    adapter_name='my_lora',
-    num_samples=4  # 每个 prompt 生成 4 个样本
+    adapter_path='path/to/lora',  # 已保存的 LoRA checkpoint（rank <= max_lora_rank）
 )
 ```
 

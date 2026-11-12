@@ -183,15 +183,15 @@ telemetry:
   otlp_endpoint: http://localhost:4317
 
 # Persistence: storage backend for ServerState (sessions, models, futures, etc.)
-#   mode: memory | file | redis
+#   mode: memory | redis
 persistence:
-  mode: file
-  file_path: /tmp/twinkle_state.json
+  mode: redis
+  redis_url: redis://localhost:6379/0
 
 # Application list: Each entry defines a service component deployed on the Server
 applications:
 
-  # 1. TinkerCompatServer: Central API service
+  # 1. GatewayServer: Central API service
   # Handles client connections, training run tracking, checkpoint management, etc.
   # route_prefix uses /api/v1, compatible with both Tinker and Twinkle clients
   - name: server
@@ -203,7 +203,7 @@ applications:
       supported_models:
         - Qwen/Qwen3.5-4B
     deployments:
-      - name: TinkerCompatServer
+      - name: GatewayServer
         max_ongoing_requests: 50
         autoscaling_config:
           min_replicas: 1
@@ -233,9 +233,6 @@ applications:
         rps_limit: 100                                 # Max requests per second
         tps_limit: 10000                               # Max tokens per second per user
         max_input_tokens: 10000                        # Maximum input tokens per request
-      adapter_config:
-        adapter_timeout: 30                            # Idle adapter timeout unload time (seconds)
-        adapter_max_lifetime: 36000                    # Maximum adapter lifetime (seconds)
       max_loras: 1                                     # Maximum number of LoRA adapters per model
     deployments:
       - name: ModelManagement
@@ -257,7 +254,7 @@ applications:
     args:
       model_id: "ms://Qwen/Qwen3.5-4B"               # ModelScope model identifier
       nproc_per_node: 2                                # Number of GPU processes per node
-      sampler_type: vllm                               # Inference engine: vllm (high performance) or torch
+      sampler_type: vllm                               # Inference engine: vllm | vllm_async (mock for tests)
       engine_args:                                     # vLLM engine parameters
         max_model_len: 4096                            # Maximum sequence length
         gpu_memory_utilization: 0.5                    # GPU memory usage ratio (0.0-1.0)
@@ -328,9 +325,6 @@ The difference from the Megatron backend is only in the `backend` parameter of t
       device_mesh:
         device_type: cuda
         dp_size: 2
-      adapter_config:
-        adapter_timeout: 1800                          # Idle adapter timeout unload time (seconds)
-        adapter_max_lifetime: 36000
     deployments:
       - name: ModelManagement
         autoscaling_config:
@@ -350,7 +344,7 @@ The difference from the Megatron backend is only in the `backend` parameter of t
 | `proxy_location` | HTTP proxy location (`EveryNode` or `HeadOnly`) |
 | `http_options` | HTTP listener config (`host`, `port`) |
 | `telemetry` | Observability config (`enabled`, `otlp_endpoint`) |
-| `persistence` | State persistence config (`mode`, `file_path`, `redis_url`) |
+| `persistence` | State persistence config (`mode`, `redis_url`) |
 | `applications` | Application component list |
 
 > The config file uses strict validation (`extra='forbid'`). Any misspelled field name will be rejected before startup. Use `twinkle-server check-config -c xxx.yaml` to detect errors early.
@@ -418,8 +412,7 @@ Storage backend for ServerState (sessions, models, futures, etc.).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `mode` | str | `memory` | `memory` / `file` / `redis` |
-| `file_path` | str | — | Required for `file` mode, JSON file path |
+| `mode` | str | `memory` | `memory` / `redis` |
 | `redis_url` | str | — | Required for `redis` mode, e.g. `redis://localhost:6379` |
 | `key_prefix` | str | `""` | Optional global key prefix |
 
@@ -450,3 +443,88 @@ twinkle-server check-config -c server_config.yaml
 | `use_megatron: false` | `backend: transformers` |
 
 Additionally, this refactor introduces two new top-level fields — `telemetry` and `persistence` — which did not exist before. Add them as needed.
+
+## Execution time bounds
+
+Every backend call has a finite time bound. `T` is the effective task execution
+timeout: it equals `execution_timeout`, or `3600s` when that setting is `0`.
+`asyncio.wait_for` uses `T`. The Ray wait uses `R`, which is a method's explicit
+constant timeout when present and otherwise `T`. The default `T` is `1800s`.
+
+Two distinct bounds follow, and they must not be collapsed into one number:
+
+| Bound | Expression | Meaning |
+|-------|------------|---------|
+| Record-terminal bound | `queue_timeout + T` | After this, a task's future record is guaranteed to be in a terminal state (`completed`/`failed`). Use it for alerting thresholds and client polling total-timeout. |
+| Resource-release bound | `Collect_Width × R` from execution start, or `queue_timeout + Collect_Width × R` from submission | After this, the executor thread and the in-flight model-actor call for that task are guaranteed to have finished. Use it for capacity planning. |
+
+`Collect_Width = len(self._actors) = world_size = tp × pp × dp` — the number of
+futures each `remote_function` collection waits on per call. Evidence:
+`LazyCollect._get_result` iterates `self._futures`, which come from
+`_get_workers(self._actors, execute)` (`infra/__init__.py`), covering every actor —
+not just the data-parallel width. On a `tp=8` deployment the execution-start
+resource-release bound is therefore `8 × R`, not `R`.
+
+After the task record becomes terminal, the per-replica Admission_Gate can remain
+closed for at most `max(0, Collect_Width × R − T)`: the record is already terminal,
+but a leaked executor thread may still hold the gate until its `ray.get` returns or
+raises. During that window newly arriving tasks fail fast with a `server`/503 error.
+
+Each persisted future stores its immutable `absolute_deadline` when it is created.
+Cleanup therefore reaches the same decision regardless of which deployment process
+holds the cleanup lease.
+
+## On-demand training and device reclamation
+
+Training services can load models when a request arrives and release devices when they are no longer needed. Keep the existing `applications` format and configure the `args` of an `import_path: model` entry:
+
+```yaml
+- name: training-qwen
+  route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
+  import_path: model
+  args:
+    model_id: ms://Qwen/Qwen3.5-4B
+    backend: transformers
+    train_mode: lora
+    nproc_per_node: 2
+    device_group: {name: model, ranks: 2, device_type: cuda}
+    device_mesh: {device_type: cuda, dp_size: 2}
+    max_loras: 3
+    min_replicas: 0
+    max_replicas: 2
+    idle_timeout_s: 600
+```
+
+| Setting | How to use it |
+|---------|---------------|
+| `device_group`, `device_mesh` | Set the devices and parallel layout for each training instance. Adjust them to fit your model and available devices. Megatron requires at least two devices per instance. |
+| `min_replicas` | Training instances to keep loaded at startup. With `0`, the first training request waits for model loading. |
+| `max_replicas` | Maximum number of training instances. |
+| `max_loras` | Maximum LoRA trainings per instance. Used only for LoRA training. |
+| `idle_timeout_s` | Seconds of training inactivity before its handle is released. Heartbeats and result polling do not extend this time. Queued or running training operations are protected. |
+
+This example allows two instances, each holding three LoRA trainings. Clients are also subject to `server_config.per_token_model_limit`; clients using the same token share that token's quota.
+
+For full-parameter training, set `train_mode: full` and remove `max_loras`. Each full training uses its own instance. To offer LoRA and full training for the same weights, configure two model applications with different `name` and `route_prefix` values and select the mode in each. Clients choose the model alias from the corresponding route. See [Hybrid LoRA Training](../Hybrid-LoRA-Training.md) for Hybrid LoRA configuration.
+
+Release models when training finishes; Twinkle clients can call `remove_adapter()`. After the last training releases an instance, empty instances above `min_replicas` shut down. Save checkpoints regularly. If a handle expires or the service restarts, create a new training and restore from a checkpoint. Upgrade the Twinkle SDK together with the server.
+
+Complete configurations are available in `cookbook/client/server/transformer/server_config.yaml` and `cookbook/client/server/megatron/server_config.yaml`.
+
+### Automatic sampling scaling
+
+Set instance counts and the scaling target in the `args` of your `import_path: sampler` entry. For example:
+
+```yaml
+nproc_per_node: 1
+device_group: {name: sampler, ranks: 1, device_type: cuda}
+device_mesh: {device_type: cuda, dp_size: 1}
+min_replicas: 2
+max_replicas: 4
+target_ongoing_requests: 16
+idle_timeout_s: 600
+```
+
+This configuration loads two sampling instances at startup and scales up to four as requests increase. Extra instances shut down after 600 seconds of continuous inactivity, leaving two loaded. `target_ongoing_requests` is the target number of in-flight requests per instance; a smaller value triggers earlier scaling. `device_group` and `device_mesh` determine the devices used by each instance. Allow enough devices for both training and sampling.
+
+Clients keep using the existing sampling API without selecting an instance. LoRA checkpoints load as requests need them. After a service restart, reapply custom templates and other runtime settings.

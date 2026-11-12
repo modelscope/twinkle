@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from abc import ABC, abstractmethod
+from abc import ABC
 from datetime import datetime, timezone
 from pydantic import BaseModel
 from typing import Generic, TypeVar
@@ -17,8 +17,8 @@ logger = get_logger()
 class BaseManager(ABC, Generic[T]):
     """Abstract base class for resource managers using StateBackend.
 
-    Provides common async CRUD operations and timestamp parsing.
-    Subclasses must implement `cleanup_expired`.
+    Provides common async CRUD operations and timestamp parsing. Cleanup is
+    deliberately not polymorphic because each manager needs different inputs.
     """
 
     def __init__(self, backend: StateBackend, key_prefix: str, record_type: type[T], expiration_timeout: float):
@@ -75,20 +75,6 @@ class BaseManager(ABC, Generic[T]):
                 resource_id = self._strip_prefix(key)
                 result[resource_id] = self._record_type.model_validate(data)
         return result
-
-    # ----- Cleanup -----
-
-    @abstractmethod
-    async def cleanup_expired(self, cutoff_time: float, **kwargs) -> int:
-        """Remove all records older than cutoff_time.
-
-        Args:
-            cutoff_time: Unix timestamp; records with activity before this are removed.
-
-        Returns:
-            Number of records removed.
-        """
-        ...
 
     # ----- Helpers -----
 

@@ -2,7 +2,7 @@
 1. build docs
     ```shell
     # in root directory:
-    make docs
+    bash .dev_scripts/build_docs.sh
     ```
 
 2. doc string format

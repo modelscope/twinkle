@@ -1,5 +1,5 @@
 Checkpoint Engine
-===============
+=================
 .. toctree::
    :maxdepth: 1
 

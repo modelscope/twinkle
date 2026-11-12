@@ -1,0 +1,35 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""Guards for the wire-contract migration to :mod:`twinkle.protocol`."""
+from __future__ import annotations
+
+_MIGRATED_NAMES = frozenset(
+    """
+AdapterRequest AddAdapterRequest AddMetricRequest AddMetricResponse ApplyPatchRequest ApplyPatchResponse
+BACKEND_ONLY_KEY BackwardResponse CORE_INPUT_KEYS CalculateLossResponse CalculateMetricRequest
+CalculateMetricResponse CancelRequest CancelResponse CapacityInfoResponse Checkpoint CheckpointPathResponse
+CheckpointsListResponse ClientFeatures ClipGradAndStepRequest ClipGradAndStepResponse ClipGradNormRequest
+ClipGradNormResponse CreateModelRequest CreateRequest CreateResponse CreateSessionRequest CreateSessionResponse Cursor
+DataAppendRequest DataGetRequest DataModel DataPlaneForwardOnlyRequest DataPlaneForwardRequest DataPlaneSampleRequest
+DataPutRequest DataRef DataReleaseRequest DataRowsResponse DeleteCheckpointResponse FieldRole ForwardBackwardResponse
+ForwardBackwardTaskRequest ForwardOnlyRequest ForwardRequest ForwardResponse GetServerCapabilitiesResponse
+GetTrainConfigsResponse HealthResponse LoadRequest LoadResponse LoraConfig LrStepRequest LrStepResponse ModelResult
+OkResponse ParsedCheckpointTwinklePath ProcessorCallRequest ProcessorCallResponse ProcessorCreateRequest
+ProcessorCreateResponse ProcessorHeartbeatRequest ProcessorHeartbeatResponse ProtocolLimits ResolvedLoadPath
+ResponseModel ResumeFromCheckpointRequest RetrieveFutureRequest SampleRequest SampleResponseModel
+SampleResponseModelList SampledSequenceModel SamplerAddAdapterRequest SamplerAddAdapterResponse SamplerCreateResponse
+SamplerSetTemplateRequest SamplerSetTemplateResponse SaveRequest SaveResponse SessionHeartbeatRequest
+SessionHeartbeatResponse SetLossRequest SetLossResponse SetLrSchedulerRequest SetLrSchedulerResponse SetOptimizerRequest
+SetOptimizerResponse SetProcessorRequest SetProcessorResponse SetTemplateRequest SetTemplateResponse StepRequest
+StepResponse StrictRequest SupportedModel TERMINAL_STATUSES TaskEnvelope TaskStatus TrainingProgressResponse TrainingRun
+TrainingRunsResponse UnloadAdapterPathsRequest UploadToHubRequest VLM_TENSOR_FIELDS WeightsInfoRequest
+WeightsInfoResponse WireInputBatch WireInputFeature WireInputs WireMessage WireTrajectory ZeroGradResponse backend_kwarg
+backend_only declared_wire_keys export_batch fields_with_role passthrough read_backend_only read_field_role
+""".split())
+
+
+def test_protocol_exports_match_pre_migration_snapshot() -> None:
+    import twinkle.protocol.types as types
+
+    assert set(types.__all__) == _MIGRATED_NAMES
+    assert len(types.__all__) == 120
+    assert 'ErrorResponse' not in types.__all__

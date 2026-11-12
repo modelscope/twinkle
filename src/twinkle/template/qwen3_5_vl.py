@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from twinkle import remote_class, requires
 from twinkle.data_format import InputFeature
 from twinkle.template.base import ImageInput, Template, VideoInput
+from twinkle.template.tools import HermesQwenParser
 from twinkle.template.utils import get_inputs_embeds_hf
 
 _ROPE_INDEX_CACHE: Dict[str, Callable] = {}
@@ -58,6 +59,12 @@ class Qwen3_5Template(Template):
         self._patch_size: Optional[int] = None
         self._merge_size: Optional[int] = None
         self._init_vision_config()
+
+    @property
+    def tool_call_stop(self) -> Optional[str]:
+        # Qwen writes Hermes markup, which closes every call, so stopping here
+        # leaves exactly one in the reply.
+        return HermesQwenParser.close_marker
 
     @property
     def rope_index_func(self) -> Callable:
@@ -136,7 +143,7 @@ class Qwen3_5Template(Template):
             value = _input[key]
             if isinstance(value, np.ndarray):
                 value = torch.from_numpy(value)
-            elif isinstance(value, list) and isinstance(value[0], (int, float, np.number)):
+            elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float, np.number)):
                 value = torch.tensor(value)
             _input[key] = value
         return _input

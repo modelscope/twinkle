@@ -28,8 +28,7 @@ The final data format is similar to:
 ```json
 {
   "input_ids": [1,2,3,4,5,6,7,8,9,10],
-  "position_ids": [0,1,2,3,4,0,1,2,3,4],
-  ...
+  "position_ids": [0,1,2,3,4,0,1,2,3,4]
 }
 ```
 

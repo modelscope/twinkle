@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Per-deployment ``ApplicationSpec`` and typed argument schemas.
 
-Each deployment kind (``server | model | sampler | processor``) carries its
+Each deployment kind (``server | model | sampler | processor | data_plane``) carries its
 own ``args`` block with strict field validation. ``ApplicationSpec`` holds
 the routing metadata plus the deployment kind and validates ``args`` against
 the matching ``*Args`` schema in a model validator.
@@ -11,10 +11,24 @@ other deployments) fail at load time instead of being silently dropped.
 """
 from __future__ import annotations
 
+import os
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Literal
 
-from twinkle.server.utils.task_queue.config import TaskQueueConfig
+from .task_queue import TaskQueueConfig
+from .training import ModelArgs
+
+# Env var keys the launcher sets from the gateway ``server_config`` so that any
+# Ray worker (model / sampler / processor), not just the gateway, applies the
+# configured ServerState policy instead of ``get_server_state``'s hardcoded
+# defaults. Only the four *policy* fields are propagated; ``actor_name`` is a
+# per-process cache key, not a cross-worker policy, so it is excluded.
+SERVER_STATE_ENV_KEYS: tuple[str, ...] = (
+    'TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT',
+    'TWINKLE_SERVER_STATE_CLEANUP_INTERVAL',
+    'TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT',
+    'TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL',
+)
 
 # ---------- shared helpers ------------------------------------------------- #
 
@@ -41,26 +55,6 @@ class HttpOptions(BaseModel):
 # ---------- per-deployment args schemas ------------------------------------ #
 
 
-class ModelArgs(_ArgsBase):
-    """Args for the ``model`` deployment.
-
-    The ``backend`` field selects the model implementation (transformers /
-    megatron / mock) — see ``model/app.py`` for the dispatch site that picks
-    the runtime class based on this value.
-    """
-
-    model_id: str
-    nproc_per_node: int = 1
-    device_group: dict[str, Any]
-    device_mesh: dict[str, Any]
-    backend: Literal['mock', 'transformers', 'megatron']
-    train_mode: Literal['lora', 'full'] = 'lora'
-    adapter_config: dict[str, Any] | None = None
-    queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
-    max_loras: int = 5
-    max_length: int | None = None
-
-
 class SamplerArgs(_ArgsBase):
     """Args for the ``sampler`` deployment.
 
@@ -71,9 +65,31 @@ class SamplerArgs(_ArgsBase):
     nproc_per_node: int = 1
     device_group: dict[str, Any]
     device_mesh: dict[str, Any]
-    sampler_type: Literal['mock', 'vllm', 'torch']
+    sampler_type: Literal['mock', 'vllm', 'vllm_async']
     engine_args: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
+    data_plane_url: str | None = None
+    min_replicas: int = Field(default=1, ge=0, strict=True)
+    max_replicas: int = Field(default=1, gt=0, strict=True)
+    idle_timeout_s: float = Field(default=600, gt=0, allow_inf_nan=False)
+    target_ongoing_requests: int = Field(default=16, gt=0, strict=True)
+
+    @model_validator(mode='after')
+    def _validate_pool(self):
+        if self.min_replicas > self.max_replicas:
+            raise ValueError('sampler min_replicas must not exceed max_replicas')
+        ranks = self.device_group.get('ranks', self.nproc_per_node)
+        width = self.device_group.get('gpus_per_worker', 1)
+        if type(ranks) is not int or ranks <= 0 or type(width) is not int or width <= 0 or ranks % width:
+            raise ValueError('sampler device_group requires a positive device count divisible by gpus_per_worker')
+        if self.sampler_type != 'mock':
+            from twinkle.utils.device_mesh import DeviceMesh
+            if DeviceMesh.from_sizes(**self.device_mesh).world_size != ranks:
+                raise ValueError('sampler device_mesh world_size must equal its device count')
+            tp = (self.engine_args or {}).get('tensor_parallel_size', width)
+            if tp != width:
+                raise ValueError('sampler tensor_parallel_size must equal gpus_per_worker')
+        return self
 
 
 class ServerStateArgs(_ArgsBase):
@@ -93,6 +109,47 @@ class ServerStateArgs(_ArgsBase):
     metrics_update_interval: float | None = None
     actor_name: str | None = None
 
+    def to_env_vars(self) -> dict[str, str]:
+        """Serialize the policy fields to env vars for Ray-worker propagation.
+
+        Mirrors :meth:`PersistenceConfig.to_env_vars`. Only the four policy
+        fields are emitted (``actor_name`` is a per-process cache key, not a
+        policy); unset (``None``) fields are skipped so the worker falls back to
+        ``ServerState``'s own defaults.
+        """
+        env: dict[str, str] = {}
+        if self.expiration_timeout is not None:
+            env['TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT'] = str(self.expiration_timeout)
+        if self.cleanup_interval is not None:
+            env['TWINKLE_SERVER_STATE_CLEANUP_INTERVAL'] = str(self.cleanup_interval)
+        if self.per_token_model_limit is not None:
+            env['TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT'] = str(self.per_token_model_limit)
+        if self.metrics_update_interval is not None:
+            env['TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL'] = str(self.metrics_update_interval)
+        return env
+
+    @classmethod
+    def from_env(cls) -> ServerStateArgs | None:
+        """Reconstruct policy fields from launcher-set env vars.
+
+        Returns ``None`` when no ``TWINKLE_SERVER_STATE_*`` key is set, so a
+        caller can distinguish "no env-configured policy" from "explicitly
+        configured to a default value". Only policy fields are populated;
+        ``actor_name`` stays ``None``.
+        """
+        exp = os.environ.get('TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT')
+        clean = os.environ.get('TWINKLE_SERVER_STATE_CLEANUP_INTERVAL')
+        limit = os.environ.get('TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT')
+        interval = os.environ.get('TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL')
+        if exp is None and clean is None and limit is None and interval is None:
+            return None
+        return cls(
+            expiration_timeout=float(exp) if exp is not None else None,
+            cleanup_interval=float(clean) if clean is not None else None,
+            per_token_model_limit=int(limit) if limit is not None else None,
+            metrics_update_interval=float(interval) if interval is not None else None,
+        )
+
 
 class ServerArgs(_ArgsBase):
     """Args for the gateway ``server`` deployment."""
@@ -104,12 +161,23 @@ class ServerArgs(_ArgsBase):
 
 
 class ProcessorArgs(_ArgsBase):
-    """Args for the ``processor`` deployment."""
+    """Args for the ``processor`` deployment.
+
+    A processor deployment has no task queue, so there is deliberately no
+    ``queue_config`` field here: with ``extra='forbid'`` a YAML that sets
+    ``processor.args.queue_config`` now fails validation with the offending path
+    instead of being silently ignored.
+    """
 
     ncpu_proc_per_node: int | None = None
     device_group: dict[str, Any] | None = None
     device_mesh: dict[str, Any] | None = None
-    queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
+
+
+class DataPlaneArgs(_ArgsBase):
+    """Args for the TransferQueue-backed client data plane."""
+
+    config: dict[str, Any] | None = None
 
 
 _ARGS_SCHEMA: dict[str, type[_ArgsBase]] = {
@@ -117,6 +185,7 @@ _ARGS_SCHEMA: dict[str, type[_ArgsBase]] = {
     'model': ModelArgs,
     'sampler': SamplerArgs,
     'processor': ProcessorArgs,
+    'data_plane': DataPlaneArgs,
 }
 
 # ---------- ApplicationSpec ------------------------------------------------ #
@@ -138,13 +207,13 @@ class ApplicationSpec(BaseModel):
 
     name: str
     route_prefix: str = '/'
-    import_path: Literal['server', 'model', 'sampler', 'processor']
+    import_path: Literal['server', 'model', 'sampler', 'processor', 'data_plane']
     # ``args`` is always populated by the ``mode='before'`` validator below
     # (which validates the raw block against the schema selected by
     # ``import_path`` and defaults a missing block to ``{}``), so the field is
     # required here — the validator runs first and fills it.
-    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs
-    deployments: list[dict[str, Any]] = Field(default_factory=list)
+    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs | DataPlaneArgs
+    deployments: list[dict[str, Any]] = Field(default_factory=list, max_length=1)
 
     @model_validator(mode='before')
     @classmethod
@@ -170,23 +239,3 @@ class ApplicationSpec(BaseModel):
         # ``schema.model_validate`` rejects a non-dict itself with a clean
         # error, so no separate non-dict guard is needed here.
         return {**data, 'args': schema.model_validate(raw_args)}
-
-    @model_validator(mode='after')
-    def _validate_full_mode_single_replica(self) -> ApplicationSpec:
-        """``train_mode: full`` requires exactly one replica.
-
-        The exclusive-tenant lock lives in per-replica memory
-        (``ModelManagement._resource_records``), so more than one replica would
-        silently allow one full-parameter tenant per replica, each rewriting
-        its own copy of the base weights. Reject that at config-load time.
-        """
-        if not (isinstance(self.args, ModelArgs) and self.args.train_mode == 'full'):
-            return self
-        for dep in self.deployments:
-            num_replicas = dep.get('num_replicas')
-            max_replicas = (dep.get('autoscaling_config') or {}).get('max_replicas')
-            if (num_replicas or 1) > 1 or (max_replicas or 1) > 1:
-                raise ValueError(f"Application '{self.name}': train_mode='full' is an exclusive single-tenant "
-                                 'mode and requires a single replica; set num_replicas/autoscaling_config.'
-                                 'max_replicas to 1.')
-        return self

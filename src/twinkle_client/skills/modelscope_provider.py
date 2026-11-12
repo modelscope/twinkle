@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import asyncio
-from twinkle.utils.logger import get_logger
 from pathlib import Path
 
+from twinkle.utils.logger import get_logger
 from twinkle_client.skills.base import SkillProvider
 
 logger = get_logger()
@@ -42,7 +42,11 @@ class ModelScopeSkillProvider(SkillProvider):
 
         if (repo_dir / '.git').exists():
             proc = await asyncio.create_subprocess_exec(
-                'git', '-C', str(repo_dir), 'pull', '--ff-only',
+                'git',
+                '-C',
+                str(repo_dir),
+                'pull',
+                '--ff-only',
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -52,8 +56,14 @@ class ModelScopeSkillProvider(SkillProvider):
         else:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             proc = await asyncio.create_subprocess_exec(
-                'git', 'clone', '--depth', '1', '--branch', self._branch,
-                self._repo_url, str(repo_dir),
+                'git',
+                'clone',
+                '--depth',
+                '1',
+                '--branch',
+                self._branch,
+                self._repo_url,
+                str(repo_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

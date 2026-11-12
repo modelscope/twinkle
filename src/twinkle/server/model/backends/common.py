@@ -10,7 +10,9 @@ from numbers import Number
 from tinker import types
 from typing import Any, List
 
-from twinkle import DeviceMesh
+from twinkle import DeviceMesh, remote_function
+from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
+from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.template import Template
 
 
@@ -125,16 +127,41 @@ def clean_metrics(metrics: dict) -> dict:
 class TwinkleCompatModelBase:
     """Base class containing common logic for Twinkle compatibility wrappers."""
 
+    @staticmethod
+    def _normalize_ref_outputs(kwargs: dict) -> None:
+        """Convert HTTP/Ray-serialized reference logps to one padded tensor."""
+        ref_outputs = kwargs.get('ref_outputs')
+        if not isinstance(ref_outputs, dict):
+            return
+
+        logps = ref_outputs.get('logps')
+        if not isinstance(logps, (list, tuple)) or not logps or isinstance(logps[0], torch.Tensor):
+            return
+
+        rows = []
+        for item in logps:
+            if isinstance(item, (list, tuple)) and item and isinstance(item[0], (list, tuple)):
+                rows.extend(item)
+            else:
+                rows.append(item)
+
+        from twinkle.utils import pad_and_stack_tensors
+        ref_outputs['logps'] = pad_and_stack_tensors(
+            [torch.as_tensor(row, dtype=torch.float32) for row in rows],
+            pad_value=0.0,
+            concat=False,
+        )
+
     def get_template(self, adapter_name: str) -> Template:
         return self.optimizer_group[adapter_name].template
 
     def _tinker_setup_loss(self, loss_fn: str, inputs, adapter_name: str, kwargs: dict):
         """Set up loss function based on loss_fn; pops DPO/GRPO-specific params from kwargs in-place."""
+        is_dpo = validate_tinker_loss(loss_fn, inputs)
         if loss_fn == 'cross_entropy':
             self.set_loss('CrossEntropyLoss', adapter_name=adapter_name)
         elif loss_fn == 'importance_sampling':
-            has_ref_logps = any('ref_logps' in d.loss_fn_inputs for d in inputs)
-            if has_ref_logps:
+            if is_dpo:
                 beta = kwargs.pop('dpo_beta', 0.1)
                 loss_type = kwargs.pop('dpo_loss_type', 'sigmoid')
                 sft_weight = kwargs.pop('dpo_sft_weight', 0.0)
@@ -146,8 +173,35 @@ class TwinkleCompatModelBase:
                 epsilon = kwargs.pop('epsilon', 0.2)
                 grpo_beta = kwargs.pop('beta', 0.0)
                 self.set_loss('GRPOLoss', adapter_name=adapter_name, epsilon=epsilon, beta=grpo_beta)
+
+    @remote_function(dispatch='all', collect='none')
+    def preflight_loss_inputs(self, *, inputs, adapter_name: str = None, loss_fn: str = None, **kwargs) -> None:
+        """Validate the full, unsliced batch on every rank before any forward.
+
+        Each backend's ``forward_backward`` is dispatched with ``slice_dp``, so a
+        rank that rejects its slice inside the loss has already forwarded while
+        its peers enter the backward collective, which deadlocks the replica
+        (BUG-05). Running the loss's own rule on the full batch first, on every
+        rank, makes them fail together before any collective is entered.
+
+        ``loss_fn`` is the tinker route's loss selector: tinker batches carry
+        their RL features inside the datums, so the loss has to be set up and
+        the datums converted before the same rule applies. Twinkle-native
+        batches already pass ``old_logps``/``ref_logps``/``advantages`` as
+        keyword arguments and leave ``loss_fn`` unset.
+        """
+        adapter_name = adapter_name or self._get_default_group()
+        if loss_fn is not None:
+            loss_values = extract_rl_features_for_loss(inputs)
+            loss_values.pop('ref_outputs', None)
+            self._tinker_setup_loss(loss_fn, inputs, adapter_name, kwargs)
+            inputs = datum_to_input_feature(inputs, self.get_template(adapter_name))
+            loss_values.update(kwargs)
         else:
-            self.set_loss('CrossEntropyLoss', adapter_name=adapter_name)
+            loss_values = kwargs
+        loss = getattr(self.optimizer_group.get(adapter_name), 'loss_instance', None)
+        if loss is not None:
+            loss.validate_inputs(inputs, **loss_values)
 
     def _ensure_dpo_metric(self, adapter_name: str, beta: float):
         """Add DPOMetric for the adapter if not already present.

@@ -2,16 +2,17 @@
 """
 Twinkle-specific checkpoint and training-run managers.
 
-Uses ``twinkle_client.types.training`` models for all serialization and response construction.
+Uses ``twinkle.protocol.types.training`` models for all serialization and response construction.
 """
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from twinkle.server.checkpoint import (TRAIN_RUN_INFO_FILENAME, BaseCheckpointManager, BaseTrainingRunManager,
-                                       validate_ownership)
-from twinkle_client.types.training import (Checkpoint, CheckpointsListResponse, CreateModelRequest, Cursor,
-                                           ParsedCheckpointTwinklePath, TrainingRun, TrainingRunsResponse,
-                                           WeightsInfoResponse)
+from twinkle.protocol.types.training import (Checkpoint, CheckpointsListResponse, CreateModelRequest, Cursor,
+                                             ParsedCheckpointTwinklePath, TrainingRun, TrainingRunsResponse,
+                                             WeightsInfoResponse)
+from twinkle.server.checkpoint.checkpoint_manager import BaseCheckpointManager
+from twinkle.server.checkpoint.paths import TRAIN_RUN_INFO_FILENAME, validate_ownership
+from twinkle.server.checkpoint.training_run_manager import BaseTrainingRunManager
 
 
 class TwinkleTrainingRunManager(BaseTrainingRunManager):
@@ -63,10 +64,6 @@ class TwinkleCheckpointManager(BaseCheckpointManager):
     @property
     def path_prefix(self) -> str:
         return 'twinkle://'
-
-    @property
-    def path_field_name(self) -> str:
-        return 'twinkle_path'
 
     def _create_checkpoint(self,
                            checkpoint_id,

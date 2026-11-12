@@ -5,7 +5,7 @@ Twinkle Client 是原生客户端，设计理念是：**将 `from twinkle import
 ## 初始化
 
 ```python
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 
 # 初始化客户端，连接到 Twinkle Server
 client = init_twinkle_client(
@@ -38,7 +38,7 @@ latest_path = client.get_latest_checkpoint_path(run_id='xxx')
 
 ## 从本地代码迁移到远端
 
-迁移非常简单，只需将 import 路径从 `twinkle` 替换为 `twinkle_client`：
+迁移时保留数据处理和训练循环；初始化远端客户端后，通过 `client.model(...)` 创建显式绑定该客户端的远端模型：
 
 ```python
 # 本地训练代码（原始）
@@ -50,10 +50,13 @@ from twinkle.model import MultiLoraTransformersModel
 # DataLoader 和 Dataset 使用本地 twinkle 或远端 twinkle_client 均可
 from twinkle.dataloader import DataLoader        # 或 from twinkle_client.dataloader import DataLoader
 from twinkle.dataset import Dataset              # 或 from twinkle_client.dataset import Dataset
-from twinkle_client.model import MultiLoraTransformersModel
+from twinkle import init_twinkle_client
+
+client = init_twinkle_client(base_url=base_url, api_key=api_key)
+model = client.model(f'ms://{base_model}')
 ```
 
-训练循环、数据处理等逻辑完全不需要修改。
+训练循环、数据处理等逻辑完全不需要修改；推荐使用 `client.model(...)`，而不是直接构造 `MultiLoraTransformersModel(...)`，以确保模型包装器显式复用当前客户端的 transport、会话与认证上下文。
 
 ## 完整训练示例（Transformers 后端）
 
@@ -64,12 +67,11 @@ dotenv.load_dotenv('.env')
 from peft import LoraConfig
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
-from twinkle_client import init_twinkle_client
+from twinkle import init_twinkle_client
 
 # DataLoader 和 Dataset 使用本地 twinkle 或远端 twinkle_client 均可
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset
-from twinkle_client.model import MultiLoraTransformersModel
 
 logger = get_logger()
 
@@ -118,8 +120,8 @@ dataset.encode(batched=True)
 # 创建 DataLoader
 dataloader = DataLoader(dataset=dataset, batch_size=4)
 
-# Step 4: 配置模型
-model = MultiLoraTransformersModel(model_id=f'ms://{base_model}')
+# Step 4: 通过当前 client 创建并绑定远端模型
+model = client.model(f'ms://{base_model}')
 
 # 配置 LoRA：对所有线性层应用低秩适配器
 lora_config = LoraConfig(target_modules='all-linear')
@@ -171,12 +173,13 @@ for epoch in range(3):
     logger.info(f'Saved checkpoint: {twinkle_path}')
 
 # Step 8: 上传到 ModelScope Hub（可选）
+# 服务端始终在后台执行上传；当前调用会通过 future layer 等待上传完成或抛出失败。
+# 不要传 async_upload 或 poll_interval：两者仅为兼容旧调用保留，已废弃且无效果。
 # YOUR_USER_NAME = "your_username"
 # hub_model_id = f'{YOUR_USER_NAME}/twinkle-self-cognition'
 # model.upload_to_hub(
 #     checkpoint_dir=twinkle_path,
 #     hub_model_id=hub_model_id,
-#     async_upload=False
 # )
 ```
 
@@ -223,17 +226,16 @@ from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import SamplingParams
 from twinkle.template import Qwen3_5Template
 from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_client.model import MultiLoraTransformersModel
 from twinkle_client.rollout import ClientMultiTurnRollout
 from twinkle_client.sampler import vLLMSampler
 
 MODEL_ID = 'ms://Qwen/Qwen3.5-4B'
 NUM_GENERATIONS = 2   # GRPO group size（rollout 每条采样 num_samples=1）
 
-init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
+client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
 
-# 训练模型（GRPO）
-model = MultiLoraTransformersModel(model_id=MODEL_ID)
+# 训练模型（GRPO）：通过当前 client 显式绑定 transport、会话与认证上下文
+model = client.model(MODEL_ID)
 model.add_adapter_to_model('default', LoraConfig(target_modules='all-linear', r=16, lora_alpha=32))
 model.set_loss('GRPOLoss', epsilon=0.2)
 model.set_optimizer('Adam', lr=1e-5)

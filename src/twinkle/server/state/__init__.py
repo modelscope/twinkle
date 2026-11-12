@@ -1,17 +1,26 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from twinkle.server.config.persistence import PersistenceConfig
-from .backend import create_backend
-from .base import BaseManager
-from .config_manager import ConfigManager
-from .future_manager import FutureManager
-from .model_manager import ModelManager
-from .models import FutureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
-from .replica_registry import ReplicaRegistry
-from .sampling_manager import SamplingSessionManager
-from .server_state import ServerState, get_server_state, reset_server_state_cache
-from .session_manager import SessionManager
+import sys
 
-__all__ = [
+from twinkle._lazy_module import _LazyModule
+
+sys.modules[__name__] = _LazyModule(
+    __name__,
+    __file__, {
+        'backend': ['create_backend'],
+        'base': ['BaseManager'],
+        'cleanup_coordinator': ['ResourceCleanupCoordinator'],
+        'count_publisher': ['ResourceCountPublisher'],
+        'future_manager': ['FutureManager'],
+        'model_manager': ['ModelManager'],
+        'models': ['FutureRecord', 'ModelRecord', 'SamplingSessionRecord', 'SessionRecord'],
+        'replica_registry': ['ReplicaRegistry'],
+        'sampling_manager': ['SamplingSessionManager'],
+        'server_state': ['ServerState', 'get_server_state', 'reset_server_state_cache'],
+        'session_manager': ['SessionManager'],
+    },
+    module_spec=__spec__)
+
+sys.modules[__name__].__all__ = [
     # Pydantic record models
     'SessionRecord',
     'ModelRecord',
@@ -24,13 +33,12 @@ __all__ = [
     'ModelManager',
     'SamplingSessionManager',
     'FutureManager',
-    'ConfigManager',
     # Server state
     'ServerState',
     'ReplicaRegistry',
+    'ResourceCleanupCoordinator',
+    'ResourceCountPublisher',
     'get_server_state',
-    'reset_server_state_cache',
     # Persistence backend factory
-    'PersistenceConfig',
     'create_backend',
 ]

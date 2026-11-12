@@ -8,7 +8,6 @@ file or a typed ``ServerConfig``. It is split into focused submodules:
 - ``server_launcher`` — the ``ServerLauncher`` class and the ``launch_server``
   entry point (the real launcher logic);
 - ``builder_registry`` — ``import_path`` → deployment-builder resolution;
-- ``env_propagation`` — telemetry / persistence env-var collection for workers.
 
 This ``__init__`` is a thin aggregator: it only re-exports the public surface so
 the dotted paths ``twinkle.server.launcher.ServerLauncher`` / ``launch_server``

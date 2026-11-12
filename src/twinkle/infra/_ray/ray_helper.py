@@ -71,13 +71,20 @@ class RayHelper:
             def clear(self):
                 self.config.clear()
 
+        registry_name = os.environ.get('TWINKLE_RAY_REGISTRY_NAME', 'config_registry')
+        registry_namespace = os.environ.get('TWINKLE_RAY_NAMESPACE')
         try:
-            RayHelper._registry = ray.get_actor('config_registry')
+            RayHelper._registry = ray.get_actor(registry_name, namespace=registry_namespace)
         except ValueError:
             try:
-                RayHelper._registry = WorkerRegistry.options(name='config_registry', lifetime='detached').remote()
+                RayHelper._registry = WorkerRegistry.options(
+                    name=registry_name,
+                    namespace=registry_namespace,
+                    lifetime='detached',
+                    # Preserve Ray's default CPU policy outside managed instances.
+                    num_cpus=0.01 if registry_namespace else None).remote()
             except ValueError:
-                RayHelper._registry = ray.get_actor('config_registry')
+                RayHelper._registry = ray.get_actor(registry_name, namespace=registry_namespace)
         assert RayHelper._registry is not None
 
     @staticmethod
@@ -137,10 +144,17 @@ class RayHelper:
         return RayHelper.ray_inited() and ray._private.worker.global_worker.mode == ray._private.worker.WORKER_MODE
 
     @staticmethod
-    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
-        """Execute method and return results."""
+    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], timeout=None):
+        """Execute method and return results.
+
+        ``timeout`` is passed to ``ray.get(list, timeout=)``, whose semantics are
+        the **total** wall-clock time to collect the whole list -- different from
+        ``LazyCollect``'s per-future timing (see ``do_get_and_collect_func``).
+        The two paths are each bounded on their own; the total-time semantics here
+        are strictly tighter.
+        """
         import ray
-        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args))
+        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args), timeout=timeout)
 
     @staticmethod
     def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
@@ -268,6 +282,7 @@ class RayHelper:
                        instance_id,
                        seed=42,
                        full_determinism=False,
+                       max_concurrency: Optional[int] = None,
                        **kwargs) -> List[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
@@ -340,23 +355,43 @@ class RayHelper:
                 # This is critical for multi-GPU workers (gpus_per_worker > 1)
                 env_vars.update(ResourceManager.noset_env())
 
+                if max_concurrency is not None:
+                    # Read back in the worker to size the thread pool that runs
+                    # blocking continuous-work methods off the actor's event loop.
+                    env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
+
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
                 worker_options = {
                     'scheduling_strategy':
                     PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
                     'name': worker_name,
-                    'namespace': 'default',
+                    'namespace': os.environ.get('TWINKLE_RAY_NAMESPACE', 'default'),
                     'runtime_env': runtime_env,
                     'num_cpus': 0.01,
                 }
 
-                if device_type == 'GPU':
-                    worker_options['num_gpus'] = 0.01
-                else:
-                    # Use custom resource key for non-GPU accelerators (e.g., NPU).
+                # The placement group already reserves a GPU worker's full
+                # allocation and ``CUDA_VISIBLE_DEVICES`` above pins that actor
+                # to the ranks selected by DeviceGroup.  Do not additionally
+                # request a fractional Ray GPU resource for CUDA workers.
+                #
+                # With a fractional request, Ray translates the placement-group
+                # GPU id through the already narrowed visible-device list.  For
+                # the second GPU that becomes index 1 into ``['1']``, killing
+                # the worker in ``set_visible_accelerator_ids`` before its
+                # constructor runs.  The CPU claim and placement-group strategy
+                # are sufficient to place the actor in the GPU-owning bundle.
+                if device_type != 'GPU':
+                    # Use a custom resource key for non-GPU accelerators
+                    # (for example, NPU).
                     worker_options['resources'] = {device_type: 0.01}
 
+                if max_concurrency is not None:
+                    worker_options['max_concurrency'] = max_concurrency
+
+                if os.environ.get('TWINKLE_RAY_NAMESPACE'):
+                    worker_options.update(max_restarts=0, max_task_retries=0)
                 worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 workers.append(worker)
         else:
@@ -380,17 +415,27 @@ class RayHelper:
                     'TWINKLE_FULL_DETERMINISM': str(int(full_determinism)),
                     **_visible_device_env
                 })
+                if max_concurrency is not None:
+                    # Read back in the worker to size the thread pool that runs
+                    # blocking continuous-work methods off the actor's event loop.
+                    env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
+
                 runtime_env = RuntimeEnv(env_vars=env_vars)
 
                 worker_options = {
                     'scheduling_strategy':
                     PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
                     'name': worker_name,
-                    'namespace': 'default',
+                    'namespace': os.environ.get('TWINKLE_RAY_NAMESPACE', 'default'),
                     'runtime_env': runtime_env,
                     'num_cpus': 0.01,
                 }
 
+                if max_concurrency is not None:
+                    worker_options['max_concurrency'] = max_concurrency
+
+                if os.environ.get('TWINKLE_RAY_NAMESPACE'):
+                    worker_options.update(max_restarts=0, max_task_retries=0)
                 worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
                 workers.append(worker)
         return workers

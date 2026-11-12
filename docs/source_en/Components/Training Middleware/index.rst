@@ -1,5 +1,5 @@
 Training Middleware
-===============
+===================
 .. toctree::
    :maxdepth: 1
 

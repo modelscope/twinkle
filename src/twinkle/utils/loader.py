@@ -6,7 +6,6 @@ import sys
 from types import ModuleType
 from typing import List, Type, TypeVar, Union
 
-from ..hub import HFHub, MSHub
 from .unsafe import trust_remote_code
 
 T = TypeVar('T')
@@ -17,6 +16,8 @@ class Plugin:
 
     @staticmethod
     def load_plugin(plugin_id: str, plugin_base: Type[T], **kwargs) -> Type[T]:
+        from twinkle.hub.hub import HFHub, MSHub
+
         if plugin_id.startswith('hf://'):
             plugin_dir = HFHub.download_model(plugin_id[len('hf://'):], **kwargs)
         elif plugin_id.startswith('ms://'):

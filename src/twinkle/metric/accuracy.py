@@ -35,8 +35,10 @@ class Accuracy(Metric):
             if mask is not None and mask.shape != output_token_ids.shape:
                 mask = mask[..., -output_token_ids.shape[-1]:]
 
-        if mask is None:
-            mask = labels != -100
+        # Same scope the loss uses: a position counts only when it is scored *and* it is the
+        # policy's own completion, otherwise -100 positions inflate the denominator.
+        trainable = labels != -100
+        mask = trainable if mask is None else trainable & mask
 
         correct_mask = (output_token_ids == labels) & mask
 

@@ -132,53 +132,14 @@ async def test_model_write_visible(make_state) -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_and_config(make_state) -> None:
+async def test_session_shared_across_states(make_state) -> None:
     a = make_state()
     b = make_state()
     sid = await a.create_session({'session_id': f'sess-{uuid.uuid4().hex[:6]}'})
     assert await b.get_session_last_heartbeat(sid) is not None
 
-    await a.add_config('feature_flag', {'value': 42})
-    assert await b.get_config('feature_flag') == {'value': 42}
-
 
 # ---------- Concurrent-write consistency --------------------------------- #
-
-
-@pytest.mark.asyncio
-async def test_concurrent_config_writes_no_torn_records(make_state) -> None:
-    """Many concurrent writes of distinct keys complete and every record
-    equals one of the writes (no torn / partial value)."""
-    a = make_state()
-    b = make_state()
-    n = 40
-    payload = {f'k-{i}': {'idx': i, 'note': 'x' * 32} for i in range(n)}
-
-    async def writer(state: ServerState, items: dict) -> None:
-        await asyncio.gather(*(state.add_config(k, v) for k, v in items.items()))
-
-    half = list(payload.items())[:n // 2]
-    other = list(payload.items())[n // 2:]
-    await asyncio.gather(writer(a, dict(half)), writer(b, dict(other)))
-
-    # Every key must read back equal to its expected payload from either side.
-    for k, v in payload.items():
-        assert await a.get_config(k) == v, k
-        assert await b.get_config(k) == v, k
-
-
-@pytest.mark.asyncio
-async def test_concurrent_same_key_lands_one_of_committed(make_state) -> None:
-    """Two writers race on the same key — final value equals one of the
-    writes; no torn record."""
-    a = make_state()
-    b = make_state()
-    write_a = {'who': 'a', 'payload': list(range(8))}
-    write_b = {'who': 'b', 'payload': list(range(8, 16))}
-
-    await asyncio.gather(a.add_config('contended', write_a), b.add_config('contended', write_b))
-    final = await a.get_config('contended')
-    assert final in (write_a, write_b)
 
 
 @pytest.mark.asyncio
@@ -198,9 +159,9 @@ async def test_concurrent_replica_registration(make_state) -> None:
 # ---------- Manager-level atomic-update guarantees ----------------------- #
 #
 # These tests pin the contract that the manager-level RMW paths
-# (``SessionManager.touch``, ``ConfigManager.add_or_get``,
-# ``FutureManager.store_status``) now go through ``StateBackend.update_atomic``
-# or ``set_nx``, so a concurrent retry cannot lose a freshly committed write.
+# (``SessionManager.touch`` and ``FutureManager.store_status``) go through
+# ``StateBackend.update_atomic``, so a concurrent retry cannot lose a freshly
+# committed write.
 
 
 @pytest.mark.asyncio
@@ -239,29 +200,6 @@ async def test_concurrent_session_touch_monotonic_heartbeat(make_state) -> None:
     final = await a.get_session_last_heartbeat(sid)
     assert final is not None
     assert final >= start, 'final heartbeat predates the test start — every write was lost'
-
-
-@pytest.mark.asyncio
-async def test_concurrent_add_or_get_consistent_value(make_state) -> None:
-    """``ConfigManager.add_or_get`` is implemented on top of ``set_nx``,
-    which is atomic in Redis. Two writers racing distinct values for the
-    same key must return the *same* committed value."""
-    a = make_state()
-    b = make_state()
-    key = f'cfg-{uuid.uuid4().hex[:6]}'
-    write_a = {'who': 'a'}
-    write_b = {'who': 'b'}
-
-    got_a, got_b = await asyncio.gather(
-        a.add_or_get_config(key, write_a),
-        b.add_or_get_config(key, write_b),
-    )
-    # Both calls must observe the same committed value — that's the whole
-    # point of the SETNX-backed contract.
-    assert got_a == got_b
-    final = await a.get_config(key)
-    assert final == got_a
-    assert final in (write_a, write_b)
 
 
 @pytest.mark.asyncio

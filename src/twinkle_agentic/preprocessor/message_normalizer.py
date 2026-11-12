@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Tuple
 
 from twinkle.preprocessor import Preprocessor
 from twinkle.template.tools import ToolCallRegistry
-from .utils import msg_content_text, msg_has_media
+from twinkle_agentic.utils.message_utils import msg_content_text, msg_has_media, normalize_tool_calls
 
 # IGNORECASE absorbs every variant ("Read HEARTBEAT.md", "HEARTBEAT_OK",
 # "duplicate heartbeat", etc.) under the single token "heartbeat".
@@ -46,7 +46,7 @@ def _strip_heartbeat(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if role == 'user' and _HEARTBEAT_USER_RE.search(text):
             skip_next_assistant = True
             continue
-        if role == 'assistant' and not m.get('tool_calls'):
+        if role == 'assistant' and normalize_tool_calls(m) is None:
             if skip_next_assistant or _HEARTBEAT_ASST_RE.search(text):
                 skip_next_assistant = False
                 continue
@@ -90,12 +90,16 @@ def _normalize_tool_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     'arguments': json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args),
                 },
             })
-        out.append({
+        # Preserve every original field (reasoning_content / thinking / name /
+        # finish_reason / ...) and only override what the rewrite changes.
+        rebuilt = dict(msg)
+        rebuilt.update({
             'role': 'assistant',
             'content': parser.clean(text),
             'tool_calls': json.dumps(tc_list, ensure_ascii=False),
             'tool_call_id': '',
         })
+        out.append(rebuilt)
 
         # Consume following user messages as tool results — one per tool call.
         j = i + 1
@@ -128,7 +132,7 @@ def _normalize_tool_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
 def _is_atomic(msg: Dict[str, Any]) -> bool:
     """Atomic = never merge: tool results + assistant turns carrying tool_calls."""
     role = msg.get('role', '')
-    return role == 'tool' or (role == 'assistant' and msg.get('tool_calls'))
+    return role == 'tool' or (role == 'assistant' and normalize_tool_calls(msg) is not None)
 
 
 def _is_blank_content(msg: Dict[str, Any]) -> bool:
@@ -197,7 +201,19 @@ class MessageNormalizer(Preprocessor):
 
     Multimodal list-shaped content passes through every stage untouched.
     This is a mapper — it never drops rows.
+
+    Args:
+        normalize_tool_calls: Whether to run the tool-call rewrite pass. Turn it
+            off for pure code data (e.g. MBPP), where an assistant turn holds a
+            markdown code block and no tool call at all: the bracket-DSL parser
+            is a marker-less fallback that matches ``[name(``, which is also the
+            shape of a python list comprehension (``[abs(b - a) for ...]``) or a
+            call-indexed subscript (``count[ord(i)]``), so the rewrite would
+            delete real code from the content.
     """
+
+    def __init__(self, normalize_tool_calls: bool = True):
+        self.normalize_tool_calls = normalize_tool_calls
 
     def __call__(self, rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows = self.map_col_to_row(rows)
@@ -206,7 +222,8 @@ class MessageNormalizer(Preprocessor):
             if not isinstance(msgs, list) or not msgs:
                 continue
             msgs = _strip_heartbeat(msgs)
-            msgs = _normalize_tool_calls(msgs)
+            if self.normalize_tool_calls:
+                msgs = _normalize_tool_calls(msgs)
             msgs = _merge_consecutive(msgs)
             row['messages'] = msgs
         return rows, []

@@ -7,10 +7,9 @@ Usage:
     python test_sampler_e2e.py
 
     # Run specific test
-    python test_sampler_e2e.py --test vllm_trajectory
-    python test_sampler_e2e.py --test torch_trajectory
-    python test_sampler_e2e.py --test vllm_input_feature
-    python test_sampler_e2e.py --test torch_input_feature
+    python test_sampler_e2e.py --test vllm_engine
+    python test_sampler_e2e.py --test vllm_batch
+    python test_sampler_e2e.py --test params_conversion
 
 Environment:
     TWINKLE_MODEL_ID: Model to use (default: Qwen/Qwen2.5-0.5B)
@@ -79,7 +78,7 @@ def test_vllm_engine_with_input_ids():
         print(f'  Input IDs: {input_ids}')
 
         response = await engine.sample(
-            prompt_token_ids=input_ids,
+            prompt=input_ids,
             sampling_params=SamplingParams(max_tokens=32, temperature=0.7),
         )
         return response, tokenizer
@@ -209,7 +208,7 @@ def test_vllm_engine_batch():
         # Sample all in parallel
         tasks = [
             engine.sample(
-                prompt_token_ids=tokenizer.encode(p, add_special_tokens=True),
+                prompt=tokenizer.encode(p, add_special_tokens=True),
                 sampling_params=sampling_params,
             ) for p in prompts
         ]

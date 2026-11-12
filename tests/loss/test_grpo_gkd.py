@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Tests for GRPO family losses and GKD loss."""
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -81,6 +82,46 @@ class TestGRPOLoss:
         adv_list = [1.0, -1.0, 0.5, -0.5]
         result = loss_fn(inputs, outputs, old_logps=old_logps, advantages=adv_list)
         assert torch.isfinite(result['loss'])
+
+    def test_pad_variable_length_full_sequence_rows(self):
+        """Unpadded per-sample rows align against a right-padded batch mask."""
+        mask = torch.tensor([
+            [False, True, True, False, False],
+            [False, False, True, True, True],
+        ])
+        rows = [
+            [-9.0, 0.1, 0.2],
+            [-9.0, -9.0, 0.3, 0.4, 0.5],
+        ]
+
+        got = GRPOLoss()._pad_and_align_to_batch(rows, mask, mask.device, torch.float32)
+
+        assert torch.equal(got[0], torch.tensor([0.0, 0.1, 0.2, 0.0, 0.0]))
+        assert torch.equal(got[1], torch.tensor([0.0, 0.0, 0.3, 0.4, 0.5]))
+
+    def test_pad_rejects_full_sequence_missing_a_masked_position(self):
+        mask = torch.tensor([[False, False, True, True, True]])
+        with pytest.raises(AssertionError, match='all masked positions'):
+            GRPOLoss()._pad_and_align_to_batch([[0.1, 0.2, 0.3, 0.4]], mask, mask.device, torch.float32)
+
+    def test_grpo_weights_sequences_equally(self):
+        labels = torch.tensor([
+            [1, -100, -100],
+            [1, 1, 1],
+        ])
+        logps = torch.zeros_like(labels, dtype=torch.float32)
+        inputs = {'labels': labels}
+        outputs = {'logps': logps}
+        advantages = torch.tensor([[1.0], [3.0]])
+
+        result = GRPOLoss()(
+            inputs,
+            outputs,
+            old_logps=logps,
+            advantages=advantages,
+        )
+
+        assert result['loss'].item() == pytest.approx(-2.0)
 
     def test_grpo_entropy_coef(self):
         loss_fn = GRPOLoss(epsilon=0.2, entropy_coef=0.01)
@@ -246,3 +287,73 @@ class TestGKDLoss:
 
         result = loss_fn({'labels': labels}, {'logits': student_logits}, teacher_logits=teacher_logits)
         assert torch.isfinite(result['loss'])
+
+
+class TestGRPOValidateInputs:
+    """Pre-forward validation must match the in-loss alignment rules."""
+
+    @staticmethod
+    def _batch():
+        # Two trainable positions per row, at indices 2 and 3, so a length-3
+        # row cannot be read as the full-sequence form (index 3 is missing).
+        labels = torch.tensor([[-100, -100, 0, 0], [-100, -100, 0, 0]])
+        return [{'labels': labels}, {'labels': labels}]
+
+    def test_accepts_response_only_scalar_and_full_length(self):
+        loss_fn = GRPOLoss()
+        inputs = self._batch()
+        loss_fn.validate_inputs(inputs, old_logps=[[0.1, 0.2], [0.3, 0.4]])
+        loss_fn.validate_inputs(inputs, old_logps=[[0.1], [0.2]])
+        loss_fn.validate_inputs(inputs, old_logps=torch.zeros(2, 4))
+
+    def test_rejects_ragged_length_before_forward(self):
+        loss_fn = GRPOLoss()
+        inputs = self._batch()
+        with pytest.raises(AssertionError, match='data/mask length mismatch at sample 1'):
+            loss_fn.validate_inputs(inputs, old_logps=[[0.1, 0.2], [0.3, 0.4, 0.5]])
+
+    def test_rejects_ragged_advantages(self):
+        loss_fn = GRPOLoss()
+        inputs = self._batch()
+        with pytest.raises(AssertionError, match='data/mask length mismatch'):
+            loss_fn.validate_inputs(inputs, advantages=[1.0, [1.0, 2.0, 3.0]])
+
+    @pytest.mark.parametrize('field', ['old_logps', 'ref_logps', 'advantages'])
+    @pytest.mark.parametrize('representation', ['list', 'tuple', 'tensor', 'numpy'])
+    @pytest.mark.parametrize('labels,n_sample,supported', [
+        ([-100, -100, 0, 0, -100], 0, False),
+        ([-100, -100, 0, 0, -100], 1, True),
+        ([-100, -100, 0, 0, -100], 2, True),
+        ([-100, -100, 0, 0, -100], 3, False),
+        ([-100, -100, 0, 0, -100], 4, True),
+        ([-100, -100, 0, 0, -100], 5, True),
+        ([-100, -100, 0, 0, -100], 6, True),
+        ([-100, -100, -100], 0, True),
+        ([-100, -100, -100], 1, True),
+        ([-100, -100, -100], 2, True),
+    ])
+    def test_preflight_and_loss_agree_on_alignment(self, labels, n_sample, supported, representation, field):
+        loss_fn = GRPOLoss(beta=0.1)
+        inputs = {'labels': torch.tensor(labels)}
+        outputs = {'logps': torch.zeros(1, len(labels), requires_grad=True)}
+        data = [[0.1] * n_sample]
+        if representation == 'tuple':
+            data = tuple(tuple(row) for row in data)
+        elif representation == 'tensor':
+            data = torch.tensor(data)
+        elif representation == 'numpy':
+            data = np.asarray(data, dtype=np.float32)
+        kwargs = {'advantages': [1.0], field: data}
+
+        if not supported:
+            with pytest.raises(AssertionError, match='data/mask length mismatch at sample 0'):
+                loss_fn.validate_inputs([inputs], **kwargs)
+            with pytest.raises(AssertionError, match='data/mask length mismatch at sample 0'):
+                loss_fn(inputs, outputs, **kwargs)
+            return
+
+        loss_fn.validate_inputs([inputs], **kwargs)
+        result = loss_fn(inputs, outputs, **kwargs)
+        assert torch.isfinite(result['loss'])
+        result['loss'].backward()
+        assert torch.isfinite(outputs['logps'].grad).all()

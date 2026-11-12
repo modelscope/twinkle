@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Checkpoint subsystem (TIER 2 consolidation).
+"""Checkpoint subsystem.
 
 Top-level package consolidating the checkpoint base classes (split from the
 former 1017-line ``utils/checkpoint_base.py``, now deleted) with the concrete
@@ -10,7 +10,7 @@ Public surface — import from here:
     from twinkle.server.checkpoint import (
         create_checkpoint_manager, create_training_run_manager,
         BaseCheckpointManager, BaseTrainingRunManager, BaseFileManager,
-        validate_user_path, validate_ownership, _resolve_client_save_dir,
+        validate_user_path, validate_ownership,
         TRAIN_RUN_INFO_FILENAME, TWINKLE_DEFAULT_SAVE_DIR,
     )
 """
@@ -30,5 +30,4 @@ __all__ = [
     'BaseTrainingRunManager',
     'validate_user_path',
     'validate_ownership',
-    '_resolve_client_save_dir',
 ]

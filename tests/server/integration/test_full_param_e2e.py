@@ -41,11 +41,12 @@ pytestmark = pytest.mark.skipif(
     reason='Set TWINKLE_TEST_GPU_E2E=1 to run real GPU E2E tests (requires running server)',
 )
 
-from twinkle import get_logger, init_tinker_client  # noqa: E402
+from twinkle import get_logger  # noqa: E402
+from twinkle import init_tinker_client  # noqa: E402
 from twinkle.dataloader import DataLoader  # noqa: E402
 from twinkle.dataset import Dataset, DatasetMeta  # noqa: E402
 from twinkle.preprocessor import SelfCognitionProcessor  # noqa: E402
-from twinkle.server.common import input_feature_to_datum  # noqa: E402
+from twinkle.server.model.tinker_datum import input_feature_to_datum  # noqa: E402
 
 init_tinker_client()
 
@@ -116,7 +117,7 @@ def main() -> int:
         raise
     except Exception as e:  # noqa: BLE001
         msg = str(e)
-        assert 'full-parameter' in msg or 'lora_config' in msg, f'Phase B FAIL: unexpected error: {msg[:500]}'
+        assert 'lora' in msg.lower(), f'Phase B FAIL: unexpected error: {msg[:500]}'
         logger.info('Phase B OK: rejected with mode-mismatch error')
 
     # ── Phase C: second full tenant must be rejected (exclusive) ──
@@ -129,8 +130,8 @@ def main() -> int:
         raise
     except Exception as e:  # noqa: BLE001
         msg = str(e)
-        assert 'exclusive' in msg or 'already' in msg, f'Phase C FAIL: unexpected error: {msg[:500]}'
-        logger.info('Phase C OK: rejected with exclusive-busy error')
+        assert 'replica limit' in msg.lower() or 'allocation' in msg.lower(), f'Phase C FAIL: unexpected error: {msg[:500]}'
+        logger.info('Phase C OK: rejected at configured instance capacity')
 
     # ── Phase D: save full weights for sampler + sample ──
     logger.info('Phase D: save_weights_and_get_sampling_client + sample')

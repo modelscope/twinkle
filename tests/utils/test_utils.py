@@ -134,11 +134,115 @@ class TestSelectiveLogSoftmax:
         assert torch.allclose(entropy[0], manual_entropy, atol=1e-5)
 
     def test_bfloat16_fallback(self):
+        torch.manual_seed(42)
         logits = torch.randn(4, 20, dtype=torch.bfloat16)
         index = torch.randint(0, 20, (4,))
         result = selective_log_softmax(logits, index)
         expected = torch.gather(logits.float().log_softmax(-1), -1, index.unsqueeze(-1)).squeeze(-1)
-        assert torch.allclose(result.float(), expected, atol=1e-2)
+        # The fallback keeps the softmax in bfloat16, whose ULP around these
+        # magnitudes is already ~3e-2, so compare against the float reference at
+        # bfloat16 resolution rather than float32's.
+        assert torch.allclose(result.float(), expected, atol=5e-2)
+
+    def test_bfloat16_does_not_quantize_large_negative_logps(self):
+        # A peaked row pushes the selected log-prob to ~-100.3, where the
+        # bfloat16 ULP is 0.5. Computing the softmax in float32 and only then
+        # selecting keeps the result at float32 resolution.
+        vocab_size = 4096
+        logits = torch.zeros(2, vocab_size, dtype=torch.bfloat16)
+        logits[:, 0] = 100.0
+        logits[:, 1] = -0.3
+        index = torch.ones(2, dtype=torch.long)
+
+        result = selective_log_softmax(logits, index)
+        expected = torch.gather(
+            logits.double().log_softmax(-1), -1, index.unsqueeze(-1)).squeeze(-1)
+
+        # Computing wide only helps if the result stays wide: narrowing it back to
+        # bfloat16 would re-quantize to the 0.5 ULP this test exists to catch, and
+        # no other test in the suite asserts the output dtype.
+        assert result.dtype == torch.float32
+        assert torch.allclose(result.double(), expected, atol=1e-3)
+
+    @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize('return_entropy', [False, True])
+    def test_backward_saves_no_extra_full_vocab_activation(self, dtype, return_entropy):
+        # Every tensor handed to save_for_backward stays resident from the end of
+        # forward until backward runs, so a per-row copy of the vocabulary is as
+        # expensive as materializing the whole log_softmax. Recomputing in
+        # backward must keep nothing wider than the labels.
+        rows, vocab_size = 8, 512
+        logits = torch.randn(rows, vocab_size, dtype=dtype, requires_grad=True)
+        index = torch.randint(0, vocab_size, (rows, ))
+        logits_storage = logits.untyped_storage().data_ptr()
+        extra_storages = {}
+
+        def pack(tensor):
+            storage = tensor.untyped_storage()
+            if storage.data_ptr() != logits_storage:
+                extra_storages[storage.data_ptr()] = storage.nbytes()
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            result = selective_log_softmax(logits, index, return_entropy=return_entropy)
+
+        outputs = result if return_entropy else (result, )
+        torch.autograd.backward(outputs, [torch.ones_like(output) for output in outputs])
+
+        vocab_bytes = vocab_size * logits.element_size()
+        assert all(size < vocab_bytes for size in extra_storages.values())
+
+    def test_scales_with_chunks_not_with_rows(self):
+        # The per-row Python loop issued one save per row per intermediate, i.e.
+        # thousands of tiny kernel launches at production sequence lengths.
+        rows, vocab_size = 512, 512
+        logits = torch.randn(rows, vocab_size, requires_grad=True)
+        index = torch.randint(0, vocab_size, (rows, ))
+        save_calls = []
+
+        def pack(tensor):
+            save_calls.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            result = selective_log_softmax(logits, index)
+        result.sum().backward()
+
+        assert len(save_calls) <= 32
+
+    @pytest.mark.parametrize('return_entropy', [False, True])
+    def test_gradient_matches_naive_implementation(self, return_entropy):
+        # The backward is hand-written -- recompute-in-backward for the logps, plus
+        # a separate term for the entropy -- so it needs a numerical reference. The
+        # two tests above both run backward but assert only on saved-storage size
+        # and save count, so they would still pass with a wrong gradient, and a
+        # wrong gradient is silent: training proceeds and just converges somewhere
+        # else.
+        torch.manual_seed(0)
+        rows, vocab_size = 6, 37
+        index = torch.randint(0, vocab_size, (rows, ))
+
+        # float64, so gradcheck's finite differences are not the limiting error.
+        logits = torch.randn(rows, vocab_size, dtype=torch.float64, requires_grad=True)
+        assert torch.autograd.gradcheck(
+            lambda t: selective_log_softmax(t, index, return_entropy=return_entropy),
+            (logits, ), eps=1e-6, atol=1e-5, rtol=1e-4)
+
+        def naive(t):
+            log_probs = t.log_softmax(-1)
+            gathered = torch.gather(log_probs, -1, index.unsqueeze(-1)).squeeze(-1)
+            if not return_entropy:
+                return (gathered, )
+            return gathered, -(log_probs.exp() * log_probs).sum(-1)
+
+        x_new = torch.randn(rows, vocab_size, requires_grad=True)
+        x_ref = x_new.detach().clone().requires_grad_(True)
+        out_new = selective_log_softmax(x_new, index, return_entropy=return_entropy)
+        out_ref = naive(x_ref)
+        out_new = out_new if return_entropy else (out_new, )
+        torch.autograd.backward(list(out_new), [torch.ones_like(o) for o in out_new])
+        torch.autograd.backward(list(out_ref), [torch.ones_like(o) for o in out_ref])
+        assert torch.allclose(x_new.grad, x_ref.grad, atol=1e-5)
 
 
 class TestPadAndStackTensors:
@@ -151,7 +255,14 @@ class TestPadAndStackTensors:
     def test_different_length(self):
         tensors = [torch.randn(3), torch.randn(5)]
         result = pad_and_stack_tensors(tensors, pad_value=0)
-        assert result.shape == (10, )  # padded to max length then concat
+        # concat 沿 dim 0，而 dim 0 就是拼接维：不能 pad，否则会插入不存在的元素（旧行为给 (10,)）
+        assert result.shape == (8, )
+
+    def test_concat_does_not_pad_batch_dim(self):
+        tensors = [torch.randn(3, 4), torch.randn(2, 6)]
+        result = pad_and_stack_tensors(tensors, pad_value=0)
+        # 只对齐 seq 维；行数必须是 3+2，不能被拉成 3+3
+        assert result.shape == (5, 6)
 
     def test_different_length_stack(self):
         tensors = [torch.randn(3), torch.randn(5)]
@@ -357,6 +468,36 @@ class TestAlignLogpsToMask:
         mask = torch.tensor([[True]])
         result = align_logps_to_mask(42, mask, torch.float32)
         assert result is None
+
+    def test_full_sequence_form_indexes_by_mask(self):
+        """全序列形式（len >= seq_len，右 pad）必须先按 mask 取位置再 scatter。
+
+        这是 ref/old 模型 forward 返回的形式：它的 pad 宽度是 dp split 前整个 micro batch
+        的最大长度，所以常常比本 rank 的 logps 更宽。若退化成取行首 n_pos 个，读到的
+        就是 prompt 位置，每一个 IS ratio 都会错位。
+        """
+        mask = torch.tensor([[False, False, True, True],
+                            [False, False, False, True]])
+        full = torch.zeros(2, 7)          # 7 > seq_len=4
+        full[0, 2:4] = torch.tensor([-1.0, -2.0])
+        full[1, 3] = -3.0
+        result = align_logps_to_mask(full, mask, torch.float32)
+        assert result.shape == (2, 4)
+        assert result[0, 2].item() == pytest.approx(-1.0)
+        assert result[0, 3].item() == pytest.approx(-2.0)
+        assert result[1, 3].item() == pytest.approx(-3.0)
+        assert result[0, :2].abs().sum().item() == 0.0
+        assert result[1, :3].abs().sum().item() == 0.0
+
+    def test_full_sequence_matches_grpo_loss_alignment(self):
+        """指标侧与损失侧必须对齐到**同一批 token**，否则面板上的 ratio 不是优化器看到的。"""
+        from twinkle.loss.grpo import GRPOLoss
+        mask = torch.tensor([[False, True, True, True],
+                            [False, False, True, True]])
+        full = torch.randn(2, 9)
+        got = align_logps_to_mask(full, mask, torch.float32)
+        want = GRPOLoss()._pad_and_align_to_batch(full, mask, mask.device, torch.float32)
+        assert torch.equal(got, want)
 
 
 class TestFilterFromConfigKwargs:

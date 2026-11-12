@@ -247,6 +247,7 @@ def main():
             model_id=MODEL_ID,
             device_mesh=model_mesh,
             remote_group='model',
+            attn_implementation='flash_attention_2',
         )
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)

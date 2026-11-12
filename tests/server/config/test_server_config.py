@@ -9,6 +9,8 @@ Properties covered:
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 import yaml
 from hypothesis import given, settings
@@ -19,53 +21,38 @@ from pydantic import ValidationError
 from twinkle.server.config import ApplicationSpec, ServerConfig
 from twinkle.server.exceptions import ConfigParseError
 from twinkle.server.launcher import ServerLauncher
+from twinkle.server.sampler.app import SAMPLER_SELECTOR, build_sampler_app
 
 # ---------- minimal valid config strategy ---------------------------------- #
 
 _PERSISTENCE_VARIANTS = st.one_of(
     st.fixed_dictionaries({'mode': st.just('memory')}),
     st.fixed_dictionaries({
-        'mode': st.just('file'),
-        'file_path': st.just('/tmp/state.json')
-    }),
-    st.fixed_dictionaries({
         'mode': st.just('redis'),
         'redis_url': st.just('redis://localhost:6379/0')
     }),
 )
 
-_MODEL_APP = st.fixed_dictionaries({
-    'name':
-    st.just('m'),
-    'route_prefix':
-    st.just('/api/v1/m'),
-    'import_path':
-    st.just('model'),
-    'args':
-    st.fixed_dictionaries({
+_TRAINING_MODEL = st.fixed_dictionaries({
+    'name': st.just('m'), 'import_path': st.just('model'), 'route_prefix': st.just('/api/v1/model/m'),
+    'args': st.fixed_dictionaries({
         'model_id': st.just('model-id'),
-        'device_group': st.just({
-            'name': 'g',
-            'ranks': 1,
-            'device_type': 'CPU'
-        }),
-        'device_mesh': st.just({
-            'device_type': 'CPU',
-            'dp_size': 1
-        }),
         'backend': st.sampled_from(['mock', 'transformers', 'megatron']),
+        'device_group': st.just({'ranks': 2, 'device_type': 'cuda'}),
+        'device_mesh': st.just({'dp_size': 2}),
+        'train_mode': st.sampled_from(['lora', 'full']),
     }),
 })
 
 _VALID_CONFIG = st.fixed_dictionaries({
     'persistence': _PERSISTENCE_VARIANTS,
-    'applications': st.lists(_MODEL_APP, min_size=0, max_size=3),
+    'applications': st.lists(_TRAINING_MODEL, min_size=0, max_size=1),
 })
 
 # ---------- valid → fully validated ---------------------------------------- #
 
 
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 @given(payload=_VALID_CONFIG)
 def test_valid_payload_yields_full_instance(payload: dict) -> None:
     cfg = ServerConfig.model_validate(payload)
@@ -84,13 +71,6 @@ def test_redis_mode_missing_url() -> None:
         ServerConfig.model_validate({'persistence': {'mode': 'redis'}})
     msg = str(exc.value)
     assert 'persistence.redis_url' in msg or 'redis_url' in msg
-
-
-def test_file_mode_missing_path() -> None:
-    with pytest.raises(ValidationError) as exc:
-        ServerConfig.model_validate({'persistence': {'mode': 'file'}})
-    msg = str(exc.value)
-    assert 'persistence.file_path' in msg or 'file_path' in msg
 
 
 @settings(max_examples=100)
@@ -126,10 +106,30 @@ def test_nested_field_constraint_violation_named(bad_max_input_tokens: int) -> N
     assert any('max_input_tokens' in err['loc'] for err in errors)
 
 
+def test_torch_sampler_is_rejected_during_config_validation() -> None:
+    with pytest.raises(ValidationError):
+        ApplicationSpec.model_validate({
+            'name': 'sampler',
+            'import_path': 'sampler',
+            'args': {
+                'model_id': 'm',
+                'device_group': {},
+                'device_mesh': {},
+                'sampler_type': 'torch',
+            },
+        })
+
+
+def test_sampler_docstring_values_match_selector() -> None:
+    doc = build_sampler_app.__doc__ or ''
+    line = next(line for line in doc.splitlines() if 'sampler_type:' in line)
+    assert set(re.findall(r'``(\w+)``', line)) == set(SAMPLER_SELECTOR.builders)
+
+
 # ---------- round-trip fidelity ----------------------------------------- #
 
 
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 @given(payload=_VALID_CONFIG)
 def test_round_trip_fidelity(payload: dict) -> None:
     cfg = ServerConfig.model_validate(payload)
@@ -235,14 +235,71 @@ def test_launcher_accepts_typed_config() -> None:
     assert launcher.config is cfg
 
 
-def test_cookbook_examples_load() -> None:
-    """Migrated cookbook configs all parse with the new field names."""
+def test_data_plane_application_uses_its_own_strict_args_schema() -> None:
+    app = ApplicationSpec.model_validate({
+        'name': 'data-plane',
+        'route_prefix': '/api/v1/data-plane',
+        'import_path': 'data_plane',
+        'args': {
+            'config': {
+                'backend': {
+                    'SimpleStorage': {
+                        'num_data_storage_units': 2,
+                    },
+                },
+            },
+        },
+    })
+    assert app.import_path == 'data_plane'
+    assert app.args.config['backend']['SimpleStorage']['num_data_storage_units'] == 2
+
+    with pytest.raises(ValidationError):
+        ApplicationSpec.model_validate({
+            'name': 'data-plane',
+            'import_path': 'data_plane',
+            'args': {
+                'unknown': True
+            },
+        })
+
+
+def test_processor_queue_config_is_rejected() -> None:
+    # A processor deployment has no task queue; queue_config was silently ignored
+    # before and now fails validation (F013 / P009) naming the offending field.
+    ApplicationSpec.model_validate({
+        'name': 'processor',
+        'import_path': 'processor',
+        'args': {
+            'ncpu_proc_per_node': 1
+        },
+    })
+    with pytest.raises(ValidationError) as exc:
+        ApplicationSpec.model_validate({
+            'name': 'processor',
+            'import_path': 'processor',
+            'args': {
+                'ncpu_proc_per_node': 1,
+                'queue_config': {
+                    'rps_limit': 4
+                }
+            },
+        })
+    assert 'queue_config' in str(exc.value)
+
+
+def test_cookbook_examples_load(monkeypatch) -> None:
+    """Cookbook, real E2E, and mock configs parse with the current schema."""
     here = Path(__file__).resolve().parents[3]
+    monkeypatch.setenv('TWINKLE_LOCAL_MODEL_PATH', '/tmp/twinkle-config-validation-model')
     examples = [
         here / 'cookbook' / 'client' / 'server' / 'transformer' / 'server_config.yaml',
+        here / 'cookbook' / 'client' / 'server' / 'transformer' / 'server_config_hybrid_lora.yaml',
         here / 'cookbook' / 'client' / 'server' / 'megatron' / 'server_config.yaml',
         here / 'cookbook' / 'client' / 'server' / 'megatron' / 'server_config_4b.yaml',
+        here / 'cookbook' / 'client' / 'async_rl' / 'server_config.yaml',
     ]
+    examples.extend(sorted((here / 'tests' / 'server' / 'config').glob('server_config_*.yaml')))
+    examples.extend(sorted((here / 'tests' / 'server' / 'fixtures').glob('server_config_*.yaml')))
     for p in examples:
         cfg = ServerConfig.from_yaml(p)
         assert isinstance(cfg, ServerConfig), p

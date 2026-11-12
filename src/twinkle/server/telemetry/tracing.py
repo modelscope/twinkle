@@ -9,7 +9,6 @@ from typing import Any
 
 try:
     from opentelemetry import trace
-    from opentelemetry.context import Context
     from opentelemetry.propagate import extract, inject
     _OTEL_AVAILABLE = True
 except Exception:

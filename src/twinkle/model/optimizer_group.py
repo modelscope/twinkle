@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import torch
 from dataclasses import dataclass, field
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -10,6 +11,7 @@ from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
+from twinkle.utils.framework import Torch
 
 
 @dataclass
@@ -47,12 +49,6 @@ class BaseOptimizerGroup:
     _device_mesh: DeviceMesh = None
     _last_grad_norm: float = 0.0
 
-    def __setattr__(self, name, value):
-        if name == 'loss_instance' and value is not None:
-            from twinkle.utils.nccl_safe import safe_loss
-            value = safe_loss(value)
-        super().__setattr__(name, value)
-
     def do_grad_sync(self, gradient_accumulation_steps: Optional[int] = None) -> bool:
         if gradient_accumulation_steps is None:
             gradient_accumulation_steps = self.gradient_accumulation_steps
@@ -69,20 +65,37 @@ class BaseOptimizerGroup:
         """Accumulate metrics for train/eval status. Override in subclass if needed."""
         status = self.train_status if is_training else self.eval_status
         if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
+            metric_kwargs = {
+                **status.forward_kwargs,
+                'lr': self._get_lr(),
+                'step': self.cur_step - 1,
+                'gradient_accumulation_steps': self.gradient_accumulation_steps,
+                'grad_norm': self._last_grad_norm,
+            }
             for metric in status.metrics:
-                metric.accumulate(
-                    status.inputs,
-                    status.outputs,
-                    lr=self._get_lr(),
-                    step=self.cur_step - 1,
-                    gradient_accumulation_steps=self.gradient_accumulation_steps,
-                    grad_norm=self._last_grad_norm,
-                    **status.forward_kwargs)
+                metric.accumulate(status.inputs, status.outputs, **metric_kwargs)
 
     def calculate_metrics(self, is_training):
         """Calculate and return metrics."""
         self.accumulate_metrics(is_training)
         status = self.train_status if is_training else self.eval_status
+        # The metrics below gather over the DP group, and that gather is the first
+        # use of its NCCL communicator: NCCL connects it with its own cudaMalloc,
+        # which draws on device memory torch's caching allocator has *not* taken, so
+        # it fails on whichever rank has the least left -- and it fails where nothing
+        # reports it. Measured on 8xH20 with one padded trajectory per micro batch:
+        # 16 mini batches of 7k-19k tokens left the allocator holding 87.8 GiB
+        # reserved against 29.0 GiB live, one rank down to 164 MiB free, and that
+        # rank raised inside all_gather_object while the other seven waited in it
+        # forever -- 54 minutes, no log line, GPUs at 0% with their memory held,
+        # because calculate_metric is collected 'last_pp_first' so the driver never
+        # fetches the failing rank's exception. Releasing the cache first puts every
+        # rank above 54 GiB free and the same step completes in 5 ms. The cost is one
+        # re-allocation per optimizer step, which is once per iteration here.
+        if status.metrics:
+            # Torch.empty_cache() releases the cache of the accelerator in use
+            # (CUDA, Ascend NPU, ...) and does nothing when there is none.
+            Torch.empty_cache()
         results = {}
         for metric in status.metrics:
             results.update(metric.calculate())

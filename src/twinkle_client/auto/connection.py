@@ -20,7 +20,6 @@ File layout under run_dir (~/.cache/twinkle/{run_id}/):
 from __future__ import annotations
 
 import json
-from twinkle.utils.logger import get_logger
 import os
 import re
 import shutil
@@ -29,6 +28,8 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+
+from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 
@@ -186,7 +187,11 @@ class LocalConnection:
             error_msg = output_file.read_text().strip()[-500:] if output_file.exists() else ''
             meta['status'] = 'error'
             self._write_meta(run_id, meta)
-            return {'status': 'error', 'run_id': run_id, 'error': error_msg or f'Process exited immediately (code={retcode})'}
+            return {
+                'status': 'error',
+                'run_id': run_id,
+                'error': error_msg or f'Process exited immediately (code={retcode})'
+            }
 
         meta['pid'] = proc.pid
         meta['status'] = 'running'
