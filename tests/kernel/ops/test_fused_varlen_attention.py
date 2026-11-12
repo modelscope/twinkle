@@ -284,6 +284,39 @@ def test_npu_gqa_matches_native(dtype):
 
 
 @requires_npu
+@pytest.mark.parametrize('seed', [0, 1])
+@pytest.mark.parametrize('lengths,heads,kv_heads,dim', [
+    ((64, ) * 16, 4, 4, 32),
+    ((1024, 1024), 16, 4, 128),
+    ((1024, 512, 256), 16, 8, 128),
+])
+def test_npu_bf16_matches_twinkle_sdpa_baseline(lengths, heads, kv_heads, dim, seed):
+    from twinkle.kernel.ops.fused_varlen_attention.npu import _additive_mask
+    from twinkle.kernel.ops.sdpa_attention.npu import npu_sdpa_attention_forward
+
+    query, key, value, boundaries = make_inputs(
+        lengths, heads, kv_heads, dim, torch.bfloat16, seed=seed, device=NPU_DEVICE)
+    grad = torch.randn_like(query)
+    fused_inputs = [tensor.clone().requires_grad_() for tensor in (query, key, value)]
+    native_inputs = [tensor.clone().requires_grad_() for tensor in (query, key, value)]
+    output = fused_varlen_attention(*fused_inputs, boundaries)
+    module = type('Module', (), {'num_key_value_groups': heads // kv_heads})()
+    native_outputs = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        q = native_inputs[0][start:end].transpose(0, 1).unsqueeze(0)
+        k = native_inputs[1][start:end].transpose(0, 1).unsqueeze(0)
+        v = native_inputs[2][start:end].transpose(0, 1).unsqueeze(0)
+        native_outputs.append(npu_sdpa_attention_forward(
+            module, q, k, v, _additive_mask(None, q, k), is_causal=False)[0][0])
+    expected = torch.cat(native_outputs, 0)
+    grads = torch.autograd.grad(output, fused_inputs, grad)
+    expected_grads = torch.autograd.grad(expected, native_inputs, grad)
+    torch.testing.assert_close(output, expected, **tolerance(torch.bfloat16))
+    for got, want in zip(grads, expected_grads):
+        torch.testing.assert_close(got, want, **tolerance(torch.bfloat16))
+
+
+@requires_npu
 def test_npu_documents_are_isolated():
     lengths = (128, 96, 160)
     query, key, value, boundaries = make_inputs(lengths, 4, 4, 64, torch.bfloat16, device=NPU_DEVICE)

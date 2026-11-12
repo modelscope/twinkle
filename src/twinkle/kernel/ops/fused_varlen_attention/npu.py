@@ -98,10 +98,24 @@ def _as_list(cu_seqlens):
     return values
 
 
+def _expand_bf16_gqa(query, key, value):
+    """与 Twinkle 原生 SDPA 的 ``repeat_kv`` BF16 反向归约路径对齐。"""
+    if query.dtype != torch.bfloat16 or query.shape[1] == key.shape[1]:
+        return key, value
+    groups = query.shape[1] // key.shape[1]
+
+    def expand(tensor):
+        total, heads, dim = tensor.shape
+        return tensor[:, :, None, :].expand(total, heads, groups, dim).reshape(total, heads * groups, dim)
+
+    return expand(key), expand(value)
+
+
 def npu_fused_varlen_attention(query, key, value, cu_seqlens, *, scale=None, causal=True):
     """``cu_seqlens`` 可为累积长度列表或整型张量；张量在此转成列表（CANN 只接受 ``list[int]``）。"""
     if not causal:
         raise NotImplementedError('NPU 融合路径只支持因果注意力；非因果请用 backend="torch"')
+    key, value = _expand_bf16_gqa(query, key, value)
     actual = _as_list(cu_seqlens)
     _verify_vendor_semantics(query.device)
     return _vendor_attention(query, key, value, actual, query.shape[-1]**-0.5 if scale is None else scale)
