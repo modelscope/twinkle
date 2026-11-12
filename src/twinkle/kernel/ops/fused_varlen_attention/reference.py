@@ -47,3 +47,40 @@ def fused_varlen_attention_reference(query, key, value, cu_seqlens, *, scale=Non
             mask = mask.masked_fill(torch.triu(torch.ones_like(mask, dtype=torch.bool), 1), float('-inf'))
         outputs.append(F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)[0].transpose(0, 1))
     return torch.cat(outputs, 0)
+
+
+def torch_varlen_attention_forward(
+    module,
+    query,
+    key,
+    value,
+    attention_mask=None,
+    dropout=0.0,
+    scaling=None,
+    sliding_window=None,
+    is_causal=None,
+    cu_seq_lens_q=None,
+    cu_seq_lens_k=None,
+    max_length_q=None,
+    max_length_k=None,
+    **kwargs,
+):
+    """``transformers`` 注意力接口的精确 PyTorch 实现；无 NPU 时的可用后端。"""
+    from .adapter import varlen_attention_forward
+
+    return varlen_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout,
+        scaling,
+        sliding_window,
+        is_causal,
+        cu_seq_lens_q,
+        cu_seq_lens_k,
+        max_length_q,
+        max_length_k,
+        packed_attention=fused_varlen_attention_reference,
+    )

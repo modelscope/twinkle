@@ -13,6 +13,12 @@ from __future__ import annotations
 
 import torch
 
+from .adapter import additive_mask as _additive_mask
+from .adapter import boundary_list
+from .adapter import causal_sdpa as _sdpa_causal
+from .adapter import sdpa_attention as _sdpa_fallback
+from .adapter import varlen_attention_forward
+
 #: 块掩码边长。CANN 的 compressed sparse mask 只接受固定的 2048x2048 块，
 #: 与 ``sparse_mode=3``（rightDownCausal）配合时按分段边界对齐，不会跨文档。
 BLOCK_MASK = 2048
@@ -21,8 +27,6 @@ SELF_CHECK_TOL = 1e-4
 
 _MASK_CACHE: dict = {}
 _VERIFIED: set = set()
-#: 上一次「整型张量 -> list[int]」转换的缓存，见 :func:`_as_list`。
-_LIST_CACHE: dict = {}
 
 
 def _block_mask(device):
@@ -81,21 +85,8 @@ def _verify_vendor_semantics(device):
 
 
 def _as_list(cu_seqlens):
-    """把累积长度转成 CANN 要求的 ``list[int]``。
-
-    一次前向里每层拿到的都是同一个张量对象，逐层 ``.tolist()`` 会逐层触发一次主机同步，
-    把设备流水线打空（28 层就是 56 次）。这里按「对象 identity + 版本号」缓存上一次结果：
-    张量被就地改写会推进 ``_version``，缓存自动失效，不会读到过期边界。
-    """
-    if isinstance(cu_seqlens, (list, tuple)):
-        return [int(value) for value in cu_seqlens]
-    key = (cu_seqlens.device.type, cu_seqlens.device.index)
-    cached = _LIST_CACHE.get(key)
-    if cached is not None and cached[0] is cu_seqlens and cached[1] == cu_seqlens._version:
-        return cached[2]
-    values = [int(value) for value in cu_seqlens.tolist()]
-    _LIST_CACHE[key] = (cu_seqlens, cu_seqlens._version, values)
-    return values
+    """``adapter.boundary_list`` 的别名：保留既有调用点与测试的入口名。"""
+    return boundary_list(cu_seqlens)
 
 
 def _expand_bf16_gqa(query, key, value):
@@ -121,70 +112,6 @@ def npu_fused_varlen_attention(query, key, value, cu_seqlens, *, scale=None, cau
     return _vendor_attention(query, key, value, actual, query.shape[-1]**-0.5 if scale is None else scale)
 
 
-def _masked_min(dtype):
-    return torch.finfo(dtype).min if dtype.is_floating_point else torch.finfo(torch.float32).min
-
-
-def _additive_mask(attention_mask, query, key):
-    """把 HF 的 None/2D padding 掩码/4D 因果掩码统一成 SDPA 可用的加性掩码。"""
-    seq_q, seq_kv = query.shape[2], key.shape[2]
-    if attention_mask is not None and attention_mask.ndim == 4:
-        return attention_mask[..., :seq_kv]
-    additive = torch.zeros(seq_q, seq_kv, dtype=query.dtype, device=query.device)
-    causal = torch.triu(torch.ones(seq_q, seq_kv, dtype=torch.bool, device=query.device), 1)
-    additive = additive.masked_fill(causal, _masked_min(query.dtype))
-    if attention_mask is not None and attention_mask.ndim == 2:
-        padding = attention_mask[:, :seq_kv] == 0
-        blocked = torch.tensor(_masked_min(query.dtype), dtype=query.dtype, device=query.device)
-        additive = additive[None, None] + torch.where(padding[:, None, None, :], blocked,
-                                                      torch.zeros((), dtype=query.dtype, device=query.device))
-    return additive
-
-
-def _sdpa_fallback(module, query, key, value, attention_mask, dropout, scaling, is_causal):
-    """非 packed 调用（padded 前向、正确性对照）走 HF 语义的 SDPA，掩码自行补全。
-
-    ``_attn_implementation`` 为 flash 时上游不会构造 4D 因果掩码，只可能给 2D padding 掩码，
-    直接下传会被 FA 拒绝（``get unsupported atten_mask shape``），因此这里显式合成。
-    """
-    import torch.nn.functional as F
-    from transformers.integrations.sdpa_attention import repeat_kv
-
-    if hasattr(module, 'num_key_value_groups'):
-        key = repeat_kv(key, module.num_key_value_groups)
-        value = repeat_kv(value, module.num_key_value_groups)
-    mask = _additive_mask(attention_mask, query, key)
-    output = F.scaled_dot_product_attention(
-        query.contiguous(),
-        key.contiguous(),
-        value.contiguous(),
-        attn_mask=mask,
-        dropout_p=dropout,
-        scale=scaling,
-        is_causal=False,
-    )
-    return output.transpose(1, 2).contiguous(), None
-
-
-def _sdpa_causal(module, query, key, value, dropout, scaling):
-    import torch.nn.functional as F
-    from transformers.integrations.sdpa_attention import repeat_kv
-
-    if hasattr(module, 'num_key_value_groups'):
-        key = repeat_kv(key, module.num_key_value_groups)
-        value = repeat_kv(value, module.num_key_value_groups)
-    output = F.scaled_dot_product_attention(
-        query.contiguous(),
-        key.contiguous(),
-        value.contiguous(),
-        attn_mask=None,
-        dropout_p=dropout,
-        scale=scaling,
-        is_causal=True,
-    )
-    return output.transpose(1, 2).contiguous(), None
-
-
 def npu_varlen_attention_forward(
     module,
     query,
@@ -204,22 +131,22 @@ def npu_varlen_attention_forward(
     """``transformers`` flash-attention 接口的昇腾变长实现。
 
     只接受 padding-free 拼接输入（batch=1 且提供 ``cu_seq_lens_q``）：拿不到分段边界时
-    回退到原生 SDPA（padded 前向、正确性对照用），绝不把无边界输入当成分段输入。
+    回退到原生 SDPA（padded 前向、生成、正确性对照用），绝不把无边界输入当成分段输入。
     单文档直接使用原生 causal SDPA；多文档使用 TND 融合 varlen。
     """
-    if dropout:
-        raise ValueError('训练态融合变长注意力不支持 dropout')
-    if sliding_window is not None:
-        raise NotImplementedError('融合变长注意力暂不支持滑动窗口')
-    if cu_seq_lens_q is None:
-        return _sdpa_fallback(module, query, key, value, attention_mask, dropout, scaling, is_causal)
-    if query.ndim != 4 or query.shape[0] != 1:
-        raise ValueError('融合变长注意力要求 [1, H, S, D] 的 padding-free 拼接输入')
-    if len(cu_seq_lens_q) == 2:
-        return _sdpa_causal(module, query, key, value, dropout, scaling)
-    _, heads, seq_len, head_dim = query.shape
-    flat_q = query.transpose(1, 2).reshape(seq_len, heads, head_dim)
-    flat_k = key.transpose(1, 2).reshape(seq_len, key.shape[1], head_dim)
-    flat_v = value.transpose(1, 2).reshape(seq_len, value.shape[1], head_dim)
-    output = npu_fused_varlen_attention(flat_q, flat_k, flat_v, cu_seq_lens_q, scale=scaling, causal=True)
-    return output.reshape(1, seq_len, heads, head_dim), None
+    return varlen_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout,
+        scaling,
+        sliding_window,
+        is_causal,
+        cu_seq_lens_q,
+        cu_seq_lens_k,
+        max_length_q,
+        max_length_k,
+        packed_attention=npu_fused_varlen_attention,
+    )
