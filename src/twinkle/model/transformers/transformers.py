@@ -671,6 +671,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             if self.sp_strategy is not None:
                 self.sp_strategy.initialize()
             self._ensure_gdn_padding_free_patch()
+            if self.model_arch['aligner']:
+                from .vision_keepalive import VisionKeepAlive
+
+                base_model = self.model.get_base_model() if isinstance(self.model, PeftModel) else self.model
+                self._vision_keepalive = VisionKeepAlive(base_model, self.model, self.model_arch['aligner'])
 
             if optimizer_groups:
                 result = self.strategy.wrap_model(self.model, *(group.optimizer for group in optimizer_groups))
