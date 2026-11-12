@@ -35,17 +35,30 @@ class LazyCollect:
         self.device_mesh = device_mesh
         self._result = None  # Cache collected results
         self._timeout = timeout
+        #: ObjectRef -> its Ray future, once ``add_done_callback`` asked for one; the collect then reads the
+        #: value that future already fetched instead of fetching it again.
+        self._ref_futures = {}
 
-    def _get_result(self):
-        """Internal method to lazily collect and cache results"""
+    def __getstate__(self):
+        # Ray futures are this process's waiters; a copy in another process fetches on its own.
+        state = self.__dict__.copy()
+        state['_ref_futures'] = {}
+        return state
+
+    def _get_result(self, fetched: Optional[Dict[Any, Any]] = None):
+        """Collect and cache the result; ``fetched`` holds ref values a caller already got in one batch."""
         import ray
         if self._result is None:
             result = []
             for future in self._futures:
-                if isinstance(future, ray.ObjectRef):
-                    result.append(ray.get(future, timeout=self._timeout))
-                else:
+                if not isinstance(future, ray.ObjectRef):
                     result.append(future)
+                elif fetched is not None and future in fetched:
+                    result.append(fetched[future])
+                elif future in self._ref_futures:
+                    result.append(self._ref_futures[future].result(timeout=self._timeout))
+                else:
+                    result.append(ray.get(future, timeout=self._timeout))
             self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
         return self._result
 
@@ -113,7 +126,10 @@ class LazyCollect:
                 fn(self)
 
         for ref in refs:
-            ref.future().add_done_callback(_on_ref_done)
+            future = self._ref_futures.get(ref)
+            if future is None:
+                future = self._ref_futures[ref] = ref.future()
+            future.add_done_callback(_on_ref_done)
 
     def __iter__(self):
         """Support iteration: automatically collect results then iterate"""
@@ -461,37 +477,68 @@ class RayHelper:
         return isinstance(value, ray.ObjectRef) or isinstance(value, LazyCollect)
 
     @staticmethod
-    def _resolve_arg_refs(value: Any) -> Any:
+    def _resolve_arg_refs(value: Any, resolved: Dict[Any, Any]) -> Any:
         """Materialise remote handles (ObjectRef / LazyCollect) anywhere inside an argument value.
 
         Ray dereferences only refs passed at the TOP level of an actor call; a handle nested in a
         list element, a dict value or a dataclass field rides through to the worker as a handle.
         This is where every one of them turns back into a value, so a component method body reads
-        its arguments as plain single-process data.
+        its arguments as plain single-process data. ``resolved`` maps each ObjectRef to its value,
+        fetched beforehand in one batch (:meth:`do_get_and_collect`).
         """
         import ray
         from dataclasses import fields, is_dataclass, replace
         if isinstance(value, ray.ObjectRef):
-            return ray.get(value)
+            return resolved[value]
         if isinstance(value, LazyCollect):
-            return value()
+            return value._get_result(resolved)
         if isinstance(value, list):
-            return [RayHelper._resolve_arg_refs(item) for item in value]
+            return [RayHelper._resolve_arg_refs(item, resolved) for item in value]
         if isinstance(value, tuple):
-            resolved = tuple(RayHelper._resolve_arg_refs(item) for item in value)
-            return type(value)(*resolved) if hasattr(type(value), '_fields') else resolved
+            items = tuple(RayHelper._resolve_arg_refs(item, resolved) for item in value)
+            return type(value)(*items) if hasattr(type(value), '_fields') else items
         if isinstance(value, dict):
-            return {key: RayHelper._resolve_arg_refs(item) for key, item in value.items()}
+            return {key: RayHelper._resolve_arg_refs(item, resolved) for key, item in value.items()}
         if is_dataclass(value) and not isinstance(value, type):
-            return replace(value, **{field.name: RayHelper._resolve_arg_refs(getattr(value, field.name))
+            return replace(value, **{field.name: RayHelper._resolve_arg_refs(getattr(value, field.name), resolved)
                                      for field in fields(value) if field.init})
         return value
 
     @staticmethod
+    def _collect_arg_refs(value: Any, refs: List[Any]) -> None:
+        """Append every ObjectRef nested in ``value``; a LazyCollect contributes its own refs."""
+        import ray
+        from dataclasses import fields, is_dataclass
+        if isinstance(value, ray.ObjectRef):
+            refs.append(value)
+        elif isinstance(value, LazyCollect):
+            # Fetched with the rest; its collect then reads them from ``resolved``.
+            refs.extend(ref for ref in value._futures if isinstance(ref, ray.ObjectRef))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                RayHelper._collect_arg_refs(item, refs)
+        elif isinstance(value, dict):
+            for item in value.values():
+                RayHelper._collect_arg_refs(item, refs)
+        elif is_dataclass(value) and not isinstance(value, type):
+            for field in fields(value):
+                if field.init:
+                    RayHelper._collect_arg_refs(getattr(value, field.name), refs)
+
+    @staticmethod
     def do_get_and_collect(args, kwargs):
-        """Materialise every remote handle the arguments carry, wherever it is nested."""
-        new_args = [RayHelper._resolve_arg_refs(arg) for arg in args]
-        new_kwargs = {key: RayHelper._resolve_arg_refs(value) for key, value in kwargs.items()}
+        """Materialise every remote handle the arguments carry, wherever it is nested, in ONE ``ray.get``.
+
+        A list of N trajectory refs is then fetched concurrently instead of in N sequential round trips.
+        """
+        import ray
+        refs: List[Any] = []
+        for value in list(args) + list(kwargs.values()):
+            RayHelper._collect_arg_refs(value, refs)
+        refs = list(dict.fromkeys(refs))
+        resolved = dict(zip(refs, ray.get(refs))) if refs else {}
+        new_args = [RayHelper._resolve_arg_refs(arg, resolved) for arg in args]
+        new_kwargs = {key: RayHelper._resolve_arg_refs(value, resolved) for key, value in kwargs.items()}
         return new_args, new_kwargs
 
     @staticmethod
