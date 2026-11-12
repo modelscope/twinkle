@@ -131,8 +131,8 @@ class DataLoader:
         writes and a Ray worker inherits through its runtime_env -- so the draw agrees everywhere
         without a caller having to thread a seed through. An explicit ``retry_seed`` wins over this.
         """
-        from twinkle.infra import _torch_setup
-        return _torch_setup.seed_from_env()
+        from twinkle.utils import seed_from_env
+        return seed_from_env()
 
     @remote_function()
     def __len__(self):

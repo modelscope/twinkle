@@ -28,8 +28,7 @@ def init_twinkle_client(
 
 if TYPE_CHECKING:
     from twinkle_client import init_tinker_client, init_twinkle_client
-    from .infra import alive_node_ids, cluster_resources, get_device_placement, get_mode, initialize, \
-        kill_actors, node_ip, remote_class, remote_function, remote_map, resolve_all, spawn_sidecar, stash
+    from .infra import get_device_placement, initialize, remote_class, remote_function, shutdown
 
     from .utils import (GPU, NPU, DeviceGroup, DeviceMesh, Platform, Plugin, check_unsafe, exists, find_free_port,
                         find_node_ip, framework_util, get_logger, requires, torch_util, trust_remote_code)
@@ -41,9 +40,7 @@ else:
             'framework_util', 'torch_util', 'exists', 'requires', 'Platform', 'GPU', 'NPU', 'find_node_ip',
             'find_free_port', 'trust_remote_code', 'check_unsafe', 'DeviceMesh', 'Plugin', 'DeviceGroup', 'get_logger'
         ],
-        'infra': ['initialize', 'remote_class', 'remote_function', 'remote_map', 'get_device_placement', 'get_mode',
-                  'node_ip', 'alive_node_ids', 'spawn_sidecar', 'resolve_all', 'kill_actors',
-                  'cluster_resources', 'stash'],
+        'infra': ['initialize', 'remote_class', 'remote_function', 'get_device_placement', 'shutdown'],
     }
 
     import sys

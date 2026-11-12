@@ -2,9 +2,10 @@
 """Twinkle infrastructure: process-level state, ``initialize``, and the remote-call re-exports.
 
 This package keeps the process-level knobs (mode, lazy-collect policy, device groups/mesh,
-notifier) together with :func:`initialize`, the sanctioned setup seam. The dispatch decorators
-live in ``.dispatch`` and the continuous-work protocol in ``.continuous_work``; both read the
-globals above through this module object at call time, so a later ``initialize`` is honoured.
+notifier) together with :func:`initialize`, the sanctioned setup seam, and :func:`shutdown`. The
+dispatch decorators live in ``.dispatch``, the continuous-work routing in ``.continuous_work`` and the
+replica lifecycle in ``.worker_mixin``; they read the globals above through this module object at call
+time, so a later ``initialize`` is honoured.
 """
 import json
 import os
@@ -15,17 +16,10 @@ from twinkle.notifier import Notifier
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, get_logger, requires
 
 from . import _torch_setup
-from .collectors import collect_dp_and_flatten, collect_tensor_dict
-from .continuous_work import _cw_barrier, _cw_drop_locked, _cw_unregister, _get_workers, _select_workers, \
-    get_worker_id
 from .dispatch import _collect_func, _dispatch_args, _get_device_mesh_param_name, _prepare_lazy_collect, \
-    alive_node_ids, cluster_resources, kill_actors, node_ip, remote_class, remote_function, remote_map, \
-    resolve_all, spawn_sidecar, stash
+    remote_class, remote_function
 
-__all__ = ['collect_dp_and_flatten', 'collect_tensor_dict', 'get_device_mesh', 'get_device_placement', 'get_mode',
-           'get_worker_id', 'initialize', 'remote_class', 'remote_function', 'remote_map',
-           'node_ip', 'alive_node_ids', 'spawn_sidecar', 'resolve_all', 'kill_actors',
-           'cluster_resources', 'stash']
+__all__ = ['get_device_placement', 'initialize', 'remote_class', 'remote_function', 'shutdown']
 
 logger = get_logger()
 
@@ -149,30 +143,15 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             nproc_per_node=nproc_per_node, ncpu_proc_per_node=ncpu_proc_per_node, device_groups=_device_group)
 
 
-def get_device_mesh() -> Optional[DeviceMesh]:
-    """The global default device mesh set by ``initialize`` (None before init).
+def shutdown():
+    """Release everything ``initialize`` started: in ray mode every actor of this run, then Ray itself.
 
-    A ``@remote_class`` model receives this mesh automatically: its wrapped ``__init__`` injects it
-    whenever the caller passes ``device_mesh=None`` (see the dispatch module's ``_new_init_body``).
-    A model that builds *outside* that wrapper -- one overriding ``__init__`` rather than inheriting
-    the wrapped base -- resolves its mesh through this accessor to uphold the same invariant: a
-    constructed model holds a real mesh, so the InputProcessor / OptimizerGroup it builds get proper
-    DP placement instead of silently degrading to single-rank loss normalisation and no metric
-    aggregation.
+    Local mode holds nothing to release, so this is a no-op there.
     """
-    return _device_mesh
-
-
-def get_mode() -> Optional[Literal['local', 'ray']]:
-    """The twinkle execution mode (``'local'`` or ``'ray'``) set by :func:`initialize` (None before init).
-
-    Public accessor over the module-private ``_mode``. Callers outside twinkle (e.g. swift/dev) need to
-    know whether cross-process isolation is in effect: under ``'ray'`` a ``forward_only`` serializes its
-    inputs to a worker process, so a driver-side defensive copy of those inputs is redundant, while under
-    ``'local'`` the compute shares this process and the copy is load-bearing. Reading ``_mode`` directly
-    would reach into a private global, so this is the sanctioned seam.
-    """
-    return _mode
+    if _mode != 'ray':
+        return
+    from ._ray import RayHelper
+    RayHelper.shutdown()
 
 
 def get_device_placement(device_group=None) -> str:

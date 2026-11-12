@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
@@ -183,48 +183,32 @@ async def _stream_queue(q, sentinel, request_id: str, total_timeout: float, sing
             pass
 
 
-async def _await_futures(service: SamplerManagement, futures: List[Any], request_ids: List[str]):
-    """Collect submit futures off the event loop (``result()`` blocks); a failure stops the rest.
+async def _await_futures(futures: List[Any]):
+    """Collect submit futures off the event loop (``result()`` blocks); the first failure is raised.
 
-    Each future is the sampler's submit return (a LazyCollect handle): probing and collecting are
-    LOCAL operations on the handle -- no per-status RPC round trip. When one request fails, the
-    still-running siblings are ended via the sampler's stop (abort + settle) so no engine work is
-    leaked; on success every future is already complete and the stop calls are skipped entirely.
+    Each future is the sampler's submit return: waiting on it is a LOCAL operation on the handle --
+    no per-status RPC round trip. Siblings of a failed request run to their own end on the engine.
     """
     loop = asyncio.get_running_loop()
-    try:
-        results = await asyncio.gather(
-            *[loop.run_in_executor(None, future.result) for future in futures])
-        return [response for result in results for response in result]
-    except BaseException:
-        for request_id in request_ids:
-            try:
-                await service.call_backend(service.sampler.stop, {'request_id': request_id})
-            except Exception:
-                logger.warning('Failed to stop generation %s', request_id, exc_info=True)
-        raise
+    results = await asyncio.gather(*[loop.run_in_executor(None, future.result) for future in futures])
+    return [response for result in results for response in result]
 
 
 def _submit_group(service: SamplerManagement, inputs: List[Any], params: Any, *,
-                  adapter_name: str, adapter_path: Optional[str]) -> Tuple[List[Any], List[str], List[str]]:
-    """Submit one generation per input; returns (futures, request_ids, trajectories).
+                  adapter_name: str, adapter_path: Optional[str]) -> List[Any]:
+    """Submit one generation per input; returns the futures in input order.
 
     Synchronous on purpose: the caller wraps it in ``call_backend`` (the backend gate's executor),
-    which is also what hands each LazyCollect back across the event-loop boundary. Each trajectory
-    gets its request_id stamped by ``submit`` itself, so the ids returned here are the ones a later
-    stop/cancel addresses.
+    which is also what hands each future back across the event-loop boundary. Each trajectory gets
+    a request_id here, which the engine uses as its request id.
     """
     futures: List[Any] = []
-    request_ids: List[str] = []
-    trajectories: List[Dict[str, Any]] = []
     for entry in inputs:
         trajectory = dict(entry)
-        future = service.sampler.submit(trajectory, params, adapter_name=adapter_name,
-                                        adapter_path=adapter_path)
-        futures.append(future)
-        request_ids.append(trajectory['request_id'])
-        trajectories.append(trajectory)
-    return futures, request_ids, trajectories
+        trajectory.setdefault('request_id', uuid.uuid4().hex)
+        futures.append(service.sampler.submit(trajectory, params, adapter_name=adapter_name,
+                                              adapter_path=adapter_path))
+    return futures
 
 
 def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -268,7 +252,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             if body.sampling_params:
                 params = SamplingParams.from_dict(body.sampling_params)
 
-            # Sample
+            # Sample. token_only goes to the backend only when asked: a multi-turn client that
+            # re-uploads its media every turn builds the extended feature itself.
+            extra = {'token_only': True} if body.token_only else {}
+
             async def generate(adapter_path):
                 return await self.call_backend(
                     self.sampler.sample,
@@ -276,6 +263,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                     params,
                     adapter_name=full_adapter_name,
                     adapter_path=adapter_path,
+                    **extra,
                 )
 
             responses = await sample_with_weights(self, resolved_uri, generate)
@@ -328,12 +316,12 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             # The async engine owns generation concurrency, so the whole submit -> await -> store
             # sequence runs as one background future (outside the serial compute queue) and its
             # result is the DataRef. One submit per input (num_samples rides SamplingParams),
-            # each handing back a LazyCollect the handler awaits locally -- no per-status RPC.
+            # each handing back a future the handler awaits locally -- no per-status RPC.
             async def generate():
-                futures, request_ids, _ = await self.call_backend(
+                futures = await self.call_backend(
                     _submit_group, self, inputs, params,
                     adapter_name=full_adapter_name, adapter_path=adapter_path)
-                return await _await_futures(self, futures, request_ids)
+                return await _await_futures(futures)
 
             responses = await self.sampling_guard.run(generate)
             rows, tags = _build_rollout_rows_and_tags(

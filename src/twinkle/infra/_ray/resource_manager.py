@@ -38,6 +38,7 @@ class ResourceManager:
         manager.group_configs = [group]
         manager.placement_groups = [placement_group]
         manager.cpu_placement_groups = []
+        manager.rank_placements = {}
         manager._external_allocation = True
         manager.device_groups = {
             group.name: [{
@@ -255,6 +256,17 @@ class ResourceManager:
             for node_rank, placement_group in zip(self.node_ranks, self.placement_groups):
                 self.node2pg[node_rank] = placement_group
 
+        # Placement of every allocated physical rank, so a pool can grow onto ranks another group owns
+        # (a sampler borrowing idle trainer devices).
+        self.rank_placements = {}
+        if device_type != 'CPU':
+            for rank in all_ranks:
+                node_rank = rank // nproc_per_node
+                self.rank_placements[rank] = {
+                    'gpu_rank': self.visible_devices[node_rank - self.min_node_idx][rank % nproc_per_node],
+                    'placement_group': self.node2pg[node_rank],
+                }
+
         self.device_groups = {}
         ray_address = str(ray.get_runtime_context().gcs_address)
         global_cpu_proc_idx = 0
@@ -296,13 +308,15 @@ class ResourceManager:
                             dict(
                                 gpu_rank=gpu_ranks_local,
                                 placement_group=self.node2pg[node_rank],
-                                ray_address=ray_address))
+                                ray_address=ray_address,
+                                ranks=list(worker_ranks)))
                 else:
                     for alloc_rank in normalized_ranks:
                         node_rank = alloc_rank // nproc_per_node
                         gpu_rank = self.visible_devices[node_rank - self.min_node_idx][alloc_rank % nproc_per_node]
                         local_device_groups.append(
-                            dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address))
+                            dict(gpu_rank=[gpu_rank], placement_group=self.node2pg[node_rank], ray_address=ray_address,
+                                 ranks=[alloc_rank]))
 
                 self.device_groups[group.name] = local_device_groups
 

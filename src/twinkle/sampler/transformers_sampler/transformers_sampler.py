@@ -57,6 +57,8 @@ class TransformersSampler(Sampler):
         model_id: str = None,
         engine_args: dict[str, Any] = None,
         device_mesh: DeviceMesh = None,
+        template: Optional[Any] = None,
+        template_kwargs: Optional[dict[str, Any]] = None,
         *,
         model: Any = None,
         **kwargs,
@@ -71,8 +73,10 @@ class TransformersSampler(Sampler):
                 is a bare ``nn.Module`` for the engine to generate with in this process, whereas ``model``
                 below is a ``TransformersModel`` whose workers do the generating. Both avoid a reload;
                 the first is what ``TransformersModel.generate`` uses internally.
-            device_mesh: Data-parallel layout. Slicing is done by ``dispatch='slice_dp'`` on
-                :meth:`sample`, so each rank only ever sees its own shard.
+            device_mesh: Data-parallel layout of this sampler's replicas.
+            template: The chat template (instance, class or registered name) that encodes Trajectory
+                inputs. In facade mode it is handed to the model, where encoding happens.
+            template_kwargs: Keyword arguments for building ``template``.
             model: A ``TransformersModel`` to generate from instead of loading one. Sampling is then
                 done by its workers, on the weights they already hold -- no second copy of the model,
                 and no weight sync, which is what makes this worth having during training. Construct
@@ -113,6 +117,8 @@ class TransformersSampler(Sampler):
             from .transformers_engine import TransformersEngine
 
             self.engine: TransformersEngine = TransformersEngine(model_id, **engine_kwargs)
+        if template is not None:
+            self.set_template(template, **(template_kwargs or {}))
 
         self._shutdown_called = False
         atexit.register(self.shutdown)
@@ -152,7 +158,7 @@ class TransformersSampler(Sampler):
     def apply_patch(self, patch_cls: Patch | type[Patch] | str, **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
-    @remote_function(dispatch="all", collect="first", lazy_collect=False, exclusive=True, replay=True)
+    @remote_function(dispatch="all", collect="first", lazy_collect=False)
     def set_template(self, template_cls, **kwargs):
         """Set the template that turns messages into token ids.
 
@@ -166,10 +172,9 @@ class TransformersSampler(Sampler):
 
     # ------------------------------------------------------------------ sampling
 
-    # enable_continous_work=True, as vLLM/sglang declare: the rollout path samples one trajectory
-    # per call, and a slice_dp sampler raises when a worker gets nothing from a batch of one.
-    @remote_function(dispatch="slice_dp", collect="flatten", lazy_collect=False,
-                     enable_continous_work=True)
+    # Same declaration as vLLM/sglang: each request goes to one replica (least loaded, or the one its
+    # session_id is pinned to).
+    @remote_function(enable_continous_work=True, sticky_key="session_id")
     @timed
     def sample(
         self,
@@ -182,12 +187,13 @@ class TransformersSampler(Sampler):
         use_base_model: bool = False,
         adapter_paths: list[str | None] | None = None,
         strict: bool = True,
+        session_id: str | None = None,
     ) -> list[SampleResponse]:
         """Sample completions for ``inputs``.
 
         Args:
             inputs: ``InputFeature``(s) carrying ``input_ids``, or ``Trajectory``(s) carrying
-                ``messages`` (which then requires ``set_template`` to have been called).
+                ``messages`` (which then requires the sampler to be built with ``template=``).
             sampling_params: ``max_tokens == 0`` means "score, do not generate", matching the vLLM
                 backend: one token is generated and discarded so the prompt gets its logprobs.
             adapter_name: Name for the adapter loaded from ``adapter_path``.
@@ -202,6 +208,7 @@ class TransformersSampler(Sampler):
                 ``SampleResponse`` with ``stop_reason='error'`` instead of aborting the batch, so one
                 bad row cannot discard a long offline run. Positions are preserved: the result list
                 always lines up with ``inputs``.
+            session_id: Routing key: calls sharing it go to the same replica.
 
         Returns:
             One ``SampleResponse`` per input, each holding ``num_samples`` sequences.
@@ -237,8 +244,8 @@ class TransformersSampler(Sampler):
             if len(adapter_paths) != len(inputs_list):
                 raise ValueError(
                     f"adapter_paths has {len(adapter_paths)} entries but there are "
-                    f"{len(inputs_list)} inputs; they must correspond one-to-one so that DP "
-                    "slicing keeps them aligned."
+                    f"{len(inputs_list)} inputs; they must correspond one-to-one so that "
+                    "request routing keeps them aligned."
                 )
 
         logprobs_only = params.max_tokens == 0
@@ -287,7 +294,7 @@ class TransformersSampler(Sampler):
             feat = state.feature
         elif self._not_encoded(inputs):
             if self.template is None:
-                raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
+                raise ValueError(f"Template not set for adapter '{adapter_name}'. Pass template= to the sampler.")
             state = self.template.encode_prompt(inputs, backend="transformers").state
             feat = state.feature
         else:

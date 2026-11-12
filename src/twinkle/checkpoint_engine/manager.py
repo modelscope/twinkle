@@ -2,12 +2,12 @@
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
 import os
 import threading
-from contextlib import contextmanager
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from twinkle import Platform, get_logger
-from twinkle.infra import get_worker_id
+from twinkle import Platform, get_logger, remote_class, remote_function
 from .base import CheckpointEngine
 from .delta import DeltaSyncConfig, resolve_delta_engine_cls
 from .mixin import CheckpointEngineMixin
@@ -19,8 +19,35 @@ CheckpointEngineMode = Literal['auto', 'naive', 'colocate', 'standalone']
 _VALID_MODES = {'auto', 'naive', 'colocate', 'standalone'}
 
 
+def _wait(result: Any) -> Any:
+    """The value of a lazily collected call (its handle is called), or the value itself."""
+    return result() if callable(result) else result
+
+
+def _together(*calls) -> List[Any]:
+    """Run the calls side by side and wait for all of them.
+
+    Rendezvous pairs (a process-group init whose master blocks until every peer connects, a send
+    and its receive) must not run one after the other; the first failure is raised after every call
+    has ended.
+    """
+    with ThreadPoolExecutor(len(calls)) as pool:
+        futures = [pool.submit(lambda call=call: _wait(call())) for call in calls]
+    results, error = [], None
+    for future in futures:
+        try:
+            results.append(future.result())
+        except BaseException as failure:  # noqa
+            error = error or failure
+            results.append(None)
+    if error is not None:
+        raise error
+    return results
+
+
+@remote_class(execute='first', max_concurrency=3)
 class CheckpointEngineManager:
-    """Weight synchronization manager for local and Ray deployments.
+    """Weight synchronization manager for local and Ray deployments; one per model/sampler pair.
 
     ``mode`` selects one of three synchronization paths:
 
@@ -31,8 +58,15 @@ class CheckpointEngineManager:
     ``auto`` resolves local objects to ``naive`` and Ray actor handlers to ``standalone``. It never
     guesses ``colocate`` because actor placement cannot be inferred reliably from the driver.
 
-    Delta synchronization follows verl's workflow ordering: finish training before syncing,
-    await sync before submitting more training, and do not overlap sync and close calls.
+    The manager owns the policy version: every completed :meth:`sync_weights` adds one, and
+    :meth:`version` reads it without waiting for a sync in progress. Built with a ``remote_group``
+    it is a single actor every process shares (the training loop syncs, the streaming driver reads
+    the version); syncs and :meth:`warm` run one at a time.
+
+    The receivers are the sampler's current replicas. A standalone sync holds their generation
+    (``pause_generation``) for the transfer and releases it after, so running requests continue on
+    the new weights; when the replica set changed since the last sync the transport is rebuilt for
+    the new set. New replicas get the current weights from :meth:`warm` before they serve.
 
     Architecture (following verl's CheckpointEngineManager):
 
@@ -48,32 +82,17 @@ class CheckpointEngineManager:
         │                  │                    │        ▼         │
         │                  │                    │ VLLMEngine       │
         │                  │                    │  update_weights()│
-        │                  │                    │   (CUDA IPC)     │
-        │                  │                    │        │         │
-        │                  │                    │        ▼         │
-        │                  │                    │ vLLM subprocess  │
-        │                  │                    │  load_weights()  │
         └──────────────────┘                    └──────────────────┘
 
     Usage:
         >>> manager = CheckpointEngineManager(model=model, sampler=sampler)
         >>> manager.sync_weights()  # Call after each training step
 
-    With colocated Ray actors, the caller also owns the memory schedule, because only it knows where
-    in the loop the device is free. The sampler must have its weights resident to be written into --
-    ``sleep(1)`` puts them on the host -- and the trainer has to step aside before a rollout:
-
-        >>> manager = CheckpointEngineManager(model=model, sampler=sampler, mode='colocate')
-        >>> sampler.wake_up(tags=['weights'])   # able to receive, still without a KV cache
-        >>> manager.sync_weights()
-        >>> model.offload_to_cpu()              # the trainer's turn is over
-        >>> sampler.wake_up()                   # KV cache, then generate
-        >>> ...
-        >>> sampler.sleep()                     # and back the other way
-        >>> model.reload_to_gpu()
-
-    This is deliberately not done for the caller: waking a sampler that is already awake is not a
-    no-op in vLLM, so guessing the current state here would trade one foot-gun for another.
+    With colocated Ray actors the sync also moves the device between the two roles, in the order
+    the training loop needs: the sampler's weights are woken (``sleep_level`` > 0), written, the
+    trainer offloads (``offload_kwargs`` go to ``model.offload_to_cpu``), and the sampler's KV cache
+    is woken, ready to generate. The training loop does the other half after it takes a batch:
+    ``sampler.sleep(level)`` and ``model.reload_to_gpu()``.
     """
 
     def __init__(
@@ -85,9 +104,22 @@ class CheckpointEngineManager:
         sync_backend: Literal['full', 'delta_sharded'] = 'full',
         delta_config: Optional[DeltaSyncConfig] = None,
         channel: str = 'default',
-        colocate_trainer_ranks: Optional[List[int]] = None,
-        receiver_worker_ids: Optional[List[str]] = None,
+        sleep_level: int = 0,
+        offload_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """
+        Args:
+            model: The weight sender (a training model).
+            sampler: The weight receiver (a sampler, or a reference model for :meth:`sync_ema`).
+            platform: The device platform; picks the transport.
+            mode: ``auto`` / ``naive`` / ``colocate`` / ``standalone``, see the class docstring.
+            sync_backend: ``full`` sends every weight; ``delta_sharded`` sends only changed ones.
+            delta_config: Settings of ``delta_sharded``.
+            channel: Name of this manager's transport channel, separating managers that share actors.
+            sleep_level: Colocate only: the level the training loop sleeps the sampler at; 0 means it
+                never sleeps, so the sync wakes nothing.
+            offload_kwargs: Colocate only: keyword arguments of ``model.offload_to_cpu`` after a sync.
+        """
         self.model = model
         self.sampler = sampler
         self.requested_mode = mode
@@ -110,34 +142,25 @@ class CheckpointEngineManager:
         self._delta_failed = False
         self.last_delta_metrics = None
         self._sync_lock = threading.RLock()
-        self.receiver_worker_ids = self._validate_receiver_ids(receiver_worker_ids)
-        self._receiver_snapshot = self.receiver_worker_ids
-        self._channel_closed = False
+        self._version = 0
         if not isinstance(channel, str) or not channel:
             raise ValueError(f'checkpoint channel must be a non-empty string, got {channel!r}.')
         self.channel = channel
-        if colocate_trainer_ranks is not None:
-            if self.mode != 'colocate':
-                raise ValueError('colocate_trainer_ranks is valid only for mode="colocate".')
-            colocate_trainer_ranks = self._validate_colocate_ranks(colocate_trainer_ranks, self.receiver_worker_ids)
-        elif self.mode == 'colocate' and self.receiver_worker_ids is not None:
-            raise ValueError(
-                'mode="colocate" with an explicit receiver_worker_ids subset also requires '
-                'colocate_trainer_ranks: an arbitrary subset cannot be paired with trainer ranks by '
-                'the uniform default topology, and a mismatched pair would hang on the first bucket.')
-        self.colocate_trainer_ranks = (None if colocate_trainer_ranks is None
-                                       else tuple(colocate_trainer_ranks))
+        self.sleep_level = int(sleep_level)
+        self.offload_kwargs = dict(offload_kwargs or {})
         self.backend = None if self.mode == 'naive' else self.backend_cls.backend_name
         # Signs the engine's control frames. Generated here and delivered to both sides through the
         # Ray control path, so a peer that guessed the endpoint path still cannot inject frames.
         self._auth_key = generate_auth_key()
+        # The receiver replicas the open channel was built for; None when no channel is open.
+        self._members = None
 
         if self.mode != 'naive':
             try:
-                self._activate_checkpoint_channel()
+                self._members = self._activate_checkpoint_channel()
             except BaseException:
                 try:
-                    self.close()
+                    self._close_checkpoint_channel()
                 except Exception:
                     logger.warning('Failed to fully close checkpoint channel %s after initialization failure.',
                                    channel, exc_info=True)
@@ -146,6 +169,7 @@ class CheckpointEngineManager:
         # LoRA sync state: tracks whether the first full sync has been done.
         # After the first sync, only LoRA adapter weights are transferred.
         self.base_sync_done: bool = False
+        self._merge_and_sync = True
         # Cached peft_config dict for LoRA-only sync.
         # Fetched lazily from the model on first LoRA sync.
         self._peft_config: dict | None = None
@@ -195,110 +219,48 @@ class CheckpointEngineManager:
         # instantiate the HCCL/XCCL engine.
         return Platform.get_platform(platform).checkpoint_engine()[0]
 
-    def _validate_receiver_ids(self, worker_ids):
-        if worker_ids is None:
-            return None
-        if self.mode == 'naive':
-            raise ValueError('receiver_worker_ids requires Ray checkpoint receivers.')
-        worker_ids = tuple(worker_ids)
-        if any(not isinstance(worker_id, str) for worker_id in worker_ids):
-            raise ValueError('receiver_worker_ids must contain stable actor ID strings.')
-        known = {get_worker_id(actor) for actor in self.sampler._actors}
-        if len(set(worker_ids)) != len(worker_ids) or set(worker_ids) - known:
-            raise ValueError(f'receiver_worker_ids contains duplicate or unknown actor IDs: {worker_ids!r}.')
-        return worker_ids
+    # ── Channel ──────────────────────────────────────────────────────────────
 
-    def _validate_colocate_ranks(self, ranks, worker_ids):
-        ranks = tuple(ranks)
-        count = self.sampler.device_mesh.data_world_size if worker_ids is None else len(worker_ids)
-        if any(type(rank) is not int or not 0 <= rank < self.model.device_mesh.world_size for rank in ranks):
-            raise ValueError('Each IPC receiver requires a physical trainer sender rank within the trainer world.')
-        if len(ranks) != count or len(set(ranks)) != len(ranks):
-            raise ValueError('Each IPC receiver requires one unique physical trainer sender rank.')
-        return ranks
+    def _activate_checkpoint_channel(self, receiver: Any = None, channel: Optional[str] = None) -> tuple:
+        """Select the channel on both sides; returns the ids of the receiver replicas it reached."""
+        receiver = self.sampler if receiver is None else receiver
+        channel = channel or self.channel
+        self.model.activate_checkpoint_engine(self.backend, channel, auth_key=self._auth_key)
+        members = receiver.activate_checkpoint_engine(self.backend, channel, auth_key=self._auth_key)
+        return tuple(members if isinstance(members, list) else [members])
 
-    def set_receiver_workers(self, worker_ids, *, colocate_trainer_ranks=None):
-        """Register the receiver set for the next sync; communication changes are applied
-        lazily, only inside sync_weights."""
-        with self._sync_lock:
-            worker_ids = self._validate_receiver_ids(worker_ids)
-            if colocate_trainer_ranks is not None:
-                if self.mode != 'colocate':
-                    raise ValueError('colocate_trainer_ranks requires mode="colocate".')
-                self.colocate_trainer_ranks = self._validate_colocate_ranks(colocate_trainer_ranks, worker_ids)
-            elif self.mode == 'colocate':
-                if worker_ids is not None and worker_ids != self.receiver_worker_ids:
-                    # A changed receiver subset with stale ranks pairs receivers with trainers that
-                    # share no GPU; the mismatch would only surface -- as a hang -- inside sync.
-                    raise ValueError(
-                        'Changing receiver_worker_ids in mode="colocate" requires colocate_trainer_ranks '
-                        'for the new set; the previous ranks no longer describe the pairing.')
-                if worker_ids is None:
-                    # Back to the full receiver set: the uniform default topology applies again.
-                    self.colocate_trainer_ranks = None
-            self.receiver_worker_ids = worker_ids
+    def _close_checkpoint_channel(self, receiver: Any = None, channel: Optional[str] = None) -> None:
+        receiver = self.sampler if receiver is None else receiver
+        channel = channel or self.channel
+        try:
+            self.model.reset_checkpoint_engine(channel, self.backend)
+        finally:
+            receiver.reset_checkpoint_engine(channel, self.backend)
 
-    def _sampler_call(self, method, *args, **kwargs):
-        if self._receiver_snapshot is not None:
-            kwargs['_worker_ids'] = self._receiver_snapshot
-        return getattr(self.sampler, method)(*args, **kwargs)
-
-    def _activate_checkpoint_channel(self) -> None:
-        if self._channel_closed:
-            self._receiver_snapshot = self.receiver_worker_ids
-        self._channel_closed = False
-        self.model.activate_checkpoint_engine(self.backend, self.channel, auth_key=self._auth_key)
-        self._sampler_call('activate_checkpoint_engine', self.backend, self.channel, auth_key=self._auth_key)
-
-    def _close_checkpoint_channel(self):
-        if self.mode != 'naive':
-            try:
-                self.model.reset_checkpoint_engine(self.channel, self.backend)
-            finally:
-                self._sampler_call('reset_checkpoint_engine', self.channel, self.backend)
-
+    @remote_function(collect='first', lazy_collect=False)
     def close(self) -> None:
-        """Tear down this channel, cleaning only the receiver snapshot that the last sync used."""
+        """Tear down this manager's channel; the next sync rebuilds it."""
         with self._sync_lock:
-            if self._channel_closed:
+            if self.mode == 'naive' or self._members is None:
                 return
             try:
                 self._close_checkpoint_channel()
             finally:
-                self._receiver_snapshot = ()
-                self._channel_closed = True
+                self._members = None
                 self.base_sync_done = False
 
+    # ── Version ──────────────────────────────────────────────────────────────
+
+    @remote_function(collect='first', lazy_collect=False)
+    def version(self) -> int:
+        """How many syncs have completed; read without waiting for one in progress."""
+        return self._version
+
+    # ── Sync ─────────────────────────────────────────────────────────────────
+
+    @remote_function(collect='first', lazy_collect=False)
     def sync_weights(self, merge_and_sync=True):
-        with self._sync_lock:
-            if self._channel_closed or self.receiver_worker_ids != self._receiver_snapshot:
-                self.close()
-                self._receiver_snapshot = self.receiver_worker_ids
-                self.base_sync_done = False
-            if self._receiver_snapshot == ():
-                return
-            try:
-                self._sync_weights(merge_and_sync)
-            except BaseException:
-                # A failed sync can leave the transport half-torn -- a NCCL group in error state, a
-                # dead socket -- and the next sync only rebuilds on membership change. Close here so
-                # the next attempt rebuilds the channel instead of reusing the broken one.
-                try:
-                    self.close()
-                except Exception:
-                    # Mirror __init__: a failing close (e.g. the remote actor already died) must
-                    # not replace the original sync failure -- warn and re-raise the root cause.
-                    logger.warning('Failed to fully close checkpoint channel %s after sync failure.',
-                                   self.channel, exc_info=True)
-                raise
-
-    def _sync_weights(self, merge_and_sync=True):
-        """
-        Synchronize the weights between the model and the sampler.
-
-        This method ensures that the sampler's weights are consistent with the model's
-        current state. It supports two synchronization modes: full merge-and-sync or
-        separate base-and-LoRA sync.
+        """Push the model's current weights to every sampler replica, then advance the version.
 
         Args:
             merge_and_sync (bool, optional): Whether to merge and sync the weights.
@@ -308,80 +270,108 @@ class CheckpointEngineManager:
                 sampler. On subsequent calls, only the LoRA adapter weights are
                 synced incrementally.
                 Defaults to True.
-
-        Returns:
-            None
         """
-        if self.sync_backend == 'delta_sharded':
-            with self._delta_rpc_timeouts():
+        with self._sync_lock:
+            self._merge_and_sync = merge_and_sync
+            if self.sync_backend == 'delta_sharded':
+                # The delta session holds and releases generation itself (begin/publish).
                 self._sync_delta_weights(merge_and_sync)
-            return
-        if self.mode == 'naive':
-            self._sync_weights_naive(merge_and_sync)
-            return
-        if self._sync_weights_direct_vllm(merge_and_sync):
-            return
+            elif self.mode == 'colocate':
+                self._sync_colocate(merge_and_sync)
+            else:
+                self.sampler.pause_generation()
+                try:
+                    if self.mode == 'naive':
+                        self._sync_weights_naive(merge_and_sync)
+                    else:
+                        self._sync_channel(merge_and_sync)
+                finally:
+                    self.sampler.resume_generation()
+            self._version += 1
 
-        self._activate_checkpoint_channel()
-        model_metadata = self.model.prepare_checkpoint_engine([True]
-                                                              + [False] * (self.model.device_mesh.world_size - 1))
-        self._sampler_call('prepare_checkpoint_engine', False)
+    def _wake_sampler(self, tags: List[str]) -> None:
+        if self.sleep_level > 0:
+            self.sampler.wake_up(tags=tags)
+
+    def _sync_colocate(self, merge_and_sync):
+        """Weights in, trainer out, KV cache in: the sampler is ready to generate when this returns."""
+        self._wake_sampler(['weights'])
+        if not self._sync_weights_direct_vllm(merge_and_sync):
+            self._sync_channel(merge_and_sync)
+        self.model.offload_to_cpu(**self.offload_kwargs)
+        self._wake_sampler(['kv_cache'])
+
+    def _sync_channel(self, merge_and_sync):
+        """Checkpoint-engine sync over the manager's channel, rebuilt when the replicas changed."""
+        try:
+            members = self._activate_checkpoint_channel()
+            if members != self._members:
+                if self._members is not None:
+                    logger.info('Sampler replicas changed (%s -> %s); rebuilding checkpoint channel %s.',
+                                len(self._members), len(members), self.channel)
+                    self._close_checkpoint_channel()
+                    members = self._activate_checkpoint_channel()
+                self._members = members
+                self.base_sync_done = False
+            self._transfer(self.sampler, len(self._members), merge_and_sync, self.base_sync_done)
+        except BaseException:
+            # A failed sync can leave the transport half-torn -- a NCCL group in error state, a
+            # dead socket. Close here so the next attempt rebuilds the channel instead of reusing
+            # the broken one.
+            try:
+                self.close()
+            except Exception:
+                # A failing close (e.g. the remote actor already died) must not replace the
+                # original sync failure -- warn and re-raise the root cause.
+                logger.warning('Failed to fully close checkpoint channel %s after sync failure.',
+                               self.channel, exc_info=True)
+            raise
+        if not self.base_sync_done:
+            self.base_sync_done = True
+            if not merge_and_sync:
+                logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
+
+    def _transfer(self, receiver, receiver_count: int, merge_and_sync: bool, base_sync_done: bool) -> None:
+        """One checkpoint-engine round from the model to ``receiver``'s ``receiver_count`` replicas."""
         model_world_size = self.model.device_mesh.world_size
-        sampler_world_size = (self.sampler.device_mesh.data_world_size if self._receiver_snapshot is None
-                              else len(self._receiver_snapshot))
-        topology_kwargs = {}
-        if self.colocate_trainer_ranks is not None:
-            topology_kwargs['sender_ranks'] = self.colocate_trainer_ranks
+        model_metadata = self.model.prepare_checkpoint_engine([True] + [False] * (model_world_size - 1))
+        receiver.prepare_checkpoint_engine(False)
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
             model_world_size,
-            sampler_world_size,
+            receiver_count,
             [model_metadata],
-            **topology_kwargs,
         )
-        # Launch both init calls concurrently — TCPStore server (model rank 0)
-        # blocks until all clients (sampler ranks) connect, so these MUST NOT
-        # be serialised.  lazy_collect=True makes them return futures.
-        model_init = self.model.init_checkpoint_process_group(**model_kwargs)
-        sampler_init = self._sampler_call('init_checkpoint_process_group', **sampler_kwargs)
-        model_init()  # wait for model init to complete
-        sampler_init()  # wait for sampler init to complete
+        # The TCPStore server (model rank 0) blocks until all clients (sampler ranks) connect.
+        _together(lambda: self.model.init_checkpoint_process_group(**model_kwargs),
+                  lambda: receiver.init_checkpoint_process_group(**sampler_kwargs))
 
         peft_config = None
-        if self.base_sync_done and not merge_and_sync:
+        if base_sync_done and not merge_and_sync:
             if self._peft_config is None:
                 self._peft_config = self.model.get_peft_config_dict()
             peft_config = self._peft_config
 
         self._ensure_model_keys()
-
-        model_result = self.model.send_weights(
-            base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)
-        sampler_result = self._sampler_call('receive_weights', base_sync_done=self.base_sync_done,
-                                           peft_config=peft_config)
-        model_result()
-        sampler_result()
+        _together(
+            lambda: self.model.send_weights(
+                base_sync_done=base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys),
+            lambda: receiver.receive_weights(base_sync_done=base_sync_done, peft_config=peft_config))
 
         self.model.finalize_checkpoint_engine()
-        self._sampler_call('finalize_checkpoint_engine')
-
-        if not self.base_sync_done:
-            self.base_sync_done = True
-            if not merge_and_sync:
-                logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
+        receiver.finalize_checkpoint_engine()
 
     def _sync_weights_direct_vllm(self, merge_and_sync):
         """Colocated full-weight path: trainer bucket -> vLLM TP workers.
 
         LoRA-only updates, non-CUDA platforms and other sampler backends retain
         the existing checkpoint-engine protocol. Physical UUIDs, rather than
-        inferred rank strides, also cover explicit/shared receiver subsets.
+        inferred rank strides, pair each receiver with its trainer device.
         """
-        if (self.mode != 'colocate' or not merge_and_sync
-                or os.environ.get('TWINKLE_DISABLE_DIRECT_VLLM_SYNC', '0') == '1'
+        if (not merge_and_sync or os.environ.get('TWINKLE_DISABLE_DIRECT_VLLM_SYNC', '0') == '1'
                 or not hasattr(self.sampler, 'direct_weight_sync_metadata')
                 or not hasattr(self.model, 'direct_weight_sync_device')):
             return False
-        replicas = self._sampler_call('direct_weight_sync_metadata')
+        replicas = self.sampler.direct_weight_sync_metadata()
         if not isinstance(replicas, list) or not replicas or any(target is None for target in replicas):
             return False
         targets = [target for replica in replicas for target in (replica if isinstance(replica, list) else [replica])]
@@ -391,32 +381,45 @@ class CheckpointEngineManager:
             raise ValueError('Direct vLLM receivers must have unique physical device UUIDs.')
         if any(devices.count(device) != 1 for device in receiver_devices):
             raise ValueError('Each direct vLLM receiver must share exactly one trainer device.')
-        if self.colocate_trainer_ranks is not None:
-            leaders = [replica[0] if isinstance(replica, list) else replica for replica in replicas]
-            actual = tuple(devices.index(target['device_uuid']) for target in leaders)
-            if actual != self.colocate_trainer_ranks:
-                raise ValueError('Direct vLLM receiver devices disagree with colocate_trainer_ranks.')
         self._ensure_model_keys()
-        sender = self.model.send_weights_to_vllm(
-            targets, channel=self.channel, auth_key=self._auth_key,
-            base_sync_done=self.base_sync_done, model_keys=self._model_keys)
-        receiver = self._sampler_call(
-            'receive_weights_direct', targets, auth_key=self._auth_key, base_sync_done=self.base_sync_done)
-        error = None
-        for pending in (sender, receiver):
-            try:
-                pending()
-            except BaseException as failure:
-                # Collect both futures even on failure: explicit-lazy exclusive
-                # calls hold their configuration lock until collection.
-                if error is None:
-                    error = failure
-        if error is not None:
-            raise error
+        _together(
+            lambda: self.model.send_weights_to_vllm(
+                targets, channel=self.channel, auth_key=self._auth_key,
+                base_sync_done=self.base_sync_done, model_keys=self._model_keys),
+            lambda: self.sampler.receive_weights_direct(
+                targets, auth_key=self._auth_key, base_sync_done=self.base_sync_done))
         self.base_sync_done = True
         logger.info('Direct colocated weight sync completed: %s vLLM workers (per-device trainer -> worker IPC).',
                     len(targets))
         return True
+
+    # ── New replicas ─────────────────────────────────────────────────────────
+
+    @remote_function(collect='first', lazy_collect=False)
+    def warm(self, sub) -> None:
+        """Load the current weights into new sampler replicas before they take requests.
+
+        ``sub`` is a handle holding only the new replicas (``add_workers`` passes it to its
+        ``warmup``). The transfer runs on a channel of its own, closed afterwards; the next
+        :meth:`sync_weights` rebuilds the main channel for the grown replica set.
+        """
+        if self.mode != 'standalone' or self.sync_backend != 'full':
+            raise NotImplementedError(
+                f'warm needs mode="standalone" with sync_backend="full" (got mode={self.mode!r}, '
+                f'sync_backend={self.sync_backend!r}): colocated replicas share the trainer\'s devices '
+                'and the delta session has a fixed replica set.')
+        with self._sync_lock:
+            channel = f'{self.channel}-warm-{uuid.uuid4().hex[:8]}'
+            try:
+                count = len(self._activate_checkpoint_channel(sub, channel))
+                # LoRA-only syncs need the base first, then the current adapter on top of it.
+                self._transfer(sub, count, self._merge_and_sync, False)
+                if not self._merge_and_sync and self.base_sync_done:
+                    self._transfer(sub, count, self._merge_and_sync, True)
+            finally:
+                self._close_checkpoint_channel(sub, channel)
+
+    # ── Delta ────────────────────────────────────────────────────────────────
 
     def _prepare_delta_transport(self):
         capabilities = self.sampler.validate_delta_sampler(self.delta_config)
@@ -461,15 +464,10 @@ class CheckpointEngineManager:
         try:
             self.sampler.begin_delta_sync()
             if seed:
-                trainer_init = self.model.init_delta_transport(endpoint)
-                sampler_init = self.sampler.init_delta_sampler_transport(endpoint)
-                trainer_init()
-                sampler_init()
+                _together(lambda: self.model.init_delta_transport(endpoint),
+                          lambda: self.sampler.init_delta_sampler_transport(endpoint))
                 self._delta_replica_count = replica_count
-            sender = self.model.send_delta_weights()
-            receiver = self.sampler.receive_delta_weights()
-            metrics = sender()
-            worker_metrics = receiver()
+            metrics, worker_metrics = _together(self.model.send_delta_weights, self.sampler.receive_delta_weights)
             results = worker_metrics if isinstance(worker_metrics, list) else [worker_metrics]
             if len(results) != self._delta_replica_count or any(
                     result['changed'] != results[0]['changed'] for result in results):
@@ -487,27 +485,12 @@ class CheckpointEngineManager:
                 logger.exception('Could not pause failed delta sampler; restart rollout actors before serving')
             raise
 
+    @remote_function(collect='first', lazy_collect=False)
     def close_sync_session(self):
         """Release delta snapshots and communicators; keep rollout paused until a new full seed."""
-        with self._delta_rpc_timeouts():
+        with self._sync_lock:
             if self.sync_backend == 'delta_sharded':
                 self._close_delta_session()
-
-    @contextmanager
-    def _delta_rpc_timeouts(self):
-        missing = object()
-        previous = [(actor, getattr(actor, '_ray_get_timeout', missing)) for actor in (self.model, self.sampler)]
-        try:
-            for actor, _ in previous:
-                actor._ray_get_timeout = self.delta_config.timeout_seconds
-            yield
-        finally:
-            for actor, timeout in previous:
-                if timeout is missing:
-                    # Ray driver proxies can inherit nn.Module without initializing its registries.
-                    object.__delattr__(actor, '_ray_get_timeout')
-                else:
-                    actor._ray_get_timeout = timeout
 
     def _close_delta_session(self):
         errors = []
@@ -525,12 +508,14 @@ class CheckpointEngineManager:
         # Cleanup cannot make an unknown partially updated model safe for a new session.
         self.base_sync_done = False
 
+    # ── Shared helpers ───────────────────────────────────────────────────────
+
     def _ensure_model_keys(self):
         if self._model_keys is not None:
             return
 
         if hasattr(self.sampler, 'get_state_keys'):
-            self._model_keys = self._sampler_call('get_state_keys')
+            self._model_keys = self.sampler.get_state_keys()
 
         if self._model_keys is None:
             self._model_keys = []
@@ -587,6 +572,7 @@ class CheckpointEngineManager:
 
     # ── Paired EMA sync (policy → reference) ────────────────────────────────
 
+    @remote_function(collect='first', lazy_collect=False)
     def sync_ema(self, alpha: float):
         """Synchronize reference weights as an EMA of policy weights.
 
@@ -598,11 +584,8 @@ class CheckpointEngineManager:
         independent of model size.
 
         Requires policy and reference to have the SAME parallel_spec (identical sharding),
-        so local parameter names and shapes match one-to-one across the pair.
-
-        The receiver side is always the full reference world: this method routes every remote
-        call through :meth:`_sampler_call`, so a manager constructed with ``receiver_worker_ids``
-        would filter them -- construct EMA managers without a receiver subset.
+        so local parameter names and shapes match one-to-one across the pair. ``sampler`` is the
+        reference model here.
 
         Args:
             alpha: EMA decay factor.  ``ref = alpha * ref + (1 - alpha) * policy``.
@@ -613,7 +596,7 @@ class CheckpointEngineManager:
                 self._sync_ema_naive(alpha)
                 return
 
-            self._activate_checkpoint_channel()
+            self._members = self._activate_checkpoint_channel()
             world_size = self.model.device_mesh.world_size
             ref_world_size = self.sampler.device_mesh.world_size
             if world_size != ref_world_size:
@@ -627,32 +610,21 @@ class CheckpointEngineManager:
                 all_metadata = [all_metadata]
             # Reference ranks prepare as non-master (allocate receive buffers).
             # Scalar False: dispatch='slice' broadcasts it identically to every rank.
-            self._sampler_call('prepare_checkpoint_engine', False)
+            self.sampler.prepare_checkpoint_engine(False)
 
             # Phase 2: init paired 2-rank groups (policy rank k = NCCL rank 0, ref rank k = rank 1).
-            model_init = self.model.init_checkpoint_process_group(
-                rank=[0] * world_size,
-                world_size=[2] * world_size,
-                master_metadata=all_metadata,
-            )
-            sampler_init = self._sampler_call(
-                'init_checkpoint_process_group',
-                rank=[1] * world_size,
-                world_size=[2] * world_size,
-                master_metadata=all_metadata,
-            )
-            model_init()
-            sampler_init()
+            _together(
+                lambda: self.model.init_checkpoint_process_group(
+                    rank=[0] * world_size, world_size=[2] * world_size, master_metadata=all_metadata),
+                lambda: self.sampler.init_checkpoint_process_group(
+                    rank=[1] * world_size, world_size=[2] * world_size, master_metadata=all_metadata))
 
             # Phase 3: concurrent send (local shard) / receive+EMA.
-            send_future = self.model.send_weights(local=True)
-            recv_future = self._sampler_call('receive_weights_ema', alpha)
-            send_future()
-            recv_future()
+            _together(lambda: self.model.send_weights(local=True), lambda: self.sampler.receive_weights_ema(alpha))
 
             # Phase 4: finalize.
             self.model.finalize_checkpoint_engine()
-            self._sampler_call('finalize_checkpoint_engine')
+            self.sampler.finalize_checkpoint_engine()
 
     def _sync_ema_naive(self, alpha: float):
         """In-process EMA: iterate policy's local params and blend into reference's."""

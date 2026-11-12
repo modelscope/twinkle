@@ -2,7 +2,7 @@
 """Server sampling concurrency over the stateless sampler.
 
 The server's async backend is the plain VLLMSampler: the multi-turn and async-RL control lives on
-the CLIENT (the streaming driver drives submit/pause/stop over this handle), while the server side
+the CLIENT (the client's rollout and streaming driver sample over this handle), while the server side
 stays a stateless execution device. The wrapper exists only so the deployment registry can key on
 its own class per sampler_type; the decorator keeps the actor's method-concurrency ceiling in one
 place with the sampler-side default.

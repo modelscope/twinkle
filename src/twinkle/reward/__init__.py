@@ -8,3 +8,5 @@ from .gsm8k import (GSM8KAccuracyBrevityReward, GSM8KAccuracyReward, GSM8KBrevit
 from .math_reward import MathReward
 from .mm_reward import MultiModalAccuracyReward
 from .olympiad_bench import OlympiadBenchAccuracyReward, OlympiadBenchFormatReward, OlympiadBenchQualityReward
+from .shaping import RewardShape
+from .worker import SCORER_MAX_CONCURRENCY, ClassifyRMWorker, FunctionWorker, GenerativeWorker

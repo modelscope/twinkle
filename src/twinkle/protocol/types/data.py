@@ -124,6 +124,12 @@ class WireInputFeature(DataModel):
     feature_attention_mask: Numbers1to4 | None = None
     grid_thws: Numbers1to4 | None = None
 
+    # The media an encoded multimodal prompt runs with (``input_ids`` are then the engine's ids):
+    # a multi-turn client uploads them again with every turn, the server keeps no episode.
+    images: MediaList | None = None
+    videos: MediaList | None = None
+    audios: MediaList | None = None
+
     @model_validator(mode='after')
     def require_encoded_key(self) -> WireInputFeature:
         """At least one of the encoded-input keys must be present.

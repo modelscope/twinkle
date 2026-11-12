@@ -100,6 +100,15 @@ def last_assistant_text(trajectory: Trajectory) -> str:
     return ''
 
 
+def conversation(trajectory: Trajectory) -> Trajectory:
+    """Only the :class:`Trajectory` fields of ``trajectory``, without any model's encoding of it.
+
+    A rollout's trajectory also carries the policy's token fields; a different model (a reward
+    model, a judge) has to re-encode the conversation with its own template instead.
+    """
+    return {key: trajectory[key] for key in Trajectory.__annotations__ if key in trajectory}
+
+
 def user_data_get(items: Any, key: str, default: Any = None) -> Any:
     """Look up the first value matching ``key`` in packed user_data, decoded."""
     if isinstance(items, Mapping):

@@ -478,6 +478,27 @@ class TrainableModel(ABC):
             k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
             for k in inputs)
 
+    @staticmethod
+    def _rollout_features(inputs, kwargs: Dict[str, Any], *, lift: bool) -> tuple:
+        """Split trajectories handed over by a rollout into model features and the loss's sampler columns.
+
+        A rollout's merged trajectory (it carries ``response_token_ids``) holds its messages, episode facts
+        and the sampler's per-token ``rollout_logprobs`` / ``sampling_mask`` next to the features. Only the
+        features go on to the processor; with ``lift`` the two columns fill the ``rollout_logps`` /
+        ``sampling_masks`` kwargs the loss reads, unless the caller passed them. Other inputs pass through.
+        """
+        rows = inputs if isinstance(inputs, list) else [inputs]
+        if not rows or not isinstance(rows[0], dict) or 'response_token_ids' not in rows[0]:
+            return inputs, kwargs
+        if lift:
+            kwargs = dict(kwargs)
+            for column, kwarg in (('rollout_logprobs', 'rollout_logps'), ('sampling_mask', 'sampling_masks')):
+                if kwargs.get(kwarg) is None and any(row.get(column) is not None for row in rows):
+                    kwargs[kwarg] = [row.get(column) for row in rows]
+        keys = InputProcessor.FEATURE_KEYS
+        features = [{key: value for key, value in row.items() if key in keys} for row in rows]
+        return (features if isinstance(inputs, list) else features[0]), kwargs
+
     def upload_to_hub(self,
                       checkpoint_dir: str,
                       hub_model_id: str,

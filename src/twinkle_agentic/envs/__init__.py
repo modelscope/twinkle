@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .agentenv import AgentEnv
-from .base import Env, EnvLeases, StepResult
+from .agentenv import AgentEnv, AgentSandbox
+from .base import Env, SessionNotFound, StepResult
 from .env_tool import EnvTool
 from .localenv import LocalEnv
-from .openenv import EnvPool, EnvPoolAdapter, OpenEnv, OpenEnvClient
+from .openenv import ClientSession, OpenEnv, OpenEnvClient
 
 __all__ = [
-    'AgentEnv', 'Env', 'EnvLeases', 'EnvPool', 'EnvPoolAdapter', 'EnvTool', 'LocalEnv', 'OpenEnv', 'OpenEnvClient',
-    'StepResult'
+    'AgentEnv', 'AgentSandbox', 'ClientSession', 'Env', 'EnvTool', 'LocalEnv', 'OpenEnv', 'OpenEnvClient',
+    'SessionNotFound', 'StepResult'
 ]

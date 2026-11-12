@@ -5,7 +5,7 @@ from twinkle import DeviceMesh
 from twinkle.utils import pad_and_stack_tensors
 
 
-def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) -> Dict[str, Any]:
+def tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) -> Dict[str, Any]:
     import torch
     if not outputs:
         return {}
@@ -49,7 +49,7 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) 
             result[key] = pad_and_stack_tensors(values)
 
         elif isinstance(first_value, dict):
-            result[key] = collect_tensor_dict(values, device_mesh)
+            result[key] = tensor_dict(values, device_mesh)
 
         elif isinstance(first_value, np.ndarray) and first_value.size > 1:
             raise NotImplementedError('Numpy array not supported for now.')
@@ -62,13 +62,13 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) 
     return result
 
 
-def collect_dp_and_flatten(outputs: List[List[Any]], device_mesh: DeviceMesh) -> List[Any]:
+def dp_flatten(outputs: List[List[Any]], device_mesh: DeviceMesh) -> List[Any]:
     """Collect a ``slice_dp`` call whose per-worker result is a list: dedup by data rank, then flatten.
 
     Each worker returns the list of results for the data shard it was handed. ``slice_dp`` splits by
     *data rank*, and within one data rank several workers (TP / PP / ulysses peers) hold the same shard
     and produce identical outputs, so ``get_collect_ranks()`` nominates a single representative per data
-    rank -- the same dedup ``collect_tensor_dict`` applies to tensors. Keeping only those and flattening
+    rank -- the same dedup ``tensor_dict`` applies to tensors. Keeping only those and flattening
     in worker order yields each input's result exactly once, in the order it was submitted. DP and FSDP
     need no dedup (each of their ranks is its own data rank holding a distinct shard), and this handles
     them unchanged because ``get_collect_ranks()`` then returns every rank.

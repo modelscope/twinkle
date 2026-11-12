@@ -151,9 +151,9 @@ class TwinkleWorkerExtension:
         return self._delta_ipc_endpoint
 
     def delta_receiver_metadata(self) -> 'DeltaWorkerMetadata':
-        from twinkle.infra import node_ip
+        from twinkle.utils import find_node_ip
         return {
-            'node_ip': node_ip(),
+            'node_ip': find_node_ip(),
             'device_uuid': str(torch.cuda.get_device_properties(self.device).uuid),
             'cuda_visible_device': _cuda_visible_device(self.device),
             'zmq_handle': self.delta_ipc_endpoint(),

@@ -21,8 +21,9 @@ from twinkle.metric import CompletionRewardMetric, PPOMetric, PPOValueMetric
 from twinkle.model import TransformersModel, TransformersValueModel
 from twinkle.processor import InputProcessor
 from twinkle.preprocessor.llm import GSM8KProcessor
-from twinkle.reward import GSM8KAccuracyReward, GSM8KFormatReward
+from twinkle.reward import GSM8KAccuracyReward, GSM8KFormatReward, RewardShape
 from twinkle.sampler import vLLMSampler
+from twinkle.signals import KLEstimator, ResponseScores
 
 logger = get_logger()
 args = CLI.from_args()
@@ -59,29 +60,6 @@ def compute_rewards(trajectories: List[Dict[str, Any]]) -> Tuple[List[float], Li
     accuracy = GSM8KAccuracyReward()(trajectories)
     formatting = GSM8KFormatReward()(trajectories)
     return [a + f for a, f in zip(accuracy, formatting)], formatting, accuracy
-
-
-def response_rows(full_values, trajectories) -> List[List[float]]:
-    """Extract response-token rows from collected model outputs."""
-    import torch
-
-    value_rows = []
-    tensors = full_values if isinstance(full_values, list) else [full_values]
-    for tensor in tensors:
-        if tensor is None:
-            continue
-        tensor = torch.as_tensor(tensor)
-        if tensor.dim() == 1:
-            tensor = tensor.unsqueeze(0)
-        value_rows.extend(tensor)
-    if len(value_rows) != len(trajectories):
-        raise ValueError(f'model output batch mismatch: {len(value_rows)} rows for {len(trajectories)} trajectories')
-
-    rows = []
-    for value_row, trajectory in zip(value_rows, trajectories):
-        mask = torch.as_tensor(trajectory['labels'], device=value_row.device) != -100
-        rows.append(value_row[:mask.numel()][mask].detach().float().cpu().tolist())
-    return rows
 
 
 def main():
@@ -149,6 +127,7 @@ def main():
         remote_group='policy',
     )
     gae = GAEAdvantage(args.rl.gamma, args.rl.gae_lambda, args.rl.normalize_advantages)
+    scores, kl, reward_shape = ResponseScores(), KLEstimator(), RewardShape()
     reward_metric = CompletionRewardMetric()
     sampling_params = SamplingParams(max_tokens=MAX_NEW_TOKENS, num_samples=1, logprobs=1)
 
@@ -179,18 +158,13 @@ def main():
             )
 
             reference = policy.forward_only(inputs=trajectories, disable_lora=True)
-            ref_logps = response_rows(reference['logps'], trajectories)
+            ref_logps = scores(trajectories, reference)
             critic_outputs = critic.forward_only(inputs=trajectories)
-            old_values = response_rows(critic_outputs['values'], trajectories)
-            token_rewards = gae.build_token_rewards(
-                rewards, lengths, old_logps=old_logps, ref_logps=ref_logps, kl_coef=args.rl.kl_coef)
-            max_len = max(lengths)
-            padded_rewards = [row + [0.0] * (max_len - len(row)) for row in token_rewards]
-            padded_values = [row + [0.0] * (max_len - len(row)) for row in old_values]
-            masks = [[True] * length + [False] * (max_len - length) for length in lengths]
-            advantages, returns = gae(padded_rewards, padded_values, masks=masks)
-            advantages = [advantages[i, :length].tolist() for i, length in enumerate(lengths)]
-            returns = [returns[i, :length].tolist() for i, length in enumerate(lengths)]
+            old_values = scores(trajectories, critic_outputs, output_key='values')
+            # r_t = -kl_coef * (old_logp_t - ref_logp_t), plus the sequence reward on the last token
+            token_kl = kl(old_logps, ref_logps, kind='k1', reduce='none')
+            token_rewards = reward_shape(rewards, token_kl, beta=args.rl.kl_coef, profile='token')
+            advantages, returns = gae(token_rewards, old_values)
 
             indices = list(range(len(trajectories)))
             for _ in range(PPO_EPOCHS):

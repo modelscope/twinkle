@@ -78,6 +78,7 @@ class vLLMSampler:
         adapter_name: str = '',
         adapter_uri: Optional[str] = None,
         num_samples: int = 1,
+        token_only: bool = False,
     ) -> List[SampleResponseModel]:
         """Sample from the model.
 
@@ -87,6 +88,8 @@ class vLLMSampler:
             adapter_name: Adapter name for LoRA inference.
             adapter_uri: Adapter URI (twinkle:// path or local path) for LoRA inference.
             num_samples: Number of completions to generate per prompt.
+            token_only: Return the sampled tokens and logprobs only (no ``new_input_feature``); the
+                inputs are the ids the engine runs on, with their media alongside.
 
         Returns:
             SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
@@ -98,7 +101,8 @@ class vLLMSampler:
                 inputs=_json_safe(inputs),
                 sampling_params=self._sampling_params(sampling_params, num_samples),
                 adapter_name=adapter_name,
-                adapter_uri=adapter_uri))
+                adapter_uri=adapter_uri,
+                token_only=token_only))
         return self._await_task(response, SampleResponseModelList).samples
 
     @staticmethod

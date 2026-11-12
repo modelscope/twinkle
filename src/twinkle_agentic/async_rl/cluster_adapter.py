@@ -3,16 +3,14 @@ from __future__ import annotations
 
 import math
 import statistics
-import time
+import threading
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from twinkle.perf import CounterRegistry
+from twinkle.utils import get_logger
 
-if TYPE_CHECKING:
-    from .streaming_driver import DriverStats
+logger = get_logger()
 
 _GIB = 1024**3
 _ALLOWED_OVERRIDE_KEYS = frozenset({
@@ -111,24 +109,6 @@ class ModelMemoryEstimate:
     graph_reserve_bytes: int
 
 
-@dataclass
-class ResourceWindow:
-    """One observe-window sample of the production/consumption time balance (per optimizer step).
-
-    ``trainer_idle`` / ``score_time`` / ``generation_time`` are the window's wall-clock deltas: the
-    trainer bubble, the scoring channel's occupancy (reap waits), and the generation channel's
-    occupancy (in-flight admit->collect time). ``blocked_passes`` counts admission passes gated by
-    backpressure (buffer capacity or the staleness window) -- the production-surplus signal.
-    """
-
-    step: int
-    trainer_idle: float
-    score_time: float
-    generation_time: float
-    blocked_passes: float
-    handover_time: float
-
-
 class RLResourceEstimator:
     """Pure, deterministic estimator; it never creates actors or mutates input configs."""
 
@@ -142,26 +122,14 @@ class RLResourceEstimator:
 
     @classmethod
     def from_rollout_config(cls, rollout_config: Any) -> 'RLResourceEstimator':
-        """``resource_gpu_memory_gib`` (None -> the cluster's smallest reported GPU) + utilization."""
+        """``resource_gpu_memory_gib`` (the per-card memory) + the engine's memory utilization."""
         memory = getattr(rollout_config, 'resource_gpu_memory_gib', None)
         if memory is None:
-            memory = cls._cluster_min_gpu_memory_gib()
+            raise ValueError('resource_gpu_memory_gib is required for resource estimation.')
         utilization = (rollout_config.vllm_gpu_memory_utilization
                        if rollout_config.rollout_sampler == 'vllm'
                        else (getattr(rollout_config, 'sglang_mem_fraction_static', None) or 0.9))
         return cls(gpu_memory_gib=memory, utilization=utilization)
-
-    @staticmethod
-    def _cluster_min_gpu_memory_gib() -> float:
-        try:
-            from twinkle.infra import cluster_resources
-            resources = cluster_resources()
-            for key, value in resources.items():
-                if key.startswith('accelerator_memory_gib_'):
-                    return float(value)
-        except Exception:
-            pass
-        raise ValueError('resource_gpu_memory_gib is required when the cluster does not expose per-GPU memory.')
 
     @staticmethod
     def prompt_length_summary(lengths: Iterable[int]) -> Dict[str, int]:
@@ -513,578 +481,151 @@ def apply_plan(plan: RLResourcePlan, *, distributed_config: Any, rollout_config:
         rollout_config.sglang_dp_size = sampler.replica_count
 
 
-def flex_role_groups(plan: RLResourcePlan, role: str = 'sampler') -> Dict[str, Tuple[int, ...]]:
-    """The ``flex_<role>_<i>`` slot map the flex rank span splits into (whole replicas only).
+def resource_device_groups(plan: RLResourcePlan) -> List[Tuple[str, List[int]]]:
+    """The twinkle DeviceGroups a planned run initializes with (trainer, sampler, auxiliaries, flex).
 
-    The flex pool is role-generic at plan level: one span, any elastic role. Which roles may draw
-    from it is an adapter runtime concern (``elastic_models``); the per-role split below sizes each
-    slot by that role's model-parallel width, so a span reserved for width-2 RMs yields fewer,
-    wider slots than one for width-1 samplers.
+    ``resource_flex`` only reserves the flex ranks: no actor is built on it, :class:`ClusterAdapter`
+    places replicas there by rank (``spare_ranks``).
     """
-    width = plan.sampler.model_parallel_width
-    if role != 'sampler':
-        for aux in plan.auxiliaries:
-            if aux.role == role:
-                width = aux.model_parallel_width
-                break
-    count = len(plan.flex_ranks) // width
-    return {f'flex_{role}_{index}': tuple(plan.flex_ranks[index * width:(index + 1) * width])
-            for index in range(count)}
-
-
-def elastic_roles(plan: RLResourcePlan) -> Tuple[str, ...]:
-    """The roles allowed to draw flex slots: the sampler plus every planned auxiliary role.
-
-    Auxiliaries (reward_<i>/prm_0/reference/teacher) are plan-level roles already; a role joins the
-    ELASTIC runtime only when the adapter is handed a matching handle via ``elastic_models`` --
-    without one, its overlay groups exist but no decision can ever address it.
-    """
-    return ('sampler', *(aux.role for aux in plan.auxiliaries))
-
-
-def resource_device_groups(plan: RLResourcePlan, *, adaptive: bool = False) -> List[Tuple[str, List[int]]]:
-    """The twinkle DeviceGroups a planned run initializes with (trainer, sampler, auxiliaries, flex)."""
-
-    def sampler_groups(shared: bool) -> List[Tuple[str, List[int]]]:
-        role = plan.shared_sampler if shared else plan.sampler
-        if role is None:
-            return []
-        return [('shared_sampler' if shared else 'sampler', list(role.ranks))]
-
-    groups = [('model', list(plan.trainer.ranks))]
-    groups.extend(sampler_groups(shared=False))
+    groups = [('model', list(plan.trainer.ranks)), ('sampler', list(plan.sampler.ranks))]
     groups.extend((role.role, list(role.ranks)) for role in plan.auxiliaries)
     if plan.flex_ranks:
-        # The base group reserves physical capacity. Candidate role groups below are overlays and
-        # create no additional placement-group bundles; actors are constructed only when a slot
-        # receives that role.
         groups.append(('resource_flex', list(plan.flex_ranks)))
-        if adaptive:
-            for role in elastic_roles(plan):
-                groups.extend((name, list(ranks)) for name, ranks in flex_role_groups(plan, role).items())
-    if plan.shared_sampler is not None:
-        groups.extend(sampler_groups(shared=True))
     return groups
 
 
 class ClusterAdapter:
-    """The adaptive cluster runtime: replica scaling, shared-GPU borrowing, one-call publication.
+    """Moves replicas toward the busiest role, and lends the trainer's devices while it waits.
 
-    ONE object where dev kept two that pointed at each other (an ``AdaptiveResourceController`` and
-    an ``AdaptiveColocateHandover``): it owns the dedicated (disjoint-GPU) sampler actors, the
-    optional shared (trainer-GPU) engines, the pre-reserved flex slots, and both weight-sync
-    channels. A single change is driven only at batch and publish boundaries:
+    ``roles`` maps a name to a pool handle (the sampler, each reward / PRM worker): anything with
+    ``pressure()`` / ``add_workers`` / ``remove_workers``. The driver makes three calls:
 
-    * :meth:`observe` folds one batch boundary's time deltas into the decision window;
-    * :meth:`decide` names at most one change per publish boundary (activate/deactivate the shared
-      pool, scale a flex replica in or out), debounced by ``min_hold_steps``;
-    * :meth:`publish` is the WHOLE publication barrier: quiesce admission, run the controller's
-      prepare/finish phases around the dedicated-channel weight sync, borrow the shared engines on
-      the same fresh weights, and restore admission -- with the full failure path
-      (``fail_publish`` + ``reclaim``) that returns borrowed GPUs, drops half-built actors and
-      reloads the trainer.
+    * :meth:`adjust` after each version change reads every role's ``pressure()`` and averages the
+      last ``window`` readings. Once the busiest role's average exceeds the idlest one's by
+      ``ratio_up``, one replica's devices move to it: from ``spare_ranks`` when they hold one, else
+      by retiring the idlest role's least loaded replica. Moves go on, one per call and ``cooldown``
+      calls apart, until the ratio falls under ``ratio_down``.
+    * :meth:`lend` while the trainer waits for a batch: when it spent more than ``lend_idle_ratio``
+      of the last step waiting, ``model`` is offloaded and the busiest role grows onto
+      ``lend_ranks``.
+    * :meth:`reclaim` before the batch is handed out retires the replicas on ``lend_ranks`` (their
+      requests are resubmitted to the other replicas) and reloads ``model``.
+
+    A new replica is passed to ``warmups[role]`` before it takes requests (the sampler's
+    ``checkpoint_manager.warm`` loads the current weights into it). ``widths[role]`` is the device
+    count of one replica of that role (default 1).
     """
 
-    def __init__(self, *,
-                 sampler: Any,
-                 plan: RLResourcePlan,
-                 model: Any,
-                 additional_models: Sequence[Any] = (),
-                 backend: str = 'vllm',
-                 sleep_level: int = 1,
-                 window_steps: int = 8,
-                 min_hold_steps: int = 16,
-                 elastic_models: Mapping[str, Any] = None):
-        if window_steps < 1 or min_hold_steps < 1:
-            raise ValueError('window_steps and min_hold_steps must be positive.')
-        if sleep_level not in (0, 1):
-            raise ValueError('the shared sampler supports only sleep_level 0 or 1.')
-        from twinkle.checkpoint_engine import CheckpointEngineManager
+    def __init__(self,
+                 roles: Mapping[str, Any],
+                 *,
+                 model: Any = None,
+                 lend_ranks: Optional[Sequence[int]] = None,
+                 spare_ranks: Sequence[int] = (),
+                 warmups: Optional[Mapping[str, Callable[[Any], None]]] = None,
+                 widths: Optional[Mapping[str, int]] = None,
+                 window: int = 3,
+                 ratio_up: float = 1.5,
+                 ratio_down: float = 1.2,
+                 cooldown: int = 5,
+                 lend_idle_ratio: float = 0.3):
+        if not roles:
+            raise ValueError('ClusterAdapter needs at least one role.')
+        if window < 1 or cooldown < 0:
+            raise ValueError(f'window must be >= 1 and cooldown >= 0, got {window} / {cooldown}.')
+        if not 1.0 <= ratio_down <= ratio_up:
+            raise ValueError(f'need 1 <= ratio_down <= ratio_up, got {ratio_down} / {ratio_up}.')
+        if lend_ranks and model is None:
+            raise ValueError('lend_ranks are the trainer\'s devices: pass the trainer model to offload.')
+        unknown = sorted((set(warmups or {}) | set(widths or {})) - set(roles))
+        if unknown:
+            raise ValueError(f'warmups / widths name unknown roles {unknown}; roles are {sorted(roles)}.')
+        if set(spare_ranks) & set(lend_ranks or ()):
+            raise ValueError('spare_ranks and lend_ranks must not overlap.')
+        self.roles = dict(roles)
+        self.model = model
+        self.lend_ranks = tuple(lend_ranks or ())
+        self.warmups = dict(warmups or {})
+        self.widths = {name: int((widths or {}).get(name, 1)) for name in self.roles}
+        self.window = window
+        self.ratio_up = ratio_up
+        self.ratio_down = ratio_down
+        self.cooldown = cooldown
+        self.lend_idle_ratio = lend_idle_ratio
+        self._spare = sorted(spare_ranks)
+        self._history = {name: deque(maxlen=window) for name in self.roles}
+        self._engaged = False
+        self._cooldown = 0
+        #: the role holding replicas on ``lend_ranks``, until ``reclaim``
+        self._lent: Optional[str] = None
+        self._lock = threading.Lock()
 
-        self.sampler = sampler
-        self.plan = plan
-        self.models = (model, *tuple(additional_models))
-        self.backend = backend
-        self.sleep_level = sleep_level or 1
-        self.window_steps = window_steps
-        self.min_hold_steps = min_hold_steps
-        # The role -> frozen-model-handle registry for RM-side elasticity (protocol: the handle has
-        # ``add_workers(group, ranks)`` / ``remove_workers(worker_ids)`` / ``worker_ids()`` -- the
-        # same actor-native shape the sampler itself grew). Roles without a handle stay static.
-        self.elastic_models: Dict[str, Any] = dict(elastic_models or {})
-        self._flex_groups = flex_role_groups(plan)
-        self._free_flex_groups = deque(self._flex_groups)
-        self._flex_workers: Dict[str, Any] = {}
-        self._rm_flex_workers: Dict[str, Any] = {}
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='rl-flex-sampler')
-        # In-flight change state, at most ONE change at a time: ``_pending`` holds the (group,
-        # future) of a background actor construction; ``_draining`` -> ``_removal`` the two phases
-        # of a scale-down; ``_addition`` the finished-but-unactivated scale-up worker ids.
-        self._pending: Optional[Tuple[str, Future]] = None
-        self._addition: Optional[Tuple[str, Any]] = None
-        self._draining: Optional[Tuple[str, Any]] = None
-        self._removal: Optional[Tuple[str, Any]] = None
-        self._decision: Optional[str] = None
-        self._decision_step = 0
-        self._shared_change = False
-        self._shared_previous_enabled = None
-        self._shared_enabled = False
-        self.in_generation = False
-        self._closed = False
-        self.last_error = None
-        # Hand-over accounting rides the perf package's always-live counters: per-adapter
-        # lifecycle, monotonic, observe reads window deltas off it.
-        self._counters = CounterRegistry()
-        self._windows: deque = deque(maxlen=window_steps)
-        self._last_change_step = -min_hold_steps
-        self._shared_pressure_windows = 0
-        self._last_stats: Dict[str, float] = {}
-        # Weight-sync channels: one NCCL channel for the dedicated (disjoint-GPU) actors, one CUDA-IPC
-        # channel for the shared (trainer-GPU) engines. The shared channel only exists when the plan
-        # reserved a shared pool.
-        self.dedicated_manager: Optional[CheckpointEngineManager] = None
-        self.shared_manager: Optional[CheckpointEngineManager] = None
-        if plan.shared_sampler is not None:
-            shared_ids = self._initialize_shared_workers('shared_sampler', plan.shared_sampler.ranks)
-            self.shared_manager = CheckpointEngineManager(
-                model=model, sampler=sampler, platform='GPU', mode='colocate', channel='sampler:ipc',
-                receiver_worker_ids=shared_ids,
-                colocate_trainer_ranks=[ranks[0] for ranks in sampler.worker_ranks(shared_ids)])
+    def adjust(self) -> None:
+        """Read the roles' pressure and move at most one replica's devices to the busiest role."""
+        with self._lock:
+            for name, handle in self.roles.items():
+                self._history[name].append(float(handle.pressure()))
+            if self._cooldown > 0:
+                self._cooldown -= 1
+                return
+            if any(len(history) < self.window for history in self._history.values()):
+                return
+            averages = {name: statistics.fmean(history) for name, history in self._history.items()}
+            hot = max(averages, key=averages.get)
+            cold = min((name for name in averages if name != hot), key=averages.get, default=None)
+            ratio = averages[hot] / max(averages[cold] if cold is not None else 0.0, 1e-6)
+            self._engaged = ratio > (self.ratio_down if self._engaged else self.ratio_up)
+            if self._engaged and self._move(hot, cold):
+                self._cooldown = self.cooldown
 
-    @classmethod
-    def build(cls, *, model: Any, sampler: Any, plan: RLResourcePlan, rollout_config: Any,
-              additional_models: Sequence[Any] = ()) -> 'ClusterAdapter':
-        """Build the adapter around an already-placed sampler, or clean everything up on failure.
-
-        The caller builds the sampler to the plan's shape (``DeviceMesh.from_sizes(dp_size=
-        plan.sampler.replica_count)``); this activates its dedicated ranks, wires both weight-sync
-        channels and the shared engines. Any failure closes the channels, the workers and restores
-        the trainer's GPU residency before re-raising.
-        """
-        adapter = None
-        try:
-            sampler.configure_workers(plan.sampler.ranks, state='ACTIVE')
-            adapter = cls(
-                sampler=sampler,
-                plan=plan,
-                model=model,
-                additional_models=additional_models,
-                backend=rollout_config.rollout_sampler,
-                sleep_level=getattr(rollout_config, 'sleep_level', 1),
-                window_steps=int(getattr(rollout_config, 'resource_window_steps', 8)),
-                min_hold_steps=int(getattr(rollout_config, 'resource_min_hold_steps', 16)))
-            from twinkle.checkpoint_engine import CheckpointEngineManager
-
-            adapter.dedicated_manager = CheckpointEngineManager(
-                model=model, sampler=sampler, platform='GPU', mode='standalone', channel='sampler:nccl',
-                receiver_worker_ids=sampler.worker_ids(shared=False))
-            return adapter
-        except BaseException:
-            # Either failure point restores the trainer's GPU residency before re-raising: an __init__
-            # failure is cleaned inside _initialize_shared_workers; a later failure here goes through
-            # the adapter's own channels/workers/reclaim chain, in that order (dev's original order).
-            if adapter is not None:
-                adapter.close_channels()
-                try:
-                    sampler.close_workers()
-                except Exception:
-                    pass
-                try:
-                    adapter.reclaim()
-                except Exception:
-                    pass
-            else:
-                try:
-                    sampler.close_workers()
-                except Exception:
-                    pass
-            raise
-
-    # --- the publication barrier -------------------------------------------------------------------
-
-    def publish(self) -> None:
-        """The whole weight-publication barrier: dedicated sync + shared borrow + replica changes.
-
-        Runs the controller's ``prepare_publish`` -> dedicated-channel ``sync_weights`` ->
-        ``finish_publish`` phases (or the full ``fail_publish`` + ``reclaim`` failure path) around
-        the caller's trained weights, borrowing the shared engines onto the same fresh weights so
-        every ACTIVE sampler replica generates from one policy version. The recipe's visible loop
-        body is ``adapter.publish() if adapter else engine.sync_weights()``.
-        """
-        suspended = self.sampler.worker_ids()
-        self.sampler.suspend_admission(suspended)
-        dedicated_ids = self.sampler.worker_ids(shared=False, states=('ACTIVE', 'DRAINING'))
-        try:
-            self.sampler.pause_generation(_worker_ids=dedicated_ids)
-            dedicated_ids = self.prepare_publish()
-            self.dedicated_manager.set_receiver_workers(dedicated_ids)
-            self.dedicated_manager.sync_weights(merge_and_sync=True)
-            self._borrow_shared(publish=True)
-            self.finish_publish()
-            self.sampler.resume_generation(_worker_ids=dedicated_ids)
-            self.sampler.resume_admission(suspended + dedicated_ids)
-        except BaseException as error:
+    def lend(self, train_idle_ratio: float) -> None:
+        """Offload the trainer and grow the busiest role onto ``lend_ranks``; only while it waits."""
+        with self._lock:
+            if not self.lend_ranks or self._lent is not None or train_idle_ratio <= self.lend_idle_ratio:
+                return
+            pressures = {name: float(handle.pressure()) for name, handle in self.roles.items()}
+            name = max(pressures, key=pressures.get)
+            width = self.widths[name]
+            count = len(self.lend_ranks) // width
+            if count == 0:
+                return
+            self.model.offload_to_cpu()
             try:
-                self.fail_publish(error)
-            except Exception as cleanup:
-                self.last_error = f'{type(cleanup).__name__}: {cleanup}'
-            try:
-                self.reclaim()
-            except Exception as cleanup:
-                self.last_error = self.last_error or f'{type(cleanup).__name__}: {cleanup}'
-            raise
-
-    def _initialize_shared_workers(self, group: str, ranks: Sequence[int]) -> Tuple[Any, ...]:
-        """Build the shared engines, releasing trainer memory first and restoring it after."""
-        worker_ids: Tuple[Any, ...] = ()
-        initialization_error = None
-        can_reload = True
-        self.in_generation = True
-        try:
-            for one in self.models:
-                _wait(one.offload_to_cpu())
-            worker_ids = self.sampler.add_workers(group, list(ranks), shared=True, engine_args={
-                ('enable_sleep_mode' if self.backend == 'vllm' else 'enable_memory_saver'): True})
-            self.sampler.pause_workers(worker_ids)
-            self.sampler.pause_generation(_worker_ids=worker_ids)
-            _wait(self.sampler.sleep(level=self.sleep_level, _worker_ids=worker_ids))
-        except BaseException as exc:
-            initialization_error = exc
-            try:
-                if worker_ids and not self.sampler.remove_workers(worker_ids):
-                    raise RuntimeError('Shared sampler initialization still has unfinished worker calls.')
-            except Exception:
-                pass
-            can_reload = not set(worker_ids) & set(self.sampler.worker_ids(shared=True))
-            raise
-        finally:
-            if can_reload:
-                try:
-                    self._reload_models()
-                    self.in_generation = False
-                except BaseException:
-                    if initialization_error is None:
-                        raise
-        return worker_ids
-
-    def _borrow_shared(self, *, publish: bool) -> None:
-        """Wake the shared engines for a generation window, on the freshly published weights."""
-        shared_ids = self.sampler.worker_ids(shared=True)
-        outstanding = any(self.sampler.worker_inflight(shared_ids))
-        if not shared_ids or (not self._shared_enabled and not outstanding) or self.in_generation:
-            return
-        started = time.perf_counter()
-        # Even with new shared admission stopped, already-submitted requests must keep generating and
-        # receive the new policy like everyone else.
-        self.in_generation = True
-        try:
-            _wait(self.sampler.wake_up(tags=['weights'], _worker_ids=shared_ids))
-            if publish:
-                trainer_ranks = [ranks[0] for ranks in self.sampler.worker_ranks(shared_ids)]
-                self.shared_manager.set_receiver_workers(shared_ids, colocate_trainer_ranks=trainer_ranks)
-                self.shared_manager.sync_weights(merge_and_sync=True)
-            for one in self.models:
-                _wait(one.offload_to_cpu())
-            _wait(self.sampler.wake_up(tags=['kv_cache'], _worker_ids=shared_ids))
-            self.sampler.resume_generation(_worker_ids=shared_ids)
-            if self._shared_enabled:
-                self.sampler.activate_workers(shared_ids)
-        except BaseException:
-            try:
-                self.reclaim()
-            except Exception as cleanup:
-                self.last_error = self.last_error or f'{type(cleanup).__name__}: {cleanup}'
-            raise
-        # Bare add (not time_span): the interval must exclude the except-path cleanup, which calls
-        # reclaim() and is timed there -- a time_span around the try would double-count it.
-        self._counters.add('handover', time.perf_counter() - started)
+                self.roles[name].add_workers(
+                    count, warmup=self.warmups.get(name), ranks=list(self.lend_ranks[:count * width]))
+            except BaseException:
+                self.model.reload_to_gpu()
+                raise
+            self._lent = name
+            logger.info(f'ClusterAdapter: lent trainer ranks {list(self.lend_ranks[:count * width])} to {name}.')
 
     def reclaim(self) -> None:
-        """Stop shared admission, sleep the shared engines, and restore the trainer's GPU residency."""
-        if not self.in_generation:
-            return
-        shared_ids = self.sampler.worker_ids(shared=True)
-        # time_span's finally carries the old try/finally semantics: failure paths still count.
-        with self._counters.time_span('handover'):
-            self.sampler.pause_workers(shared_ids)
-            self.sampler.pause_generation(_worker_ids=shared_ids)
-            _wait(self.sampler.sleep(level=self.sleep_level, _worker_ids=shared_ids))
-            # On a pause/sleep failure keep the hand-over state; the trainer's memory is restored
-            # only after the engines are down.
-            self._reload_models()
-            self.in_generation = False
-
-    def _reload_models(self) -> None:
-        error = None
-        for one in reversed(self.models):
+        """Retire the replicas on ``lend_ranks`` and reload the trainer; a no-op when nothing is lent."""
+        with self._lock:
+            if self._lent is None:
+                return
+            name, self._lent = self._lent, None
             try:
-                _wait(one.reload_to_gpu())
-            except BaseException as exc:
-                error = error or exc
-        if error is not None:
-            raise error
-
-    def close_channels(self) -> None:
-        if self.dedicated_manager is not None:
-            try:
-                self.dedicated_manager.close()
+                self.roles[name].remove_workers(ranks=list(self.lend_ranks))
             finally:
-                if self.shared_manager is not None:
-                    self.shared_manager.close()
+                self.model.reload_to_gpu()
 
-    # --- the single-change controller ----------------------------------------------------------------
-
-    @property
-    def change_pending(self) -> bool:
-        return (self._decision is not None or self._pending is not None or self._draining is not None
-                or self._addition is not None or self._removal is not None)
-
-    def register_decision(self, decision: Optional[str], *, step: int) -> None:
-        self._decision_step = step
-        if decision is not None and not self._closed and not self.change_pending:
-            self._decision = decision
-
-    def prepare_publish(self) -> Tuple[Any, ...]:
-        """Apply the pending decision after the pause barrier; background construction does no sync."""
-        decision, self._decision = self._decision, None
-        self._shared_change = decision in ('activate_shared', 'deactivate_shared')
-        self._shared_previous_enabled = self._shared_enabled if self._shared_change else None
-        if decision == 'activate_shared':
-            self._shared_enabled = bool(self.shared_manager is not None)
-        elif decision == 'deactivate_shared':
-            self._shared_enabled = False
-        elif decision == 'scale_up_sampler' and self._free_flex_groups:
-            group = self._free_flex_groups.popleft()
+    def _move(self, hot: str, cold: Optional[str]) -> bool:
+        """One replica's devices to ``hot``: spare ranks first, else a replica retired from ``cold``."""
+        width = self.widths[hot]
+        if len(self._spare) < width and cold is not None and len(self._spare) + self.widths[cold] >= width:
             try:
-                self._pending = (group, self._executor.submit(self.sampler.add_workers, group,
-                                                              list(self._flex_groups[group])))
-            except BaseException:
-                self._free_flex_groups.appendleft(group)
-                raise
-        elif decision == 'scale_down_sampler' and self._flex_workers:
-            group, worker_ids = next(reversed(self._flex_workers.items()))
-            self.sampler.drain_workers(worker_ids)
-            self._draining = (group, worker_ids)
-        elif decision is not None and decision.startswith('scale_up_rm:'):
-            role = decision[len('scale_up_rm:'):]
-            handle = self.elastic_models.get(role)
-            if handle is not None and self._free_flex_groups:
-                group = self._free_flex_groups.popleft()
-                try:
-                    worker_ids = handle.add_replicas(group)
-                    self._rm_flex_workers[role] = (group, worker_ids)
-                except BaseException:
-                    self._free_flex_groups.appendleft(group)
-                    raise
-        elif decision is not None and decision.startswith('scale_down_rm:'):
-            role = decision[len('scale_down_rm:'):]
-            held = self._rm_flex_workers.get(role)
-            if held is not None:
-                group, worker_ids = held
-                # A frozen RM is a stateless forward service: no drain phase, the removal is the
-                # whole retirement (the scoring worker's in-flight call finishes on the actor Ray
-                # keeps alive until the call returns).
-                handle = self.elastic_models[role]
-                handle.remove_replicas(worker_ids)
-                self._rm_flex_workers.pop(role, None)
-                self._free_flex_groups.append(group)
-        if decision is not None:
-            self._shared_pressure_windows = 0
-        if self._pending is not None and self._pending[1].done():
-            group, future = self._pending
-            self._pending = None
-            try:
-                self._addition = (group, future.result())
-            except Exception as error:
-                self.last_error = f'{type(error).__name__}: {error}'
-                self._free_flex_groups.appendleft(group)
-        if self._draining is not None and self.sampler.workers_idle(self._draining[1]):
-            self._removal = self._draining
-        receivers = self.sampler.worker_ids(shared=False, states=('ACTIVE', 'DRAINING'))
-        if self._addition is not None:
-            receivers += self._addition[1]
-        removed = () if self._removal is None else self._removal[1]
-        return tuple(worker_id for worker_id in receivers if worker_id not in removed)
-
-    def finish_publish(self) -> None:
-        """Commit the applied change: activate added workers, retire drained ones, mark the change."""
-        changed = self._shared_change or self._removal is not None or self._addition is not None
-        if self._removal is not None:
-            group, worker_ids = self._removal
-            try:
-                if not self.sampler.remove_workers(worker_ids):
-                    raise RuntimeError('A drained sampler actor received new work during its publication '
-                                       'barrier.')
-            finally:
-                # Even when removal errored, return the slot exactly once, and only if the actors are gone.
-                if not set(worker_ids) & set(self.sampler.worker_ids()):
-                    self._flex_workers.pop(group)
-                    self._free_flex_groups.append(group)
-                    self._removal = self._draining = None
-        if self._addition is not None:
-            group, worker_ids = self._addition
-            self.sampler.activate_workers(worker_ids)
-            self._flex_workers[group] = worker_ids
-            self._addition = None
-            self.last_error = None
-        if changed:
-            self._last_change_step = self._decision_step
-        self._shared_change = False
-        self._shared_previous_enabled = None
-
-    def fail_publish(self, publication_error: Optional[BaseException] = None) -> None:
-        """Roll a half-applied change back: shared enablement, half-built actors, receiver sets."""
-        if publication_error is not None:
-            self.last_error = f'{type(publication_error).__name__}: {publication_error}'
-        if self._shared_previous_enabled is not None:
-            self._shared_enabled = bool(self._shared_previous_enabled) and self.shared_manager is not None
-        self._shared_change = False
-        self._shared_previous_enabled = None
-        self._removal = None
-        error = None
-        if self._addition is not None:
-            group, worker_ids = self._addition
-            try:
-                self.dedicated_manager.close()
-            except BaseException as exc:
-                error = exc
-            try:
-                if not self.sampler.remove_workers(worker_ids):
-                    raise RuntimeError('Failed publication left a sampler actor with unfinished '
-                                       'initialization work.')
-            except BaseException as exc:
-                error = error or exc
-            finally:
-                if not set(worker_ids) & set(self.sampler.worker_ids()):
-                    self._free_flex_groups.appendleft(group)
-                    self._addition = None
+                released = self.roles[cold].remove_workers(1)
+            except ValueError:  # its last replica: it has nothing to give
+                released = []
+            self._spare = sorted(set(self._spare) | (set(released) - set(self.lend_ranks)))
+        if len(self._spare) < width:
+            return False
+        ranks, self._spare = self._spare[:width], self._spare[width:]
         try:
-            self.dedicated_manager.set_receiver_workers(
-                self.sampler.worker_ids(shared=False, states=('ACTIVE', 'DRAINING')))
-        except BaseException as exc:
-            error = error or exc
-        if error is not None:
-            raise error
-
-    def shutdown(self) -> None:
-        """Tear the adapter down without leaking a pin, an actor, or the trainer's GPU residency."""
-        if self._closed:
-            return
-        self._closed = True
-        self.sampler.close_admission()
-        # Retire RM flex replicas first: their actors live on the flex span, and the flex-span
-        # teardown below (close_workers / reclaim) must not race a still-alive RM actor on it.
-        for role, (group, worker_ids) in list(self._rm_flex_workers.items()):
-            try:
-                self.elastic_models[role].remove_workers(list(worker_ids))
-            except Exception:
-                pass
-        self._rm_flex_workers.clear()
-        try:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-            if self._pending is not None and not self._pending[1].cancelled():
-                try:
-                    self._pending[1].result()
-                except Exception:
-                    pass
-            try:
-                self.sampler.abort_all_inflight()
-            finally:
-                self.reclaim()
-        finally:
-            try:
-                self.close_channels()
-            finally:
-                try:
-                    self.sampler.close_workers()
-                finally:
-                    self.reclaim()
-
-    # --- observation / decision ------------------------------------------------------------------------
-
-    def performance_snapshot(self) -> dict[str, float]:
-        """Commit-boundary resource counters; allocated GPU budget stays fixed."""
-        return {
-            'resource/shared_enabled': int(self._shared_enabled),
-            'resource/in_generation': int(self.in_generation),
-            'resource/flex_sampler_replicas': len(self._flex_workers),
-            'resource/free_flex_groups': len(self._free_flex_groups),
-            'resource/change_pending': int(self.change_pending),
-            'resource/last_change_step': self._last_change_step,
-            'resource/handover_seconds_total': self._counters.get('handover'),
-        }
-
-    def observe(self, *, step: int, driver_stats: DriverStats) -> ResourceWindow:
-        """Fold one batch boundary's stat deltas into the decision window (the commit boundary).
-
-        Every signal is a driver-local counter read off ``driver_stats`` (zero RPC): train / idle /
-        score / generation are mutually-exclusive wall-clock buckets on the driver thread, blocked
-        counts the backpressure-gated admission passes.
-        """
-        current = {
-            'train': float(driver_stats.train_active_time),
-            'idle': float(driver_stats.idle_time),
-            'score': float(driver_stats.score_time),
-            'generation': float(driver_stats.generation_time),
-            'blocked': float(driver_stats.capacity_blocked_passes + driver_stats.staleness_blocked_passes),
-            'handover': self._counters.get('handover'),
-        }
-        delta = {key: value - self._last_stats.get(key, value) for key, value in current.items()}
-        self._last_stats = current
-        total = max(1e-9, delta['train'] + delta['idle'])
-        window = ResourceWindow(step, delta['idle'] / total, delta['score'], delta['generation'],
-                                delta['blocked'], delta['handover'])
-        self._windows.append(window)
-        return window
-
-    def decide(self, *, step: int, publish_boundary: bool) -> Optional[str]:
-        """The single change to make at a publish boundary, or ``None`` (held by window / cooldown)."""
-        if (not publish_boundary or self.change_pending or step - self._last_change_step < self.min_hold_steps
-                or len(self._windows) < self.window_steps):
-            return None
-        idle = statistics.fmean(window.trainer_idle for window in self._windows)
-        handover = statistics.fmean(window.handover_time for window in self._windows)
-        loaded = self.sampler.inflight_count > 0
-        profitable = loaded and idle > 0 and idle > 1.25 * handover
-        self._shared_pressure_windows = self._shared_pressure_windows + 1 if profitable else 0
-        if self._shared_pressure_windows >= 2:
-            if not self._shared_enabled and self.shared_manager is not None:
-                return 'activate_shared'
-            if self._free_flex_groups:
-                return 'scale_up_sampler'
-        if idle < 0.75 * handover:
-            if self._flex_workers:
-                return 'scale_down_sampler'
-            if self._shared_enabled:
-                return 'deactivate_shared'
-        # RM-side elasticity, channel-split: the production side's wall time divides into the scoring
-        # channel (score_time -- the reap waits) and the generation channel (generation_time -- in-flight
-        # occupancy); the scoring share picks WHICH channel grows, replacing the old merged share that
-        # could only ever pick the first role without a replica. The near-dead-band (score_share within
-        # 0.35..0.65) refuses the channel call: with the two channels at comparable speed, a replica on
-        # either side pays back too little to justify its engine-load cost, and acting would only
-        # oscillate -- paired with the per-change hold above (one change per min_hold_steps) this is the
-        # anti-oscillation pair. Backpressure (blocked passes) plus a drained idle window is the
-        # production-surplus signal for shrinking. The thresholds are constants, not knobs: no consumer
-        # has tuning evidence yet.
-        if self.elastic_models:
-            score = statistics.fmean(window.score_time for window in self._windows)
-            generation = statistics.fmean(window.generation_time for window in self._windows)
-            blocked = statistics.fmean(window.blocked_passes for window in self._windows)
-            channel_total = score + generation
-            score_share = score / channel_total if channel_total > 0 else 0.0
-            has_rm_replica = any(self._rm_flex_workers.get(role) for role in self.elastic_models)
-            if score_share > 0.65 and idle > 0 and self._free_flex_groups:
-                return next((f'scale_up_rm:{role}' for role in self.elastic_models
-                             if not self._rm_flex_workers.get(role)), None)
-            if score_share < 0.35 and has_rm_replica and (blocked > 0 or idle < 0.75 * handover):
-                return next((f'scale_down_rm:{role}' for role in self.elastic_models
-                             if self._rm_flex_workers.get(role)), None)
-        return None
-
-
-def _wait(result: Any) -> Any:
-    """Resolve a lazily-collected remote result (twinkle's LazyCollect), or pass the value through."""
-    if callable(result) and getattr(result, '_is_lazy_collect', False):
-        return result()
-    return result
+            self.roles[hot].add_workers(1, warmup=self.warmups.get(hot), ranks=ranks)
+        except BaseException:
+            self._spare = sorted(self._spare + ranks)
+            raise
+        logger.info(f'ClusterAdapter: ranks {ranks} -> {hot}.')
+        return True

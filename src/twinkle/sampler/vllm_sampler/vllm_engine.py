@@ -225,30 +225,11 @@ class VLLMEngine(BaseSamplerEngine):
 
     async def _delta_admitted_outputs(self, generator):
         self._check_delta_availability()
-        # No await between the gate check and increment on the engine's event loop.
-        self._delta_admitting = getattr(self, '_delta_admitting', 0) + 1
-        admitted = False
         try:
             async for output in generator:
-                if not admitted:
-                    admitted = True
-                    self._delta_admitting -= 1
                 yield output
         finally:
-            if not admitted:
-                self._delta_admitting -= 1
             await generator.aclose()
-
-    async def pause_delta_generation(self, timeout: float):
-        self._delta_unavailable = True
-
-        async def pause():
-            while getattr(self, '_delta_admitting', 0):
-                await asyncio.sleep(0.01)
-            await self.engine.pause_generation(mode='abort')
-
-        # A barrier timeout keeps the gate closed and prevents worker writes.
-        await asyncio.wait_for(pause(), timeout=timeout)
 
     def __init__(
         self,
@@ -438,12 +419,11 @@ class VLLMEngine(BaseSamplerEngine):
     async def abort_request(self, request_id: str) -> None:
         """Abort an in-flight request so its ``generate()`` finishes with ``finish_reason='abort'``.
 
-        This is the trigger half of partial rollout (the resume/merge half is
-        :class:`~twinkle.sampler.partial_rollout.PartialRolloutMixin`). vLLM v1's ``AsyncLLM.abort`` is a
+        Used on server shutdown and replica removal. vLLM v1's ``AsyncLLM.abort`` is a
         coroutine; under the hood ``OutputProcessor.abort_requests`` enqueues a final ``RequestOutput`` with
         ``FinishReason.ABORT`` that carries the tokens decoded so far -- and because that output counts as
         finished, it is emitted even in ``FINAL_ONLY`` mode -- so the caller gets ``stop_reason='abort'``
-        plus the partial tokens it needs to resume from. ``request_id`` is the external id passed to
+        plus the partial tokens. ``request_id`` is the external id passed to
         :meth:`sample`; aborting one already finished is a harmless no-op.
         """
         if self.engine is None:

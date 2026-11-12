@@ -82,6 +82,28 @@ class InputProcessor:
         "feature_attention_mask",
         "grid_thws",
     }
+    #: Every key the model reads off a processed row; anything else on an input row is dropped.
+    FEATURE_KEYS = frozenset({
+        "input_ids",
+        "inputs_embeds",
+        "attention_mask",
+        "position_ids",
+        "labels",
+        "completion_mask",
+        "loss_scale",
+        "channel",
+        "cu_seq_lens_q",
+        "cu_seq_lens_k",
+        "cu_seqlens_q",
+        "cu_seqlens_kv",
+        "max_length_q",
+        "max_length_k",
+        "packed_seq_params",
+        "routed_experts",
+        "replay_mask",
+        "mm_token_type_ids",
+        "second_per_grid_ts",
+    } | VLM_CONCAT_FIELDS)
 
     def __init__(
         self,
@@ -821,29 +843,8 @@ class InputProcessor:
         results = []
         for _input in inputs:
             output = {}
-            _keys = [
-                "input_ids",
-                "inputs_embeds",
-                "attention_mask",
-                "position_ids",
-                "labels",
-                "completion_mask",
-                "loss_scale",
-                "channel",
-                "cu_seq_lens_q",
-                "cu_seq_lens_k",
-                "cu_seqlens_q",
-                "cu_seqlens_kv",
-                "max_length_q",
-                "max_length_k",
-                "packed_seq_params",
-                "routed_experts",
-                "replay_mask",
-                "mm_token_type_ids",
-                "second_per_grid_ts",
-            ] + list(InputProcessor.VLM_CONCAT_FIELDS)
             for key in list(_input.keys()):
-                if key not in _keys:
+                if key not in InputProcessor.FEATURE_KEYS:
                     continue
                 value = _input[key]
                 if key == "channel" or isinstance(value, torch.Tensor) or not isinstance(value, (list, np.ndarray)):

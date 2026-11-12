@@ -1,14 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
-import uuid
-import zlib
+import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Future
+from contextlib import contextmanager
 from peft import PeftConfig
 from typing import Any, List, Optional, Type, Union
 
 import twinkle
-from twinkle import remote_function
+from twinkle import get_logger, remote_function
 from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampleResponse, SamplingParams,
                                  Trajectory, is_encoded)
 from twinkle.patch import Patch
@@ -16,65 +16,62 @@ from twinkle.sampler import generation
 from twinkle.template import Template
 from twinkle.template.utils import construct_template
 
+logger = get_logger()
 
-def _dispatch_request(worker_count: int, worker_index: int, args: tuple, kwargs: dict, **_):
-    """submit's routing policy: one request hashed by request_id onto exactly one worker, the rest
-    receive an empty batch.
 
-    Deterministic, stateless, evenly spread: the same request_id always lands on the same worker
-    (when combined with sticky ownership the wrapper already pins the call to a single worker, so
-    target is always 0 there -- the two stay consistent).
+class _GenerationGate:
+    """The fallback pause for an engine with no native one: ``sample`` calls read, a pause writes.
+
+    ``pause`` stops new generations and waits for the running ones to finish; the gate stays closed
+    until ``resume``. Only used when the engine can neither keep nor wait on its own.
     """
-    trajectory = args[0] if args else kwargs.get('trajectory')
-    request_id = trajectory.get('request_id') if isinstance(trajectory, dict) else None
-    target = zlib.crc32(str(request_id).encode('utf-8')) % worker_count
-    shard = trajectory if worker_index == target else None
-    if args:
-        return (shard, *args[1:]), kwargs
-    return args, dict(kwargs, trajectory=shard)
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._paused = False
+
+    @contextmanager
+    def read(self):
+        with self._cond:
+            while self._paused:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                self._cond.notify_all()
+
+    def pause(self):
+        with self._cond:
+            self._paused = True
+            while self._readers:
+                self._cond.wait()
+
+    def resume(self):
+        with self._cond:
+            self._paused = False
+            self._cond.notify_all()
 
 
 class Sampler(ABC):
 
-    @staticmethod
-    def _normalize_sampling_args(args, kwargs):
-        args, kwargs = list(args), dict(kwargs)
-        inputs = args[0] if args else kwargs['inputs']
-        if isinstance(inputs, tuple):
-            inputs = list(inputs)
-        elif not isinstance(inputs, list) and not getattr(inputs, '_is_lazy_collect', False):
-            inputs = [inputs]
-        if args:
-            args[0] = inputs
-        else:
-            kwargs['inputs'] = inputs
-        return tuple(args), kwargs
-
-    @staticmethod
-    def _dispatch_sampling_inputs(worker_count, worker_index, args, kwargs, **_):
-        """Slice only the top-level inputs, keeping each input's tokens, tensors and multimodal fields intact."""
-        args, kwargs = list(args), dict(kwargs)
-        inputs = args[0] if args else kwargs['inputs']
-        batch = list(inputs) if isinstance(inputs, (list, tuple)) else [inputs]
-        size, remainder = divmod(len(batch), worker_count)
-        start = worker_index * size + min(worker_index, remainder)
-        stop = start + size + (worker_index < remainder)
-        shard = batch[start:stop]
-        for index, value in enumerate(args):
-            if index > 0 and isinstance(value, list) and len(value) == len(batch):
-                args[index] = value[start:stop]
-        for key, value in kwargs.items():
-            if key != 'inputs' and isinstance(value, list) and len(value) == len(batch):
-                kwargs[key] = value[start:stop]
-        if args:
-            args[0] = shard
-        else:
-            kwargs['inputs'] = shard
-        return tuple(args), kwargs
-
     def __init__(self):
         self.engine = None
         self.template = None
+
+    def _init_template(self, template: Optional[Union[Template, Type[Template], str]],
+                       template_kwargs: Optional[dict] = None) -> None:
+        """Build the constructor's ``template`` (a template instance, class or registered name)."""
+        if template is not None:
+            self.template = self._build_template(template, **(template_kwargs or {}))
+
+    def _build_template(self, template_cls, **kwargs) -> Template:
+        if 'template_spec' not in kwargs and 'model_id' not in kwargs and getattr(self, 'model_id', None):
+            kwargs['model_id'] = self.model_id
+        return construct_template(template_cls, **kwargs)
 
     @abstractmethod
     def sample(
@@ -160,36 +157,31 @@ class Sampler(ABC):
                           adapter_name: str = '',
                           add_generation_prompt: bool = True) -> InputFeature:
         if self.template is None:
-            raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
+            raise ValueError(f"Template not set for adapter '{adapter_name}'. Pass template= to the sampler.")
         return generation.encode_trajectory(self.template, trajectory, add_generation_prompt)
 
     def decode_response(self, token_ids: List[int], adapter_name: str = '') -> str:
         """Decode token ids to text."""
         template = self.template
         if template is None:
-            raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
+            raise ValueError(f"Template not set for adapter '{adapter_name}'. Pass template= to the sampler.")
         return template.decode(token_ids)
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
-        if 'template_spec' not in kwargs and 'model_id' not in kwargs and hasattr(self, 'model_id'):
-            kwargs['model_id'] = self.model_id
-        self.template = construct_template(template_cls, **kwargs)
+        """Replace the template on every replica (server deployments pin it per request stream)."""
+        self.template = self._build_template(template_cls, **kwargs)
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig) -> None:
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # Async trio: submit / pause / stop
+    # Async submission (server)
     # ------------------------------------------------------------------
     def _submit_in_loop(self, coro) -> Future:
         """Schedule the coroutine on the engine's background event loop, returning a Future waitable
-        from this thread.
-        
-        Engine-side async bookkeeping (loop scheduling and Future hand-off), not cross-call state:
-        the Future completes as soon as the request finishes.
-        """
+        from this thread."""
         return asyncio.run_coroutine_threadsafe(coro, self._async_loop)
 
     @staticmethod
@@ -214,6 +206,7 @@ class Sampler(ABC):
             cleanup.result()
             raise
 
+    @remote_function(enable_continous_work=True, lazy_collect=True)
     def submit(
         self,
         trajectory: Trajectory,
@@ -223,83 +216,110 @@ class Sampler(ABC):
         *,
         use_base_model: bool = False,
         token_only: bool = False,
-        allow_partial_rollout: bool = False,
-    ) -> Future:
-        """Submit one trajectory's generation and return a Future immediately (done/result/exception/
-        ready share one contract).
-        
-        Locally this is a same-thread Future (generation runs on the engine's background loop);
-        remotely it is a lazy reference that becomes ready only when the generation truly finishes and
-        can be passed whole to downstream actors. request_id is established before submission: minted
-        in place and written back onto the trajectory when absent. Every result (natural completion or
-        the partial after a pause/stop termination) is read from that Future: a single-element list
-        (same shape as sample's batch return). ``allow_partial_rollout`` matches sample's semantics:
-        an in-flight generation aborted by a weight publish resumes from its own tokens (deep-buffer
-        mode); that mode does not pair with pause/stop (the latter are terminal semantics -- the two
-        are mutually exclusive deployment choices).
+    ) -> List[SampleResponse]:
+        """Generate one trajectory; the caller gets a Future of the single-element response list.
+
+        One request routed to the least loaded replica; the replica's thread waits on the engine loop
+        while the actor keeps taking other requests.
         """
         if not hasattr(self, '_generate_inputs'):
             raise NotImplementedError(f'{type(self).__name__} does not support async submission: it has no '
-                                      '_generate_inputs engine coroutine; async RL uses the vLLM/SGLang samplers.')
-        if 'request_id' not in trajectory:
-            trajectory['request_id'] = uuid.uuid4().hex
-        return self._submit(trajectory, sampling_params, adapter_name, adapter_path,
-                            use_base_model=use_base_model, token_only=token_only,
-                            allow_partial_rollout=allow_partial_rollout)
+                                      '_generate_inputs engine coroutine; use the vLLM/SGLang samplers.')
+        with self._gate().read():
+            return self._submit_in_loop(
+                self._generate_inputs([trajectory], sampling_params, adapter_name, adapter_path,
+                                      use_base_model=use_base_model, token_only=token_only)).result()
 
-    @remote_function(dispatch=_dispatch_request, collect='flatten', lazy_collect=True,
-                     enable_continous_work=True, sticky=True, sticky_key='trajectory.request_id')
-    def _submit(
-        self,
-        trajectory: Optional[Trajectory],
-        sampling_params: Optional[Union[SamplingParams, dict]] = None,
-        adapter_name: str = '',
-        adapter_path: Optional[str] = None,
-        *,
-        use_base_model: bool = False,
-        token_only: bool = False,
-        allow_partial_rollout: bool = False,
-    ):
-        """Worker half: schedule the generation on the engine's background loop and return the Future.
+    # ------------------------------------------------------------------
+    # Pause / resume around a weight sync
+    # ------------------------------------------------------------------
+    def _gate(self) -> _GenerationGate:
+        gate = self.__dict__.get('_generation_gate')
+        if gate is None:
+            gate = self.__dict__.setdefault('_generation_gate', _GenerationGate())
+        return gate
 
-        infra unwraps the wait on the worker side (the caller's reference comes ready when the
-        generation finishes); locally the Future is returned as is -- the component body never senses
-        the deployment form. Non-target workers of the hash routing receive None and return an empty
-        batch immediately.
+    def _pause_engine(self) -> bool:
+        """Engine-native pause, keeping in-flight requests (or waiting for them). False if unsupported."""
+        return False
+
+    def _resume_engine(self) -> None:
+        pass
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def pause_generation(self) -> None:
+        """Hold generation so weights can be swapped under it; requests continue after ``resume_generation``.
+
+        Prefers the engine's own pause that keeps running requests frozen in place; failing that the
+        engine's wait mode; failing both, a gate that blocks new ``sample`` calls and waits for the
+        running ones.
         """
-        if trajectory is None:
-            return []
-        return self._submit_in_loop(
-            self._generate_inputs([trajectory], sampling_params, adapter_name, adapter_path,
-                                  use_base_model=use_base_model, token_only=token_only,
-                                  allow_partial_rollout=allow_partial_rollout))
+        if self._pause_engine():
+            return
+        self._gate().pause()
+        self._gate_holds_pause = True
 
-    def pause(self, trajectory: Trajectory) -> bool:
-        """Terminate the in-flight request and wait for the settle; once True returns, submit's Future
-        is necessarily done.
-        
-        The partial (stop_reason='abort' + generated tokens) lives in submit's Future; assembling the
-        resumed trajectory belongs to the caller (multiturnrollout/driver, the multi-turn state layer).
-        """
-        return self._pause(trajectory['request_id'])
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def resume_generation(self) -> None:
+        """Release :meth:`pause_generation`; idempotent."""
+        if self.__dict__.pop('_gate_holds_pause', False):
+            self._gate().resume()
+        else:
+            self._resume_engine()
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True,
-                     sticky_key='request_id', enable_continous_work=True)
-    def _pause(self, request_id: str) -> bool:
-        """Worker half: abort the engine request and poll the in-flight registry until it is unregistered (settle confirmation)."""
-        return self._terminate_request(request_id).result()
+    # ------------------------------------------------------------------
+    # In-flight requests (abort on shutdown / replica removal)
+    # ------------------------------------------------------------------
+    async def _sample_engine_request(self, request_id: str, coroutine):
+        """Run one engine request registered as in-flight; on caller cancellation abort it explicitly."""
+        task = asyncio.create_task(coroutine)
+        ids = self.__dict__.setdefault('_inflight_request_ids', set())
+        ids.add(request_id)
+        try:
+            return await asyncio.shield(task)
+        except BaseException:
 
-    def stop(self, trajectory: Trajectory) -> bool:
-        """Terminate the request; the engine operation equals pause's -- the semantic difference is the caller's disposal of the partial (dropped after stop)."""
-        return self._pause(trajectory['request_id'])
+            async def cleanup():
+                try:
+                    await self.engine.abort_request(request_id)
+                except BaseException as error:
+                    logger.warning('Failed to abort engine request %s; waiting for it to end naturally: %s',
+                                   request_id, error)
+                await asyncio.gather(task, return_exceptions=True)
 
-    def _terminate_request(self, request_id: str) -> Future:
-        """Engine-side termination: run abort + settle polling on the background loop, return a Future."""
+            cleanup_task = asyncio.create_task(cleanup())
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+            cleanup_task.result()
+            raise
+        finally:
+            ids.discard(request_id)
 
-        async def _terminate():
-            await self.engine.abort_request(request_id)
-            while request_id in getattr(self, '_inflight_request_ids', ()):
-                await asyncio.sleep(0.001)
-            return True
+    async def _abort_all_inflight(self) -> int:
+        aborted = 0
+        for request_id in list(self.__dict__.get('_inflight_request_ids', ())):
+            try:
+                await self.engine.abort_request(request_id)
+                aborted += 1
+            except Exception as error:
+                logger.warning('Failed to abort in-flight request %s: %s', request_id, error)
+        return aborted
 
-        return asyncio.run_coroutine_threadsafe(_terminate(), self._async_loop)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def abort_all_inflight(self) -> dict:
+        """Abort every in-flight generation on this replica (server shutdown)."""
+        if not hasattr(self, '_async_loop'):
+            return {'aborted': 0}
+        return {'aborted': asyncio.run_coroutine_threadsafe(self._abort_all_inflight(), self._async_loop).result()}
+
+    def _drain(self) -> None:
+        """Replica removal: abort what is running so those requests are resubmitted elsewhere."""
+        if hasattr(self, '_async_loop'):
+            asyncio.run_coroutine_threadsafe(self._abort_all_inflight(), self._async_loop).result()
+
+    def _pressure(self) -> float:
+        """Engine load in [0, 1+]: (waiting + running) / max_num_seqs; 0 when the engine cannot tell."""
+        return 0.0

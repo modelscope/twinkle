@@ -1,10 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 from typing import TYPE_CHECKING, Any, Sequence
 
+from twinkle.data_format import attach_user_data
+from twinkle_agentic.protocol.api_sampler import APISampler
+from twinkle_agentic.protocol.base import API
 from twinkle_agentic.rollout import MultiTurnRollout
 from twinkle_agentic.utils.llm_backup import llm_backup
 from twinkle_agentic.utils.message_utils import assistant_text
@@ -91,13 +95,17 @@ class Summarizer:
         self._special_tokens_cache: tuple[str, ...] | None = None
         # Built on the first call rather than here, so a summarizer that never
         # compresses anything (every text already under budget) costs nothing.
+        if isinstance(backend, API):
+            if template is None:
+                raise ValueError('an API backend needs template= to account its replies.')
+            backend = APISampler(backend, template)
         self._backend = backend
         self._rollout_kwargs = dict(rollout_kwargs, max_turns=1)
         if template is not None:
             self._rollout_kwargs['template'] = template
         # Which weights, and only for a local sampler: an API endpoint serves
         # whatever it serves and has no notion of an adapter.
-        if hasattr(backend, 'sample'):
+        if not isinstance(backend, APISampler):
             if self.lora_path:
                 self._rollout_kwargs['adapter_path'] = self.lora_path
             else:
@@ -132,7 +140,11 @@ class Summarizer:
         """
         if self._rollout is None:
             self._rollout = MultiTurnRollout(self._backend, **self._rollout_kwargs)
-        replies = self._rollout([trajectory], sampling_params=sampling_params)
+        # Per-call params ride the trajectory: the rollout reads ``user_data.sampling_params``
+        # as the one episode's override.
+        if sampling_params is not None:
+            trajectory = attach_user_data(trajectory, sampling_params=dataclasses.asdict(sampling_params))
+        replies = self._rollout([trajectory])
         return assistant_text(replies[0]) if replies else ''
 
     # ------------------------------------------------------------------

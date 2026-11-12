@@ -28,8 +28,8 @@ from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.checkpoint_engine.weight_keys import add_base_layer_suffix, is_lora_key, normalize_param_name, print_weight_example
 from twinkle.data_format import InputFeature, ModelOutput, Trajectory, is_encoded
 from twinkle.hub import HubOperation
-from twinkle.infra import collect_tensor_dict, remote_function
-from twinkle.infra._torch_setup import seed_from_env
+from twinkle.infra import remote_function
+from twinkle.utils import seed_from_env
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
@@ -463,7 +463,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
     # sync=True orders the workers for PP's NCCL collectives; lazy_collect follows the global default
     # (True) so the return keeps the Future protocol. Note the sync collect itself still materializes
     # on the calling side -- the handle is a value wrapper there, resolved like any other.
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict', sync=True)
     @timed
     def forward_only(self,
                      *,
@@ -514,7 +514,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
     def backward(self, **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict', sync=True)
     @timed
     def forward_backward(self,
                          *,
@@ -548,6 +548,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         forward_only = kwargs.pop('forward_only', False)
+        inputs, kwargs = self._rollout_features(inputs, kwargs, lift=not forward_only)
         # Per-call opt-in to skip the configured loss and return logps only (an empty-loss probe:
         # a KTO z_KL / adapter-disabled reference batch carries no label/ref_logps, which the loss
         # would reject). eval/training omit it; megatron's calculate_loss is a raise, so eval_loss

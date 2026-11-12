@@ -33,7 +33,6 @@ from twinkle.checkpoint_engine.weight_keys import (add_base_layer_suffix, is_lor
                                                    print_weight_example)
 from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
@@ -956,7 +955,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         finally:
             handle.remove()
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict')
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
 
@@ -967,6 +966,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         Returns:
             The output of the model forward.
         """
+        inputs, kwargs = self._rollout_features(inputs, kwargs, lift=False)
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         temperature = float(kwargs.pop('temperature', 1.0))
         sampling_masks = kwargs.pop('sampling_masks', None)
@@ -1081,7 +1081,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     # lazy_collect follows the global default (True): a caller that reads the output itself calls
     # ``.result()`` first, while a ref-only pipeline hands the handle straight to a downstream remote
     # call, which resolves and collects it where the data is consumed (see ``LazyCollect``).
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict')
     @timed
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
@@ -1099,6 +1099,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             The output of the model forward.
         """
         config = MicroBatchConfig.from_kwargs(kwargs)
+        inputs, kwargs = self._rollout_features(inputs, kwargs, lift=False)
         # Kept IN kwargs on purpose: the single-batch / micro-batch callees below pop it
         # themselves, and the per-adapter head resolution (head_for) needs the CALL's adapter,
         # not the default group.
@@ -1271,7 +1272,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 recorded_routing=recorded_routing,
             )
 
-    @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False)
+    @remote_function(dispatch='slice_dp', collect='dp_flatten', lazy_collect=False)
     def generate(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -1295,7 +1296,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         ``AutoModelForCausalLM.generate`` reads directly -- so in-place generation is sound here.
 
         Distribution. ``dispatch='slice_dp'`` splits ``inputs`` across data ranks, so each worker only
-        generates for its own shard; ``collect=collect_dp_and_flatten`` then deduplicates the ranks that
+        generates for its own shard; ``collect='dp_flatten'`` then deduplicates the ranks that
         share one data shard (TP / PP / ulysses peers produce the same result) and flattens the per-worker
         lists back into one, in input order. A single-GPU or FSDP model is the degenerate case: one data
         rank, nothing to dedup. ``inputs`` must therefore be a *list* -- a bare ``Trajectory`` dict would
@@ -1696,7 +1697,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             **kwargs,
         )
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict')
     @timed
     def forward_backward(
         self,
@@ -1708,6 +1709,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         **kwargs,
     ):
         """Run one homogeneous loss RPC and optionally finalize a two-RPC backward transaction."""
+        inputs, kwargs = self._rollout_features(inputs, kwargs, lift=True)
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         completing_pending = optimizer_config.prepare_backward_transaction(finalize_gradients, loss_weight)

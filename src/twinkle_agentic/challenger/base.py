@@ -11,7 +11,7 @@ from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 from twinkle.advantage.group_admission import GroupAdmissionPolicy
 from twinkle.data_format import Trajectory
 from twinkle.utils import get_logger
-from twinkle_agentic.envs import Env, EnvLeases
+from twinkle_agentic.envs import Env
 from twinkle_agentic.utils.message_utils import assistant_text
 
 logger = get_logger()
@@ -38,19 +38,18 @@ class ChallengeBatch:
 
 
 class Challenger(ABC):
-    """Common batching and environment lifecycle for task challengers.
+    """Common batching and job lifecycle for task challengers.
 
-    Work is a stream of jobs over a pool of environments, not a sequence of
-    rounds. A job leases one environment for its whole life and gives it back the
-    moment it ends, to whichever job is next in line -- so proposing and solving
-    run at the same time, on the same environments, and the sampler and the API
-    are never idle waiting for the slowest member of a round.
+    Work is a stream of jobs, not a sequence of rounds. A job is one episode in its
+    own session of ``env`` (the component serving every episode), and up to
+    ``max_jobs`` run at once -- so proposing and solving run at the same time, and
+    the sampler and the API are never idle waiting for the slowest member of a round.
 
     A subclass says what a unit of work is: :meth:`_launch` submits its jobs with
     :meth:`_submit`, and whatever bookkeeping ties those jobs together calls
     :meth:`_complete` once, with the groups that unit earned. Nothing here waits
-    on a job, and a job must not wait on another job -- the workers are the
-    environments, so a job that blocks holds one hostage.
+    on a job, and a job must not wait on another job -- a job that blocks holds a
+    worker hostage.
 
     The single barrier is the batch. The caller's next move after taking one is an
     optimizer step, and a job that straddled that step would have been sampled
@@ -61,15 +60,18 @@ class Challenger(ABC):
     def __init__(
         self,
         *,
-        envs: Sequence[Env],
+        env: Env,
+        max_jobs: int = 8,
         num_challenger_rollouts: int = 8,
         num_solver_rollouts: int = 8,
         pass_band: Tuple[float, float] = (1.0, 7.0),
         max_empty_rounds: int = 0,
         group_admission_policy: Optional[GroupAdmissionPolicy] = None,
     ):
-        if not envs:
-            raise ValueError('envs is empty: a challenger needs a workspace to act in and grade')
+        if env is None:
+            raise ValueError('env is required: a challenger needs a workspace to act in and grade')
+        if max_jobs < 1:
+            raise ValueError(f'max_jobs must be >= 1, got {max_jobs}')
         if num_challenger_rollouts < 1:
             raise ValueError(f'num_challenger_rollouts must be >= 1, got '
                              f'{num_challenger_rollouts}')
@@ -84,7 +86,8 @@ class Challenger(ABC):
             if not 0 <= low <= high <= num_solver_rollouts:
                 raise ValueError(f'pass_band must satisfy 0 <= low <= high <= num_solver_rollouts, got '
                                  f'{pass_band} against num_solver_rollouts={num_solver_rollouts}')
-        self.envs = EnvLeases(envs)
+        self.env = env
+        self.max_jobs = max_jobs
         self.num_challenger_rollouts = num_challenger_rollouts
         self.num_solver_rollouts = num_solver_rollouts
         self.pass_band = pass_band
@@ -92,10 +95,7 @@ class Challenger(ABC):
         self.group_admission_policy = group_admission_policy
         self.n_proposed = 0
         self.n_kept = 0
-        # One worker per environment, which is what makes a lease never block: a
-        # worker runs one job, a job holds one environment, so a running job
-        # always has one to hold.
-        self._workers = ThreadPoolExecutor(max_workers=len(self.envs), thread_name_prefix='challenger')
+        self._workers = ThreadPoolExecutor(max_workers=max_jobs, thread_name_prefix='challenger')
         self._finished: 'queue.Queue[Tuple[List[List[Trajectory]], List[List[Trajectory]]]]' = queue.Queue()
         self._counter = threading.Lock()
         self._jobs = 0
@@ -108,18 +108,17 @@ class Challenger(ABC):
         "nothing running" as "nothing more is coming".
         """
 
-    def _submit(self, job: Callable[[Env], None]) -> None:
-        """Run ``job`` on an environment of its own, as soon as one is free."""
+    def _submit(self, job: Callable[[], None]) -> None:
+        """Run ``job`` as soon as a worker is free."""
         with self._counter:
             self._jobs += 1
         self._workers.submit(self._run, job)
 
-    def _run(self, job: Callable[[Env], None]) -> None:
-        # The count has to fall however this ends, the lease included: a job still
-        # counted as running is a batch that never finishes waiting for it.
+    def _run(self, job: Callable[[], None]) -> None:
+        # The count has to fall however this ends: a job still counted as running
+        # is a batch that never finishes waiting for it.
         try:
-            with self.envs.lease() as env:
-                job(env)
+            job()
         except Exception as exc:  # noqa: BLE001 -- one bad job must not end a run
             logger.warning(f'[{type(self).__name__}] job failed: {type(exc).__name__}: {exc}')
         finally:
@@ -231,7 +230,7 @@ class Challenger(ABC):
         logger.info(f'[{type(self).__name__}] batch shape: '
                     f'{want_challenger} x {self.num_challenger_rollouts} proposing + '
                     f'{want_solver} x {self.num_solver_rollouts} solving trajectories; '
-                    f'{len(self.envs)} environments')
+                    f'{self.max_jobs} concurrent jobs')
         produced = 0
         while total is None or produced < total:
             batch = self._fill(want_challenger, want_solver)
@@ -250,7 +249,7 @@ class Challenger(ABC):
             # Refill to capacity first: the pool is the throttle, and a unit's own
             # jobs multiply once it starts, so keeping the workers busy is enough
             # to keep proposing and solving overlapped without counting either.
-            while not exhausted and self._jobs < len(self.envs):
+            while not exhausted and self._jobs < self.max_jobs:
                 if not self._launch():
                     exhausted = True
             unit = self._next()
@@ -310,5 +309,5 @@ class Challenger(ABC):
             dropped += self._absorb(pending, unit, want_challenger, want_solver)[1]
 
     def close(self) -> None:
+        """Wait the jobs out; ``env`` is the caller's, and every job closed its own session."""
         self._workers.shutdown(wait=True)
-        self.envs.close()

@@ -1,12 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from twinkle import remote_function
 from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
-from twinkle_agentic.utils.leases import Leases
 from .snapshot import list_workspace
 
 logger = get_logger()
@@ -19,6 +21,10 @@ TIMEOUT_EXIT_CODE = 124
 # Truncation guard for anything that becomes an observation: a command that
 # dumps a whole file would otherwise spend the episode's context on one turn.
 MAX_OBSERVATION_CHARS = 32 * 1024
+
+#: The default ceiling of concurrent method calls on one env replica: its sessions (64 by default)
+#: plus room for the calls that wait for one to free up, and for ``close`` to get through meanwhile.
+ENV_MAX_CONCURRENCY = 96
 
 # The tools every general-purpose environment advertises, sandboxed or local.
 # Shared rather than restated per implementation: a trajectory built against one
@@ -114,26 +120,42 @@ class StepResult:
     info: Dict[str, Any] = field(default_factory=dict)
 
 
+class SessionNotFound(KeyError):
+    """The episode has no open session here: never reset, already closed, or its replica is gone."""
+
+
+class _Session:
+    __slots__ = ('state', 'reward', 'touched')
+
+    def __init__(self, state: Any):
+        self.state = state
+        self.reward = 0.0
+        self.touched = time.monotonic()
+
+
 class Env(ABC):
-    """Base class for RL execution environments.
+    """Base class for RL execution environments: one component serving many episodes.
 
-    All environments implement this interface. Usage::
+    Every episode is a session keyed by its ``episode_id``::
 
-        env = SomeEnv(...)
-        result = env.reset()
-        result = env.step(tool_name, arguments)
+        env = SomeEnv(..., max_sessions=64, remote_group='env')
+        result = env.reset(episode_id)                       # open; waits while all sessions are taken
+        result = env.step(episode_id, tool_name, arguments)
+        code, out = env.run_script(episode_id, source)       # a verifier's script, in the same place
+        reward = env.close(episode_id)                       # the episode's reward; frees the session
+
+    The session methods route by ``episode_id`` (calls of one episode reach the replica holding its
+    session), so a deployment with several replicas looks like one env to its callers. A call for
+    an episode that has no session here raises :class:`SessionNotFound`.
 
     Tool-call markup is parsed upstream by
     :meth:`twinkle.template.base.Template.parse_tool_call`. This class only
     executes already-split ``(tool_name, arguments)`` pairs.
-    """
 
-    #: How many times this environment had to be rebuilt under a caller that was
-    #: holding it. Reported rather than dropped: a run whose environments were
-    #: rebuilt twenty times produced its numbers under different conditions than
-    #: one that was rebuilt never, and that is invisible from the outputs alone.
-    #: Stays at zero for an environment that cannot be lost.
-    n_recoveries = 0
+    A subclass implements the session hooks: ``_open(traj) -> (state, StepResult)``,
+    ``_step(state, tool_name, arguments)``, ``_run_script(state, source, interpreter, timeout)``,
+    ``_close(state)`` and ``_workspace(state)``; plus :meth:`tools`.
+    """
 
     #: What :meth:`snapshot` shows of the workspace: how many files to name, how
     #: many bytes of each body, how many bytes of bodies in total, and which
@@ -146,44 +168,113 @@ class Env(ABC):
     snapshot_budget = 20000
     snapshot_skip = ('__pycache__', '.git', '.ipynb_checkpoints')
 
-    @property
-    def workspace(self) -> Optional[str]:
-        """The directory this environment keeps between calls, or None.
+    #: Seconds a session may go untouched before the next ``reset`` closes it: a caller that died
+    #: or never called ``close`` would otherwise hold a sandbox forever.
+    session_idle_timeout = 1800.0
+    #: Seconds ``reset`` waits for a free session before it gives up with ``TimeoutError``.
+    session_wait_timeout = 600.0
 
-        None is the honest answer for an environment that holds nothing -- and
-        what makes :meth:`snapshot` and :meth:`clear` correct by default for one:
-        there is no state to read back and none to throw away.
-        """
-        return None
+    def __init__(self, max_sessions: int = 64):
+        self._max_sessions = max(1, int(max_sessions))
+        self._session_slots = threading.Semaphore(self._max_sessions)
+        self._sessions: Dict[str, _Session] = {}
+        self._sessions_lock = threading.Lock()
 
-    def reset(self, trajectory: Optional[Trajectory] = None) -> StepResult:
-        return StepResult()
+    # ------------------------------------------------------------------
+    # Hooks
+    # ------------------------------------------------------------------
 
     @abstractmethod
-    def step(self, tool_name: str, arguments: Dict[str, Any]) -> StepResult:
-        raise NotImplementedError
+    def _open(self, trajectory: Optional[Trajectory]) -> Tuple[Any, StepResult]:
+        """Start one episode; returns its state and the initial observation."""
 
-    def step_batch(
-        self,
-        calls: Sequence[Tuple[str, Dict[str, Any]]],
-    ) -> List[StepResult]:
-        """Execute a batch of already-parsed ``(tool_name, arguments)`` pairs.
+    @abstractmethod
+    def _step(self, state: Any, tool_name: str, arguments: Dict[str, Any]) -> StepResult:
+        """Run one tool call in the episode."""
 
-        Default is a serial loop over :meth:`step`. Subclasses that talk to a
-        remote sandbox should override this so MultiTurn can keep tools off
-        the generate critical path.
+    def _run_script(self, state: Any, source: str, interpreter: str, timeout: Optional[float]) -> Tuple[int, str]:
+        raise NotImplementedError(f'{type(self).__name__} cannot run scripts; act through its tools instead.')
+
+    def _close(self, state: Any) -> None:
+        pass
+
+    def _workspace(self, state: Any) -> Optional[str]:
+        return None
+
+    # ------------------------------------------------------------------
+    # Sessions
+    # ------------------------------------------------------------------
+
+    def _session(self, episode_id: str) -> _Session:
+        with self._sessions_lock:
+            session = self._sessions.get(episode_id)
+        if session is None:
+            raise SessionNotFound(f'{type(self).__name__}: no open session for episode {episode_id!r}.')
+        session.touched = time.monotonic()
+        return session
+
+    def _close_idle_sessions(self) -> None:
+        now = time.monotonic()
+        with self._sessions_lock:
+            idle = [eid for eid, session in self._sessions.items() if now - session.touched > self.session_idle_timeout]
+        for eid in idle:
+            logger.warning(f'{type(self).__name__}: closing session {eid!r}, idle for over '
+                           f'{self.session_idle_timeout:.0f}s.')
+            self.close(eid)
+
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def reset(self, episode_id: str, traj: Optional[Trajectory] = None) -> StepResult:
+        """Open the episode's session (closing an earlier one under the same id); returns the first observation.
+
+        Waits while every session is taken, up to :attr:`session_wait_timeout`.
         """
-        return [self.step(name, args or {}) for name, args in calls]
+        self._close_idle_sessions()
+        if episode_id in self._sessions:
+            self.close(episode_id)
+        if not self._session_slots.acquire(timeout=self.session_wait_timeout):
+            raise TimeoutError(f'{type(self).__name__}: no free session within {self.session_wait_timeout:.0f}s '
+                               f'({self._max_sessions} in use).')
+        try:
+            state, result = self._open(traj)
+        except BaseException:
+            self._session_slots.release()
+            raise
+        with self._sessions_lock:
+            self._sessions[episode_id] = _Session(state)
+        return result
 
-    def run_script(self, source: str, interpreter: str = 'python', timeout: Optional[int] = None) -> Tuple[int, str]:
-        """Run a whole script here; returns ``(exit_code, output)``.
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def step(self, episode_id: str, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> StepResult:
+        session = self._session(episode_id)
+        result = self._step(session.state, tool_name, arguments or {})
+        session.reward += float(result.reward or 0.0)
+        return result
 
-        The execution path a *verifier* takes, as opposed to :meth:`step`, which
-        is the one the model takes. Both land in the same place, and that is the
-        point: a check has to observe the filesystem the episode actually wrote
-        to, so it runs in the environment rather than beside it.
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def step_batch(self, episode_id: str, calls: Sequence[Tuple[str, Dict[str, Any]]]) -> List[StepResult]:
+        """Execute already-parsed ``(tool_name, arguments)`` pairs in order, in one round trip."""
+        session = self._session(episode_id)
+        results = []
+        for name, args in calls:
+            result = self._step(session.state, name, args or {})
+            session.reward += float(result.reward or 0.0)
+            results.append(result)
+        return results
+
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def run_script(self,
+                   episode_id: str,
+                   source: str,
+                   interpreter: str = 'python',
+                   timeout: Optional[float] = None) -> Tuple[int, str]:
+        """Run a whole script in the episode's session; returns ``(exit_code, output)``.
+
+        The execution path a *verifier* (or an agent program) takes, as opposed to :meth:`step`,
+        which is the one the model takes. Both land in the same place, and that is the point: a
+        check has to observe the filesystem the episode actually wrote to.
 
         Args:
+            episode_id: the session.
             source: the script, not a path.
             interpreter: ``'python'`` or ``'shell'``.
             timeout: seconds; ``None`` means the environment's own default.
@@ -195,147 +286,63 @@ class Env(ABC):
             value is the script's, except for a timeout, which is
             :data:`TIMEOUT_EXIT_CODE`.
         """
-        raise NotImplementedError(f'{type(self).__name__} cannot run scripts')
+        return self._run_script(self._session(episode_id).state, source, interpreter, timeout)
 
-    def ensure_idle(self) -> None:
-        """同步执行层的安全边界；带后台或远程执行的环境必须覆盖并确认真实结束。"""
-        return None
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def workspace(self, episode_id: str) -> Optional[str]:
+        """The directory the episode works in, or None for an environment that keeps none."""
+        return self._workspace(self._session(episode_id).state)
 
-    def ensure_ready(self) -> bool:
-        """Re-establish this environment if it has gone away. True if it did.
-
-        For a caller that holds one environment across many jobs, losing it --
-        evicted, timed out, runtime crashed -- otherwise ends the whole run. Safe
-        to call only where the workspace is about to be discarded anyway: a
-        mid-episode rebuild silently swaps the state a job is being judged on for
-        an empty directory, which is why recovery is an explicit call rather than
-        a retry hidden inside every dispatch.
-
-        The default is ``False``: an environment that is a local process has
-        nothing to lose between calls and so is never not ready.
-        """
-        return False
-
-    def rebuild(self) -> None:
-        """Throw this environment away and stand a fresh one up in its place.
-
-        For the caller that has a *working* environment it no longer trusts --
-        one that keeps failing an operation it should not fail -- as opposed to
-        :meth:`ensure_ready`, which is about one that stopped answering. Counted
-        in :attr:`n_recoveries`.
-
-        The default is a no-op, which is the truth for an environment holding
-        nothing worth rebuilding.
-        """
-
-    def clear(self) -> None:
-        """Return to a clean state, ready for the next episode.
-
-        Called by whoever owns the environment, before handing it to a job that
-        must not see the previous one's files. Raising is the right answer for an
-        environment that could not clean itself: a silent no-op there means the
-        next job inherits a workspace, which lets a solver pass without doing
-        anything and makes a difficulty measurement meaningless.
-
-        The default is a no-op because it is the truth for an environment holding
-        no state between calls -- the shape one-shot verification uses. That is
-        also what lets both halves run the same sequence: the code half clears
-        before every judgement too, and clearing nothing costs nothing.
-        """
-
-    def snapshot(self) -> Tuple[str, str]:
-        """The end state as ``(listing, error)``; both empty when there is none.
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def snapshot(self, episode_id: str) -> Tuple[str, str]:
+        """The episode's end state as ``(listing, error)``; both empty when there is none.
 
         What an episode left behind, for a caller that has to describe it to a
         model -- writing a check against a workspace means knowing what is in it.
         The two strings are kept apart because a snapshot that returns "empty"
         when it means "I could not look" produces tasks whose only true assertion
-        is that nothing happened.
-
-        The default lists :attr:`workspace` from inside the environment, and is
-        ``('', '')`` for one that has no workspace -- the honest answer when there
-        is no end state to read back. Truncation is set by the ``snapshot_*``
-        class attributes.
+        is that nothing happened. Truncation is set by the ``snapshot_*`` class attributes.
         """
+        state = self._session(episode_id).state
         return list_workspace(
-            self,
+            self._workspace(state),
+            lambda source: self._run_script(state, source, 'python', None),
             max_files=self.snapshot_max_files,
             per_file=self.snapshot_per_file,
             budget=self.snapshot_budget,
             skip=self.snapshot_skip)
 
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def close(self, episode_id: str) -> float:
+        """End the episode's session and return its reward (the sum of its step rewards).
+
+        Closing an episode with no session returns 0.0.
+        """
+        with self._sessions_lock:
+            session = self._sessions.pop(episode_id, None)
+        if session is None:
+            return 0.0
+        try:
+            self._close(session.state)
+        except Exception:  # noqa
+            logger.warning(f'{type(self).__name__}: closing session {episode_id!r} failed.', exc_info=True)
+        finally:
+            self._session_slots.release()
+        return session.reward
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    def shutdown(self) -> None:
+        """Close every open session."""
+        with self._sessions_lock:
+            episode_ids = list(self._sessions)
+        for episode_id in episode_ids:
+            self.close(episode_id)
+
+    @remote_function(execute='first', collect='first', lazy_collect=False)
     def tools(self) -> List[ToolInfo]:
+        """What the model is told it can call in an episode."""
         return []
 
-    def tool_manager(self, schemas: Optional[Sequence[ToolInfo]] = None) -> Any:
-        """A ``ToolManager`` that dispatches tool calls into this environment.
-
-        What a rollout needs to let a model act here, so it is built once on the
-        environment rather than restated by every caller that owns one -- and a
-        caller holding N environments gets N managers that cannot be crossed,
-        which is the failure this prevents: an episode acting in one workspace
-        and being checked in another produces a task nobody can pass.
-
-        Args:
-            schemas: the tool contract to advertise; defaults to :meth:`tools`.
-                Passed explicitly when an agent framework owns the names that go
-                into the prompt and this environment only supplies the
-                implementation.
-        """
-        # Local import: ToolManager is a consumer of this package, and the tools
-        # package is not needed by an env that is only ever asked to run scripts.
-        from ..tools.tool_manager import ToolManager
-        from .env_tool import EnvTool
-        declared = list(schemas) if schemas is not None else self.tools()
-        return ToolManager(EnvTool.from_schemas(self, declared))
-
-    def evaluate(self, trajectories: List[Trajectory], **kwargs) -> List[float]:
-        return [0.0] * len(trajectories)
-
-    def close(self) -> None:
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close()
-
-
-class EnvLeases(Leases[Env]):
-    """Lend one environment to one job for the whole life of that job.
-
-    A job that acts in an environment is also verified in it, so it needs the
-    same one from start to end -- but only that it be its own: nothing about a
-    job says *which* environment it wants. A lease is therefore the whole of the
-    routing question, and :class:`~twinkle_agentic.utils.leases.Leases` is the
-    whole of the scheduler; what an environment adds is what cleaning one means.
-    """
-
-    def __init__(self, envs: Sequence[Env]):
-        super().__init__(envs)
-        self.n_recovered = 0
-
-    def _prepare(self, env: Env) -> Env:
-        """Hand over an empty workspace, standing the environment up if need be.
-
-        The lease boundary is also the only moment at which recovery is safe:
-        throwing the workspace away is what the next job wanted anyway, whereas
-        doing it mid-job would swap the state being judged for an empty
-        directory.
-        """
-        env.ensure_idle()
-        try:
-            env.clear()
-            return env
-        except Exception as exc:  # noqa: BLE001 -- the reason is logged, the fix is below
-            logger.warning(f'[{type(self).__name__}] {type(env).__name__} could not clean itself '
-                           f'({type(exc).__name__}: {exc}); recovering it')
-        # Gone and re-established, or still there and not to be trusted: one of
-        # the two is why clear() failed, and ensure_ready() reports which.
-        if not env.ensure_ready():
-            env.rebuild()
-        env.clear()
-        with self._lock:
-            self.n_recovered += 1
-        return env
+    def _pressure(self) -> float:
+        with self._sessions_lock:
+            return len(self._sessions) / self._max_sessions
