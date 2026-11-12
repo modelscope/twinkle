@@ -61,15 +61,28 @@ kernelize(model, {
 - 反向由融合内核计算；调用方不需要逐文档循环。
 - 块掩码使用固定的 `2048 × 2048` 上三角布尔矩阵，并按 `cu_seqlens` 对齐分段边界。
 
+## 适配层边界
+
+同一个适配层同时服务 `npu` 后端（融合内核）和 `torch` 后端（逐文档精确实现），
+因此两条路径的语义完全一致：
+
+- 拿不到 `cu_seq_lens_q` 时按 HF 语义合成掩码：方阵输入走原生 causal SDPA；
+  `query` 短于 `key`（KV-cache 解码、chunked 解码）时因果掩码按右下角对齐，
+  放行全部历史 key。
+- 拼接入口会校验边界（从 0 开始、严格递增、末项等于总长），并显式拒绝
+  `attention_mask`、非因果请求、`query/key` 长度不一致以及非共享分段边界，
+  不再静默忽略这些参数。
+
 ## 正确性
 
 ```bash
 pytest tests/kernel/ops/test_fused_varlen_attention.py -q
 ```
 
-无 NPU 环境为 `20 passed, 34 skipped`；NPU 环境运行全部用例。
+无 NPU 环境为 `38 passed, 46 skipped`；NPU 环境运行全部用例。
 
-对当前 Twinkle NPU SDPA baseline 的严格对照结果：
+**验收口径（严格，不放宽）**：对当前 Twinkle NPU SDPA baseline（同精度原生实现）逐元素
+`assert_close`：
 
 - 13 个形状、FP32/BF16、10 个种子，共 **260/260** 组前向及 `dq/dk/dv` 通过；
 - FP32：`rtol=1e-4`，`atol=1e-5`；
@@ -77,10 +90,13 @@ pytest tests/kernel/ops/test_fused_varlen_attention.py -q
 - 单文档 HF 快路径：**40/40** 组严格前反向通过；
 - 连续 token、单 token 文档、跨 2048 块、MHA、GQA 16/4、GQA 16/8 均有覆盖。
 
+**诊断口径（仅用于定位精度来源）**：对“显式浮点掩码 + FP32 精确参考”比对时，FP32 仍是
+严格判定；BF16 因为 `dv = P^T @ do` 的上千项求和在两套分块顺序下的舍入差异，会有最多
+4/1,048,576 个元素站在 `atol` 边界（最大绝对差 0.0312），因此这类诊断用显式越界元素预算
+判定，且不作为验收依据。
+
 BF16 GQA 会在调用融合内核前展开 KV，使反向归约顺序与当前 baseline 的
-`repeat_kv` 一致；FP32 保留原生 GQA。对更早的“显式浮点掩码 + 精确参考”测试，
-BF16 仍保留少量越界元素预算（最多 8 个，最大绝对差不超过 `4e-2`），
-`rtol/atol` 本身不放宽。
+`repeat_kv` 一致；FP32 保留原生 GQA。
 
 ## 单算子性能
 
