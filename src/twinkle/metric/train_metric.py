@@ -52,7 +52,10 @@ class TrainMetric(Metric):
         if self.step is not None:
             results['iters'] = self.step // self.gradient_accumulation_steps
             interval = time.time() - self.time
-            speed = (self.step - self.last_step) / interval / self.gradient_accumulation_steps
+            # Coarse platform clocks (e.g. Windows) can return the same timestamp twice in a row;
+            # a zero-length window has no meaningful rate, so report 0 instead of dividing by zero.
+            speed = ((self.step - self.last_step) / interval / self.gradient_accumulation_steps
+                     if interval > 0 else 0.0)
             if interval < 60:
                 results['total time elapse'] = f'{(time.time() - self.start_time):.0f} seconds'
             else:

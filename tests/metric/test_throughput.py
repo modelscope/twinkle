@@ -90,3 +90,42 @@ def test_memory_reduction_uses_rank_max_for_peaks_and_mean_for_host_ram():
             {"max_memory_allocated_bytes": 5 * 1024**3, "cpu_memory_used_bytes": 10 * 1024**3},
         ]
     ) == {"perf/max_memory_allocated_gb": 5, "perf/cpu_memory_used_gb": 9}
+    # A bare dict is a single worker row; missing counters are simply absent.
+    assert memory_metrics({}) == {}
+    assert memory_metrics({"max_memory_reserved_bytes": 2 * 1024**3}) == {"perf/max_memory_reserved_gb": 2}
+
+
+def test_calculate_before_accumulate_is_empty():
+    assert ThroughputMetric().calculate() == {}
+
+
+def test_rejects_malformed_batches():
+    metric = ThroughputMetric()
+    with pytest.raises(ValueError, match="nonempty batch"):
+        metric.accumulate(prompt_lengths=[], response_lengths=[], timings={"step": 1}, num_devices=1)
+    with pytest.raises(ValueError, match="paired"):
+        metric.accumulate(prompt_lengths=[1], response_lengths=[1, 2], timings={"step": 1}, num_devices=1)
+    with pytest.raises(ValueError, match="nonnegative integers"):
+        metric.accumulate(prompt_lengths=[1], response_lengths=[-1], timings={"step": 1}, num_devices=1)
+    with pytest.raises(ValueError, match="nonnegative integers"):
+        metric.accumulate(prompt_lengths=[1], response_lengths=[1.5], timings={"step": 1}, num_devices=1)
+    with pytest.raises(ValueError, match="physical devices"):
+        metric.accumulate(prompt_lengths=[1], response_lengths=[1], timings={"step": 1}, num_devices=True)
+
+
+def test_allocation_change_requires_a_reset():
+    metric = ThroughputMetric()
+    metric.accumulate(prompt_lengths=[1], response_lengths=[1], timings={"step": 1}, num_devices=1)
+    with pytest.raises(ValueError, match="reset"):
+        metric.accumulate(prompt_lengths=[1], response_lengths=[1], timings={"step": 1}, num_devices=2)
+    metric.reset()
+    metric.accumulate(prompt_lengths=[1], response_lengths=[1], timings={"step": 1}, num_devices=2)
+
+
+def test_padded_width_smaller_than_an_actual_sequence_is_rejected():
+    metric = ThroughputMetric()
+    metric.accumulate(prompt_lengths=[3], response_lengths=[2], timings={"step": 1}, num_devices=1)
+    with pytest.raises(ValueError, match="padded width"):
+        metric.calculate(prompt_width=2)
+    with pytest.raises(ValueError, match="padded width"):
+        metric.calculate(response_width=1)
