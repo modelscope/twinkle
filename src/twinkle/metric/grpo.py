@@ -75,6 +75,18 @@ class GRPOMetric(Metric):
             return [logps_val]
         return None
 
+    @staticmethod
+    def _logps_row_count(logps_mb: Any) -> int:
+        """Rows a microbatch contributes to the flattened per-sample cursor lists."""
+        import torch
+        if torch.is_tensor(logps_mb):
+            if logps_mb.dim() == 0:
+                return 0
+            return 1 if logps_mb.dim() == 1 else int(logps_mb.shape[0])
+        if isinstance(logps_mb, (list, tuple)):
+            return len(logps_mb)
+        return 0
+
     def _collect_high_kl(
         self,
         d: 'torch.Tensor',
@@ -294,6 +306,8 @@ class GRPOMetric(Metric):
         assert 'logps' in outputs
         logps_val = outputs.get('logps')
         logps_list = self._as_mb_list(logps_val)
+        if logps_list is None:
+            return
         ent_val = outputs.get('entropies') if isinstance(outputs, dict) else None
         ent_list = self._as_mb_list(ent_val)
         inputs_list = inputs if isinstance(inputs, list) else [inputs]
@@ -324,10 +338,14 @@ class GRPOMetric(Metric):
         n_mb = min(len(inputs_list), len(logps_list))
         for mb_idx in range(n_mb):
             mb_input = inputs_list[mb_idx]
-            if not isinstance(mb_input, dict):
-                continue
-            labels = mb_input.get('labels')
+            labels = mb_input.get('labels') if isinstance(mb_input, dict) else None
             if labels is None:
+                # A dropped microbatch still owns rows in the flattened old/adv/sampler
+                # lists (and in the per-sample gsi sequence); advance both cursors by its
+                # logps rows so the next microbatch is not aligned against this one's values.
+                rows = self._logps_row_count(logps_list[mb_idx])
+                cursor += rows
+                self._gsi_cursor += rows
                 continue
 
             labels = torch.as_tensor(labels)
