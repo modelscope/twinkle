@@ -604,7 +604,7 @@ class SequenceParallel:
             if router_logits is None:
                 return output
 
-            attention_mask = kwargs['attention_mask']
+            attention_mask = kwargs.get('attention_mask')
             if attention_mask is None:
                 batch_size = 1
             else:
@@ -622,15 +622,16 @@ class SequenceParallel:
                 _bs_logits, _ = GatherLoss.apply(self, _bs_logits, None, 1, self.real_position_ids)
                 _gathered_logits.append(_bs_logits)
             router_logits = torch.stack(_gathered_logits, dim=0)
-            if self.real_position_ids is not None:
-                if self.rp_world_size > 1:
-                    # Ring padding is interleaved, not a suffix: a plain prefix slice keeps padding
-                    # positions and drops real ones, so select by the padded position ids instead.
-                    position_ids = self.pad(
-                        self.real_position_ids, padding_value=-1, position_ids=self.real_position_ids)
-                    router_logits = router_logits[:, :, position_ids[0] >= 0, :]
-                else:
-                    router_logits = router_logits[:, :, :self.real_position_ids.shape[1], :]
+            if attention_mask is not None:
+                # The HF auxiliary loss consumes the global padded mask after this hook.
+                # Keep router rows in the same layout, including masked padding rows.
+                if attention_mask.dim() != 2 or router_logits.shape[2] != attention_mask.shape[-1]:
+                    raise ValueError('SP router logits must align with the global 2D attention mask')
+            elif self.real_position_ids is not None:
+                # Packed batches have no mask; remove SP padding, including Ring gaps.
+                positions = self.pad(self.real_position_ids, padding_value=-1,
+                                     position_ids=self.real_position_ids)
+                router_logits = router_logits[:, :, positions[0] >= 0, :]
             output['router_logits'] = tuple(
                 [logit.reshape(-1, logit.shape[-1]) for logit in router_logits.split(1, dim=1)])
             return output
