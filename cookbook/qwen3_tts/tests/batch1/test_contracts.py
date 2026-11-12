@@ -181,6 +181,8 @@ class Contracts(unittest.TestCase):
             cfg, rows, mels = samples(n)
             batch = collate_qwen3_batch(rows, cfg, mels)
             model = Model()
+            from twinkle.patch.transformers_qwen3_tts import Qwen3TTSTrainingPatch
+            Qwen3TTSTrainingPatch()(model)
             status = types.SimpleNamespace()
             config = types.SimpleNamespace(processor=Qwen3TTSInputProcessor(), train_status=status)
             wrapper = types.SimpleNamespace(

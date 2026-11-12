@@ -33,7 +33,7 @@ class AcceptanceContracts(unittest.TestCase):
     def cpu_batch(self, model, cfg, rows, mels):
         # These are CPU regressions even on an NPU host. Fail if the processor
         # consults the platform default instead of the supplied model device.
-        with patch('tts.qwen3.input_processor.Platform.get_local_device',
+        with patch('twinkle.processor.tts.Platform.get_local_device',
                    side_effect=AssertionError('CPU fixture must use model.device')):
             batch = previous.Qwen3TTSInputProcessor()(
                 previous.collate_qwen3_batch(rows, cfg, mels), model=model)

@@ -42,3 +42,15 @@ def install(root):
     module('twinkle.infra', collect_tensor_dict=lambda x: x)
     module('twinkle.model')
     module('twinkle.model.transformers', TransformersModel=object)
+
+    # Load the production kernels from this checkout while keeping infrastructure doubled.
+    framework = root.parents[1] / 'src' / 'twinkle'
+    module('twinkle.patch', __path__=[str(framework / 'patch')])
+    processor = sys.modules['twinkle.processor']
+    processor.__path__ = [str(framework / 'processor')]
+    loss = sys.modules['twinkle.loss']
+    loss.__path__ = [str(framework / 'loss')]
+    from twinkle.processor.tts import TTSInputProcessor
+    from twinkle.loss.qwen3_tts import TTSLoss
+    processor.TTSInputProcessor = TTSInputProcessor
+    loss.TTSLoss = TTSLoss
