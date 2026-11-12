@@ -73,6 +73,23 @@ class TestPaddingFreeMode:
         assert b['input_ids'].shape == (1, 12)
         assert b['labels'].shape == (1, 12)
 
+    def test_dense_flash_padding_free_prepares_varlen_metadata(self, monkeypatch):
+        monkeypatch.setattr(Platform, 'get_local_device', staticmethod(lambda: 'cpu'))
+        proc = InputProcessor(padding_free=True)
+        config = type('Config', (), {'_attn_implementation': 'flash_attention_2'})()
+        out = proc(_make_text_batch(3, seq_len=4), hf_config=config, enable_sp=False)
+        assert out['cu_seq_lens_q'].tolist() == [0, 4, 8, 12]
+        assert out['cu_seq_lens_k'].tolist() == [0, 4, 8, 12]
+        assert out['max_length_q'] == 4
+        assert out['max_length_k'] == 4
+
+    def test_dense_sdpa_padding_free_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(Platform, 'get_local_device', staticmethod(lambda: 'cpu'))
+        proc = InputProcessor(padding_free=True)
+        config = type('Config', (), {'_attn_implementation': 'sdpa'})()
+        with pytest.raises(RuntimeError, match='require a FlashAttention backend'):
+            proc(_make_text_batch(3, seq_len=4), hf_config=config, enable_sp=False)
+
 
 class TestMicroBatchMode:
     """micro_batch split."""

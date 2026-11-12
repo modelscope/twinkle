@@ -418,7 +418,8 @@ class InputProcessor:
         return inputs
 
     def prepare_gdn_padding_free_args(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-        if self.framework != 'transformers' or not kwargs.get('gdn_padding_free_enabled', False):
+        """Add varlen metadata for packed Transformers inputs, including dense attention models."""
+        if self.framework != 'transformers':
             return inputs
         padding_free = bool(self.padding_free or self._any_packing(inputs))
         if not padding_free or bool(kwargs.get('enable_sp', False)):
