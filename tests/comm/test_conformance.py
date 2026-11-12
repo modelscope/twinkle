@@ -27,6 +27,7 @@ _PORT_RETRIES = 3
 #: backend name -> device type its ranks bind to.
 _BACKEND_DEVICE_TYPES = {
     'gloo': 'cpu',
+    'nccl': 'cuda',
 }
 
 _BROADCAST_DTYPES = (torch.float32, torch.bfloat16, torch.int64, torch.uint8)

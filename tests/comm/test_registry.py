@@ -64,6 +64,21 @@ def test_gloo_is_registered_and_lazily_resolved(isolated_registry):
     assert registry._BACKENDS['gloo'] is GlooCommunicator
 
 
+def test_nccl_is_registered_and_lazily_resolved():
+    from twinkle.comm.backends.nccl import NCCLCommunicator
+
+    assert get_communicator_cls('nccl') is NCCLCommunicator
+    assert NCCLCommunicator.supports('all_reduce')
+    assert not NCCLCommunicator.supports('barrier')
+
+
+def test_nccl_rejects_non_cuda_device():
+    from twinkle.comm import Rendezvous
+
+    with pytest.raises(ValueError, match='cuda device'):
+        create_communicator(Rendezvous('127.0.0.1', 1), 0, 1, 'cpu', backend='nccl')
+
+
 def test_unknown_backend_lists_available():
     with pytest.raises(ValueError, match=r"'nope'.*gloo"):
         get_communicator_cls('nope')
@@ -132,7 +147,7 @@ def test_create_communicator_rejects_unknown_options(isolated_registry):
 
 
 def test_import_needs_no_accelerator_stack():
-    code = ('import sys, twinkle.comm, twinkle.comm.backends.gloo\n'
+    code = ('import sys, twinkle.comm, twinkle.comm.backends.gloo, twinkle.comm.backends.nccl\n'
             "leaked = [m for m in ('torch_npu', 'vllm', 'vllm_ascend') if m in sys.modules]\n"
             'assert not leaked, leaked\n')
     subprocess.run([sys.executable, '-c', code], check=True, timeout=120)
