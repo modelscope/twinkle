@@ -7,11 +7,12 @@ lazily-built registry. Callers invoke the dispatcher only; backend details
 (NPU, GPU, ...) stay hidden behind the interface.
 
 Importing this package also registers all built-in kernel ops (swiglu,
-rms_norm, rotary, geglu, moe, sdpa_attention, fla) into
-``twinkle.kernel.registry`` — registration modules are lightweight (lazy
+rms_norm, rotary, geglu, moe, sdpa_attention, fla, fused_varlen_attention)
+into ``twinkle.kernel.registry`` — registration modules are lightweight (lazy
 references + availability checks only, no optional-dependency imports).
 """
 # Trigger built-in op registration (must happen before the first kernelize() call)
+from . import fused_varlen_attention  # noqa: F401,E402
 from . import dsv4_sas_li, fla, geglu, moe, rms_norm, rotary, sdpa_attention, swiglu  # noqa: F401,E402
 from .ep import EpExpertsGmm, ep_forward
 
