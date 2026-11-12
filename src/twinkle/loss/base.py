@@ -11,8 +11,10 @@ class Loss:
     require_logps = True
     require_values = False
     # Consecutive samples that must stay together, in order, on one DP rank when the model reorders a
-    # batch to balance DP workloads (2 for interleaved chosen/rejected pairs). None forbids reordering.
-    dp_balance_group_size: Optional[int] = 1
+    # batch to balance DP workloads (2 for interleaved chosen/rejected pairs). Opt in only when
+    # moving whole groups between equally sized ranks preserves the objective's gradient weights.
+    # Rank-local token means and batch-dependent statistics do not satisfy that contract.
+    dp_balance_group_size: int | None = None
 
     def __call__(self, inputs: InputFeature, outputs: ModelOutput, **kwargs) -> LossOutput:
         ...

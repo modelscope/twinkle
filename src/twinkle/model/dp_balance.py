@@ -155,6 +155,20 @@ def batch_aligned(args: tuple, kwargs: dict[str, Any], batch_size: int) -> bool:
     return not any(_sliced_with_other_size(value, batch_size) for value in (*args, *kwargs.values()))
 
 
+def has_per_sample_values(value: Any) -> bool:
+    """Conservatively detect fresh batch data on a loss call whose inputs were reordered earlier."""
+    import numpy as np
+    import torch
+
+    if isinstance(value, dict):
+        return any(has_per_sample_values(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return True
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return value.ndim > 0
+    return False
+
+
 def call_lengths(args: tuple, kwargs: dict[str, Any]) -> list[int] | None:
     """Sequence lengths of a ``slice_dp`` call's ``inputs``, or None when the call cannot be reordered."""
     inputs = kwargs.get("inputs")

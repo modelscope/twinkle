@@ -117,6 +117,17 @@ class GRPOLoss(Loss):
         self.require_entropy = entropy_coef > 0.0 or log_entropy or top_entropy_quantile < 1.0
         self.require_logits = self._distill_wrap
 
+    @property
+    def dp_balance_group_size(self):
+        # Only the audited sample-mean path opts in. Subclasses with a different aggregation,
+        # reduction or call path must declare their own contract (e.g. PPO and global BNPO).
+        if (self._advanced or self._distill_wrap
+                or type(self)._aggregate_loss is not GRPOLoss._aggregate_loss
+                or type(self)._reduce_loss is not GRPOLoss._reduce_loss
+                or type(self).__call__ is not GRPOLoss.__call__):
+            return None
+        return 1
+
     def micro_batch_scale(self, inputs, indices):
         return len(indices) / len(inputs)
 
@@ -805,6 +816,11 @@ class PPOLoss(GRPOLoss):
                              f'Expected one of {sorted(self._LOSS_AGG_MODES)}.')
         self.loss_agg_mode = loss_agg_mode
 
+    @property
+    def dp_balance_group_size(self):
+        return (1 if self.loss_agg_mode == 'seq-mean-token-mean'
+                and not self._advanced and not self._distill_wrap else None)
+
     def micro_batch_scale(self, inputs, indices):
         if self.loss_agg_mode != 'token-mean':
             return super().micro_batch_scale(inputs, indices)
@@ -961,6 +977,11 @@ class BNPOLoss(GRPOLoss):
         # token 和当均值直接平均，展示出一个被 token 数放大的巨大 loss（梯度不受影响，纯展示失真）。
         self.reduction = 'sum' if token_mean_scope == 'global' else 'mean'
 
+    @property
+    def dp_balance_group_size(self):
+        return (1 if self.token_mean_scope == 'global'
+                and not self._advanced and not self._distill_wrap else None)
+
     def batch_normalizer(self, inputs):
         if self.token_mean_scope != "global":
             return None
@@ -1058,9 +1079,10 @@ class REALLoss(GRPOLoss):
         self.num_generations = num_generations
 
     @property
-    def dp_balance_group_size(self) -> int:
+    def dp_balance_group_size(self) -> int | None:
         # Each generation group is read off consecutive rows of the local batch.
-        return self.num_generations
+        # Its standalone token-mean KL term is not invariant to changing rank membership.
+        return self.num_generations if self.beta == 0.0 and not self._distill_wrap else None
 
     def _reduce_loss(
         self,

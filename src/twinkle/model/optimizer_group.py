@@ -58,6 +58,9 @@ class BaseOptimizerGroup:
     pending_loss: float = 0.0
     # Set by forward_only when the driver reordered its batch for DP balance.
     dp_balance_reordered: bool = False
+    # Full rank-local kwargs captured before forward_only splits micro-batches. None means the
+    # cached status is only the last micro-batch and cannot serve a subsequent balanced loss call.
+    dp_balance_forward_kwargs: dict[str, Any] | None = None
     dp_balance_metrics: Dict[str, List[float]] = field(default_factory=dict)
 
     def set_loss(self, loss: Loss, loss_key: Optional[str] = None) -> None:

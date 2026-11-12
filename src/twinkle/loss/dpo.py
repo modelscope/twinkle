@@ -40,7 +40,7 @@ def _cap_exp(value: 'torch.Tensor', cap: float = -1) -> 'torch.Tensor':
 class PreferenceLossBase(Loss):
     """Base class for preference optimization losses with shared utilities."""
 
-    dp_balance_group_size = 2
+    dp_balance_group_size = None
 
     def __init__(self, ignore_index: int = -100):
         self.ignore_index = ignore_index
@@ -277,6 +277,11 @@ class DPOLoss(PreferenceLossBase):
             weight = weights[idx] if weights is not None else 1.0
             total = variant * weight if total is None else total + variant * weight
         return total.mean()
+
+    @property
+    def dp_balance_group_size(self):
+        # The auxiliary chosen-token NLL is a rank-local token mean.
+        return 2 if self.sft_weight == 0 else None
 
     def _variant_losses(
         self,
@@ -611,6 +616,8 @@ class SimPOLoss(PreferenceLossBase):
         gamma: Target reward margin (default: 0.5).
         ignore_index: Index to ignore in labels (default: -100).
     """
+
+    dp_balance_group_size = 2
 
     def __init__(
         self,

@@ -266,7 +266,8 @@ def test_group_size_follows_the_loss():
     from twinkle.loss.base import dp_balance_group_size
 
     assert dp_balance_group_size(None) == 1
-    assert dp_balance_group_size(CrossEntropyLoss()) == 1
+    assert dp_balance_group_size(CrossEntropyLoss()) is None
+    assert dp_balance_group_size(CrossEntropyLoss(reduction='sum')) == 1
     assert dp_balance_group_size(DPOLoss()) == 2
     assert dp_balance_group_size(lambda inputs, outputs: 0) is None
 

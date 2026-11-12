@@ -38,6 +38,7 @@ class PointwiseRerankerLoss(Loss):
     """
 
     require_logits = True
+    dp_balance_group_size = 1
     require_entropy = False
     require_logps = False
 
