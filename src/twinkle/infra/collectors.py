@@ -62,10 +62,12 @@ def tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) -> Dict[
             raise NotImplementedError('Numpy array not supported for now.')
 
         else:
-            result[key] = values
+            # One surviving worker keeps the bare value -- the counterpart of stacking a single
+            # tensor, which adds no batch row either; several keep the per-worker list, the
+            # scalar counterpart of that batch dimension. No key is special-cased: which
+            # quantity a scalar reports, and how a caller folds it, is the caller's business.
+            result[key] = values[0] if len(values) == 1 else values
 
-    if 'loss' in result and len(result['loss']) > 1:
-        result['loss'] = np.mean(result['loss'])
     return result
 
 

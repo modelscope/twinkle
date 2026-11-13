@@ -172,6 +172,11 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
         # global ranks belong to the same actor (TP peers).
         _mesh_world = device_mesh.world_size if device_mesh is not None else length
         _rank_stride = max(1, _mesh_world // length)
+        if _rank_stride * length != _mesh_world:
+            raise ValueError(
+                f'slice_dp dispatch needs the {length} workers to tile the device mesh exactly '
+                f'(world_size {_mesh_world}): uneven tiling leaves data ranks unserved, and their '
+                'outputs silently drop out of the collect step.')
 
         def dispatch_func(arg, n):
             import torch
@@ -704,6 +709,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     workers = _get_workers([None] * world_size, execute)
                     local_dispatch = dispatch
                     local_mesh = device_mesh
+                    # 'first' and 'peer' hand this process a one-entry subset (its own slot);
+                    # indexing it by the GLOBAL rank reads past it. 'all' keeps every rank, so
+                    # the rank itself is the entry index.
+                    entry = rank if execute == 'all' else 0
                 else:
                     # The caller sent the refs to every worker unsliced; slice here, now that the
                     # structure is visible.
@@ -711,7 +720,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     workers = [None] * world_size
                     local_dispatch = 'slice' if pool and dispatch == 'slice_dp' else dispatch
                     local_mesh = None if pool else device_mesh
-                _, args, kwargs = _dispatch_args(workers, local_dispatch, execute, local_mesh, args, kwargs)[rank]
+                    # The caller numbered the entries of the worker list it dispatched to, and
+                    # this rank's index is its position in that same list.
+                    entry = rank
+                _, args, kwargs = _dispatch_args(workers, local_dispatch, execute, local_mesh, args, kwargs)[entry]
             if enable_continous_work and getattr(self, '_twinkle_draining', False):
                 raise WorkerDraining(f'{func.__name__}: this replica is leaving its pool.')
             try:
