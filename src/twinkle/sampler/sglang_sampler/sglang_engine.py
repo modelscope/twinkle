@@ -477,7 +477,30 @@ class SGLangEngine(BaseSamplerEngine):
         else:
             logger.info(f'Updated {total} weights into the sglang engine')
 
-    async def _flush_bucket(self, bucket: List[Tuple[str, torch.Tensor]], flush_cache: bool) -> None:
+    async def update_weights_delta(self, flushes: list[tuple[list[tuple[str, torch.Tensor]], bool]]) -> None:
+        """Apply the delta engine's collected flushes: one tensor update per flush.
+
+        ``flushes`` is the trainer's collected ``(named_tensors, is_last)`` stream (see
+        :class:`twinkle.checkpoint_engine.delta.transport.collect_engine.DeltaCollectEngine`):
+        each flush carries ``__delta_spec__`` / ``__positions__`` / ``__values__`` and is handed
+        to sglang with ``load_format`` pointing at twinkle's delta loader, which decodes and
+        masked-applies it inside every TP worker process. The KV cache is flushed once, on the
+        stream's last flush -- the model is only consistent again at the end of the stream, the
+        same reason :meth:`update_weights` buckets with ``flush_cache=False``.
+        """
+        from twinkle.checkpoint_engine.delta.rollout.sglang_loader import LOADER_FQN
+
+        applied = 0
+        for named, is_last in flushes:
+            await self._flush_bucket(list(named), flush_cache=is_last, load_format=LOADER_FQN)
+            applied += 1
+        if applied:
+            logger.info(f'Applied {applied} delta flushes into the sglang engine (in-place via the delta loader)')
+        else:
+            logger.info('delta round carried no flushes: the rollout weights are unchanged')
+
+    async def _flush_bucket(self, bucket: List[Tuple[str, torch.Tensor]], flush_cache: bool,
+                           load_format: Optional[str] = None) -> None:
         """Hand one bucket to sglang, which forwards it to the TP workers as CUDA IPC handles.
 
         ``monkey_patch_torch_reductions`` swaps the device index inside each handle for the physical
@@ -495,7 +518,7 @@ class SGLangEngine(BaseSamplerEngine):
                 MultiprocessingSerializer.serialize([(name, tensor.detach()) for name, tensor in bucket])
                 for _ in range(self.tensor_parallel_size)
             ],
-            load_format=None,
+            load_format=load_format,
             flush_cache=flush_cache,
         )
         success, message = await self._manager.update_weights_from_tensor(request, None)

@@ -27,8 +27,8 @@ def _spawn_receiver(node_id: str, env_vars: dict[str, str], args: tuple) -> Any:
     ).remote(*args)
 
 
-class DeltaSamplerMixin:
-    """Sampler-side delta lifecycle RPCs (device-aware: CUDA uses receiver actors, NPU does not)."""
+class VLLMDeltaSamplerMixin:
+    """vLLM sampler's delta lifecycle RPCs (device-aware: CUDA uses receiver actors, NPU does not)."""
     _delta_config: DeltaSyncConfig
     _delta_job_failed: bool = False
     _delta_weight_transfer_initialized: bool = False

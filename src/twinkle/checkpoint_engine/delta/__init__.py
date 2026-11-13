@@ -17,8 +17,14 @@ Layout:
         gather.py      sparse gather of per-rank deltas to rank 0
         nccl_engine.py DeltaShardedCheckpointEngine: NCCL transport (hooks + rollout receive)
         hccl_engine.py DeltaHCCLCheckpointEngine: HCCL (Ascend NPU) sender transport
+        collect_engine.py DeltaCollectEngine: gathers the flushes to rank 0 and RETURNS them (no
+                       wire) -- the manager forwards the stream to an SGLang sampler
     rollout/       rollout side
-        mixin.py       DeltaSamplerMixin: rollout-side lifecycle RPCs driven by vLLMSampler
+        mixin.py       VLLMDeltaSamplerMixin: rollout-side lifecycle RPCs driven by vLLMSampler
+        sglang_mixin.py SGLangDeltaSamplerMixin: the SGLang sampler's lifecycle RPCs (in-process
+                       receive: the manager hands it the collected flush stream)
+        sglang_loader.py apply_delta: in-process sparse apply inside every SGLang TP worker, loaded
+                       via SGLang's custom_weight_loader hook
         cuda_receiver.py  CudaDeltaReceiver: Ray actor per vLLM worker, NCCL receive + CUDA IPC relay (GPU)
         hccl_receiver.py  HCCL receive pump that runs inside each vLLM worker process (NPU)
     ../zmq_pubsub.py   zmq PUB/SUB manifest-channel helpers shared by the NCCL and HCCL engines

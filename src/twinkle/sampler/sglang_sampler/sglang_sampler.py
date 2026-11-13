@@ -11,6 +11,7 @@ import numpy as np
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
+from twinkle.checkpoint_engine.delta.rollout.sglang_mixin import SGLangDeltaSamplerMixin
 from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
                                  SamplingParams, Trajectory)
 from twinkle.hub import HubOperation
@@ -42,7 +43,7 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
 
 
 @remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
-class SGLangSampler(Sampler, CheckpointEngineMixin):
+class SGLangSampler(Sampler, CheckpointEngineMixin, SGLangDeltaSamplerMixin):
     """An sglang-based sampler using :class:`SGLangEngine`.
 
     Mirrors :class:`vLLMSampler`: tensor parallelism is taken from the visible devices unless given
@@ -113,6 +114,9 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
 
         from .sglang_engine import SGLangEngine
         engine_kwargs = engine_args.copy() if engine_args else {}
+        # The delta lane validates its engine-side registration (custom_weight_loader) against
+        # the exact kwargs the engine was built with, so keep the post-defaults copy.
+        self._sglang_engine_kwargs = engine_kwargs
 
         if 'tensor_parallel_size' not in engine_kwargs:
             tp_size = 1

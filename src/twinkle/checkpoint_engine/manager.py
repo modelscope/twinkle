@@ -4,6 +4,7 @@ import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace as _replace
 from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional
 
@@ -136,7 +137,19 @@ class CheckpointEngineManager:
         if sync_backend == 'delta_sharded':
             # Fail at construction, not mid-sync, when the platform has no delta transport.
             self._delta_platform = Platform.get_platform(platform).__name__
-            self.delta_engine_cls = resolve_delta_engine_cls(self._delta_platform)
+            # SGLang samplers receive in process (sglang's own update channel is the
+            # transport), so the trainer collects the flush stream instead of broadcasting it.
+            # Probed on the CLASS, not the instance: a unittest.mock.Mock sampler answers
+            # hasattr on every name, and a flipped probe would route the wire lane into the
+            # collect orchestration.
+            self._delta_collect = hasattr(type(self.sampler), 'receive_delta_flushes')
+            if self._delta_collect:
+                if self._delta_platform != 'GPU':
+                    raise ValueError('delta_sharded on an SGLang sampler is CUDA-only: the collect '
+                                     'engine gathers the flush stream on the trainer GPUs.')
+                self.delta_config = _replace(self.delta_config, transport='collect')
+            else:
+                self.delta_engine_cls = resolve_delta_engine_cls(self._delta_platform)
         self._delta_replica_count = None
         self._delta_round = 0
         self._delta_failed = False
@@ -424,6 +437,13 @@ class CheckpointEngineManager:
     # ── Delta ────────────────────────────────────────────────────────────────
 
     def _prepare_delta_transport(self):
+        if getattr(self, '_delta_collect', False):
+            capabilities = self.sampler.validate_delta_sampler(self.delta_config)
+            replicas = capabilities if isinstance(capabilities, list) else [capabilities]
+            # No wire endpoint: the flush stream travels through the manager itself, so the only
+            # trainer-side preparation is the collect engine (built inside prepare_delta_sync).
+            self.model.prepare_delta_sync(self.delta_config)
+            return None, len(replicas)
         capabilities = self.sampler.validate_delta_sampler(self.delta_config)
         replicas = capabilities if isinstance(capabilities, list) else [capabilities]
         if self._delta_platform == 'NPU':
@@ -465,11 +485,30 @@ class CheckpointEngineManager:
             endpoint, replica_count = self._prepare_delta_transport()
         try:
             self.sampler.begin_delta_sync()
-            if seed:
-                _together(lambda: self.model.init_delta_transport(endpoint),
-                          lambda: self.sampler.init_delta_sampler_transport(endpoint))
-                self._delta_replica_count = replica_count
-            metrics, worker_metrics = _together(self.model.send_delta_weights, self.sampler.receive_delta_weights)
+            if getattr(self, '_delta_collect', False):
+                # Collect-then-forward: the trainer gathers the flush stream on rank 0 and hands
+                # it back; the sampler then forwards each flush into its TP workers through
+                # sglang's own update channel. The halves are strictly ordered (the stream must
+                # exist before it can be applied), unlike the wire lane's overlapping pair.
+                if seed:
+                    self._delta_replica_count = replica_count
+                sends = _wait(self.model.send_delta_weights())
+                sends = [send for send in (sends if isinstance(sends, list) else [sends])
+                         if isinstance(send, dict)]
+                # Rank 0's engine is the only collector, but every rank's result carries the
+                # key (an empty stream is a legitimate zero-change round, not a failure).
+                flushes = next((send['flushes'] for send in sends if 'flushes' in send), None)
+                if flushes is None:
+                    raise RuntimeError('the delta collect engine returned no flush stream: the '
+                                       "trainer side did not gather rank 0's flushes")
+                metrics = [{k: v for k, v in send.items() if k != 'flushes'} for send in sends]
+                worker_metrics = _wait(self.sampler.receive_delta_flushes(flushes))
+            else:
+                if seed:
+                    _together(lambda: self.model.init_delta_transport(endpoint),
+                              lambda: self.sampler.init_delta_sampler_transport(endpoint))
+                    self._delta_replica_count = replica_count
+                metrics, worker_metrics = _together(self.model.send_delta_weights, self.sampler.receive_delta_weights)
             results = worker_metrics if isinstance(worker_metrics, list) else [worker_metrics]
             if len(results) != self._delta_replica_count or any(
                     result['changed'] != results[0]['changed'] for result in results):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypedDict, Union
+from typing import TYPE_CHECKING, Literal, TypedDict, Union
 from typing_extensions import NotRequired
 
 if TYPE_CHECKING:
@@ -24,6 +24,10 @@ class DeltaSyncConfig:
     gather_batch_size: int = 32
     delta_pin_snapshots: bool = True
     free_cache_engine: bool = True
+    #: How the trainer's gathered flushes leave rank 0. 'wire' broadcasts them through the
+    #: NCCL/HCCL engine to the vLLM receiver actors; 'collect' returns them to the manager,
+    #: which forwards them to an SGLang sampler (sglang's own update channel is the transport).
+    transport: Literal['wire', 'collect'] = 'wire'
 
     def __post_init__(self):
         if not isinstance(self.gather_batch_size, int) or self.gather_batch_size < 1:
@@ -32,6 +36,8 @@ class DeltaSyncConfig:
             raise ValueError('delta bucket must hold at least one int32 index and BF16 value')
         if not 0 < self.timeout_seconds < float('inf'):
             raise ValueError('delta timeout must be finite and positive')
+        if self.transport not in ('wire', 'collect'):
+            raise ValueError(f"delta transport must be 'wire' or 'collect', got {self.transport!r}")
 
 
 class DeltaTransportEndpoint(TypedDict):
