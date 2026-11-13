@@ -1164,6 +1164,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     'logits. Run the whole batch in one forward (the default), or use the megatron backend, '
                     'whose collate splits at record level.')
         plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        if optimizer_config.dp_balance_reordered and len(plan) == 1 and list(plan[0]) == list(range(len(inputs))):
+            # One in-order micro-batch leaves the whole rank batch cached, as the unbatched path does.
+            optimizer_config.dp_balance_forward_kwargs = dict(kwargs)
         batches = []
         for indices in plan:
             micro_kwargs = {key: select_batch(value, indices, len(inputs)) for key, value in kwargs.items()}

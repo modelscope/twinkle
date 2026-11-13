@@ -19,6 +19,7 @@ from twinkle.loss import (
     GKDLoss,
     GRPOLoss,
     KLCovLoss,
+    KTOLoss,
     LigerFusedLinearCrossEntropyLoss,
     Loss,
     MOPDLoss,
@@ -26,6 +27,7 @@ from twinkle.loss import (
     ORPOLoss,
     PPOLoss,
     PPOValueLoss,
+    PointwiseRerankerLoss,
     REALLoss,
     RewardLoss,
     SimPOLoss,
@@ -53,6 +55,8 @@ from .test_grpo_micro_batch import TrainingHarness
         REALLoss(beta=0.1),
         GRPOLoss(top_entropy_quantile=0.5),
         GRPOLoss(loss_type="fipo"),
+        GRPOLoss(sdar_loss_coef=0.1),
+        PPOLoss(loss_agg_mode="seq-mean-token-mean", top_entropy_quantile=0.5),
         ChannelLoss(),
         ChunkedCrossEntropyLoss(chunk_size=4),
         LigerFusedLinearCrossEntropyLoss(reduction="mean"),
@@ -107,10 +111,98 @@ def test_rank_local_token_means_change_gradients_if_reordered(loss):
         (SimPOLoss(), 2),
         (RewardLoss(), 2),
         (REALLoss(num_generations=4), 4),
+        (KTOLoss(), 1),
+        (PointwiseRerankerLoss(), 1),
+        (GRPOLoss(overlong_filter=True, delta=3.0, log_entropy=True), 1),
+        (GRPOLoss(rollout_importance_sampling_mode="token_truncate", log_rollout_offpolicy_metrics=True), 1),
+        (GRPOLoss(off_policy_sequence_mask_delta=0.1, importance_sampling_level="sequence"), 1),
+        (PPOLoss(loss_agg_mode="seq-mean-token-mean", rollout_importance_sampling_mode="sequence_mask"), 1),
     ],
 )
 def test_audited_invariant_losses_keep_balancing_enabled(loss, size):
     assert dp_balance_group_size(loss) == size
+
+
+class _ScoreHarness(TrainingHarness):
+    """One relevance logit per row, for losses that read a score head instead of token log-probs."""
+
+    def forward(self, *, inputs, **kwargs):
+        status = self.optimizer_group["default"].train_status
+        status.inputs = {"labels": torch.tensor([row["relevance"] for row in inputs], dtype=torch.float64)}
+        scores = torch.tensor([[sum(row["coefficients"])] for row in inputs], dtype=torch.float64)
+        status.outputs = {"logits": self.weight * scores}
+        status.loss_value = 0.0
+        return dict(status.outputs)
+
+
+def _assert_reordering_preserves_gradient(factory, signals, harness=TrainingHarness):
+    lengths = [9, 8, 1, 1]
+    rows = [
+        {
+            "input_ids": [index] * length,
+            "labels": [1] * length,
+            "coefficients": [0.1 * (index + 1) * (position + 1) for position in range(length)],
+            "relevance": float(index % 2),
+        }
+        for index, length in enumerate(lengths)
+    ]
+    kwargs = {"inputs": rows, **signals}
+    planner = _FakeModel(group_size=dp_balance_group_size(factory()))
+    plan, _, balanced = planner._dp_balance_call("forward_backward", (), kwargs)
+    assert plan is not None and plan.reorders
+
+    def gradient(batch):
+        models = [harness(factory()), harness(factory())]
+        for rank, model in enumerate(models):
+            lo, hi = rank * 2, (rank + 1) * 2
+            shard = {
+                key: value[lo:hi] if isinstance(value, list) else value
+                for key, value in batch.items()
+                if key not in ("inputs", "_dp_balance")
+            }
+            model.run(batch["inputs"][lo:hi], **shard)
+        return sum(model.weight.grad for model in models) / sum(
+            model.optimizer_group["default"].train_status.num_tokens for model in models
+        )
+
+    torch.testing.assert_close(gradient(kwargs), gradient(balanced))
+
+
+def test_kto_reordering_preserves_training_gradient():
+    signals = {
+        "label": [True, False, False, True],
+        "z_kl": 0.05,
+        "ref_logps": [[-0.02 * (index + 1)] * length for index, length in enumerate([9, 8, 1, 1])],
+    }
+    _assert_reordering_preserves_gradient(lambda: KTOLoss(beta=0.5, undesirable_weight=1.5), signals)
+
+
+def test_pointwise_reranker_reordering_preserves_training_gradient():
+    _assert_reordering_preserves_gradient(PointwiseRerankerLoss, {}, harness=_ScoreHarness)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: GRPOLoss(overlong_filter=True, delta=1.0),
+        lambda: GRPOLoss(rollout_importance_sampling_mode="sequence_truncate", rollout_importance_sampling_threshold=1.01),
+        lambda: GRPOLoss(off_policy_sequence_mask_delta=0.0, importance_sampling_level="sequence"),
+        lambda: PPOLoss(
+            loss_agg_mode="seq-mean-token-mean",
+            rollout_importance_sampling_mode="token_truncate",
+            rollout_importance_sampling_threshold=1.01,
+        ),
+    ],
+)
+def test_per_sample_grpo_controls_preserve_training_gradient(factory):
+    lengths = [9, 8, 1, 1]
+    signals = {
+        "advantages": [1.0, -0.5, 0.7, -1.2],
+        "old_logps": [[0.01 * (index + 1)] * length for index, length in enumerate(lengths)],
+        "rollout_logps": [[0.03 * index] * length for index, length in enumerate(lengths)],
+        "truncated": [False, True, False, False],
+    }
+    _assert_reordering_preserves_gradient(factory, signals)
 
 
 @pytest.mark.parametrize(
@@ -199,14 +291,27 @@ def test_calculate_loss_rejects_fresh_per_sample_arguments_after_reordering(extr
         unwrap(TransformersModel.calculate_loss)(model, **extra)
 
 
+def _micro_batched_model():
+    model, group = _cached_model()
+    model._build_micro_batch_plan = lambda inputs, config, optimizer_config: [
+        list(range(start, min(start + config.micro_batch_size, len(inputs))))
+        for start in range(0, len(inputs), config.micro_batch_size)
+    ]
+    model._forward_only_micro_batches = lambda **kwargs: TransformersModel._forward_only_micro_batches(model, **kwargs)
+    return model, group
+
+
 def test_reordered_micro_batch_forward_only_cannot_calculate_loss_from_last_micro_batch():
-    model, _ = _cached_model()
-    model._forward_only_micro_batches = lambda **kwargs: model._forward_only_single(
-        **{key: value for key, value in kwargs.items() if key != "config"}
-    )
+    model, _ = _micro_batched_model()
     _forward(model, advantages=[1.0, 2.0], micro_batch_size=1)
     with pytest.raises(ValueError, match="micro-batch"):
         unwrap(TransformersModel.calculate_loss)(model)
+
+
+def test_reordered_single_micro_batch_forward_only_supports_calculate_loss():
+    model, _ = _micro_batched_model()
+    _forward(model, advantages=[1.0, 2.0], micro_batch_size=2)
+    assert unwrap(TransformersModel.calculate_loss)(model) == pytest.approx(-1.5)
 
 
 def test_reordered_forward_only_does_not_allow_switching_loss_groups():

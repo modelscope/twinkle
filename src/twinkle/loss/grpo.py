@@ -121,12 +121,18 @@ class GRPOLoss(Loss):
     def dp_balance_group_size(self):
         # Only the audited sample-mean path opts in. Subclasses with a different aggregation,
         # reduction or call path must declare their own contract (e.g. PPO and global BNPO).
-        if (self._advanced or self._distill_wrap
+        if (not self._dp_balance_controls_invariant() or self._distill_wrap
                 or type(self)._aggregate_loss is not GRPOLoss._aggregate_loss
                 or type(self)._reduce_loss is not GRPOLoss._reduce_loss
                 or type(self).__call__ is not GRPOLoss.__call__):
             return None
         return 1
+
+    def _dp_balance_controls_invariant(self) -> bool:
+        # Dual-clip, overlong/off-policy masks, rollout IS and the logging channels act per token or
+        # per sequence. The entropy quantile is taken over the local batch and FIPO aggregates a
+        # local token mean, so both depend on which samples share a rank.
+        return self.loss_type != 'fipo' and self.top_entropy_quantile >= 1.0
 
     def micro_batch_scale(self, inputs, indices):
         return len(indices) / len(inputs)
@@ -819,7 +825,7 @@ class PPOLoss(GRPOLoss):
     @property
     def dp_balance_group_size(self):
         return (1 if self.loss_agg_mode == 'seq-mean-token-mean'
-                and not self._advanced and not self._distill_wrap else None)
+                and self._dp_balance_controls_invariant() and not self._distill_wrap else None)
 
     def micro_batch_scale(self, inputs, indices):
         if self.loss_agg_mode != 'token-mean':
