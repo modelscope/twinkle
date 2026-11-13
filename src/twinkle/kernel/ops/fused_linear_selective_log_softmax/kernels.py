@@ -11,9 +11,9 @@ NUM_WARPS = 8
 
 @triton.jit
 def stats_row_kernel(LOGITS, TARGETS, LSE, LOGPS, V, BLOCK_SIZE: tl.constexpr):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     base = row * V
-    target = tl.load(TARGETS + row).to(tl.int64)
+    target = tl.load(TARGETS + row)
     running_max = -float('inf')
     running_sum = 0.0
     target_logit = 0.0
@@ -35,9 +35,9 @@ def stats_row_kernel(LOGITS, TARGETS, LSE, LOGPS, V, BLOCK_SIZE: tl.constexpr):
 @triton.jit
 def backward_row_kernel(LOGITS, TARGETS, LSE, EXPECTED, GRAD_LOGPS, GRAD_ENTROPIES, V, HAS_ENTROPY: tl.constexpr,
                         BLOCK_SIZE: tl.constexpr):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     base = row * V
-    target = tl.load(TARGETS + row).to(tl.int64)
+    target = tl.load(TARGETS + row)
     lse = tl.load(LSE + row)
     grad_logp = tl.load(GRAD_LOGPS + row).to(tl.float32)
     if HAS_ENTROPY:

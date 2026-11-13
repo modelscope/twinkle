@@ -104,13 +104,53 @@ def test_npu_frozen_weight_skips_weight_gradient():
 
 @pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
 def test_npu_repeated_backward_is_rejected():
-    x = torch.randn(4, 8, device='npu', requires_grad=True)
-    weight = torch.randn(31, 8, device='npu')
+    x = torch.randn(4, 8, device='npu', dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(31, 8, device='npu', dtype=torch.bfloat16)
     targets = torch.randint(0, 31, (4, ), device='npu')
     logps = fused_linear_selective_log_softmax(x, weight, targets)
     torch.autograd.grad(logps.sum(), x, retain_graph=True)
     with pytest.raises(RuntimeError, match='repeated backward'):
         torch.autograd.grad(logps.sum(), x)
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+def test_real_vocab_matches_native(dtype):
+    # Qwen-family vocabulary size: exercises the full [rows, 151936] logits workspace
+    # and the row * V address arithmetic of the Ascend kernels.
+    _check_forward_backward('cpu', dtype, False, shape=(64, 2048, 151936))
+
+
+@pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize('return_entropy', [False, True])
+def test_npu_real_vocab_matches_native(dtype, return_entropy):
+    _check_forward_backward('npu', dtype, return_entropy, shape=(128, 2048, 151936))
+
+
+def test_float_targets_are_rejected():
+    x = torch.randn(4, 8)
+    weight = torch.randn(31, 8)
+    targets = torch.randint(0, 31, (4, )).float()
+    with pytest.raises(ValueError, match='integer'):
+        fused_linear_selective_log_softmax(x, weight, targets)
+
+
+def test_int32_targets_are_accepted():
+    x = torch.randn(4, 8)
+    weight = torch.randn(31, 8)
+    targets = torch.randint(0, 31, (4, ), dtype=torch.int32)
+    logps = fused_linear_selective_log_softmax(x, weight, targets)
+    expected = _native(x, weight, targets.long(), 1.0, False)
+    torch.testing.assert_close(logps, expected, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
+def test_npu_out_of_range_targets_are_rejected():
+    x = torch.randn(4, 8, device='npu', dtype=torch.bfloat16)
+    weight = torch.randn(31, 8, device='npu', dtype=torch.bfloat16)
+    targets = torch.tensor([0, 1, 2, 31], device='npu')
+    with pytest.raises(IndexError, match='vocabulary'):
+        fused_linear_selective_log_softmax(x, weight, targets)
 
 
 @pytest.mark.parametrize('kwargs', [

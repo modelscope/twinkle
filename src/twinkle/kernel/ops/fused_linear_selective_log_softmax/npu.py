@@ -1,10 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Ascend fused lm_head projection and selective log-softmax."""
+"""Ascend Triton fused lm_head projection and selective log-softmax (BF16)."""
 from __future__ import annotations
 
 import torch
 
 from .kernels import backward_launch, stats_launch
+
+# Entropy's E_p[z] reduction runs in FP32 over row chunks; chunking is over rows,
+# so per-row math is chunk-size independent.
+_ENTROPY_CHUNK_BYTES = 128 << 20
 
 
 class _FusedLinearSelectiveLogSoftmax(torch.autograd.Function):
@@ -16,31 +20,18 @@ class _FusedLinearSelectiveLogSoftmax(torch.autograd.Function):
         rows = x.shape[0]
         lse = torch.empty(rows, dtype=torch.float32, device=x.device)
         logps = torch.empty(rows, dtype=torch.float32, device=x.device)
-        entropies = None
         expected = torch.empty_like(logps) if return_entropy else lse
-        if x.dtype == torch.float32:
-            temporary_bytes = 32 << 20 if return_entropy else 64 << 20
-            chunk_rows = max(1, temporary_bytes // (logits.shape[-1] * 4))
+        stats_launch(logits, targets, lse, logps)
+        if return_entropy:
+            chunk_rows = max(1, _ENTROPY_CHUNK_BYTES // (logits.shape[-1] * 4))
             for start in range(0, rows, chunk_rows):
                 stop = min(start + chunk_rows, rows)
-                chunk = logits[start:stop]
-                lse[start:stop] = torch.logsumexp(chunk, dim=-1)
-                selected = torch.gather(chunk, dim=-1, index=targets[start:stop].unsqueeze(-1)).squeeze(-1)
-                logps[start:stop] = selected - lse[start:stop]
-                if return_entropy:
-                    probabilities = torch.softmax(chunk, dim=-1)
-                    expected[start:stop] = (probabilities * chunk).sum(dim=-1)
-        else:
-            stats_launch(logits, targets, lse, logps)
-            if return_entropy:
-                chunk_rows = max(1, (32 << 20) // (logits.shape[-1] * 4))
-                for start in range(0, rows, chunk_rows):
-                    stop = min(start + chunk_rows, rows)
-                    wide = logits[start:stop].float()
-                    probabilities = torch.softmax(wide, dim=-1)
-                    expected[start:stop] = (probabilities * wide).sum(dim=-1)
-        if return_entropy:
+                wide = logits[start:stop].float()
+                probabilities = torch.softmax(wide, dim=-1)
+                expected[start:stop] = (probabilities * wide).sum(dim=-1)
             entropies = lse - expected
+        else:
+            entropies = None
 
         ctx.save_for_backward(logits, targets, lse, expected, x, weight)
         ctx.return_entropy = return_entropy
@@ -66,23 +57,7 @@ class _FusedLinearSelectiveLogSoftmax(torch.autograd.Function):
         if grad_entropies is not None:
             grad_entropies = grad_entropies.contiguous()
         grad_logps = grad_logps.contiguous()
-        if logits.dtype == torch.float32:
-            temporary_bytes = 32 << 20 if ctx.return_entropy else 64 << 20
-            chunk_rows = max(1, temporary_bytes // (logits.shape[-1] * 4))
-            for start in range(0, logits.shape[0], chunk_rows):
-                stop = min(start + chunk_rows, logits.shape[0])
-                chunk = logits[start:stop]
-                probabilities = torch.softmax(chunk, dim=-1)
-                grad_chunk = torch.zeros_like(chunk)
-                grad_logp = grad_logps[start:stop].unsqueeze(-1)
-                grad_chunk.scatter_add_(dim=-1, index=targets[start:stop].unsqueeze(-1), src=grad_logp)
-                grad_chunk.sub_(probabilities * grad_logp)
-                if ctx.return_entropy:
-                    grad_entropy = grad_entropies[start:stop].unsqueeze(-1)
-                    grad_chunk.add_(probabilities * (grad_entropy * (expected[start:stop].unsqueeze(-1) - chunk)))
-                chunk.copy_(grad_chunk)
-        else:
-            backward_launch(logits, targets, lse, expected, grad_logps, grad_entropies)
+        backward_launch(logits, targets, lse, expected, grad_logps, grad_entropies)
         logits.div_(ctx.temperature)
         grad_x = torch.mm(logits, weight) if ctx.needs_input_grad[0] else None
         grad_weight = torch.mm(logits.t(), x) if ctx.needs_input_grad[1] else None
@@ -90,5 +65,10 @@ class _FusedLinearSelectiveLogSoftmax(torch.autograd.Function):
 
 
 def npu_fused_linear_selective_log_softmax(x, weight, targets, temperature=1.0, return_entropy=False):
+    # The functional entry has already validated the integer dtype and normalized to
+    # int64; this explicit range check mirrors native gather, which rejects out-of-range
+    # indices instead of silently producing wrong probabilities in the Triton kernels.
+    if not torch.logical_and(targets >= 0, targets < weight.shape[0]).all():
+        raise IndexError(f'targets must be within the vocabulary range [0, {weight.shape[0]})')
     return _FusedLinearSelectiveLogSoftmax.apply(x.contiguous(), weight.contiguous(),
-                                                 targets.contiguous().long(), temperature, return_entropy)
+                                                 targets.contiguous(), temperature, return_entropy)

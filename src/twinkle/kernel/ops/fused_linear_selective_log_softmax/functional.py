@@ -23,6 +23,8 @@ def _validate_inputs(x, weight, targets, temperature):
         raise ValueError(f'unsupported x/weight dtypes: {x.dtype} and {weight.dtype}')
     if x.shape[0] == 0 or weight.shape[0] == 0:
         raise ValueError('token and vocabulary dimensions must be non-empty')
+    if targets.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        raise ValueError(f'targets must have an integer dtype, got {targets.dtype}')
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError(f'temperature must be finite and positive, got {temperature!r}')
 
@@ -44,16 +46,19 @@ def fused_linear_selective_log_softmax_reference(x, weight, targets, temperature
 def fused_linear_selective_log_softmax(x, weight, targets, temperature=1.0, return_entropy=False):
     """Compute selected log-probabilities from hidden states without exposing logits.
 
-    The Ascend implementation owns the logits workspace and reuses it for its
-    gradient. It supports one first-order backward per forward. FP32 hidden
-    states with a BF16 weight follow the usual mixed-precision cast. Other
-    devices use the native PyTorch reference implementation.
+    The Ascend Triton implementation owns the logits workspace and reuses it for its
+    gradient. It supports one first-order backward per forward. FP32 hidden states
+    with a BF16 weight follow the usual mixed-precision cast. FP32 inputs and
+    non-NPU devices use the native PyTorch reference: the strict FP32 gradient
+    tolerance requires native-order reductions, which measured slower than the
+    native pipeline itself, so only the BF16 path ships a fused kernel.
     """
     temperature = float(temperature)
     _validate_inputs(x, weight, targets, temperature)
+    targets = targets.long()
     if x.dtype != weight.dtype:
         x = x.to(weight.dtype)
-    if x.device.type == 'npu':
+    if x.device.type == 'npu' and x.dtype == torch.bfloat16:
         from .npu import npu_fused_linear_selective_log_softmax
         return npu_fused_linear_selective_log_softmax(x, weight, targets, temperature, return_entropy)
     return fused_linear_selective_log_softmax_reference(x, weight, targets, temperature, return_entropy)
