@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, Literal, Union
 from twinkle import remote_class, remote_function
 
 from .base import Advantage
-from ._utils import apply_kl_in_reward, reduce_rewards
+from ._utils import apply_kl_in_reward, nanstd, reduce_rewards
 
 if TYPE_CHECKING:
     import torch
@@ -77,11 +77,18 @@ class GRPOPassKAdvantage(Advantage):
 
         for g in range(n_groups):
             group_rewards = grouped[g]
-            topk_vals, topk_idx = torch.topk(group_rewards, 2)
+            if (~torch.isnan(group_rewards)).sum() < 2:
+                # Fewer than two scored responses: the top-2 ranking is undefined, so the group
+                # keeps its zeros instead of letting an unscored row win the top-2.
+                continue
+            # An unscored row rides as NaN out of reduce_rewards, and torch.topk sorts NaN as the
+            # largest value -- map it to -inf so it can never take r_max / r_second_max.
+            ranked = torch.nan_to_num(group_rewards, nan=float('-inf'))
+            topk_vals, topk_idx = torch.topk(ranked, 2)
             r_max, r_second_max = topk_vals[0], topk_vals[1]
             adv_val = r_max - r_second_max
             if norm_by_std:
-                std = group_rewards.std()
+                std = nanstd(group_rewards)
                 adv_val = adv_val / (std + epsilon)
             advantages[g, topk_idx[0]] = adv_val
 

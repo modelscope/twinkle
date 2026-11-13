@@ -270,6 +270,10 @@ class Advantage:
             kl_values = self._kl(old_logps, ref_logps, kind=self.kl_kind)
         # None (an unparseable judge verdict) rides as nan, exactly as the scorer recorded it; a
         # no-scorer row (no ORM wired) stays [nan] -- a zero-column tensor cannot carry a group mean.
+        # The nan rows then land per estimator: the grpo / rloo / passk lanes exclude them from the
+        # group statistics and zero their advantage (see reduce_rewards / nanstd); the remaining
+        # scalar estimators and gae fold them to 0, and gae refuses a batch with no valid score at
+        # all.
         orm_rows = [self._orm_row(score) for score in scores]
         matrix_rows = [[float('nan') if value is None or value != value else float(value) for value in row]
                        or [float('nan')] for row in orm_rows]

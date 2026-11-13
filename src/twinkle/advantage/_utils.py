@@ -34,14 +34,16 @@ def reduce_rewards(rewards: torch.Tensor, reward_weights: Optional[Sequence[floa
     With no weights this is the plain sum the estimators used before (so existing single-reward and
     unweighted multi-reward behavior is unchanged). With weights it is the weighted ``nansum`` used by
     the legacy rl_core path, so a NaN from a skipped reward function drops out instead of poisoning the
-    row.
+    row. A row where every function is NaN folds back to NaN, though: that sample was never scored,
+    and a fake 0 would quietly join the group statistics as a real score.
     """
     if rewards.dim() <= 1:
         return rewards
     if reward_weights is None:
         return rewards.sum(dim=-1)
     weights = torch.as_tensor(reward_weights, dtype=rewards.dtype, device=rewards.device)
-    return (rewards * weights.unsqueeze(0)).nansum(dim=1)
+    folded = (rewards * weights.unsqueeze(0)).nansum(dim=1)
+    return folded.masked_fill(torch.isnan(rewards).all(dim=-1), float('nan'))
 
 
 def apply_kl_in_reward(

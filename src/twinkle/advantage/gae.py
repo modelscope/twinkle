@@ -37,6 +37,11 @@ class GAEAdvantage(Advantage):
             raise ValueError('GAEAdvantage requires ref_out: the reference forward lane for the token KL.')
         if value_out is None:
             raise ValueError("GAEAdvantage requires value_out: the pre-update critic forward (task='value').")
+        if not any(value is not None and value == value
+                   for score in scores for value in self._orm_row(score)):
+            raise ValueError('GAEAdvantage got no valid ORM score in the batch (every score row is None): '
+                             'the reward would degenerate into pure KL + value bootstrap. Wire a reward '
+                             'scorer, or pick a scalar-family estimator for a teacher-only run.')
         # old_logps is fixed to the sampler's lane (no scalar-family pre-update policy forward);
         # old_values is the pre-update critic snapshot the value loss replays against.
         old_logps = rollout_logps

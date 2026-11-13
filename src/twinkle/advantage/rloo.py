@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, Literal, Union
 from twinkle import remote_class, remote_function
 
 from .base import Advantage
-from ._utils import apply_kl_in_reward, compute_gdpo_advantages, reduce_rewards
+from ._utils import apply_kl_in_reward, compute_gdpo_advantages, nanstd, reduce_rewards
 
 if TYPE_CHECKING:
     import torch
@@ -71,16 +71,23 @@ class RLOOAdvantage(Advantage):
         K = num_generations
         grouped = rewards.view(-1, K)
 
-        # RLOO: baseline = (sum - self) / (K - 1)
-        group_sum = grouped.sum(dim=1, keepdim=True)
-        baselines = (group_sum - grouped) / (K - 1)
+        # RLOO: baseline = mean of the OTHER K-1 samples. An unscored row rides as NaN out of
+        # reduce_rewards: it stays out of every baseline (nansum + the valid mask) and lands at a
+        # zero advantage. A group reduced to one valid sample has no "others" to average -- the
+        # 0/0 baseline is NaN and nan_to_num zeroes the group below.
+        valid = ~torch.isnan(grouped)
+        count = valid.sum(dim=1, keepdim=True)
+        group_sum = grouped.nansum(dim=1, keepdim=True)
+        others_sum = group_sum - torch.nan_to_num(grouped, nan=0.0)
+        others_count = (count - valid.to(count.dtype)).to(grouped.dtype)
+        baselines = others_sum / others_count
         advantages = grouped - baselines
 
         if scale == 'group':
-            group_std = grouped.std(dim=1, keepdim=True)
+            group_std = nanstd(grouped, dim=1, keepdim=True)
             advantages = advantages / (group_std + 1e-8)
         elif scale == 'batch':
-            batch_std = grouped.std()
+            batch_std = nanstd(grouped)
             advantages = advantages / (batch_std + 1e-8)
 
-        return advantages.view(-1)
+        return torch.nan_to_num(advantages, nan=0.0).view(-1)

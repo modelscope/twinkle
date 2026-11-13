@@ -45,6 +45,9 @@ class ReinforcePlusPlusAdvantage(Advantage):
             rewards = torch.tensor(rewards, dtype=torch.float32)
 
         rewards = reduce_rewards(rewards, kwargs.get('reward_weights'))
+        # An unscored row (nan out of reduce_rewards) records 0 here, exactly as the legacy
+        # weighted-nansum fold did -- nan-aware group exclusion is grpo/rloo/passk's contract.
+        rewards = torch.nan_to_num(rewards, nan=0.0)
         rewards = apply_kl_in_reward(
             rewards,
             kl_in_reward=kwargs.get('kl_in_reward', False),
