@@ -32,9 +32,9 @@ from dataclasses import replace
 from typing import Any
 
 from twinkle.data_format import Trajectory
-from twinkle.data_format import _trainable_positions as _trainable_positions
 from twinkle.data_format import last_assistant_text as _traj_last_assistant_text
 from twinkle.data_format import turn_token_spans, validate_trajectory
+from twinkle.data_format.trajectory import _trainable_positions
 from twinkle.data_format.sampling import SampledSequence
 from twinkle.template.base import Template
 from twinkle.template.contract import RolloutState, coerce_tool_call_arguments
