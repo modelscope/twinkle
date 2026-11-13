@@ -24,8 +24,9 @@ def batch_summary(trajs: Sequence[Trajectory]) -> Dict[str, Any]:
 
     Row-level facts (per-row lengths, ``truncated`` / ``turns``) are small metadata the consumer
     folds into its rollout metrics without materialising the trajectories; the aggregates are
-    kept too so a caller that only logs totals reads one key. Shared by the transforms here and
-    the streaming driver's own hand-out summary -- ONE summary shape, not per-producer ones.
+    kept too so a caller that only logs totals reads one key. ONE summary shape for every
+    row-based producer here (the streaming driver's own delivery facts are sample-based -- its
+    rows are references it never opens).
     """
     response_lengths = [len(traj.get('response_token_ids') or ()) for traj in trajs]
     prompt_lengths = [(len(traj.get('input_ids') or ()) - length if traj.get('input_ids') is not None else 0)
@@ -96,7 +97,8 @@ class TrajectoryFilter:
         materialised rows, so it may read any trajectory field -- the nonempty-response rule is
         ``where=lambda traj: bool(traj.get('response_token_ids'))``. The summary describes the
         original batch as well, so a caller filtering rows can log both sides without
-        materialising them.
+        materialising them; ``indices`` reports which rows were kept, so a row-aligned side
+        column (the driver's score rows) can be sliced to match.
         """
         if indices is not None and where is not None:
             raise ValueError('select takes one rule: indices or where, not both.')
@@ -115,6 +117,9 @@ class TrajectoryFilter:
         kept = [trajs[index] for index in indices]
         summary = dict(batch_summary(kept))
         summary['num_dropped'] = len(trajs) - len(kept)
+        # Which rows survived, in delivery order: a caller holding a row-aligned side column (the
+        # driver's score rows) slices it with these to match the rows that train.
+        summary['indices'] = list(indices)
         return kept, summary
 
 
@@ -124,7 +129,7 @@ _MULTIMODAL_KEYS = ('images', 'videos', 'audios', 'tools', 'objects', 'chat_temp
 
 # What a privileged row inherits from its student trajectory: identity and the original response
 # ids (the encode-and-check tail guarantees the re-encoded tokens are exactly those ids).
-_PRIVILEGED_KEYS = ('episode_id', 'group_key', 'batch_id', 'policy_version', 'role',
+_PRIVILEGED_KEYS = ('episode_id', 'group_key', 'policy_version', 'role',
                     'response_token_ids', 'tokenizer_fingerprint')
 
 

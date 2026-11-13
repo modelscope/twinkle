@@ -22,10 +22,9 @@ class Trajectory(InputFeature, total=False):
     videos: Optional[List[Union[str, Any]]]
     audios: Optional[List[Union[str, Any]]]
     prompt: Optional[str]
-    # Identity: episode_id unique per episode; batch_id carries source identity + hand-out index.
+    # Identity: episode_id unique per episode; group_key groups one prompt's generations.
     episode_id: str
     group_key: Any
-    batch_id: str
     policy_version: int
     role: str
     # Response frame: response_positions address shifted labels; labels[positions] == token ids.
@@ -35,10 +34,10 @@ class Trajectory(InputFeature, total=False):
     # Sampling: rollout_logps is response-framed; engines without logps leave it absent.
     rollout_logps: List[float]
     sampling_masks: InputType
-    # Rewards: orm/env/baseline row-level named entries; process_rewards response-framed per scorer.
+    # Rewards: the rollout's own row-level named entries (``env``). The scorer columns
+    # (``orm`` / ``baseline``) and the PRM segment facts ride the delivery facts' row-aligned
+    # score entries instead -- they meet the rows inside the advantage worker, never on the row.
     rewards: Dict[str, Any]
-    process_rewards: Dict[str, List[float]]
-    prm_segments: Any
     # Training targets: response-framed; GRPO scalar advantages are broadcast by their producer.
     advantages: List[float]
     returns: List[float]
@@ -212,11 +211,13 @@ def _trainable_positions(input_ids: List[int], labels: List[int], completion_mas
     position-wise intersection.
     """
     in_labels = _input_order_labels(list(labels or []))
-    mask = (
-        _input_order_labels(list(completion_mask))
-        if completion_mask is not None and len(completion_mask) == len(in_labels)
-        else None
-    )
+    if completion_mask is not None and len(completion_mask) != len(in_labels):
+        # A mask that disagrees with the labels is an encoding bug upstream; silently dropping
+        # it would count non-policy turns (API/human/replayed, mask==0) as trainable and skew
+        # every projection built on these positions.
+        raise ValueError(f'completion_mask ({len(completion_mask)}) does not match labels '
+                         f'({len(in_labels)}).')
+    mask = _input_order_labels(list(completion_mask)) if completion_mask is not None else None
     positions: List[int] = []
     for j, lab in enumerate(in_labels):
         if lab == -100:

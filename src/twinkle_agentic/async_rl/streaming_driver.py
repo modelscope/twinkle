@@ -4,11 +4,13 @@
 One driver per run. It reads the dataloader, turns each row into ``num_generations`` episodes and
 steps them through the rollout; a finished episode is scored by every ORM, a closed PRM segment by
 every PRM, and a group whose members are all scored becomes ready. ``__next__`` hands out
-``batch_size`` rows of ready groups as ONE list of trajectories: collecting the batch and merging
-the named score columns (``rewards`` / ``prm_segments`` fields plus the identity facts) onto the
-rows is one locked section of row-level work -- the per-token response-contract validation ran
-at its producer, the rollout's merge -- and the light batch facts ride :meth:`batch_summary` for
-the consumer that just received the batch.
+``batch_size`` rows of ready groups as ``(rows, facts)``: the rows are the rollout's own artefacts,
+handed out exactly as they travel (a reference under ray -- the driver never opens one; the
+identity fields were stamped on them at admission), and the light facts (row lengths, the named
+score columns aligned row for row, version spans) ride the SAME yield, so the consumer never
+calls back for them. The scores land on ``facts['scores']`` -- one row-shaped entry per trajectory
+(``rewards.orm`` / ``rewards.baseline``, optionally ``prm_segments``) -- and meet the rows again
+inside the advantage worker, which receives both.
 
 How far ahead of the trainer the driver runs is bounded by the policy version ``v`` (the checkpoint
 manager's sync count): the rows admitted and not dropped never exceed
@@ -33,7 +35,6 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import user_data_get
-from twinkle.processor import batch_summary
 from twinkle.utils import get_logger
 from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutSample
 
@@ -62,6 +63,41 @@ def _role_of(traj: Any) -> str:
     if role is None:
         role = user_data_get(traj.get('user_data'), 'role')
     return str(role or '')
+
+
+def _sample_facts(samples: Sequence[RolloutSample], scores: Sequence[Dict[str, Any]],
+                   version_spans: Sequence[int]) -> Dict[str, Any]:
+    """The delivery facts of one batch, off the samples -- never the trajectories.
+
+    The rows are never opened for this (under ray they are references): the lengths /
+    truncation / turns / identity facts come off the light sample records, and the named score
+    columns arrive row-aligned in ``scores`` -- the one payload-adjacent lane, which the advantage
+    estimator and the reward metrics consume without materialising a trajectory.
+    """
+    prompt_lengths: List[int] = []
+    response_lengths: List[int] = []
+    for sample in samples:
+        tokens = sample.token_lengths
+        # None means the episode never produced an encoded frame (an empty prompt); a delivered
+        # batch is finished, so the lengths are final.
+        prompt_lengths.append(tokens[0] if tokens else 0)
+        response_lengths.append(tokens[1] if tokens else 0)
+    truncated = [bool(sample.truncated) for sample in samples]
+    return {
+        'num_rows': len(samples),
+        'episode_ids': [sample.episode_id for sample in samples],
+        'prompt_lengths': prompt_lengths,
+        'response_lengths': response_lengths,
+        'response_length_min': min(response_lengths) if response_lengths else 0,
+        'response_length_max': max(response_lengths) if response_lengths else 0,
+        'response_length_sum': sum(response_lengths),
+        'policy_versions': sorted({sample.policy_version for sample in samples}),
+        'truncated': truncated,
+        'num_truncated': sum(truncated),
+        'turns': [sample.turns for sample in samples],
+        'version_spans': list(version_spans),
+        'scores': list(scores),
+    }
 
 
 @dataclass
@@ -118,8 +154,8 @@ class StreamingDriver:
             most ``(max_staleness + 1) * sync_interval * batch_size`` rows ahead), nothing is dropped
             as stale.
         orms: outcome scorers, ``scorer([traj]) -> [score]``, run on every finished episode.
-        orm_names: each ORM's name in the handed-out ``rewards.orm`` column; ``None`` names them
-            by position (``orm_0`` ...).
+        orm_names: each ORM's name in the handed-out ``facts['scores']`` rows' ``rewards.orm``
+            column; ``None`` names them by position (``orm_0`` ...).
         prms: process scorers, run on the trajectory so far at every closed segment.
         prm_names: each PRM's name in the handed-out ``prm_segments['scores']``; ``None`` names
             them by position (``prm_0`` ...).
@@ -231,25 +267,17 @@ class StreamingDriver:
         self._wait_time = 0.0
         self._returned_at: Optional[float] = None
         self._idle_ratio = 0.0
-        self._source_id = uuid.uuid4().hex
         self._iter_started = False
-        self._iter_handed: Optional[int] = None
-        self._yields = 0
-        self._last_batch_index: Optional[int] = None
-        self._last_summary: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------ iteration
 
-    @remote_function(execute='first', collect='first', lazy_collect=False, stash=True)
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=(0,))
     def __iter__(self):
-        """Iterate the driver once: yields the handed-out trajectory lists, batch by batch."""
+        """Iterate the driver once: ``(rows, facts)`` per batch, delivered together."""
         if self._iter_started:
             raise RuntimeError('StreamingDriver serves ONE iteration per run; a second one would re-read '
                                'the dataloader from an unrelated position. Wrap the single iterator instead.')
         self._iter_started = True
-        with self._lock:
-            self._iter_handed = self._handed
-        self._yields = 0
         return self._batches()
 
     def _batches(self) -> Iterator[List[Any]]:
@@ -259,8 +287,13 @@ class StreamingDriver:
                 return
             yield batch
 
-    def _next_batch(self) -> Optional[List[Any]]:
-        """Wait for ``batch_size`` rows of complete, fresh groups; ``None`` once nothing more will come."""
+    def _next_batch(self) -> Optional[tuple]:
+        """Wait for ``batch_size`` rows of complete, fresh groups; ``None`` once nothing more will come.
+
+        A delivery is ``(rows, facts)``: the rows exactly as they travel (a reference under ray,
+        a dict in-process -- never opened here), and the light per-batch facts (row lengths, the
+        row-aligned score column, version spans) built in the same locked section.
+        """
         self._start()
         started = time.monotonic()
         if self._returned_at is not None:
@@ -294,44 +327,48 @@ class StreamingDriver:
                 if lending is not None:
                     lending.join()
                 self.cluster_adapter.reclaim()
-        # ONE locked section: collect the batch AND merge the named score columns onto the rows.
-        # Both halves are row-level work -- a shallow dict copy, a few assignments, length reads;
-        # the per-token response-contract validation already ran at its producer (the rollout's
-        # merge), so nothing here scales with the tokens and the event thread is never held up.
-        # Collecting, merging and counting move together: a failure inside raises before the
-        # delivery counter moves, so the batch is never half-published.
+        # ONE locked section: collect the batch and build its light facts. The rows are handed
+        # out exactly as they travel (a reference under ray, a dict in-process) -- the driver
+        # never opens one; the score columns ride the facts instead, aligned row for row, and
+        # the identity fields were stamped on the rows at admission. Nothing here scales with
+        # the tokens, so the event thread is never held up; collecting and counting move
+        # together, so the batch is never half-published.
         with self._lock:
             self._drop_stale()
             trajs: List[Any] = []
+            samples: List[RolloutSample] = []
+            scores: List[Dict[str, Any]] = []
             version_spans: List[int] = []
             while len(trajs) < self.batch_size and self._ready:
                 for episode in self._ready.popleft():
                     episode.sample.version_span = self._version - episode.sample.policy_version
-                    merged = dict(episode.traj)
-                    merged.update(self._score_update(episode))
-                    episode.traj = merged
-                    trajs.append(merged)
+                    trajs.append(episode.traj)
+                    samples.append(episode.sample)
+                    scores.append(self._score_update(episode))
                     version_spans.append(episode.sample.version_span)
             self._ready_rows -= len(trajs)
-            self._last_batch_index = self._iter_handed + self._yields
             self._handed += 1
-            self._yields += 1
             self._lock.notify_all()
-        self._last_summary = dict(batch_summary(trajs), version_spans=version_spans)
         self._returned_at = time.monotonic()
         self._wait_time = self._returned_at - started
-        return trajs
+        return trajs, _sample_facts(samples, scores, version_spans)
 
     def _score_update(self, episode: _Episode) -> Dict[str, Any]:
-        """One row's update: the named score columns and the identity facts, off the private bookkeeping.
+        """One row's light score entry, off the private bookkeeping -- never written onto the row.
 
-        ``rewards.orm`` / ``rewards.baseline`` map scorer name -> float-or-None; a missing judge
-        verdict stays ``None`` (never a silent 0), an unparseable one keeps its nan. The rollout's
-        own ``rewards.env`` rides along untouched. ``prm_segments`` carries each segment's end turn
-        and every scorer's raw segment scores -- the facts the PRM fusion broadcasts from.
+        The entry mirrors the row's column contract (``rewards.orm`` / ``rewards.baseline`` map
+        scorer name -> float-or-None; ``prm_segments`` carries each segment's end turn and every
+        scorer's raw segment scores) but rides the delivery facts instead of the trajectory: the
+        driver holds the row as a reference under ray and never opens it, so the scores meet the
+        row again inside the advantage worker, which receives both. A missing judge verdict stays
+        ``None`` (never a silent 0), an unparseable one keeps its nan. The rollout's own
+        ``rewards.env`` stays on the row, where its producer wrote it.
         """
         sample = episode.sample
-        rewards = dict(episode.traj.get('rewards') or {})
+        rewards: Dict[str, Any] = {
+            'orm': {name: (None if value is None else float(value))
+                    for name, value in zip(self.orm_names, episode.orm or ())},
+        }
         if sample.baseline is not None:
             rows = sample.baseline if (sample.baseline and isinstance(sample.baseline[0], (list, tuple))) \
                 else [sample.baseline]
@@ -340,39 +377,14 @@ class StreamingDriver:
                                    'baseline column carries one. Return a single baseline per group.')
             rewards['baseline'] = {name: (None if value is None else float(value))
                                    for name, value in zip(self.orm_names, rows[0])}
-        update: Dict[str, Any] = {
-            'episode_id': episode.episode_id,
-            'group_key': episode.group.key,
-            'role': episode.role or '',
-            'policy_version': episode.version,
-            'batch_id': f'{self._source_id}:{self._iter_handed + self._yields}',
-            'rewards': rewards,
-        }
+        score: Dict[str, Any] = {'rewards': rewards}
         if episode.prm is not None:
-            update['prm_segments'] = {
+            score['prm_segments'] = {
                 'end_turns': [int(turns) for turns in episode.prm_turns],
                 'scores': {name: [(None if value is None else float(value)) for value in column]
                            for name, column in zip(self.prm_names, episode.prm)},
             }
-        return update
-
-    @remote_function(execute='first', collect='first', lazy_collect=False)
-    def batch_summary(self, batch_index: int) -> Dict[str, Any]:
-        """The light summary of batch ``batch_index``, as captured when it was handed out.
-
-        One iteration, one consumer: only the CURRENT delivery's summary is kept -- earlier
-        batches' are gone, so read it while the batch is still the latest one. ``batch_index``
-        must therefore name the latest delivery (the batches handed out before this iteration
-        began plus the yields so far, minus the one in flight); anything else is a misread,
-        reported, not replayed.
-        """
-        with self._lock:
-            if self._last_batch_index is None:
-                raise RuntimeError('batch_summary reads a handed-out batch; iterate the driver first.')
-            if batch_index != self._last_batch_index:
-                raise ValueError(f'batch_summary(batch_index={batch_index}) names a batch other than the latest '
-                                 f'delivery ({self._last_batch_index}); only the latest batch has a live summary.')
-            return dict(self._last_summary or {})
+        return score
 
     def _drop_stale(self) -> None:
         """Drop ready groups more than ``max_staleness`` versions behind (under the lock).
@@ -677,6 +689,10 @@ class StreamingDriver:
     def _maybe_finish(self, episode: _Episode) -> None:
         if not episode.done or episode.finished or episode.lost or episode.orm_pending or episode.prm_pending:
             return
+        # The trajectory itself stays exactly as it travels (a reference under ray, the rollout's
+        # stash channel): it is only ever passed on to remote calls (the forwards, the advantage,
+        # the filter) and handed out at delivery -- the driver never opens it. The scores and the
+        # identity the recipe reads live on the sample and the delivery facts instead.
         sample = episode.sample
         sample.prompt_id = episode.group.key
         sample.group_key = episode.group.key
@@ -691,13 +707,6 @@ class StreamingDriver:
             self._counters['dropped_sample'] += 1
             self._lose(episode)
             return
-        if self.orms:
-            # the named ORM column lands on the row HERE, at finish, a plain local write (no
-            # publish): the group verdict reads it to rule on admission before any hand-out.
-            rewards = dict(episode.traj.get('rewards') or {})
-            rewards['orm'] = {name: (None if value is None else float(value))
-                               for name, value in zip(self.orm_names, episode.orm or ())}
-            episode.traj = dict(episode.traj, rewards=rewards)
         episode.finished = True
         self._inflight -= 1
         self._settle(episode.group)
@@ -731,7 +740,9 @@ class StreamingDriver:
             self._accept(group)
             return
         if self.on_group is not None:
-            trajectories = list(self.on_group(group.row, [e.traj for e in group.members], group.attempt) or [])
+            # the verdict reads the samples (light, local: the scores are already stamped on
+            # them); the trajectories themselves are references under ray and never opened here.
+            trajectories = list(self.on_group(group.row, [e.sample for e in group.members], group.attempt) or [])
             regenerate = [t for t in trajectories if _role_of(t) != _BASELINE]
             if regenerate and len(regenerate) != self.num_generations:
                 raise ValueError(f'on_group returned {len(regenerate)} trajectories to replace a group of '

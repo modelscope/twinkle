@@ -29,7 +29,7 @@ class GAEAdvantage(Advantage):
         """Trajectories and forward lanes in, training-target columns out -- see :class:`Advantage`."""
         return self._call(trajs, **kwargs)
 
-    def _estimate(self, trajs, rollout_logps, *, ref_out, teacher_out, old_out, value_out, global_step=0):
+    def _estimate(self, trajs, rollout_logps, scores, *, ref_out, teacher_out, old_out, value_out, global_step=0):
         if teacher_out is not None or old_out is not None:
             raise ValueError("GAEAdvantage reads ref_out and value_out only; teacher_out / old_out are "
                              'the scalar-family lanes.')
@@ -43,7 +43,7 @@ class GAEAdvantage(Advantage):
         ref_logps = self._lane('ref_out', ref_out, 'logps', trajs)
         old_values = self._lane('value_out', value_out, 'values', trajs)
         kl_rows = self._kl(old_logps, ref_logps, kind=self.kl_kind, reduce='none')
-        rm_scores = [weighted_score(self._orm_row(traj), self.reward_weights) for traj in trajs]
+        rm_scores = [weighted_score(self._orm_row(score), self.reward_weights) for score in scores]
         token_rewards = self._shape(rm_scores, kl_rows, beta=self.kl_coef, profile='token')
         advantages, returns = self.token_advantages(token_rewards, old_values)
         new_trajs = self._write_back(trajs, {'advantages': advantages, 'returns': returns,

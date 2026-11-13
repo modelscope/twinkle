@@ -2,7 +2,10 @@
 
 Recipes flatten the forwards themselves (``reference.forward_only(inputs=trajs,
 output_frame='response', output_fields=('logps',))`` and friends) and call the estimator handle
-with them: ``advantage(trajs, ref_out=..., value_out=...)``. This base owns the numeric half
+with them: ``advantage(trajs, scores=..., ref_out=..., value_out=...)``. The driver hands the
+score columns out BESIDE the rows (it never opens one), so the named reward maps arrive as the
+row-aligned ``scores`` argument and meet the trajectories here, inside the worker. This base owns
+the numeric half
 shared by the family -- reward folding, group-relative estimation over the per-sequence math
 each subclass provides, KL, PRM segment broadcast, teacher reweighting, the write-back -- and
 returns ``(updated_trajs, summary)`` like every trajectory transform. Each CONCRETE subclass
@@ -50,8 +53,9 @@ def _mean(rows: Sequence[Sequence[float]]) -> float:
 class Advantage:
     """The model-free advantage estimation step: one call per rollout batch, before training.
 
-    GRPO-family estimators read the outcome rewards (``rewards['orm']`` / ``rewards['baseline']``,
-    optionally ``prm_segments``) plus the reference / teacher / pre-update-policy forward lanes and
+    GRPO-family estimators read the outcome rewards (the ``scores`` argument's
+    ``rewards['orm']`` / ``rewards['baseline']``, optionally ``prm_segments``) plus the reference /
+    teacher / pre-update-policy forward lanes and
     produce response-framed ``advantages`` (the per-sequence scalar is broadcast onto the response
     tokens by this component); ``estimator='gae'`` (PPO) reads them plus the critic's ``value_out``
     and produces token-level ``advantages`` / ``returns``. The training-target columns land on
@@ -123,9 +127,13 @@ class Advantage:
                       ('rlsd_negative_only', rlsd_negative_only),
                       ('rollout_importance_sampling_mode', rollout_importance_sampling_mode),
                       ('log_rollout_offpolicy_metrics', log_rollout_offpolicy_metrics)]
+            if not kl_in_reward:
+                unused.append(('kl_kind', kl_kind != 'k1'))
         else:
             unused = [('gamma', gamma != 1.0), ('gae_lambda', gae_lambda != 0.95),
                       ('normalize', not normalize), ('kl_coef', kl_coef != 0.0)]
+            if kl_coef == 0.0:
+                unused.append(('kl_kind', kl_kind != 'k1'))
             if teacher_reweight != 'expand':
                 unused.append(('teacher_kl_coef', teacher_kl_coef != 0.0))
             if teacher_reweight != 'rlsd':
@@ -173,13 +181,17 @@ class Advantage:
         self._teacher = TeacherReweight()
         self._correction = RolloutCorrection()
 
-    def _call(self, trajs: List[Trajectory], *, ref_out: Optional[ModelOutput] = None,
+    def _call(self, trajs: List[Trajectory], *, scores: List[Dict[str, Any]],
+              ref_out: Optional[ModelOutput] = None,
               teacher_out: Optional[ModelOutput] = None, old_out: Optional[ModelOutput] = None,
               value_out: Optional[ModelOutput] = None,
               global_step: int = 0) -> Tuple[List[Trajectory], Dict[str, Any]]:
         """Guards plus the family dispatch: estimate once for the whole batch.
 
-        ``ref_out`` / ``teacher_out`` / ``old_out`` / ``value_out`` are the response-framed
+        ``scores`` is the delivery facts' row-aligned score column: one row-shaped entry per
+        trajectory (``rewards.orm`` / ``rewards.baseline`` named maps, optionally ``prm_segments``),
+        as the driver hands them out beside the rows. ``ref_out`` / ``teacher_out`` / ``old_out`` /
+        ``value_out`` are the response-framed
         ``forward_only`` outputs (or their lazy handles; the dispatch resolves them here in the
         worker) the estimator reads -- GRPO-family lanes are ``ref_out`` / ``teacher_out`` /
         ``old_out`` (the pre-update policy forward), the gae lane pair is ``ref_out`` +
@@ -190,6 +202,9 @@ class Advantage:
         """
         if not trajs:
             raise ValueError('advantage received an empty batch.')
+        if len(scores) != len(trajs):
+            raise ValueError(f'scores carries {len(scores)} rows for {len(trajs)} trajectories; the driver '
+                             'hands out exactly one score entry per trajectory.')
         for traj in trajs:
             if 'advantages' in traj or 'returns' in traj:
                 raise ValueError(f'trajectory {traj.get("episode_id")!r} already carries advantages/returns; '
@@ -203,17 +218,18 @@ class Advantage:
                 raise ValueError(f'trajectory {traj.get("episode_id")!r} has no rollout_logps; the '
                                  'importance-ratio math needs the sampler log-probs lane.')
             rollout_logps.append(lane)
-        return self._estimate(trajs, rollout_logps, ref_out=ref_out, teacher_out=teacher_out,
+        return self._estimate(trajs, rollout_logps, scores, ref_out=ref_out, teacher_out=teacher_out,
                               old_out=old_out, value_out=value_out, global_step=global_step)
 
-    def _estimate(self, trajs: List[Trajectory], rollout_logps: List[List[float]], *,
+    def _estimate(self, trajs: List[Trajectory], rollout_logps: List[List[float]],
+                  scores: List[Dict[str, Any]], *,
                   ref_out: Optional[ModelOutput], teacher_out: Optional[ModelOutput],
                   old_out: Optional[ModelOutput], value_out: Optional[ModelOutput],
                   global_step: int) -> Tuple[List[Trajectory], Dict[str, Any]]:
         # The scalar family has no critic; the token-level subclass overrides this whole step.
         if value_out is not None:
             raise ValueError(f'{type(self).__name__} has no critic; value_out is the token-level lane.')
-        return self._estimate_group(trajs, rollout_logps, ref_out, teacher_out, old_out, global_step)
+        return self._estimate_group(trajs, rollout_logps, scores, ref_out, teacher_out, old_out, global_step)
 
     def _per_sequence(self, rewards: Any, num_generations: int = 1, scale: str = 'group',
                       **kwargs) -> Any:
@@ -229,6 +245,7 @@ class Advantage:
     # ------------------------------------------------------------------ GRPO family
 
     def _estimate_group(self, trajs: List[Trajectory], rollout_logps: List[List[float]],
+                        scores: List[Dict[str, Any]],
                         ref_out: Optional[ModelOutput], teacher_out: Optional[ModelOutput],
                         old_out: Optional[ModelOutput], global_step: int
                         ) -> Tuple[List[Trajectory], Dict[str, Any]]:
@@ -253,7 +270,7 @@ class Advantage:
             kl_values = self._kl(old_logps, ref_logps, kind=self.kl_kind)
         # None (an unparseable judge verdict) rides as nan, exactly as the scorer recorded it; a
         # no-scorer row (no ORM wired) stays [nan] -- a zero-column tensor cannot carry a group mean.
-        orm_rows = [self._orm_row(traj) for traj in trajs]
+        orm_rows = [self._orm_row(score) for score in scores]
         matrix_rows = [[float('nan') if value is None or value != value else float(value) for value in row]
                        or [float('nan')] for row in orm_rows]
         widths = {len(row) for row in matrix_rows}
@@ -263,7 +280,7 @@ class Advantage:
                              'shorter row).')
         reward_matrix = torch.tensor(matrix_rows, dtype=torch.float32)
         self._check_groups(trajs)
-        baseline_rows = [list(((traj.get('rewards') or {}).get('baseline') or {}).values()) for traj in trajs]
+        baseline_rows = [list(((score.get('rewards') or {}).get('baseline') or {}).values()) for score in scores]
         baselines = ([weighted_score(row, self.reward_weights) for row in baseline_rows]
                      if any(baseline_rows) else None)
         advantages = compute_advantages(
@@ -281,7 +298,7 @@ class Advantage:
         if self.use_prm:
             # advantage = mix * process + (1 - mix) * orm_advantage on every response token: mix=0
             # is standard GRPO, mix=1 pure PRM. The scalar ORM lane broadcasts over the token rows.
-            process = [self._process_row(traj) for traj in trajs]
+            process = [self._process_row(traj, score) for traj, score in zip(trajs, scores)]
             mix = float(self.prm_orm_mix)
             advantages = self._combine([process, advantages], weights=[mix, 1.0 - mix])
         elif self.teacher_reweight is not None:
@@ -344,24 +361,24 @@ class Advantage:
         return rows
 
     @staticmethod
-    def _orm_row(traj: Trajectory) -> List[Optional[float]]:
-        """The ORM scores of one trajectory, in the scorer order the driver stamped them."""
-        rewards = traj.get('rewards') or {}
+    def _orm_row(score: Dict[str, Any]) -> List[Optional[float]]:
+        """The ORM scores of one score row, in the scorer order the driver stamped them."""
+        rewards = score.get('rewards') or {}
         return list((rewards.get('orm') or {}).values())
 
-    def _process_row(self, traj: Trajectory) -> List[float]:
+    def _process_row(self, traj: Trajectory, score: Dict[str, Any]) -> List[float]:
         """Broadcast one trajectory's PRM segment scores over the turns they closed.
 
         ``prm_segments`` is ``{'end_turns': [...], 'scores': {scorer: [per-segment float | None]}}``:
         ``end_turns[k]`` is the cumulative count of assistant turns closed by segment ``k``, and
         segment ``k``'s ``prm_weights``-folded score covers the response tokens of its turns
         (``turn_token_spans`` of the trajectory). Same math as the driver's
-        ``ProcessReward``, reading the trajectory column instead of the sample record.
+        ``ProcessReward``, reading the score row instead of the sample record.
         """
-        segments = traj.get('prm_segments')
+        segments = score.get('prm_segments')
         if not segments:
             raise ValueError(f'trajectory {traj.get("episode_id")!r} carries no prm_segments; use_prm requires '
-                             'the driver to record them.')
+                             'the driver to record them in the score rows.')
         ends = list(segments.get('end_turns') or ())
         columns = list(zip(*(list(column) for column in (segments.get('scores') or {}).values())))
         if len(columns) != len(ends):
