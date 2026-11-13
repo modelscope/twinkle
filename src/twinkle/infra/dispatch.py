@@ -424,8 +424,9 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         value = next(_self._iter)
                     except StopIteration:
                         return [], True
-                    if iter_stash is not None:
-                        # The stash declared on ``__iter__`` applies to each yielded batch.
+                    if iter_stash is not None and iter_stash is not False:
+                        # The stash declared on ``__iter__`` applies to each yielded batch;
+                        # ``True`` stashes the whole (bare-list) batch element-wise.
                         value = _stash_channels(value, iter_stash)
                     return value, False
 
@@ -580,7 +581,7 @@ def _stash_channel(value: Any) -> Any:
     return _stash_value(value)
 
 
-def _stash_channels(result: Any, channels: Sequence[Union[int, str]]) -> Any:
+def _stash_channels(result: Any, channels: Union[bool, Sequence[Union[int, str]]]) -> Any:
     """Lift a remote return value's declared ``stash`` channels to ObjectRefs, in the worker.
 
     The outgoing half of partial collect. ``lazy_collect`` keeps the WHOLE return value as one
@@ -590,14 +591,21 @@ def _stash_channels(result: Any, channels: Sequence[Union[int, str]]) -> Any:
     the light half while the stashed channels ride through as references the next remote call
     dereferences at its worker.
 
-    A tuple channel is addressed by position and must exist (arity is the method's contract); a
-    dict channel is a key that MAY be absent (a branch-dependent return carries one signal key
-    per mode) and is skipped when it is.
+    ``True`` lifts the whole return value as a single channel (a bare-list payload element-wise,
+    an existing ref untouched, anything else whole); ``False`` never reaches here -- the
+    decorators skip it. A tuple channel is addressed by position and must exist (arity is the
+    method's contract); a dict channel is a key that MAY be absent (a branch-dependent return
+    carries one signal key per mode) and is skipped when it is.
     """
+    if channels is True:
+        return _stash_channel(result)
+    if isinstance(channels, bool):
+        raise TypeError(f'stash {channels!r} is not a usable channel declaration')
     if isinstance(result, tuple):
         lifted = list(result)
         for channel in channels:
-            if not isinstance(channel, int):
+            if isinstance(channel, bool) or not isinstance(channel, int):
+                # bool is an int subclass: True must never address tuple position 1.
                 raise TypeError(f'stash channel {channel!r} does not address a tuple return value')
             lifted[channel] = _stash_channel(lifted[channel])
         return tuple(lifted)
@@ -619,7 +627,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     timeout: Optional[float] = None,
                     enable_continous_work: bool = False,
                     sticky_key: Optional[Union[str, Callable]] = None,
-                    stash: Optional[Sequence[Union[int, str]]] = None):
+                    stash: Optional[Union[bool, Sequence[Union[int, str]]]] = None):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -665,13 +673,21 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             standard mechanism for a mixed (light + heavy) multi-part return whose light half the
             caller must read. Tuple channels are addressed by position (must exist), dict channels
             by key (skipped when absent); a list channel is lifted element-wise, anything else
-            whole. The caller's collect then materialises only the rest of the container, and the
-            next remote call dereferences the stashed references at its worker. Local mode has no
-            remote path, so the natural value passes through untouched. Declared on ``__iter__``, it
-            applies to every batch ``__next__`` yields.
+            whole. ``True`` lifts the whole return value as one such channel -- the declaration
+            for a bare-list payload (e.g. a trajectory batch) that must ride element-wise. ``False``
+            and ``None`` stash nothing. The caller's collect then materialises only the rest of the
+            container, and the next remote call dereferences the stashed references at its worker.
+            Local mode has no remote path, so the natural value passes through untouched. Declared
+            on ``__iter__``, it applies to every batch ``__next__`` yields.
     """ # noqa
     if sticky_key is not None and not enable_continous_work:
         raise ValueError('remote_function(sticky_key=...) requires enable_continous_work=True.')
+    if stash is not None and stash is not False and stash is not True:
+        if isinstance(stash, (int, str, bool)) or not isinstance(stash, (list, tuple)):
+            raise TypeError(f'stash {stash!r} must be True/False/None or a sequence of int/str channels')
+        for channel in stash:
+            if isinstance(channel, bool) or not isinstance(channel, (int, str)):
+                raise TypeError(f'stash channel {channel!r} must be an int position or a str key')
     continuous_lazy = enable_continous_work and lazy_collect is True
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
@@ -710,7 +726,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                 # A worker method may hand back a plain Future (an engine-side async submission);
                 # waiting here makes the caller's reference come ready only when the work finishes.
                 result = result.result()
-            if stash is not None:
+            if stash is not None and stash is not False:
                 # Partial collect: lift the declared heavy channels to refs here, at the value's
                 # birthplace, so the caller's collect materialises only the light half.
                 result = _stash_channels(result, stash)

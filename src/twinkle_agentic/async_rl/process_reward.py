@@ -5,21 +5,10 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from twinkle import remote_class, remote_function
+from twinkle.advantage.base import weighted_score
 
 from ..rollout import turn_token_spans
 from .streaming_driver import PRM_SEGMENT_TURNS
-
-
-def weighted_score(values: Sequence[Any] | None, weights: Sequence[float] | None) -> float:
-    """One score row folded by ``weights`` (default all-ones); ``None`` / nan entries count as 0."""
-    row = [0.0 if value is None or value != value else float(value) for value in (values or ())]
-    if not row:
-        return 0.0
-    if weights is None:
-        weights = [1.0] * len(row)
-    if len(weights) != len(row):
-        raise ValueError(f'{len(weights)} weights for {len(row)} scores.')
-    return sum(value * float(weight) for value, weight in zip(row, weights))
 
 
 @remote_class(execute='first')

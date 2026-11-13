@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
+from .base import Advantage
 from .gpg import GPGAdvantage
 from .grpo import GRPOAdvantage
 from .grpo_passk import GRPOPassKAdvantage
@@ -30,7 +31,7 @@ def compute_advantages(rewards: Union[torch.Tensor, Sequence[Any]],
                        num_generations: int,
                        *,
                        reward_weights: Optional[Sequence[float]] = None,
-                       advantage_estimator: str = 'grpo',
+                       advantage_estimator: Union[str, type, Advantage] = 'grpo',
                        scale_rewards: str = 'group',
                        kl_in_reward: bool = False,
                        beta: float = 0.0,
@@ -45,9 +46,23 @@ def compute_advantages(rewards: Union[torch.Tensor, Sequence[Any]],
     ``kl_in_reward`` subtracts ``beta * kl_values`` BEFORE normalization; ``remax`` needs
     ``reward_baselines``, ``opo`` ``response_lengths``, ``gpg`` ``f_norm``. The input is one scalar
     per sample, so this runs wherever the rewards are -- no remote placement needed.
+    ``advantage_estimator`` is a registered name, an ``Advantage`` subclass of your own, or a
+    ready instance -- the estimator subclasses are the algorithm extension point.
     """
-    if advantage_estimator not in ESTIMATORS:
-        raise ValueError(f'advantage_estimator {advantage_estimator!r} not in {tuple(ESTIMATORS)}.')
+    if isinstance(advantage_estimator, str):
+        if advantage_estimator not in ESTIMATORS:
+            raise ValueError(f'advantage_estimator {advantage_estimator!r} not in {tuple(ESTIMATORS)}.')
+        estimator = ESTIMATORS[advantage_estimator]()
+    elif isinstance(advantage_estimator, type):
+        if not issubclass(advantage_estimator, Advantage):
+            raise TypeError(f'advantage_estimator class {advantage_estimator!r} must subclass '
+                            'twinkle.advantage.Advantage.')
+        estimator = advantage_estimator()
+    elif isinstance(advantage_estimator, Advantage):
+        estimator = advantage_estimator
+    else:
+        raise TypeError('advantage_estimator must be a registered name, an Advantage subclass, or an '
+                        'Advantage instance.')
     if scale_rewards not in SCALINGS:
         raise ValueError(f'scale_rewards {scale_rewards!r} not in {SCALINGS}.')
     matrix = rewards if isinstance(rewards, torch.Tensor) else torch.tensor(list(rewards), dtype=torch.float32)
@@ -71,11 +86,11 @@ def compute_advantages(rewards: Union[torch.Tensor, Sequence[Any]],
     extra: Dict[str, Any] = {}
     if reward_baselines is not None:
         extra['reward_baselines'] = reward_baselines
-    if response_lengths is not None:
+    if response_lengths is not None and isinstance(estimator, OPOAdvantage):
         extra['response_lengths'] = response_lengths
-    if advantage_estimator == 'gpg':
+    if isinstance(estimator, GPGAdvantage):
         extra['f_norm'] = f_norm
-    advantages = ESTIMATORS[advantage_estimator]()(
+    advantages = estimator._per_sequence(
         matrix,
         num_generations,
         scale=scale_rewards,

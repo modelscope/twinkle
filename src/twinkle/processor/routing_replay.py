@@ -15,6 +15,22 @@ class RoutingReplay:
     per-row references, so a caller swaps them in positionally without materialising them.
     """
 
+    @remote_function(dispatch='all', collect='first', sync=True)
+    def verify(self, trajs: Sequence[Dict[str, Any]], **kwargs) -> None:
+        """R3's admission check: every trajectory carries the sampler-exported routing.
+
+        The real ``routed_experts`` field, read where the trajectories live -- a trajectory
+        without one fails loudly here rather than silently replaying a dense forward.
+        """
+        missing = [traj.get('episode_id') for traj in trajs if traj.get('routed_experts') is None]
+        if missing:
+            raise RuntimeError(
+                f'router_replay_mode="R3" replays the sampler-reported MoE routing, but '
+                f'{len(missing)} of {len(trajs)} rollout trajectories carry none (first: '
+                f'{missing[0]!r}): the sampling engine did not export routed_experts. Use '
+                'router_replay_mode="R2" to RECORD the routing on the training model instead, '
+                'or "disabled" to recompute it.')
+
     @remote_function(dispatch='all', collect='first', lazy_collect=True, stash=(0,))
     def __call__(self, trajs: Sequence[Dict[str, Any]], recorded: Any, **kwargs) -> Tuple[List[Dict[str, Any]]]:
         routed_rows = recorded.get('routed_experts') if isinstance(recorded, dict) else None

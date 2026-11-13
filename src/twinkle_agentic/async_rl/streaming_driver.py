@@ -4,9 +4,11 @@
 One driver per run. It reads the dataloader, turns each row into ``num_generations`` episodes and
 steps them through the rollout; a finished episode is scored by every ORM, a closed PRM segment by
 every PRM, and a group whose members are all scored becomes ready. ``__next__`` hands out
-``batch_size`` rows of ready groups as ``(trajectories, samples)``: the trajectories are references
-the training calls dereference where they run, the samples are the light ``RolloutSample`` records
-(scores, versions, episode facts).
+``batch_size`` rows of ready groups as ONE list of trajectories: collecting the batch and merging
+the named score columns (``rewards`` / ``prm_segments`` fields plus the identity facts) onto the
+rows is one locked section of row-level work -- the per-token response-contract validation ran
+at its producer, the rollout's merge -- and the light batch facts ride :meth:`batch_summary` for
+the consumer that just received the batch.
 
 How far ahead of the trainer the driver runs is bounded by the policy version ``v`` (the checkpoint
 manager's sync count): the rows admitted and not dropped never exceed
@@ -27,12 +29,13 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from twinkle import remote_class, remote_function
-from twinkle.data_format import attach_user_data, user_data_get
+from twinkle.data_format import user_data_get
+from twinkle.processor import batch_summary
 from twinkle.utils import get_logger
-from twinkle_agentic.rollout import EpisodeError, RolloutSample
+from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutSample
 
 logger = get_logger()
 
@@ -47,6 +50,18 @@ _BASELINE = 'baseline'
 
 def _is_episode_error(exc: BaseException) -> bool:
     return isinstance(exc, EpisodeError) or isinstance(getattr(exc, 'cause', None), EpisodeError)
+
+
+def _role_of(traj: Any) -> str:
+    """A trajectory's role: the top-level field first, the legacy ``user_data`` spelling second.
+
+    The group verdict returns baseline rows to the driver before they are submitted; those rows
+    may carry either spelling, so both are read -- writing is top-level only.
+    """
+    role = traj.get('role')
+    if role is None:
+        role = user_data_get(traj.get('user_data'), 'role')
+    return str(role or '')
 
 
 @dataclass
@@ -103,7 +118,11 @@ class StreamingDriver:
             most ``(max_staleness + 1) * sync_interval * batch_size`` rows ahead), nothing is dropped
             as stale.
         orms: outcome scorers, ``scorer([traj]) -> [score]``, run on every finished episode.
+        orm_names: each ORM's name in the handed-out ``rewards.orm`` column; ``None`` names them
+            by position (``orm_0`` ...).
         prms: process scorers, run on the trajectory so far at every closed segment.
+        prm_names: each PRM's name in the handed-out ``prm_segments['scores']``; ``None`` names
+            them by position (``prm_0`` ...).
         prm_segment: ``prm_segment(sample) -> bool``, whether the step just finished closes a PRM
             segment (default: every step; the last step always does).
         on_step: ``on_step(sample, prm_scores) -> bool``, called with a closed segment's scores;
@@ -142,7 +161,9 @@ class StreamingDriver:
                  sync_interval: int = 1,
                  checkpoint_manager: Any = None,
                  orms: Sequence[Any] = (),
+                 orm_names: Optional[Sequence[str]] = None,
                  prms: Sequence[Any] = (),
+                 prm_names: Optional[Sequence[str]] = None,
                  prm_segment: Optional[Callable[[RolloutSample], bool]] = None,
                  on_step: Optional[Callable[[RolloutSample, List[Any]], bool]] = None,
                  on_sample: Optional[Callable[[RolloutSample], Optional[bool]]] = None,
@@ -159,6 +180,14 @@ class StreamingDriver:
                              f'{sync_interval}.')
         if on_step is not None and not prms:
             raise ValueError('on_step reads PRM scores; pass prms= or drop on_step.')
+        self.orms = list(orms)
+        self.orm_names = list(orm_names) if orm_names is not None else [f'orm_{i}' for i in range(len(self.orms))]
+        if len(self.orm_names) != len(self.orms):
+            raise ValueError(f'orm_names ({len(self.orm_names)}) must name every ORM ({len(self.orms)}).')
+        self.prms = list(prms)
+        self.prm_names = list(prm_names) if prm_names is not None else [f'prm_{i}' for i in range(len(self.prms))]
+        if len(self.prm_names) != len(self.prms):
+            raise ValueError(f'prm_names ({len(self.prm_names)}) must name every PRM ({len(self.prms)}).')
         self.dataloader = dataloader
         self.rollout = rollout
         self.batch_size = batch_size
@@ -168,8 +197,6 @@ class StreamingDriver:
         self.max_staleness = max_staleness
         self.sync_interval = sync_interval
         self.checkpoint_manager = checkpoint_manager
-        self.orms = list(orms)
-        self.prms = list(prms)
         self.prm_segment = prm_segment
         self.on_step = on_step
         self.on_sample = on_sample
@@ -204,21 +231,35 @@ class StreamingDriver:
         self._wait_time = 0.0
         self._returned_at: Optional[float] = None
         self._idle_ratio = 0.0
+        self._source_id = uuid.uuid4().hex
+        self._iter_started = False
+        self._iter_handed: Optional[int] = None
+        self._yields = 0
+        self._last_batch_index: Optional[int] = None
+        self._last_summary: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------ iteration
 
-    @remote_function(execute='first', collect='first', lazy_collect=False, stash=(0,))
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=True)
     def __iter__(self):
+        """Iterate the driver once: yields the handed-out trajectory lists, batch by batch."""
+        if self._iter_started:
+            raise RuntimeError('StreamingDriver serves ONE iteration per run; a second one would re-read '
+                               'the dataloader from an unrelated position. Wrap the single iterator instead.')
+        self._iter_started = True
+        with self._lock:
+            self._iter_handed = self._handed
+        self._yields = 0
         return self._batches()
 
-    def _batches(self) -> Iterator[Tuple[List[Any], List[RolloutSample]]]:
+    def _batches(self) -> Iterator[List[Any]]:
         while True:
             batch = self._next_batch()
             if batch is None:
                 return
             yield batch
 
-    def _next_batch(self) -> Optional[Tuple[List[Any], List[RolloutSample]]]:
+    def _next_batch(self) -> Optional[List[Any]]:
         """Wait for ``batch_size`` rows of complete, fresh groups; ``None`` once nothing more will come."""
         self._start()
         started = time.monotonic()
@@ -253,21 +294,85 @@ class StreamingDriver:
                 if lending is not None:
                     lending.join()
                 self.cluster_adapter.reclaim()
+        # ONE locked section: collect the batch AND merge the named score columns onto the rows.
+        # Both halves are row-level work -- a shallow dict copy, a few assignments, length reads;
+        # the per-token response-contract validation already ran at its producer (the rollout's
+        # merge), so nothing here scales with the tokens and the event thread is never held up.
+        # Collecting, merging and counting move together: a failure inside raises before the
+        # delivery counter moves, so the batch is never half-published.
         with self._lock:
             self._drop_stale()
             trajs: List[Any] = []
-            samples: List[RolloutSample] = []
-            while len(samples) < self.batch_size and self._ready:
+            version_spans: List[int] = []
+            while len(trajs) < self.batch_size and self._ready:
                 for episode in self._ready.popleft():
                     episode.sample.version_span = self._version - episode.sample.policy_version
-                    trajs.append(episode.traj)
-                    samples.append(episode.sample)
-            self._ready_rows -= len(samples)
+                    merged = dict(episode.traj)
+                    merged.update(self._score_update(episode))
+                    episode.traj = merged
+                    trajs.append(merged)
+                    version_spans.append(episode.sample.version_span)
+            self._ready_rows -= len(trajs)
+            self._last_batch_index = self._iter_handed + self._yields
             self._handed += 1
+            self._yields += 1
             self._lock.notify_all()
+        self._last_summary = dict(batch_summary(trajs), version_spans=version_spans)
         self._returned_at = time.monotonic()
         self._wait_time = self._returned_at - started
-        return trajs, samples
+        return trajs
+
+    def _score_update(self, episode: _Episode) -> Dict[str, Any]:
+        """One row's update: the named score columns and the identity facts, off the private bookkeeping.
+
+        ``rewards.orm`` / ``rewards.baseline`` map scorer name -> float-or-None; a missing judge
+        verdict stays ``None`` (never a silent 0), an unparseable one keeps its nan. The rollout's
+        own ``rewards.env`` rides along untouched. ``prm_segments`` carries each segment's end turn
+        and every scorer's raw segment scores -- the facts the PRM fusion broadcasts from.
+        """
+        sample = episode.sample
+        rewards = dict(episode.traj.get('rewards') or {})
+        if sample.baseline is not None:
+            rows = sample.baseline if (sample.baseline and isinstance(sample.baseline[0], (list, tuple))) \
+                else [sample.baseline]
+            if len(rows) != 1:
+                raise RuntimeError(f'episode {episode.episode_id} carries {len(rows)} baseline rows; the named '
+                                   'baseline column carries one. Return a single baseline per group.')
+            rewards['baseline'] = {name: (None if value is None else float(value))
+                                   for name, value in zip(self.orm_names, rows[0])}
+        update: Dict[str, Any] = {
+            'episode_id': episode.episode_id,
+            'group_key': episode.group.key,
+            'role': episode.role or '',
+            'policy_version': episode.version,
+            'batch_id': f'{self._source_id}:{self._iter_handed + self._yields}',
+            'rewards': rewards,
+        }
+        if episode.prm is not None:
+            update['prm_segments'] = {
+                'end_turns': [int(turns) for turns in episode.prm_turns],
+                'scores': {name: [(None if value is None else float(value)) for value in column]
+                           for name, column in zip(self.prm_names, episode.prm)},
+            }
+        return update
+
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def batch_summary(self, batch_index: int) -> Dict[str, Any]:
+        """The light summary of batch ``batch_index``, as captured when it was handed out.
+
+        One iteration, one consumer: only the CURRENT delivery's summary is kept -- earlier
+        batches' are gone, so read it while the batch is still the latest one. ``batch_index``
+        must therefore name the latest delivery (the batches handed out before this iteration
+        began plus the yields so far, minus the one in flight); anything else is a misread,
+        reported, not replayed.
+        """
+        with self._lock:
+            if self._last_batch_index is None:
+                raise RuntimeError('batch_summary reads a handed-out batch; iterate the driver first.')
+            if batch_index != self._last_batch_index:
+                raise ValueError(f'batch_summary(batch_index={batch_index}) names a batch other than the latest '
+                                 f'delivery ({self._last_batch_index}); only the latest batch has a live summary.')
+            return dict(self._last_summary or {})
 
     def _drop_stale(self) -> None:
         """Drop ready groups more than ``max_staleness`` versions behind (under the lock).
@@ -434,8 +539,8 @@ class StreamingDriver:
 
     def _start_attempt(self, group: _Group, trajectories: List[Any]) -> None:
         """Submit one attempt's trajectories: the non-baseline ones replace the members (under the lock)."""
-        members = [traj for traj in trajectories if user_data_get(traj.get('user_data'), 'role') != _BASELINE]
-        baselines = [traj for traj in trajectories if user_data_get(traj.get('user_data'), 'role') == _BASELINE]
+        members = [traj for traj in trajectories if _role_of(traj) != _BASELINE]
+        baselines = [traj for traj in trajectories if _role_of(traj) == _BASELINE]
         if members:
             group.source = members
             group.members = []
@@ -450,7 +555,11 @@ class StreamingDriver:
 
     def _submit(self, group: _Group, traj: Any, role: str) -> _Episode:
         episode = _Episode(episode_id=uuid.uuid4().hex, group=group, role=role, version=self._version)
-        traj = attach_user_data(traj, episode_id=episode.episode_id, group_id=group.key)
+        # The identity travels on top of the trajectory: episode / group / role / the admission
+        # version. The rollout reads the episode id to route its steps back to this episode.
+        traj = dict(traj)
+        traj.update(episode_id=episode.episode_id, group_key=group.key, role=role,
+                    policy_version=episode.version)
         self._inflight += 1
         self._step(episode, traj)
         return episode
@@ -582,6 +691,13 @@ class StreamingDriver:
             self._counters['dropped_sample'] += 1
             self._lose(episode)
             return
+        if self.orms:
+            # the named ORM column lands on the row HERE, at finish, a plain local write (no
+            # publish): the group verdict reads it to rule on admission before any hand-out.
+            rewards = dict(episode.traj.get('rewards') or {})
+            rewards['orm'] = {name: (None if value is None else float(value))
+                               for name, value in zip(self.orm_names, episode.orm or ())}
+            episode.traj = dict(episode.traj, rewards=rewards)
         episode.finished = True
         self._inflight -= 1
         self._settle(episode.group)
@@ -615,8 +731,8 @@ class StreamingDriver:
             self._accept(group)
             return
         if self.on_group is not None:
-            trajectories = list(self.on_group(group.row, [e.sample for e in group.members], group.attempt) or [])
-            regenerate = [t for t in trajectories if user_data_get(t.get('user_data'), 'role') != _BASELINE]
+            trajectories = list(self.on_group(group.row, [e.traj for e in group.members], group.attempt) or [])
+            regenerate = [t for t in trajectories if _role_of(t) != _BASELINE]
             if regenerate and len(regenerate) != self.num_generations:
                 raise ValueError(f'on_group returned {len(regenerate)} trajectories to replace a group of '
                                  f'{self.num_generations}; a group is always num_generations rows.')
@@ -627,7 +743,7 @@ class StreamingDriver:
                 group.attempt += 1
                 self._start_attempt(group, regenerate)
                 return
-            baselines = [t for t in trajectories if user_data_get(t.get('user_data'), 'role') == _BASELINE]
+            baselines = [t for t in trajectories if _role_of(t) == _BASELINE]
             if baselines:
                 self._start_attempt(group, baselines)
                 return

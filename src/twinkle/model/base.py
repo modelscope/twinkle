@@ -11,7 +11,7 @@ from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
-from twinkle.model.tasks import get_task_spec_obj
+from twinkle.model.tasks import get_task_spec, get_task_spec_obj
 from twinkle.patch import Patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
@@ -52,6 +52,14 @@ def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_
     checkpoints.sort()
     for _, _, _, checkpoint_path in checkpoints[:-save_total_limit]:
         shutil.rmtree(checkpoint_path)
+
+
+# Trajectory fields ``TrainableModel._rollout_features`` lifts into loss kwargs on training calls.
+# The names match the loss kwargs exactly; token-level fields are response-framed on both sides.
+_LIFTED_TRAJECTORY_FIELDS = (
+    'rollout_logps', 'sampling_masks', 'advantages', 'returns',
+    'ref_logps', 'teacher_logps', 'old_logps', 'old_values', 'truncated',
+)
 
 
 def _freeze_then_activate(named_params,
@@ -480,24 +488,158 @@ class TrainableModel(ABC):
 
     @staticmethod
     def _rollout_features(inputs, kwargs: Dict[str, Any], *, lift: bool) -> tuple:
-        """Split trajectories handed over by a rollout into model features and the loss's sampler columns.
+        """Split trajectories handed over by a rollout into model features and the loss's columns.
 
-        A rollout's merged trajectory (it carries ``response_token_ids``) holds its messages, episode facts
-        and the sampler's per-token ``rollout_logprobs`` / ``sampling_mask`` next to the features. Only the
-        features go on to the processor; with ``lift`` the two columns fill the ``rollout_logps`` /
-        ``sampling_masks`` kwargs the loss reads, unless the caller passed them. Other inputs pass through.
+        A rollout's merged trajectory (it carries ``response_token_ids``) holds its messages, episode
+        facts, the sampler's per-token columns, and the training targets a write-back produced --
+        all next to the features. Only the features go on to the processor; with ``lift`` the
+        trajectory columns fill the kwargs the loss reads (``rollout_logps`` / ``sampling_masks``
+        and the standard training-target names), unless the caller passed the same kwarg -- in
+        which case both sides must agree or the call is rejected. Other inputs pass through.
         """
         rows = inputs if isinstance(inputs, list) else [inputs]
         if not rows or not isinstance(rows[0], dict) or 'response_token_ids' not in rows[0]:
             return inputs, kwargs
         if lift:
             kwargs = dict(kwargs)
-            for column, kwarg in (('rollout_logprobs', 'rollout_logps'), ('sampling_mask', 'sampling_masks')):
-                if kwargs.get(kwarg) is None and any(row.get(column) is not None for row in rows):
-                    kwargs[kwarg] = [row.get(column) for row in rows]
+            for field in _LIFTED_TRAJECTORY_FIELDS:
+                row_values = [row.get(field) for row in rows]
+                if field == 'truncated':
+                    # an untruncated episode carries False and a row without the fact trains
+                    # normally too -- only a True flag masks the loss (with overlong_filter on).
+                    row_values = [bool(value) for value in row_values]
+                if not any(value is not None for value in row_values):
+                    continue
+                existing = kwargs.get(field)
+                if existing is None:
+                    kwargs[field] = row_values
+                elif existing != row_values:
+                    # Both sides present: the explicit kwarg wins only when it repeats the same
+                    # values; a silent override would mask a stale parallel list.
+                    raise ValueError(
+                        f'kwarg {field!r} is also set on the trajectories and disagrees; '
+                        'pass one of them, not two different values')
         keys = InputProcessor.FEATURE_KEYS
         features = [{key: value for key, value in row.items() if key in keys} for row in rows]
         return (features if isinstance(inputs, list) else features[0]), kwargs
+
+    # -- response-framed forward_only output (shared by both backends) ------------------
+
+    ALLOWED_OUTPUT_FIELDS = frozenset({'logps', 'values', 'entropies', 'logits', 'embeddings', 'routed_experts'})
+
+    @staticmethod
+    def resolve_output_frame_request(kwargs: Dict[str, Any]) -> tuple:
+        """Validate the ``output_frame`` / ``output_fields`` request riding a forward kwargs dict.
+
+        Returns ``(output_frame, output_fields_or_None, task)`` without popping: the kwargs flow on
+        to the single-batch / micro-batch callees, which pop the controls themselves.
+        """
+        output_frame = kwargs.get('output_frame', 'sequence')
+        if output_frame not in ('sequence', 'response'):
+            raise ValueError(f'output_frame must be "sequence" or "response", got {output_frame!r}')
+        output_fields = kwargs.get('output_fields')
+        if output_fields is not None:
+            if isinstance(output_fields, str) or not isinstance(output_fields, (list, tuple, set, frozenset)):
+                raise TypeError('output_fields must be a sequence of field names, not a bare string')
+            unknown = set(output_fields) - TrainableModel.ALLOWED_OUTPUT_FIELDS
+            if unknown:
+                raise ValueError(f'output_fields names unknown fields {sorted(unknown)}; '
+                                 f'allowed: {sorted(TrainableModel.ALLOWED_OUTPUT_FIELDS)}')
+        task = kwargs.get('task', 'causal_lm')
+        if output_frame == 'response' and not get_task_spec(task).token_level_labels:
+            raise ValueError(f'task {task!r} has no token-level labels; output_frame="response" does not apply')
+        if output_fields and 'embeddings' in output_fields and task != 'embedding':
+            raise ValueError(f'output_fields requested "embeddings" but task {task!r} does not produce them')
+        return output_frame, (frozenset(output_fields) if output_fields else None), task
+
+    @staticmethod
+    def tokenizer_fingerprint(tokenizer) -> Optional[str]:
+        """A comparable identity for the tokenizer whose labels indexed a forward."""
+        if tokenizer is None:
+            return None
+        name = getattr(tokenizer, 'name_or_path', None) or type(tokenizer).__name__
+        return f'{name}#{getattr(tokenizer, "vocab_size", "")}'
+
+    @staticmethod
+    def _capture_response_rows(inputs) -> Optional[list]:
+        """Row identity (episode_id / response_token_ids) captured before feature splitting.
+
+        Returns ``None`` when no row carries identity (plain encoded features); the list stays
+        aligned with the input rows so micro-batch slicing and DP dispatch keep it in step.
+        """
+        rows = inputs if isinstance(inputs, list) else [inputs]
+        if not rows or not isinstance(rows[0], dict):
+            return None
+        if not any('episode_id' in row or 'response_token_ids' in row for row in rows):
+            return None
+        return [{'episode_id': row.get('episode_id'), 'response_token_ids': row.get('response_token_ids')}
+                for row in rows]
+
+    @staticmethod
+    def project_response_frame(outputs: Dict[str, Any], *, labels, completion_mask, rows, tokenizer) -> Dict[str, Any]:
+        """Project a forward_only public return copy onto per-sample response rows.
+
+        Runs at the public boundary only -- after the processor's gather/unpack and the internal
+        status recording, on the copied return value: the training chain's full-length tensors are
+        untouched. Token-level channels (logps/values/entropies) become per-sample Python numeric
+        lists over the response positions (``labels != -100`` intersected with ``completion_mask``
+        when present); logits/embeddings/routed_experts keep their own frames, declared in
+        ``field_frames``. Each row's derived response ids are cross-checked against the
+        ``response_token_ids`` its input row declared.
+        """
+        if labels is None:
+            raise ValueError('output_frame="response" requires labels in the forward batch')
+        # Labels may be the batched [B, L] tensor (transformers single-batch path) or the per-row
+        # list the megatron micro-batch adapter flattens; both index row-wise below.
+        batch = len(labels) if isinstance(labels, (list, tuple)) else labels.shape[0]
+        if rows is not None and len(rows) != batch:
+            raise ValueError(f'response identity rows ({len(rows)}) do not match the forward batch ({batch})')
+        positions_rows: list = []
+        token_rows: list = []
+        for i in range(batch):
+            label_row = labels[i]
+            mask = label_row != -100
+            if completion_mask is not None:
+                mask = mask & (completion_mask[i] != 0)
+            positions = mask.nonzero(as_tuple=False).squeeze(-1)
+            token_ids = label_row[positions].tolist()
+            if rows is not None and rows[i].get('response_token_ids') is not None:
+                declared = list(rows[i]['response_token_ids'])
+                if declared != token_ids:
+                    raise ValueError(
+                        f'row {i} declared response_token_ids of {len(declared)} entries but the forward labels '
+                        f'carry {token_ids}: the rows and this forward are not the same sequences')
+            positions_rows.append(positions.tolist())
+            token_rows.append(token_ids)
+        projected = dict(outputs)
+        frames: Dict[str, str] = {}
+        for key in ('logps', 'values', 'entropies'):
+            channel = outputs.get(key)
+            if channel is None:
+                continue
+            rows_out = []
+            for i, positions in enumerate(positions_rows):
+                values = channel[i][positions]
+                rows_out.append([float(v) for v in (values.tolist() if hasattr(values, 'tolist') else values)])
+            projected[key] = rows_out
+            frames[key] = 'response'
+        if outputs.get('logits') is not None:
+            frames['logits'] = 'sequence'
+        if outputs.get('embeddings') is not None:
+            frames['embeddings'] = 'row'
+        if outputs.get('routed_experts') is not None:
+            frames['routed_experts'] = 'sequence'
+        projected['field_frames'] = frames
+        projected['response_token_ids'] = token_rows
+        if rows is not None:
+            episode_ids = [row.get('episode_id') for row in rows]
+            if any(episode_id is not None for episode_id in episode_ids):
+                if any(episode_id is None for episode_id in episode_ids):
+                    raise ValueError('inconsistent episode_id presence across input rows')
+                projected['episode_ids'] = episode_ids
+        projected['tokenizer_fingerprint'] = TrainableModel.tokenizer_fingerprint(
+            getattr(tokenizer, 'tokenizer', tokenizer) if tokenizer is not None else None)
+        return projected
 
     def upload_to_hub(self,
                       checkpoint_dir: str,

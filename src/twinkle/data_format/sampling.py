@@ -239,7 +239,7 @@ class SampledSequence:
     new_input_feature: InputFeature = None
     new_state: Any | None = None
     routed_experts: Any | None = None
-    sampling_mask: SamplingMask | None = None
+    sampling_masks: SamplingMask | None = None
 
 
 @dataclass

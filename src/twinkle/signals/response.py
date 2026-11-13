@@ -1,11 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Response-token score rows: one forward channel aligned to each trajectory's trainable tokens."""
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
-
-from twinkle import remote_class, remote_function
 
 
 def response_positions(feature: Dict[str, Any]) -> List[int]:
@@ -62,39 +60,3 @@ def response_token_scores(outputs: Any, features: List[Dict[str, Any]], *, outpu
                            'per-row alignment is impossible.')
     return [_row_scores(values[i].reshape(-1), response_positions(feature), feature)
             for i, feature in enumerate(features)]
-
-
-@remote_class(execute='first')
-class ResponseScores:
-    """One per-row score lane of a batch, read where the batch lives.
-
-    - ``outputs`` and ``trajs``: the ``output_key`` channel of one whole-batch forward return,
-      aligned to each trajectory's response tokens (:func:`response_token_scores`).
-    - ``outputs`` alone: the channel itself, unaligned (a per-sample embedding / logits channel).
-    - ``trajs`` alone: each trajectory's own ``output_key`` field, already one value per response
-      token (the sampler's ``rollout_logprobs``).
-    """
-
-    @remote_function(dispatch='all', collect='first', lazy_collect=True)
-    def __call__(self,
-                 trajs: Optional[List[Dict[str, Any]]] = None,
-                 outputs: Any = None,
-                 *,
-                 output_key: str = 'logps',
-                 **kwargs) -> Any:
-        if outputs is None:
-            if trajs is None:
-                raise ValueError('ResponseScores needs trajectories, a forward return, or both.')
-            rows = []
-            for index, traj in enumerate(trajs):
-                row = traj.get(output_key)
-                if row is None:
-                    raise ValueError(f'trajectory {index} carries no {output_key!r} field.')
-                rows.append([float(value) for value in row])
-            return rows
-        if trajs is None:
-            channel = outputs.get(output_key) if isinstance(outputs, dict) else None
-            if channel is None:
-                raise ValueError(f'the forward returned no {output_key!r} channel.')
-            return channel
-        return response_token_scores(outputs, trajs, output_key=output_key)

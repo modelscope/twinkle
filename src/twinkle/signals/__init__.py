@@ -8,12 +8,11 @@ read where they live; built without one they run in the caller's process.
 from .combine import SignalCombine
 from .kl import KLEstimator
 from .reduce import Reduce
-from .response import ResponseScores, response_positions, response_token_scores
+from .response import response_positions, response_token_scores
 
 __all__ = [
     'KLEstimator',
     'Reduce',
-    'ResponseScores',
     'SignalCombine',
     'response_positions',
     'response_token_scores',

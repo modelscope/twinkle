@@ -2,7 +2,7 @@
 from typing import Any, List, Optional, Sequence, Tuple
 
 from twinkle import remote_class, remote_function
-from .base import Advantage
+from .base import Advantage, _mean, weighted_score
 
 
 def _check_unit(name: str, value: float) -> float:
@@ -15,17 +15,45 @@ def _check_unit(name: str, value: float) -> float:
 class GAEAdvantage(Advantage):
     """Token-level generalized advantage estimation over ragged per-sample response tokens.
 
-    The inputs are per-token rows, so a caller holding only references builds it with
+    The token-level member of the :class:`Advantage` family: trajectories and the critic /
+    reference forward lanes in, ``advantages`` / ``returns`` / ``old_logps`` / ``old_values``
+    written back onto the trajectories. The recursion itself (:meth:`token_advantages`) takes
+    per-token rows, so a caller holding only references builds this class with
     ``remote_group`` and the rows are read where they live.
     """
 
-    def __init__(self, gamma: float = 1.0, gae_lambda: float = 0.95, normalize: bool = True):
-        self.gamma = _check_unit('gamma', gamma)
-        self.gae_lambda = _check_unit('gae_lambda', gae_lambda)
-        self.normalize = normalize
+    _token_level = True
+
+    @remote_function(execute='first', collect='first', stash=(0,))
+    def __call__(self, trajs, **kwargs):
+        """Trajectories and forward lanes in, training-target columns out -- see :class:`Advantage`."""
+        return self._call(trajs, **kwargs)
+
+    def _estimate(self, trajs, rollout_logps, *, ref_out, teacher_out, old_out, value_out, global_step=0):
+        if teacher_out is not None or old_out is not None:
+            raise ValueError("GAEAdvantage reads ref_out and value_out only; teacher_out / old_out are "
+                             'the scalar-family lanes.')
+        if ref_out is None:
+            raise ValueError('GAEAdvantage requires ref_out: the reference forward lane for the token KL.')
+        if value_out is None:
+            raise ValueError("GAEAdvantage requires value_out: the pre-update critic forward (task='value').")
+        # old_logps is fixed to the sampler's lane (no scalar-family pre-update policy forward);
+        # old_values is the pre-update critic snapshot the value loss replays against.
+        old_logps = rollout_logps
+        ref_logps = self._lane('ref_out', ref_out, 'logps', trajs)
+        old_values = self._lane('value_out', value_out, 'values', trajs)
+        kl_rows = self._kl(old_logps, ref_logps, kind=self.kl_kind, reduce='none')
+        rm_scores = [weighted_score(self._orm_row(traj), self.reward_weights) for traj in trajs]
+        token_rewards = self._shape(rm_scores, kl_rows, beta=self.kl_coef, profile='token')
+        advantages, returns = self.token_advantages(token_rewards, old_values)
+        new_trajs = self._write_back(trajs, {'advantages': advantages, 'returns': returns,
+                                             'old_logps': old_logps, 'old_values': old_values})
+        return new_trajs, {'estimator': type(self).__name__, 'num_rows': len(trajs),
+                           'mean_advantage': _mean(advantages), 'mean_return': _mean(returns),
+                           'reward_totals': [float(sum(row)) for row in token_rewards]}
 
     @remote_function(dispatch='all', collect='first', lazy_collect=True)
-    def __call__(
+    def token_advantages(
         self,
         rewards: Sequence[Any],
         values: Sequence[Sequence[float]],

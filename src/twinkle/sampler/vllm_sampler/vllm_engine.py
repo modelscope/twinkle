@@ -550,7 +550,7 @@ class VLLMEngine(BaseSamplerEngine):
                     tokens=token_ids,
                     logprobs=seq_logprobs,
                     routed_experts=routed_experts,
-                    sampling_mask=sampling_mask,
+                    sampling_masks=sampling_mask,
                 ))
 
         # Extract prompt logprobs if requested

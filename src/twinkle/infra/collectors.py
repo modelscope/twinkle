@@ -51,6 +51,13 @@ def tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) -> Dict[
         elif isinstance(first_value, dict):
             result[key] = tensor_dict(values, device_mesh)
 
+        elif isinstance(first_value, str):
+            # Constant metadata (frame declarations, fingerprints): workers must agree, and the
+            # merged value is the constant itself -- never a per-worker list of copies.
+            if any(v != first_value for v in values):
+                raise ValueError(f'output key {key!r} disagrees across workers: {sorted(set(values))}')
+            result[key] = first_value
+
         elif isinstance(first_value, np.ndarray) and first_value.size > 1:
             raise NotImplementedError('Numpy array not supported for now.')
 

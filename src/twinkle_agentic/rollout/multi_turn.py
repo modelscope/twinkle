@@ -233,7 +233,9 @@ def _malformed_tool_message(errors: list[str]) -> dict[str, Any]:
 def _episode_id_of(trajectory: Any) -> Optional[str]:
     if not isinstance(trajectory, dict):
         return None
-    episode_id = user_data_get(trajectory.get('user_data'), 'episode_id')
+    episode_id = trajectory.get('episode_id')
+    if episode_id is None:
+        episode_id = user_data_get(trajectory.get('user_data'), 'episode_id')
     return str(episode_id) if episode_id else None
 
 
@@ -620,7 +622,9 @@ class MultiTurnRollout:
             env_reward = float(self.env.close(ep.episode_id) or 0.0)
             ep.env_open = False
         self._discard(ep.episode_id)
-        traj['env_reward'] = env_reward
+        # ``rewards.env`` is the one reward key the rollout itself owns; the scorer
+        # columns (orm / baseline) are the driver's to name when it hands the batch out.
+        traj['rewards'] = dict(traj.get('rewards') or {}, env=env_reward)
         if episode_end is not None:
             traj['episode_end'] = episode_end
         extra = {

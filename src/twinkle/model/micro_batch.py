@@ -322,6 +322,12 @@ class _MicroBatchOutputMerger:
             return self._merge_dicts(values, path, sequence_dims)
         if isinstance(first, tuple):
             return self._merge_tuples(values, path, sequence_dims)
+        if isinstance(first, str):
+            # Constant metadata (frame declarations, fingerprints) agrees across micro-batches
+            # or the merge is invalid -- it never becomes a per-sample list.
+            if any(value != first for value in values):
+                self._invalid(path, 'constant output values must agree across micro-batches')
+            return first
         if isinstance(first, list):
             return self._merge_sample_lists(values, path)
         self._invalid(path, f"unsupported micro-batch output type: {type(first).__name__}")

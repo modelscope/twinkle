@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import TYPE_CHECKING, List, Literal, Union
 
+from twinkle import remote_class, remote_function
+
 from .base import Advantage
 from ._utils import apply_kl_in_reward, compute_gdpo_advantages, reduce_rewards
 
@@ -8,13 +10,19 @@ if TYPE_CHECKING:
     import torch
 
 
+@remote_class(execute='first')
 class GRPOAdvantage(Advantage):
 
-    def __call__(self,
-                 rewards: Union['torch.Tensor', List[float]],
-                 num_generations: int = 1,
-                 scale: Literal['group', 'batch', 'none', 'gdpo'] = 'group',
-                 **kwargs) -> 'torch.Tensor':
+    @remote_function(execute='first', collect='first', stash=(0,))
+    def __call__(self, trajs, **kwargs):
+        """Trajectories and forward lanes in, training-target columns out -- see :class:`Advantage`."""
+        return self._call(trajs, **kwargs)
+
+    def _per_sequence(self,
+                      rewards: Union['torch.Tensor', List[float]],
+                      num_generations: int = 1,
+                      scale: Literal['group', 'batch', 'none', 'gdpo'] = 'group',
+                      **kwargs) -> 'torch.Tensor':
         """
             GRPO-style advantages: subtract group mean.
 

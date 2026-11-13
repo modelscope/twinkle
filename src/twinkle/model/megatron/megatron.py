@@ -474,12 +474,56 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
 
         Args:
             inputs: Model inputs.
-            **kwargs: Additional arguments.
+            **kwargs: ``output_frame`` / ``output_fields`` ride through to
+                :meth:`forward_backward`, which validates them and projects the public return
+                when ``output_frame='response'`` (per-sample response rows, frames declared in
+                ``field_frames``; the internal tensors recorded on eval_status are untouched).
 
         Returns:
             Model outputs.
         """
+        _, output_fields, _ = self.resolve_output_frame_request(kwargs)
+        if output_fields is not None:
+            # tuple rides dispatch untouched: a list would be sliced as a batch dimension.
+            kwargs['output_fields'] = tuple(output_fields)
+        response_rows = self._capture_response_rows(inputs)
+        if response_rows is not None:
+            # Row identity for the response projection, captured before the feature split.
+            kwargs['_response_rows'] = response_rows
         return self.forward_backward(inputs=inputs, micro_batch_size=micro_batch_size, forward_only=True, **kwargs)
+
+    def _project_response_output(self, model_output, inputs, response_rows, optimizer_config):
+        """Flatten the megatron micro-batch layout to rows, then run the shared projection.
+
+        ``inputs`` is the unpacked micro-batch dict list; per micro-batch labels/completion_mask
+        are [b_mb, L] tensors. variable_seq_lengths keeps the token channels as per-micro-batch
+        tensors -- flattened to rows here so the projection indexes row-wise uniformly.
+        """
+        labels_rows = []
+        completion_rows = []
+        for mb in inputs:
+            mb_labels = mb.get('labels')
+            if mb_labels is None:
+                raise ValueError('output_frame="response" requires labels in the forward batch')
+            mb_completion = mb.get('completion_mask')
+            row_count = mb_labels.shape[0] if hasattr(mb_labels, 'shape') else len(mb_labels)
+            for i in range(row_count):
+                labels_rows.append(mb_labels[i])
+                completion_rows.append(mb_completion[i] if mb_completion is not None else None)
+        completion_mask = completion_rows if all(c is not None for c in completion_rows) else None
+        if completion_mask is None and any(c is not None for c in completion_rows):
+            raise ValueError('inconsistent completion_mask presence across micro-batches')
+        projected = dict(model_output)
+        for key in ('logps', 'values', 'entropies'):
+            channel = projected.get(key)
+            if isinstance(channel, list):
+                projected[key] = [row for tensor in channel for row in tensor]
+        return self.project_response_frame(
+            projected,
+            labels=labels_rows,
+            completion_mask=completion_mask,
+            rows=response_rows,
+            tokenizer=optimizer_config.template)
 
     def generate(self, *args, **kwargs):
         """Refuse in-place generation rather than approximate it.
@@ -548,13 +592,16 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
         forward_only = kwargs.pop('forward_only', False)
+        output_frame = kwargs.pop('output_frame', 'sequence')
+        output_fields = frozenset(kwargs.pop('output_fields', None) or ())
+        response_rows = kwargs.pop('_response_rows', None)
         inputs, kwargs = self._rollout_features(inputs, kwargs, lift=not forward_only)
         # Per-call opt-in to skip the configured loss and return logps only (an empty-loss probe:
         # a KTO z_KL / adapter-disabled reference batch carries no label/ref_logps, which the loss
         # would reject). eval/training omit it; megatron's calculate_loss is a raise, so eval_loss
         # depends on forward_only computing it here.
         compute_loss = kwargs.pop('compute_loss', not (forward_only and disable_lora))
-        return_logits = kwargs.pop('return_logits', False)
+        return_logits = kwargs.pop('return_logits', False) or 'logits' in output_fields
         task = kwargs.pop('task', 'causal_lm')
         # MoE routing replay (R2/R3): the driver passes the MODE scalar, resolved below to this
         # backend's action. Popped before loss_extra_kwargs_per_mb so it never reaches the loss.
@@ -883,8 +930,11 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         # [b, s, 1] -> [b, s] (num_labels=1); already per-token, no pooling.
                         unpacked_logits = output_tensor.squeeze(-1) if output_tensor.dim() == 3 else output_tensor
                 elif labels is not None and is_last_pp:
-                    _loss_require_logps = getattr(_loss_instance, 'require_logps', True)
-                    _loss_require_entropy = getattr(_loss_instance, 'require_entropy', False)
+                    # The loss's require_* flags stay primary; an explicit output_fields request
+                    # (logps/entropies) widens the derivation gates for score-only callers.
+                    _loss_require_logps = getattr(_loss_instance, 'require_logps', True) or 'logps' in output_fields
+                    _loss_require_entropy = (getattr(_loss_instance, 'require_entropy', False)
+                                              or 'entropies' in output_fields)
                     _packed = batch.get('packed_seq_params')
                     cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
                     if _loss_require_logps:
@@ -918,6 +968,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                     if entropies is not None:
                         _outputs['entropies'] = entropies
                     if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
+                        _outputs['logits'] = output_tensor
+                    elif 'logits' in output_fields:
                         _outputs['logits'] = output_tensor
                     batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
                     logps = _outputs['logps']
@@ -1088,6 +1140,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             logits = None
         inputs = processor.unpack_inputs(inputs, task=task)
         model_output = ModelOutput(logits=logits, loss=loss, logps=logps, num_tokens=num_tokens)
+        if task == 'value' and logits is not None:
+            # The value readout rides the logits channel internally; expose it on 'values' too
+            # (the transformers backend's key). The legacy logits key stays for old callers.
+            model_output['values'] = model_output['logits']
         if embedding_batches:
             model_output['embeddings'] = torch.cat(embedding_batches, dim=0)
         if option_masks:
@@ -1108,6 +1164,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = model_output
             optimizer_config.eval_status.forward_kwargs = kwargs
+            if output_frame == 'response':
+                # The public return copy only; eval_status.outputs keeps the full-length tensors.
+                model_output = self._project_response_output(model_output, inputs, response_rows, optimizer_config)
+            if output_fields:
+                for field in output_fields:
+                    if model_output.get(field) is None:
+                        raise ValueError(f'output_fields requested {field!r} but this forward produced none')
         else:
             status = optimizer_config.train_status
             status.inputs = inputs

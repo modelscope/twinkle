@@ -1,19 +1,19 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
-import sys
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from .input_feature import InputFeature, InputType
 from .message import Message, Tool
 
-if sys.version_info[:2] <= (3, 11):
-    # Pydantic requirements.
-    from typing_extensions import TypedDict
-else:
-    from typing import TypedDict
 
+class Trajectory(InputFeature, total=False):
+    """The single public sample payload: conversation, encoding, and RL numeric fields.
 
-class Trajectory(TypedDict, total=False):
+    Token-level numeric fields are response-framed: their length is always the
+    trajectory's response width (``len(response_token_ids)``). Row-level facts
+    (rewards outcome scalars, identity) never masquerade as token frames.
+    """
     messages: List[Message]
     tools: List[Tool]
     # PyArrow-stable encoding: each entry is (key, json.dumps(value)). Use the helpers below.
@@ -22,6 +22,48 @@ class Trajectory(TypedDict, total=False):
     videos: Optional[List[Union[str, Any]]]
     audios: Optional[List[Union[str, Any]]]
     prompt: Optional[str]
+    # Identity: episode_id unique per episode; batch_id carries source identity + hand-out index.
+    episode_id: str
+    group_key: Any
+    batch_id: str
+    policy_version: int
+    role: str
+    # Response frame: response_positions address shifted labels; labels[positions] == token ids.
+    response_token_ids: List[int]
+    response_positions: List[int]
+    tokenizer_fingerprint: Optional[str]
+    # Sampling: rollout_logps is response-framed; engines without logps leave it absent.
+    rollout_logps: List[float]
+    sampling_masks: InputType
+    # Rewards: orm/env/baseline row-level named entries; process_rewards response-framed per scorer.
+    rewards: Dict[str, Any]
+    process_rewards: Dict[str, List[float]]
+    prm_segments: Any
+    # Training targets: response-framed; GRPO scalar advantages are broadcast by their producer.
+    advantages: List[float]
+    returns: List[float]
+    old_logps: List[float]
+    ref_logps: List[float]
+    old_values: List[float]
+    # Teacher signals: single-teacher logps response-framed; multi-teacher is K x T_i per trajectory.
+    teacher_logps: List[float]
+    multi_teacher_logps: List[List[float]]
+    teacher_ids: List[str]
+    teacher_weights: List[float]
+    # Episode facts.
+    truncated: bool
+    stop_reason: Any
+    turns: int
+
+
+# The conversational half of a trajectory: what another model re-encodes with its own template.
+CONVERSATION_FIELDS = ('messages', 'tools', 'user_data', 'images', 'videos', 'audios', 'prompt')
+
+# Token-level fields that always share the response frame; length is asserted, never inferred.
+RESPONSE_FRAME_FIELDS = frozenset({
+    'response_token_ids', 'rollout_logps', 'ref_logps', 'old_logps', 'teacher_logps',
+    'advantages', 'returns', 'old_values', 'sampling_masks',
+})
 
 
 def pack_value(value: Any) -> str:
@@ -101,12 +143,122 @@ def last_assistant_text(trajectory: Trajectory) -> str:
 
 
 def conversation(trajectory: Trajectory) -> Trajectory:
-    """Only the :class:`Trajectory` fields of ``trajectory``, without any model's encoding of it.
+    """Only the conversational fields of ``trajectory``, without any model's encoding of it.
 
     A rollout's trajectory also carries the policy's token fields; a different model (a reward
     model, a judge) has to re-encode the conversation with its own template instead.
     """
-    return {key: trajectory[key] for key in Trajectory.__annotations__ if key in trajectory}
+    return {key: trajectory[key] for key in CONVERSATION_FIELDS if key in trajectory}
+
+
+def assert_response_frame(trajectory: Trajectory, field: str) -> None:
+    """Raise unless ``field`` (a response-frame numeric) matches this trajectory's response width.
+
+    Length is asserted against ``response_token_ids`` only -- never against the full input, and
+    never used to decide what a field means: the field name declares its frame.
+    """
+    values = trajectory.get(field)
+    if values is None:
+        raise ValueError(f'{field} is missing on trajectory {trajectory.get("episode_id")!r}')
+    expected = len(trajectory.get('response_token_ids') or ())
+    if len(values) != expected:
+        raise ValueError(f'{field} has {len(values)} entries but trajectory '
+                         f'{trajectory.get("episode_id")!r} has {expected} response tokens')
+
+
+def validate_trajectory(trajectory: Trajectory) -> None:
+    """Assert the response contract of a completed (encoded, rolled-out) trajectory.
+
+    A trajectory without response fields passes untouched: dataset rows before rollout never
+    enter this validation face.
+    """
+    token_ids = trajectory.get('response_token_ids')
+    if token_ids is None:
+        return
+    positions = trajectory.get('response_positions')
+    if positions is None:
+        raise ValueError(f'trajectory {trajectory.get("episode_id")!r} has response tokens '
+                         'without response_positions')
+    if len(token_ids) != len(positions):
+        raise ValueError(f'response_token_ids ({len(token_ids)}) and response_positions '
+                         f'({len(positions)}) disagree on trajectory {trajectory.get("episode_id")!r}')
+    labels = trajectory.get('labels')
+    if labels is not None:
+        # The shifted-labels contract: every trainable position's label IS the response token.
+        for pos, token in zip(positions, token_ids):
+            if labels[pos] != token:
+                raise ValueError(f'labels[{pos}] != response_token_ids entry on trajectory '
+                                 f'{trajectory.get("episode_id")!r}')
+    for field in RESPONSE_FRAME_FIELDS:
+        if field in trajectory and trajectory[field] is not None:
+            assert_response_frame(trajectory, field)
+
+
+def _input_order_labels(labels: List[int]) -> List[int]:
+    """Undo twinkle's output-order roll to get labels aligned with ``input_ids``.
+
+    ``append_ids`` stores labels shifted, so ``labels[i]`` is the target for position
+    ``i + 1``; shifting right by one recovers input order, where a trainable position
+    ``j`` holds ``in_labels[j] == input_ids[j]``.
+    """
+    return (labels[-1:] + labels[:-1]) if labels else []
+
+
+def _trainable_positions(input_ids: List[int], labels: List[int], completion_mask: Any) -> List[int]:
+    """Input-order positions of the policy-produced tokens, in order.
+
+    ``labels != -100`` intersected with ``completion_mask`` when one is present. Labels AND
+    the mask both arrive in output/shifted order, so both are unrolled before the
+    position-wise intersection.
+    """
+    in_labels = _input_order_labels(list(labels or []))
+    mask = (
+        _input_order_labels(list(completion_mask))
+        if completion_mask is not None and len(completion_mask) == len(in_labels)
+        else None
+    )
+    positions: List[int] = []
+    for j, lab in enumerate(in_labels):
+        if lab == -100:
+            continue
+        if mask is not None and not mask[j]:
+            continue
+        positions.append(j)
+    return positions
+
+
+def trainable_runs(encoded: Dict[str, Any]) -> List[List[int]]:
+    """Contiguous runs of trainable input_ids positions, one run per assistant turn.
+
+    The ledger records a whole generation as trainable and every observation as
+    masked, so the runs alternate one-to-one with the assistant turns.
+    """
+    input_ids = list(encoded.get('input_ids') or [])
+    labels = list(encoded.get('labels') or [])
+    completion_mask = encoded.get('completion_mask')
+    positions = _trainable_positions(input_ids, labels, completion_mask)
+    runs: List[List[int]] = []
+    for j in positions:
+        if runs and j == runs[-1][-1] + 1:
+            runs[-1].append(j)
+        else:
+            runs.append([j])
+    return runs
+
+
+def turn_token_spans(encoded: Dict[str, Any]) -> List[Tuple[int, int]]:
+    """Per-assistant-turn ``[start, end)`` spans within the flat response tokens.
+
+    The k-th contiguous trainable run occupies a contiguous slice of the flat
+    response array, so this returns those slices as half-open spans -- the turn
+    boundaries multi-turn PRM step segmentation needs.
+    """
+    spans: List[Tuple[int, int]] = []
+    cursor = 0
+    for run in trainable_runs(encoded):
+        spans.append((cursor, cursor + len(run)))
+        cursor += len(run)
+    return spans
 
 
 def user_data_get(items: Any, key: str, default: Any = None) -> Any:

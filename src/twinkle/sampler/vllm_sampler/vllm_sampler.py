@@ -373,7 +373,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
                     stop_reason=seq.stop_reason,
                     tokens=[] if logprobs_only else seq.tokens,
                     logprobs=None if logprobs_only else seq.logprobs,
-                    sampling_mask=seq.sampling_mask,
+                    sampling_masks=seq.sampling_masks,
                 )
             elif logprobs_only:
                 new_input_feature = _convert_ndarray_to_list(feat)
@@ -396,7 +396,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
                     decoded=self.template.decode(seq.tokens),
                     new_input_feature=new_input_feature,
                     new_state=completion.state,
-                    sampling_mask=seq.sampling_mask,
+                    sampling_masks=seq.sampling_masks,
                 )
             sequences.append(sampled_seq)
         return SampleResponse(

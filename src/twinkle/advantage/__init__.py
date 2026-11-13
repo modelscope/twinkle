@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .base import Advantage
+from .base import Advantage, weighted_score
 from .estimate import ESTIMATORS, SCALINGS, compute_advantages
 from .gae import GAEAdvantage
 from .gpg import GPGAdvantage
@@ -27,4 +27,5 @@ __all__ = [
     'SCALINGS',
     'TeacherReweight',
     'compute_advantages',
+    'weighted_score',
 ]

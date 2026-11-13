@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import TYPE_CHECKING, List, Literal, Union
 
+from twinkle import remote_class, remote_function
+
 from .base import Advantage
 from ._utils import apply_kl_in_reward, reduce_rewards
 
@@ -8,6 +10,7 @@ if TYPE_CHECKING:
     import torch
 
 
+@remote_class(execute='first')
 class GRPOPassKAdvantage(Advantage):
     """GRPO-Pass@k advantage estimator (https://arxiv.org/abs/2503.19595).
 
@@ -20,11 +23,16 @@ class GRPOPassKAdvantage(Advantage):
     Requires at least 2 samples per group (num_generations >= 2).
     """
 
-    def __call__(self,
-                 rewards: Union['torch.Tensor', List[float]],
-                 num_generations: int = 2,
-                 scale: Literal['group', 'batch', 'none'] = 'group',
-                 **kwargs) -> 'torch.Tensor':
+    @remote_function(execute='first', collect='first', stash=(0,))
+    def __call__(self, trajs, **kwargs):
+        """Trajectories and forward lanes in, training-target columns out -- see :class:`Advantage`."""
+        return self._call(trajs, **kwargs)
+
+    def _per_sequence(self,
+                      rewards: Union['torch.Tensor', List[float]],
+                      num_generations: int = 2,
+                      scale: Literal['group', 'batch', 'none'] = 'group',
+                      **kwargs) -> 'torch.Tensor':
         """Compute GRPO-Pass@k advantages.
 
         Args:

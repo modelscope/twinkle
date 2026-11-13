@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import TYPE_CHECKING, List, Literal, Union
 
+from twinkle import remote_class, remote_function
+
 from .base import Advantage
 from ._utils import apply_kl_in_reward, reduce_rewards
 
@@ -8,6 +10,7 @@ if TYPE_CHECKING:
     import torch
 
 
+@remote_class(execute='first')
 class OPOAdvantage(Advantage):
     """OPO (Online Policy Optimization) advantage estimator (https://arxiv.org/pdf/2505.23585).
 
@@ -19,11 +22,16 @@ class OPOAdvantage(Advantage):
     shape ``[N]`` with the number of valid tokens per sample.
     """
 
-    def __call__(self,
-                 rewards: Union['torch.Tensor', List[float]],
-                 num_generations: int = 1,
-                 scale: Literal['group', 'batch', 'none'] = 'none',
-                 **kwargs) -> 'torch.Tensor':
+    @remote_function(execute='first', collect='first', stash=(0,))
+    def __call__(self, trajs, **kwargs):
+        """Trajectories and forward lanes in, training-target columns out -- see :class:`Advantage`."""
+        return self._call(trajs, **kwargs)
+
+    def _per_sequence(self,
+                      rewards: Union['torch.Tensor', List[float]],
+                      num_generations: int = 1,
+                      scale: Literal['group', 'batch', 'none'] = 'none',
+                      **kwargs) -> 'torch.Tensor':
         """Compute OPO advantages.
 
         Args:
