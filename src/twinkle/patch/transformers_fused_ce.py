@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Patch a HF transformers causal LM to skip the lm_head matmul so the loss
-layer can fuse it with cross-entropy (Liger Fused Linear-CE).
+"""Patch a HF transformers causal LM to defer the lm_head matmul to a fused
+cross-entropy or RL log-probability implementation.
 
 Two mutations applied to the model (both reverted by ``unpatch``):
 
@@ -23,7 +23,7 @@ Liger per-layer impls under ``twinkle.kernel.ops`` are emitted bare (no
 device-conditional wrapping).
 
 The patch is applied per-forward via ``apply_context`` (see
-``_resolve_task_context`` with ``task='fused_lm_ce'``), so it composes with
+``_resolve_task_context`` with ``task='fused_lm_ce'`` or ``'fused_lm_rl'``), so it composes with
 Twinkle's SP / routing-replay / FSDP2 / processor-postprocess orchestration
 without touching the forward body. Under FSDP2 the lm_head params are unsharded
 by FSDP's pre-forward hook before the (identity) forward runs, so
