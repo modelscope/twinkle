@@ -604,10 +604,12 @@ class SequenceParallel:
             if router_logits is None:
                 return output
 
-            attention_mask = kwargs['attention_mask']
+            attention_mask = kwargs.get('attention_mask')
             if attention_mask is None:
                 batch_size = 1
             else:
+                if attention_mask.dim() != 2:
+                    raise ValueError('SP MoE auxiliary loss requires a 2D attention mask')
                 batch_size = attention_mask.shape[0]
 
             assert router_logits[0].shape[0] % batch_size == 0
@@ -622,15 +624,25 @@ class SequenceParallel:
                 _bs_logits, _ = GatherLoss.apply(self, _bs_logits, None, 1, self.real_position_ids)
                 _gathered_logits.append(_bs_logits)
             router_logits = torch.stack(_gathered_logits, dim=0)
-            if self.real_position_ids is not None:
-                if self.rp_world_size > 1:
-                    # Ring padding is interleaved, not a suffix: a plain prefix slice keeps padding
-                    # positions and drops real ones, so select by the padded position ids instead.
-                    position_ids = self.pad(
-                        self.real_position_ids, padding_value=-1, position_ids=self.real_position_ids)
-                    router_logits = router_logits[:, :, position_ids[0] >= 0, :]
-                else:
-                    router_logits = router_logits[:, :, :self.real_position_ids.shape[1], :]
+            if attention_mask is not None:
+                # Text inputs expose the padded mask; deferred multimodal inputs
+                # retain the original mask outside the text forward boundary.
+                if router_logits.shape[2] != attention_mask.shape[-1] and self.real_position_ids is not None:
+                    positions = self.real_position_ids
+                    # Remove only SP-added padding, keeping the batch's own masked
+                    # positions. Ring padding can occur between packed sequences.
+                    indices = torch.arange(positions.shape[-1], device=positions.device).expand_as(positions)
+                    indices = self.pad(indices, padding_value=-1, position_ids=positions)
+                    router_logits = router_logits[:, :, indices[0] >= 0, :]
+                if router_logits.shape[2] != attention_mask.shape[-1]:
+                    raise ValueError(
+                        f'SP router sequence length {router_logits.shape[2]} must match '
+                        f'attention mask length {attention_mask.shape[-1]}')
+            elif self.real_position_ids is not None:
+                # Packed batches have no mask; remove SP padding, including Ring gaps.
+                positions = self.pad(self.real_position_ids, padding_value=-1,
+                                     position_ids=self.real_position_ids)
+                router_logits = router_logits[:, :, positions[0] >= 0, :]
             output['router_logits'] = tuple(
                 [logit.reshape(-1, logit.shape[-1]) for logit in router_logits.split(1, dim=1)])
             return output
