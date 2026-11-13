@@ -345,11 +345,7 @@ class CheckpointEngineManager:
         _together(lambda: self.model.init_checkpoint_process_group(**model_kwargs),
                   lambda: receiver.init_checkpoint_process_group(**sampler_kwargs))
 
-        peft_config = None
-        if base_sync_done and not merge_and_sync:
-            if self._peft_config is None:
-                self._peft_config = self.model.get_peft_config_dict()
-            peft_config = self._peft_config
+        peft_config = self._adapter_config(base_sync_done, merge_and_sync)
 
         self._ensure_model_keys()
         _together(
@@ -361,13 +357,13 @@ class CheckpointEngineManager:
         receiver.finalize_checkpoint_engine()
 
     def _sync_weights_direct_vllm(self, merge_and_sync):
-        """Colocated full-weight path: trainer bucket -> vLLM TP workers.
+        """Colocated trainer bucket -> vLLM TP workers, for both full and LoRA-only syncs.
 
-        LoRA-only updates, non-CUDA platforms and other sampler backends retain
-        the existing checkpoint-engine protocol. Physical UUIDs, rather than
-        inferred rank strides, pair each receiver with its trainer device.
+        Non-CUDA platforms and other sampler backends retain the checkpoint-engine
+        protocol. Physical UUIDs, rather than inferred rank strides, pair each receiver
+        with its trainer device.
         """
-        if (not merge_and_sync or os.environ.get('TWINKLE_DISABLE_DIRECT_VLLM_SYNC', '0') == '1'
+        if (os.environ.get('TWINKLE_DISABLE_DIRECT_VLLM_SYNC', '0') == '1'
                 or not hasattr(self.sampler, 'direct_weight_sync_metadata')
                 or not hasattr(self.model, 'direct_weight_sync_device')):
             return False
@@ -381,14 +377,20 @@ class CheckpointEngineManager:
             raise ValueError('Direct vLLM receivers must have unique physical device UUIDs.')
         if any(devices.count(device) != 1 for device in receiver_devices):
             raise ValueError('Each direct vLLM receiver must share exactly one trainer device.')
+        peft_config = self._adapter_config(self.base_sync_done, merge_and_sync)
         self._ensure_model_keys()
         _together(
             lambda: self.model.send_weights_to_vllm(
                 targets, channel=self.channel, auth_key=self._auth_key,
-                base_sync_done=self.base_sync_done, model_keys=self._model_keys),
+                base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync,
+                peft_config=peft_config, model_keys=self._model_keys),
             lambda: self.sampler.receive_weights_direct(
-                targets, auth_key=self._auth_key, base_sync_done=self.base_sync_done))
-        self.base_sync_done = True
+                targets, auth_key=self._auth_key, base_sync_done=self.base_sync_done,
+                peft_config=peft_config))
+        if not self.base_sync_done:
+            self.base_sync_done = True
+            if not merge_and_sync:
+                logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
         logger.info('Direct colocated weight sync completed: %s vLLM workers (per-device trainer -> worker IPC).',
                     len(targets))
         return True
@@ -510,6 +512,19 @@ class CheckpointEngineManager:
 
     # ── Shared helpers ───────────────────────────────────────────────────────
 
+    def _adapter_config(self, base_sync_done: bool, merge_and_sync: bool) -> Optional[Dict[str, Any]]:
+        """The cached PEFT config for a LoRA-only sync; None for a full transfer.
+
+        ``base_sync_done`` is a parameter, not ``self.base_sync_done``: :meth:`warm` stages a
+        new replica's base first (False) and only then the adapter (True), so the two can
+        differ within one manager.
+        """
+        if not base_sync_done or merge_and_sync:
+            return None
+        if self._peft_config is None:
+            self._peft_config = self.model.get_peft_config_dict()
+        return self._peft_config
+
     def _ensure_model_keys(self):
         if self._model_keys is not None:
             return
@@ -547,11 +562,7 @@ class CheckpointEngineManager:
 
     def _sync_weights_naive(self, merge_and_sync):
         """Stream model weights directly into a local sampler."""
-        peft_config = None
-        if self.base_sync_done and not merge_and_sync:
-            if self._peft_config is None:
-                self._peft_config = self.model.get_peft_config_dict()
-            peft_config = self._peft_config
+        peft_config = self._adapter_config(self.base_sync_done, merge_and_sync)
 
         self._ensure_model_keys()
         weights = self.model._get_weight_generator(

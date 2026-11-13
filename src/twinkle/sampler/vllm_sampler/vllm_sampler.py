@@ -832,11 +832,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
 
     @remote_function(dispatch='all', lazy_collect=True)
     @timed
-    def receive_weights_direct(self, targets, *, auth_key='', base_sync_done=False):
+    def receive_weights_direct(self, targets, *, auth_key='', base_sync_done=False, peft_config=None):
         async def receive():
             await self.engine.engine.collective_rpc(
                 'update_weights_direct',
-                kwargs={'targets': targets, 'auth_key': auth_key, 'base_sync_done': base_sync_done})
+                kwargs={'targets': targets, 'auth_key': auth_key, 'base_sync_done': base_sync_done,
+                        'peft_config': peft_config})
             if not base_sync_done:
                 self.engine.invalidate_synced_lora()
 

@@ -478,16 +478,22 @@ class SGLangEngine(BaseSamplerEngine):
             logger.info(f'Updated {total} weights into the sglang engine')
 
     async def _flush_bucket(self, bucket: List[Tuple[str, torch.Tensor]], flush_cache: bool) -> None:
-        """Hand one bucket to sglang, which serialises it out to the TP workers itself.
+        """Hand one bucket to sglang, which forwards it to the TP workers as CUDA IPC handles.
 
-        Each TP worker deserialises its own copy of the payload, hence one serialisation per rank.
+        ``monkey_patch_torch_reductions`` swaps the device index inside each handle for the physical
+        device UUID (the flow sglang's own weight sync and verl's integration use): a TP worker whose
+        CUDA enumeration differs from this process's then maps the handle onto its own card instead
+        of whatever carries the same index here. Idempotent, so calling it per flush is free.
         """
         from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
         from sglang.srt.utils import MultiprocessingSerializer
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
+        monkey_patch_torch_reductions()
         request = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=[
-                MultiprocessingSerializer.serialize(bucket) for _ in range(self.tensor_parallel_size)
+                MultiprocessingSerializer.serialize([(name, tensor.detach()) for name, tensor in bucket])
+                for _ in range(self.tensor_parallel_size)
             ],
             load_format=None,
             flush_cache=flush_cache,

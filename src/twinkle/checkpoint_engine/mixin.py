@@ -187,11 +187,14 @@ class CheckpointEngineMixin:
     @remote_function(dispatch='all', lazy_collect=True)
     @timed
     def send_weights_to_vllm(self, targets, *, channel='default', auth_key='',
-                             base_sync_done=False, model_keys=None):
-        """Stream full weights straight to vLLM, bypassing the sampler's data plane.
+                             base_sync_done=False, merge_and_sync=True,
+                             peft_config=None, model_keys=None):
+        """Stream weights straight to vLLM, bypassing the sampler's data plane.
 
-        Every rank must consume the export generator, even those without a local
-        receiver: FSDP/TP export can contain collectives across all training ranks.
+        Full transfers send merged weights; a LoRA-only sync (``base_sync_done`` with
+        ``peft_config``) sends just the adapter. Every rank must consume the export
+        generator, even those without a local receiver: FSDP/TP export can contain
+        collectives across all training ranks.
         """
         import torch
 
@@ -200,7 +203,7 @@ class CheckpointEngineMixin:
         device = self.direct_weight_sync_device()
         target = next((row for row in targets if row['device_uuid'] == device), None)
         weights = self._get_weight_generator(
-            base_sync_done=base_sync_done, merge_and_sync=True, model_keys=model_keys)
+            base_sync_done=base_sync_done, merge_and_sync=merge_and_sync, model_keys=model_keys)
         if target is None:
             for _name, _tensor in weights:
                 pass
@@ -218,7 +221,7 @@ class CheckpointEngineMixin:
         def send():
             try:
                 asyncio.run(sender.update_weights(
-                    weights, base_sync_done=base_sync_done,
+                    weights, peft_config=peft_config, base_sync_done=base_sync_done,
                     zmq_handle=target['endpoint'], auth_key=auth_key, device=transfer_device,
                     direct_large_tensors=True))
             except BaseException as error:

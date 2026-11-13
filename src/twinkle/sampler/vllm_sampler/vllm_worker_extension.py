@@ -213,11 +213,11 @@ class TwinkleWorkerExtension:
             }
         return self._weight_sync_target
 
-    def update_weights_direct(self, targets, auth_key='', base_sync_done=False):
+    def update_weights_direct(self, targets, auth_key='', base_sync_done=False, peft_config=None):
         target = next(row for row in targets
                       if row['device_uuid'] == self.weight_sync_metadata()['device_uuid'])
         return self.update_weights_from_ipc(
-            zmq_handle=target['endpoint'], auth_key=auth_key,
+            peft_config=peft_config, zmq_handle=target['endpoint'], auth_key=auth_key,
             base_sync_done=base_sync_done, independent=True)
 
     @streaming_weight_sync()
