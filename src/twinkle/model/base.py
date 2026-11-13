@@ -11,10 +11,11 @@ from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss.base import Loss
 from twinkle.metric import Metric
-from twinkle.model.tasks import get_task_spec, get_task_spec_obj
+from twinkle.model.tasks import get_task_spec_obj
 from twinkle.patch import Patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
+from twinkle.processor.tasks import get_task_spec
 from twinkle.template import Template
 
 if TYPE_CHECKING:
