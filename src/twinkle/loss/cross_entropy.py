@@ -39,7 +39,7 @@ class CrossEntropyLoss(Loss):
 
         mask = (labels != self.ignore_index).float()
         # DFT: -p·log(p) instead of -log(p)
-        per_token = -logps * logps.exp() if self.dft else -logps
+        per_token = -logps * logps.exp().detach() if self.dft else -logps
 
         if self.reduction != 'sum':
             return LossOutput(loss=(per_token * mask).sum() / mask.sum().clamp(min=1), num_tokens=0)
