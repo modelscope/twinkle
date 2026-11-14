@@ -92,18 +92,64 @@ def _resolve_task_context(model, task):
     'embedding' swaps lm_head for identity + installs a feature-extraction hook so
     downstream pooling can run inside
     ``InputProcessor.postprocess_tensor_sp(task='embedding', ...)``.
+    'fused_lm_ce' and 'fused_lm_rl' defer the vocab projection to their respective losses.
     """
     if task in (None, 'causal_lm'):
         return contextlib.nullcontext()
     if task == 'embedding':
         from twinkle.patch.transformers_emb import TransformersEmbeddingPatch
         return apply_context(model, TransformersEmbeddingPatch())
-    if task == 'fused_lm_ce':
-        # Skip the lm_head GEMM so a fused-linear-CE loss can take over (Liger).
-        # Device-agnostic: Liger self-dispatches the fused kernel across CUDA/NPU.
+    if task in ('fused_lm_ce', 'fused_lm_rl'):
         from twinkle.patch.transformers_fused_ce import TransformersFusedCEPatch
         return apply_context(model, TransformersFusedCEPatch())
-    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, fused_lm_ce.')
+    raise ValueError(f'Unknown task={task!r}; expected one of: causal_lm, embedding, fused_lm_ce, fused_lm_rl.')
+
+
+def _validate_fused_rl_task(task, labels, loss_instance, return_logits, enable_sampling_replay, parallel_enabled):
+    if task != 'fused_lm_rl':
+        return
+    supported = (
+        labels is not None and getattr(loss_instance, 'require_logps', True)
+        and not getattr(loss_instance, 'require_logits', False) and not getattr(loss_instance, 'require_values', False)
+        and not return_logits and not enable_sampling_replay and not parallel_enabled)
+    if not supported:
+        raise ValueError("task='fused_lm_rl' requires labels and a logp-only loss; sampling replay, "
+                         'return_logits, value outputs and sequence/context parallelism are not supported')
+
+
+def _check_fused_rl_task(self, task, labels, loss_instance, return_logits, enable_sampling_replay):
+    _validate_fused_rl_task(
+        task,
+        labels,
+        loss_instance,
+        return_logits,
+        enable_sampling_replay,
+        parallel_enabled=(getattr(self, '_enable_sp', False)
+                          or (self.device_mesh is not None and self.device_mesh.cp_world_size > 1)),
+    )
+
+
+def _fused_rl_logps(outputs, labels, temperature, return_entropy):
+    from twinkle.kernel.ops.fused_linear_selective_log_softmax import fused_linear_selective_log_softmax
+
+    hidden = outputs['logits']
+    lm_head = outputs.pop('lm_head', None)
+    if lm_head is None:
+        raise RuntimeError("task='fused_lm_rl' requires the lm_head-preserving forward patch")
+    weight = lm_head.weight
+    if getattr(lm_head, 'bias', None) is not None or hasattr(weight, 'full_tensor'):
+        raise NotImplementedError('fused_lm_rl supports only unsharded, bias-free lm_head weights')
+    result = fused_linear_selective_log_softmax(
+        hidden.reshape(-1, hidden.shape[-1]),
+        weight,
+        labels.reshape(-1),
+        temperature=temperature,
+        return_entropy=return_entropy,
+    )
+    if return_entropy:
+        outputs['logps'], outputs['entropies'] = (value.reshape(labels.shape) for value in result)
+    else:
+        outputs['logps'] = result.reshape(labels.shape)
 
 
 @dataclass
@@ -600,6 +646,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         labels: torch.Tensor = inputs.pop('labels', None)
         # Not a model argument; the loss reads it back off `inputs` further down.
         completion_mask = inputs.pop('completion_mask', None)
+        _check_fused_rl_task(self, task, labels, loss_instance, return_logits, enable_sampling_replay)
         replay_metadata = replay_loss_mask = replay_masked_labels = None
         if enable_sampling_replay:
             replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
@@ -633,7 +680,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
             masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
             logits = outputs['logits']
-            if enable_sampling_replay:
+            if task == 'fused_lm_rl':
+                _fused_rl_logps(outputs, masked_labels, temperature, loss_require_entropy)
+            elif enable_sampling_replay:
                 outputs['logps'] = replayed_selective_log_softmax(
                     logits=logits,
                     labels=masked_labels,
@@ -725,6 +774,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             labels = inputs.pop('labels', None)
             # Not a model argument; the loss reads it back off `inputs` further down.
             completion_mask = inputs.pop('completion_mask', None)
+            _check_fused_rl_task(self, task, labels, loss_instance, return_logits, enable_sampling_replay)
             replay_metadata = replay_loss_mask = replay_masked_labels = None
             if enable_sampling_replay:
                 packed_position_ids = processor._is_packed_position_ids(inputs.get('position_ids'))
@@ -762,7 +812,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
                 masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
                 logits = outputs['logits']
-                if enable_sampling_replay:
+                if task == 'fused_lm_rl':
+                    _fused_rl_logps(outputs, masked_labels, temperature, loss_require_entropy)
+                elif enable_sampling_replay:
                     outputs['logps'] = replayed_selective_log_softmax(
                         logits=logits,
                         labels=masked_labels,
