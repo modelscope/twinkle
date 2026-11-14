@@ -545,11 +545,16 @@ class SGLangEngine(BaseSamplerEngine):
         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
         monkey_patch_torch_reductions()
+        # Every tensor must be in device memory before it is serialized: the payload each TP worker
+        # receives is a CUDA IPC handle, and a host tensor's reduction tuple carries no device index
+        # at all, which sglang's patched reducer indexes unconditionally. The collect transport
+        # returns its flush stream on the host, so stage it here -- the same reason the vLLM lane
+        # stages host tensors into its device bucket instead of switching the wire format.
+        device = torch.device('cuda', torch.cuda.current_device())
+        staged = [(name, tensor.detach().to(device)) for name, tensor in bucket]
         request = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[
-                MultiprocessingSerializer.serialize([(name, tensor.detach()) for name, tensor in bucket])
-                for _ in range(self.tensor_parallel_size)
-            ],
+            serialized_named_tensors=[MultiprocessingSerializer.serialize(staged)
+                                      for _ in range(self.tensor_parallel_size)],
             load_format=load_format,
             flush_cache=flush_cache,
         )
