@@ -856,11 +856,16 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     return _call_impl(self, *args, **kwargs)
             return _call_impl(self, *args, **kwargs)
 
-        # Same hazard as the continuous-work companion: __wrapped__ makes inspect.signature (and so
-        # Ray's argument validation) report the original method's parameters, so the
-        # _dispatch_context that _call_replicas adds for ref-carrying calls is rejected as an
-        # unexpected keyword. This wrapper takes *args/**kwargs by design.
-        del wrapper.__wrapped__
+        # Ray's argument validation reads inspect.signature, which follows __wrapped__ and would then
+        # report the ORIGINAL method's parameters -- so the _dispatch_context that _call_replicas adds
+        # for ref-carrying calls gets rejected as an unexpected keyword. A pinned __signature__ takes
+        # precedence over __wrapped__ in inspect.signature, which keeps Ray on the var-args form this
+        # wrapper actually accepts while leaving __wrapped__ in place: reaching the undecorated body
+        # through it is how the test suite drives these methods at all.
+        wrapper.__signature__ = inspect.Signature(parameters=[
+            inspect.Parameter('args', inspect.Parameter.VAR_POSITIONAL),
+            inspect.Parameter('kwargs', inspect.Parameter.VAR_KEYWORD),
+        ])
 
         def _worker_entry(self, *args, **kwargs):
             # What the awaitable companion runs on the replica: always the body, never a Future.

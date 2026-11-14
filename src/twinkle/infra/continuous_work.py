@@ -10,6 +10,7 @@ caller drops it from its view and resubmits the request elsewhere, so correctnes
 how fresh the cache is.
 """
 import functools
+import inspect
 import os
 import threading
 import time
@@ -113,7 +114,12 @@ def _make_worker_async_companion(func, wrapper):
     # functools.wraps pins __wrapped__, and inspect.signature follows it -- so Ray would validate
     # a call against the original method's parameters instead of this companion's (self, *args,
     # **kwargs) and reject the _dispatch_context that _submit adds when the arguments carry refs.
-    del companion.__wrapped__
+    # A pinned __signature__ outranks __wrapped__ in inspect.signature, so Ray still sees the
+    # var-args form while __wrapped__ stays available for reaching the undecorated body.
+    companion.__signature__ = inspect.Signature(parameters=[
+        inspect.Parameter('args', inspect.Parameter.VAR_POSITIONAL),
+        inspect.Parameter('kwargs', inspect.Parameter.VAR_KEYWORD),
+    ])
     companion.__name__ = _WORKER_ASYNC_PREFIX + func.__name__
     return companion
 
