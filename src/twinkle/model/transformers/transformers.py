@@ -1845,10 +1845,69 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     @remote_function(dispatch='all', sync=True)
     @timed
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
+        probe = os.environ.get('TWINKLE_STEP_DELTA_PROBE')
+        pre = self._digest_parameters('param') if probe else None
         self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
+        grad = self._digest_parameters('grad') if probe else None
         self.step(**kwargs)
+        if probe:
+            self._write_step_probe(probe, pre, grad)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
+
+    @staticmethod
+    def _shard(tensor):
+        # FSDP2 parameters are DTensors whose moments and shards live per rank, so the digest is
+        # taken on the local shard: each rank reports its own piece and two runs are compared
+        # rank-wise. ``full_tensor()`` would all-gather instead, which is a collective that every
+        # rank must enter for the same names in the same order -- unusable from a per-rank probe.
+        tensor = tensor.detach()
+        return tensor.to_local() if hasattr(tensor, 'to_local') else tensor
+
+    def _digest_parameters(self, kind: str):
+        out = {}
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            tensor = param if kind == 'param' else param.grad
+            if tensor is None:
+                continue
+            tensor = self._shard(tensor).double()
+            out[name] = [float(tensor.sum()), float(tensor.abs().max()), float(tensor.norm())]
+        return out
+
+    def _write_step_probe(self, prefix, pre, grad):
+        # Answers one question a resumed run cannot answer from its loss curve alone: which
+        # parameters received a different update. The loss and the global grad_norm are aggregates
+        # -- they can match to four decimals while a subset of parameters is updated wrongly, which
+        # is exactly the signature of a resume that reproduces its first step and then drifts.
+        post = self._digest_parameters('param')
+        rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+        step_no = self.__dict__.setdefault('_probe_step_no', 0) + 1
+        self.__dict__['_probe_step_no'] = step_no
+        optimizer_step = None
+        for group in self.optimizer.param_groups:
+            for param in group['params']:
+                state = self.optimizer.state.get(param)
+                if state is not None and 'step' in state:
+                    counter = state['step']
+                    optimizer_step = int(counter.item()) if hasattr(counter, 'item') else int(counter)
+                    break
+            if optimizer_step is not None:
+                break
+        record = {
+            'rank': rank,
+            'step_no': step_no,
+            'optimizer_step': optimizer_step,
+            'lrs': [float(g.get('lr', 0.0)) for g in self.optimizer.param_groups],
+            'weight_decays': [float(g.get('weight_decay', 0.0)) for g in self.optimizer.param_groups],
+            'group_sizes': [len(g['params']) for g in self.optimizer.param_groups],
+            'pre': pre,
+            'grad': grad,
+            'post': post,
+        }
+        with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
+            handle.write(json.dumps(record) + '\n')
 
     def _create_param_group(self,
                             adapter_name: str,
