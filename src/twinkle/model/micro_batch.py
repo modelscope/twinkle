@@ -3,8 +3,9 @@
 from __future__ import annotations
 import heapq
 import math
+import torch.distributed as dist
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from twinkle.processor.tasks import get_task_spec
 
@@ -211,6 +212,100 @@ def plan_micro_batches_for_lengths(
     if config.packing_algorithm == "ffd":
         return _ffd_allocate(lengths, config, padding_free, min_micro_batches)
     return _kk_allocate(lengths, config, padding_free, min_micro_batches)
+
+
+def plan_micro_batches_contiguous(
+    lengths: list[int],
+    config: MicroBatchConfig,
+    *,
+    padding_free: bool,
+    min_micro_batches: int = 1,
+) -> list[list[int]]:
+    """Order-preserving token packing: contiguous runs of the input order.
+
+    ``ffd``/``kk`` regroup rows arbitrarily, which forces every downstream consumer of the
+    micro-batches to undo the plan permutation before reading sample-aligned data. The
+    megatron backend's consumers (per-micro-batch loss kwargs, output assembly, the
+    response projection) are all stride- and order-sensitive, so it packs contiguous runs
+    instead: each group keeps the input row order and respects both caps (the row count
+    ``micro_batch_size`` and the token budget), and can be split further -- splitting a
+    group preserves order and both caps -- to reach ``min_micro_batches`` exactly.
+    """
+    if not lengths:
+        raise ValueError("cannot plan micro-batches for empty inputs")
+    if min_micro_batches <= 0 or min_micro_batches > len(lengths):
+        raise ValueError(f"invalid min_micro_batches={min_micro_batches} for {len(lengths)} inputs")
+    capacity = config.max_tokens_per_micro_batch
+    oversized = [length for length in lengths if length > capacity]
+    if oversized:
+        raise ValueError(f"sequence length {max(oversized)} exceeds max_tokens_per_micro_batch={capacity}")
+    groups: list[list[int]] = []
+    for index in range(len(lengths)):
+        if groups and _fits(groups[-1], index, lengths, config, padding_free):
+            groups[-1].append(index)
+        else:
+            groups.append([index])
+    while len(groups) < min_micro_batches:
+        # Split the largest group in half: both halves stay within the row and token caps
+        # (splitting never adds members) and the concatenated row order is unchanged.
+        target = max(range(len(groups)), key=lambda group: len(groups[group]))
+        if len(groups[target]) < 2:
+            raise ValueError(
+                f"cannot reach min_micro_batches={min_micro_batches} with {len(lengths)} inputs")
+        mid = len(groups[target]) // 2
+        groups[target : target + 1] = [groups[target][:mid], groups[target][mid:]]
+    return groups
+
+
+def agree_micro_batch_count(
+    plan_fn: Callable[[int], list[list[int]]],
+    *,
+    config: MicroBatchConfig,
+    dp_group,
+    input_count: int,
+) -> list[list[int]]:
+    """All-gather local micro-batch counts until every DP rank agrees on one number.
+
+    The grad all-reduce and each backend's schedule iterate per rank, so every data-parallel
+    rank must execute the same number of micro-batches. ``plan_fn(min_micro_batches)`` builds
+    this rank's plan at that floor; it may raise, and the error is carried through the
+    collective (a rank-local raise before the all-gather would hang the ranks already waiting
+    in it). Dynamic configs lift every rank to the largest count, which order-preserving
+    planners can always reach exactly by splitting groups; fixed configs cannot lift, so a
+    count mismatch is an input-distribution error. Shared by both training backends, which
+    differ only in how they obtain the DP group and the planner.
+    """
+    min_micro_batches = 1
+    while True:
+        try:
+            plan = plan_fn(min_micro_batches)
+            planning_error = None
+        except Exception as exc:
+            plan = None
+            planning_error = f'{type(exc).__name__}: {exc}'
+        local_state = {
+            'micro_batch_count': len(plan) if plan is not None else None,
+            'input_count': input_count,
+            'error': planning_error,
+        }
+        states = [None] * dist.get_world_size(dp_group)
+        dist.all_gather_object(states, local_state, group=dp_group)
+        errors = [
+            f'rank {rank}: {state["error"]}' for rank, state in enumerate(states) if state['error'] is not None
+        ]
+        if errors:
+            raise RuntimeError('micro-batch planning failed on one or more model DP ranks: ' + '; '.join(errors))
+        counts = [state['micro_batch_count'] for state in states]
+        if all(count == len(plan) for count in counts):
+            return plan
+        if not config.dynamic_batching:
+            raise ValueError(
+                f'fixed micro-batch counts differ across model DP ranks ({counts}); distribute inputs so '
+                'all ranks execute the same number of non-empty micro-batches.')
+        min_micro_batches = max(counts)
+        if any(min_micro_batches > state['input_count'] for state in states):
+            raise ValueError('model DP ranks cannot execute the same number of non-empty micro-batches; '
+                             'make the input batch divisible by the model data-parallel size')
 
 
 def select_batch(value: Any, indices: list[int], batch_size: int) -> Any:

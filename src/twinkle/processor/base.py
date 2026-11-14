@@ -1024,7 +1024,8 @@ class InputProcessor:
         return result
 
     def collate_fn(
-        self, inputs: list[InputFeature], micro_batch_size: int | None = None, variable_seq_lengths=False, **kwargs
+        self, inputs: list[InputFeature], micro_batch_size: int | None = None, variable_seq_lengths=False,
+        micro_batch_plan: list[list[int]] | None = None, **kwargs
     ) -> list[InputFeature]:
         if len(inputs) == 1 and self.framework != "megatron":
             return inputs
@@ -1039,6 +1040,20 @@ class InputProcessor:
                     outputs[key] = torch.cat(outputs[key], dim=0)
             return [outputs]
         padding_free = self.padding_free or self._any_packing(inputs)
+        if micro_batch_plan is not None:
+            # Token-budget plan (the megatron backend's dynamic batching): the groups carry their
+            # own row counts and each pads to its own max length, so every group collates
+            # independently -- the same per-micro-batch collate the variable-length path takes.
+            outputs = []
+            for indices in micro_batch_plan:
+                _output = self._collate_macro_batch(
+                    [inputs[index] for index in indices], omit_megatron_attention_mask=omit_megatron_attention_mask
+                )
+                for key in _output:
+                    if key in self.VLM_CONCAT_FIELDS:
+                        _output[key] = torch.cat(_output[key], dim=0)
+                outputs.append(_output)
+            return outputs
         if variable_seq_lengths or padding_free:
             # each micro batch has its own packed length
             assert len(inputs) >= micro_batch_size
