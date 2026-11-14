@@ -253,6 +253,10 @@ class AccelerateStrategy(TransformerStrategyBase):
         import torch
 
         duplicates = self._duplicate_names(model)
+        plugin = self._get_fsdp_plugin()
+        if duplicates and plugin is not None and getattr(plugin, 'fsdp_version', 1) == 2:
+            self._untie_shared_weights(model, [obj for obj in args if isinstance(obj, torch.optim.Optimizer)],
+                                       duplicates)
         result = self.accelerator.prepare(model, *args)
         # ``Accelerator.prepare`` ends with ``return result if len(result) > 1 else result[0]``, and
         # ``result`` is a list, so the container's type says nothing about what was prepared and a
@@ -264,40 +268,54 @@ class AccelerateStrategy(TransformerStrategyBase):
                 # the model's own objects, and an argument would be evaluated before the call.
                 self._rebind_unsharded_optimizer_params(
                     prepared[0], optimizer, self.__dict__.get('_optimizer_param_names'))
-                self._adopt_untied_duplicates(prepared[0], optimizer, duplicates)
                 self._remember_optimizer_params(prepared[0], optimizer)
         return result
 
     @staticmethod
-    def _adopt_untied_duplicates(model, optimizer, duplicates):
-        """Give the optimizer the weight that sharding untied from its partner.
+    def _untie_shared_weights(model, optimizers, duplicates):
+        """Give each name of a tied weight its own parameter, before sharding splits them anyway.
 
-        ``fully_shard`` converts each module's parameters separately, so a weight two modules share
-        comes out of ``prepare`` as two objects and the tie is gone. The optimizer was built over the
-        tied view and holds only the partner's name, which leaves the duplicate frozen at its
-        pretrained value even though the model computes its logits with it -- a tied embedding/head
-        pair trained this way drifts apart, and the checkpoint carries a stale head beside a trained
-        embedding. A strict optimizer-state load then refuses the resume outright, for want of an
-        entry under the duplicate's name.
+        ``fully_shard`` converts every module's parameters on its own, so a weight two modules share
+        comes out of ``prepare`` as two objects whether or not anything asked for it. Left tied, the
+        optimizer -- built over the tied view -- keeps only one of them, so the other stays at its
+        pretrained value while the forward pass computes with it. The checkpoint then carries a head
+        that differs from the embedding it claims to be tied to, and a reload that honors
+        ``tie_word_embeddings`` binds the head back to the embedding and throws the trained one away:
+        the model that resumes is not the model that trained. Declaring the untie up front makes both
+        weights real, trainable and saveable, and the config written beside them agrees with what is
+        on disk -- the resolution accelerate's own tied-embedding error message advises.
 
-        The duplicate joins the group that holds its partner, so it inherits the partner's learning
-        rate and weight decay -- which is what the tie would have implied.
+        The new parameter joins the group that holds its partner, so it inherits the partner's
+        learning rate and weight decay, which is what the tie would have implied.
         """
-        inner = getattr(optimizer, 'optimizer', optimizer)
-        groups = getattr(inner, 'param_groups', None)
-        if not groups or not duplicates:
-            return
-        held = {id(param) for group in groups for param in group['params']}
-        by_name = dict(model.named_parameters())
-        for fqn, partner in duplicates.items():
+        import torch
+
+        groups = []
+        for optimizer in optimizers:
+            inner = getattr(optimizer, 'optimizer', optimizer)
+            groups.extend(getattr(inner, 'param_groups', None) or [])
+        by_name = dict(model.named_parameters(remove_duplicate=False))
+        for fqn, partner_name in duplicates.items():
             param = by_name.get(fqn)
-            if param is None or not param.requires_grad or id(param) in held:
+            if param is None or not param.requires_grad:
+                # A frozen duplicate is never stepped and never saved as optimizer state, so leaving
+                # it shared costs nothing and splitting it would only spend its memory twice.
                 continue
-            partner_param = by_name.get(partner)
-            group = next((group for group in groups if partner_param is not None
-                          and any(item is partner_param for item in group['params'])), None)
-            (group if group is not None else groups[0])['params'].append(param)
-            held.add(id(param))
+            parent, _, attribute = fqn.rpartition('.')
+            module = model.get_submodule(parent) if parent else model
+            fresh = torch.nn.Parameter(param.detach().clone(), requires_grad=True)
+            setattr(module, attribute, fresh)
+            partner = by_name.get(partner_name)
+            group = next((group for group in groups if partner is not None
+                          and any(item is partner for item in group['params'])), None)
+            if group is None and groups:
+                group = groups[0]
+            if group is not None:
+                group['params'].append(fresh)
+        config = getattr(model, 'config', None)
+        for holder in (config, getattr(config, 'text_config', None)):
+            if holder is not None and getattr(holder, 'tie_word_embeddings', False):
+                holder.tie_word_embeddings = False
 
     def _remember_optimizer_params(self, model, optimizer):
         """Record the name each optimizer parameter had while the model and the optimizer agreed.
@@ -447,7 +465,12 @@ class AccelerateStrategy(TransformerStrategyBase):
         """
         from torch.distributed.tensor import DTensor
 
-        params = [param for group in optimizer.param_groups for param in group['params']]
+        # An optimizer this strategy cannot introspect has nothing to check; the repair tolerates the
+        # same shape, and torch's own get_optimizer_state_dict still refuses it in production.
+        param_groups = getattr(optimizer, 'param_groups', None)
+        if not param_groups:
+            return
+        params = [param for group in param_groups for param in group['params']]
         model_params = list(model.named_parameters())
         model_ids = {id(param) for _, param in model_params}
         unreachable = [(index, param) for index, param in enumerate(params) if id(param) not in model_ids]

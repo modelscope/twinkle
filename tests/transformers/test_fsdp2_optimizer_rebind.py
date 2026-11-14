@@ -14,6 +14,8 @@ model's plain trainable parameters, a shape occurring twice must pair by travers
 shape multiset that does not match must leave the optimizer untouched so the loud save-time refusal
 still fires instead of a silent guess.
 """
+from types import SimpleNamespace
+
 import torch
 
 from twinkle.model.transformers.strategy.accelerate import AccelerateStrategy
@@ -306,16 +308,18 @@ def test_a_stale_entry_missing_from_the_name_map_falls_through_to_the_shape_rule
 class _Accelerator:
     process_index = 0
 
-    def __init__(self, prepared):
+    def __init__(self, prepared, fsdp_version=None):
         self._prepared = prepared
+        plugin = None if fsdp_version is None else SimpleNamespace(fsdp_version=fsdp_version)
+        self.state = SimpleNamespace(fsdp_plugin=plugin)
 
     def prepare(self, *args):
         return self._prepared
 
 
-def _wrap(prepared):
+def _wrap(prepared, fsdp_version=None):
     strategy = object.__new__(AccelerateStrategy)
-    strategy.accelerator = _Accelerator(prepared)
+    strategy.accelerator = _Accelerator(prepared, fsdp_version)
     model = prepared[0] if isinstance(prepared, (list, tuple)) else prepared
     return strategy, strategy.wrap_model(model, *([] if not isinstance(prepared, (list, tuple)) else prepared[1:]))
 
@@ -459,90 +463,116 @@ def test_the_guard_refuses_a_moment_whose_parameter_left_every_group():
 
     with pytest.raises(RuntimeError, match='no group holds'):
         AccelerateStrategy._check_optimizer_params_reachable(model, optimizer)
-
-
-# ---------------------------------------------------------------------------------------------
-# Sharding unties a shared weight; the duplicate must still be trained.
-# ---------------------------------------------------------------------------------------------
-
-
-def _duplicates(named):
-    class _Dup(torch.nn.Module):
-        def named_parameters(self, *args, **kwargs):
-            return list(named)
-
-    return AccelerateStrategy._duplicate_names(_Dup())
-
-
-def test_duplicate_names_finds_the_name_a_tie_is_hiding():
+def test_fsdp2_unties_a_trainable_shared_weight_before_sharding():
+    """The defect behind the divergent checkpoint: sharding unties, so declare the untie up front."""
     shared = torch.nn.Parameter(torch.zeros(6, 2))
-    other = torch.nn.Parameter(torch.zeros(3))
-    named = [('embed', shared), ('blocks.0.w', other), ('lm_head', shared)]
-
-    assert _duplicates(named) == {'lm_head': 'embed'}
-
-
-def test_an_untied_duplicate_joins_the_group_that_holds_its_partner():
-    """The defect: the head the forward pass uses stays at its pretrained value."""
-    embed = torch.nn.Parameter(torch.zeros(6, 2))
-    head = torch.nn.Parameter(torch.zeros(6, 2))
     vision = torch.nn.Parameter(torch.zeros(3))
-    model = _Model([('embed', embed), ('lm_head', head), ('vision', vision)])
-    decay, no_decay = {'params': [embed], 'weight_decay': 0.1}, {'params': [vision], 'weight_decay': 0.0}
-    optimizer = torch.optim.AdamW([decay, no_decay], lr=1e-5)
-
-    AccelerateStrategy._adopt_untied_duplicates(model, optimizer, {'lm_head': 'embed'})
-
-    assert decay['params'] == [embed, head], 'the head must train beside its partner'
-    assert no_decay['params'] == [vision]
-    assert optimizer.param_groups[0]['weight_decay'] == 0.1, 'and inherit the partner\'s weight decay'
-
-
-def test_a_frozen_or_already_held_duplicate_is_not_adopted():
-    embed = torch.nn.Parameter(torch.zeros(6, 2))
-    frozen_head = torch.nn.Parameter(torch.zeros(6, 2), requires_grad=False)
-    model = _Model([('embed', embed), ('lm_head', frozen_head)])
-    optimizer = _optimizer(embed)
-
-    AccelerateStrategy._adopt_untied_duplicates(model, optimizer, {'lm_head': 'embed'})
-
-    assert _same(_params_of(optimizer), [embed])
-
-
-def test_an_untied_model_leaves_the_optimizer_alone():
-    embed = torch.nn.Parameter(torch.zeros(6, 2))
-    model = _Model([('embed', embed)])
-    optimizer = _optimizer(embed)
-
-    AccelerateStrategy._adopt_untied_duplicates(model, optimizer, {})
-
-    assert _same(_params_of(optimizer), [embed])
-
-
-def test_wrap_model_adopts_the_duplicate_prepare_untied():
-    """End to end through the seam: the model goes in tied and comes out untied.
-
-    The optimizer was built over the tied view, so it holds one entry for the pair; prepare then
-    exposes two objects. Without the adoption the second one never trains, and the recorded name map
-    -- which the save-time repair depends on -- would not cover it either.
-    """
-    shared = torch.nn.Parameter(torch.zeros(6, 2))
-    tied = _Model([('embed', shared), ('lm_head', shared)])
-    embed = torch.nn.Parameter(torch.zeros(6, 2))
-    head = torch.nn.Parameter(torch.zeros(6, 2))
-    untied = _Model([('embed', embed), ('lm_head', head)])
-    optimizer = _optimizer(embed)
+    model = _TiedModel(shared, vision)
+    optimizer = _optimizer(shared, vision)
 
     strategy = object.__new__(AccelerateStrategy)
+    strategy.accelerator = _Accelerator([model, optimizer], fsdp_version=2)
+    strategy.wrap_model(model, optimizer)
 
-    class _Untier:
-        process_index = 0
+    head = model.lm_head.weight
+    embed = model.language_model.embed_tokens.weight
+    assert head is not embed, 'each name must own a parameter, or sharding will split them anyway'
+    assert torch.equal(head, embed), 'and start from the same values'
+    assert model.config.tie_word_embeddings is False, 'the config must agree with what is on disk'
+    assert _same(_params_of(optimizer), [embed, vision, head]), 'both weights must train'
+    assert strategy.__dict__['_optimizer_param_names'][id(head)] == 'lm_head.weight'
 
-        def prepare(self, model, *args):
-            return [untied, optimizer]
 
-    strategy.accelerator = _Untier()
-    strategy.wrap_model(tied, optimizer)
+def test_a_tied_weight_is_left_alone_outside_fsdp2():
+    """DDP keeps the tie, so splitting it there would spend the memory and change the model."""
+    shared = torch.nn.Parameter(torch.zeros(6, 2))
+    vision = torch.nn.Parameter(torch.zeros(3))
+    model = _TiedModel(shared, vision)
+    optimizer = _optimizer(shared, vision)
 
-    assert _same(_params_of(optimizer), [embed, head])
-    assert strategy.__dict__['_optimizer_param_names'] == {id(embed): 'embed', id(head): 'lm_head'}
+    strategy = object.__new__(AccelerateStrategy)
+    strategy.accelerator = _Accelerator([model, optimizer], fsdp_version=1)
+    strategy.wrap_model(model, optimizer)
+
+    assert model.lm_head.weight is model.language_model.embed_tokens.weight
+    assert model.config.tie_word_embeddings is True
+    assert _same(_params_of(optimizer), [shared, vision])
+
+
+def test_a_frozen_tied_weight_is_not_split():
+    shared = torch.nn.Parameter(torch.zeros(6, 2), requires_grad=False)
+    vision = torch.nn.Parameter(torch.zeros(3))
+    model = _TiedModel(shared, vision)
+    optimizer = _optimizer(vision)
+
+    strategy = object.__new__(AccelerateStrategy)
+    strategy.accelerator = _Accelerator([model, optimizer], fsdp_version=2)
+    strategy.wrap_model(model, optimizer)
+
+    assert model.lm_head.weight is shared, 'a frozen duplicate is never stepped, so keep it shared'
+    assert _same(_params_of(optimizer), [vision])
+
+
+def test_untie_puts_the_new_weight_in_the_group_that_holds_its_partner():
+    """The new parameter must inherit the partner's hyperparameters, not land in group 0 by default."""
+    shared = torch.nn.Parameter(torch.zeros(6, 2))
+    vision = torch.nn.Parameter(torch.zeros(3))
+    model = _TiedModel(shared, vision)
+    decay = {'params': [vision], 'weight_decay': 0.0}
+    no_decay = {'params': [shared], 'weight_decay': 0.1}
+    optimizer = torch.optim.AdamW([decay, no_decay], lr=1e-5)
+
+    AccelerateStrategy._untie_shared_weights(
+        model, [optimizer], {'lm_head.weight': 'model.language_model.embed_tokens.weight'})
+
+    head = model.lm_head.weight
+    assert no_decay['params'] == [shared, head], "the head joins the embedding's group"
+    assert decay['params'] == [vision]
+    assert optimizer.param_groups[1]['weight_decay'] == 0.1
+
+
+def test_untie_without_an_optimizer_still_splits_the_weight():
+    shared = torch.nn.Parameter(torch.zeros(6, 2))
+    model = _TiedModel(shared, torch.nn.Parameter(torch.zeros(3)))
+
+    AccelerateStrategy._untie_shared_weights(
+        model, [], {'lm_head.weight': 'model.language_model.embed_tokens.weight'})
+
+    assert model.lm_head.weight is not shared
+    assert model.config.tie_word_embeddings is False
+
+
+class _TiedConfig:
+    tie_word_embeddings = True
+
+
+class _TiedModel(torch.nn.Module):
+    """A model whose head shares its parameter object with the embedding, as a tied model does."""
+
+    def __init__(self, shared, vision):
+        super().__init__()
+        self.config = _TiedConfig()
+        self.language_model = torch.nn.Module()
+        self.language_model.embed_tokens = torch.nn.Module()
+        self.language_model.embed_tokens.weight = shared
+        self.lm_head = torch.nn.Module()
+        self.lm_head.weight = shared
+        self.visual = torch.nn.Module()
+        self.visual.w = vision
+
+    def named_parameters(self, *args, **kwargs):
+        # Dedup by object identity, as nn.Module does, so the view follows the tie: one entry while
+        # the two names share a parameter, two once something splits them.
+        remove_duplicate = True if not kwargs else kwargs.get('remove_duplicate', True)
+        out = [('model.language_model.embed_tokens.weight', self.language_model.embed_tokens.weight),
+               ('lm_head.weight', self.lm_head.weight),
+               ('visual.w', self.visual.w)]
+        if not remove_duplicate:
+            return out
+        seen, deduped = set(), []
+        for name, param in out:
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+            deduped.append((name, param))
+        return deduped
