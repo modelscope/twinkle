@@ -3,7 +3,7 @@
 import os
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import replace as _replace
 from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional
@@ -29,21 +29,23 @@ def _together(*calls) -> List[Any]:
     """Run the calls side by side and wait for all of them.
 
     Rendezvous pairs (a process-group init whose master blocks until every peer connects, a send
-    and its receive) must not run one after the other; the first failure is raised after every call
-    has ended.
+    and its receive) must not run one after the other.
+
+    A failure is raised as soon as one call has failed, without waiting for the others: the survivor
+    of a broken rendezvous blocks forever inside the collective, so waiting for every call to end
+    first turned a diagnosable one-sided error into an unbounded hang with nothing on the console.
+    The blocked sibling is left behind deliberately -- its actor is torn down by the caller.
     """
-    with ThreadPoolExecutor(len(calls)) as pool:
-        futures = [pool.submit(lambda call=call: _wait(call())) for call in calls]
-    results, error = [], None
-    for future in futures:
-        try:
-            results.append(future.result())
-        except BaseException as failure:  # noqa
-            error = error or failure
-            results.append(None)
-    if error is not None:
-        raise error
-    return results
+    pool = ThreadPoolExecutor(len(calls))
+    futures = [pool.submit(lambda call=call: _wait(call())) for call in calls]
+    done, _not_done = wait(futures, return_when=FIRST_EXCEPTION)
+    for future in done:
+        exception = future.exception()
+        if exception is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise exception
+    pool.shutdown(wait=False)
+    return [future.result() for future in futures]
 
 
 @remote_class(execute='first', max_concurrency=3)

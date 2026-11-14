@@ -4,9 +4,11 @@ import threading
 import uuid
 from typing import List
 
-from twinkle import Platform, remote_function
+from twinkle import Platform, get_logger, remote_function
 from twinkle.checkpoint_engine.base import CheckpointEngine
 from twinkle.perf import timed
+
+logger = get_logger()
 
 
 class CheckpointEngineMixin:
@@ -119,6 +121,10 @@ class CheckpointEngineMixin:
             assert len(master_metadata) == 1
             master_metadata = master_metadata[0]
         engine = self._get_or_create_checkpoint_engine()
+        # The group init ends in a barrier broadcast, so a participant that never arrives leaves the
+        # source blocked with nothing on the console to say who was missing. Record each arrival.
+        logger.info(f'init_checkpoint_process_group: {type(self).__name__} rank={rank} '
+                    f'world_size={world_size} engine={type(engine).__name__}')
         engine.init_process_group(
             rank=rank,
             world_size=world_size,
