@@ -29,6 +29,12 @@ def _params_of(optimizer):
     return [param for group in optimizer.param_groups for param in group['params']]
 
 
+def _same(actual, expected):
+    """Identity comparison: ``==`` on a list of tensors is elementwise and raises."""
+    return len(actual) == len(expected) and all(a is e for a, e in zip(actual, expected))
+
+
+
 class _Model(torch.nn.Module):
     """A stand-in for the wrapped model: named parameters in a declared order."""
 
@@ -214,3 +220,188 @@ def test_an_unprovable_repair_leaves_the_state_keyed_as_it_was():
 
     assert _params_of(optimizer) == [stale]
     assert optimizer.state[stale] == {'step': 3}
+
+
+# ---------------------------------------------------------------------------------------------
+# The name map: prepare breaks a tie, and a later cast replaces BOTH of the objects it produced.
+# ---------------------------------------------------------------------------------------------
+
+
+def _named_map(model, optimizer):
+    return AccelerateStrategy._remember_optimizer_params(_stub_strategy(), model, optimizer)
+
+
+def _stub_strategy():
+    return object.__new__(AccelerateStrategy)
+
+
+def test_a_tie_broken_by_prepare_is_repaired_by_name_not_by_shape():
+    """Defect 18's last offender: one stale entry, two same-shaped candidates.
+
+    ``embed_tokens.weight`` and ``lm_head.weight`` start tied, so ``prepare`` sees one object under
+    one name; it then exposes them as two, and the cast that follows replaces both. The optimizer is
+    left with one stale object of that shape and no way to choose by shape -- the name recorded while
+    the two sides still agreed is what makes the choice exact.
+    """
+    embed = torch.nn.Parameter(torch.zeros(6, 2, dtype=torch.float32))
+    head = torch.nn.Parameter(torch.zeros(6, 2, dtype=torch.float32))
+    stale = torch.nn.Parameter(torch.zeros(6, 2, dtype=torch.float32))
+    model = _Model([('model.language_model.embed_tokens.weight', embed), ('lm_head.weight', head)])
+    optimizer = _optimizer(stale)
+
+    # By shape alone the rule must refuse: 1 offender against 2 candidates is unprovable.
+    rebind(model, optimizer)
+    assert _same(_params_of(optimizer), [stale]), 'an ambiguous shape must not be guessed at'
+
+    rebind(model, optimizer, {'unused_id': 'x', id(stale): 'lm_head.weight'})
+    assert _same(_params_of(optimizer), [head]), 'the recorded name decides which of the two it was'
+
+
+def test_a_name_that_the_optimizer_already_holds_is_not_bound_a_second_time():
+    """Rebinding onto an already-held weight would train it twice and leave the other untrained."""
+    held = torch.nn.Parameter(torch.zeros(6, 2))
+    other = torch.nn.Parameter(torch.zeros(6, 2))
+    stale = torch.nn.Parameter(torch.zeros(6, 2))
+    model = _Model([('a', held), ('b', other)])
+    optimizer = _optimizer(held, stale)
+
+    rebind(model, optimizer, {id(stale): 'a'})
+
+    # The name is rejected because 'a' is already held, and the shape rule then proves the pairing
+    # it can: 'b' is plain, trainable and unnamed, and it is the only parameter of that shape.
+    assert _same(_params_of(optimizer), [held, other]), 'a rejected name must not duplicate an entry'
+
+
+def test_a_name_pointing_at_a_sharded_or_frozen_parameter_is_not_used():
+    """The target must be a weight the loop steps: plain and trainable."""
+    from torch.distributed.tensor import DTensor  # noqa: F401  (only the frozen half is exercised)
+
+    frozen = torch.nn.Parameter(torch.zeros(6, 2), requires_grad=False)
+    stale = torch.nn.Parameter(torch.zeros(6, 2))
+    model = _Model([('frozen', frozen)])
+    optimizer = _optimizer(stale)
+
+    rebind(model, optimizer, {id(stale): 'frozen'})
+
+    assert _same(_params_of(optimizer), [stale])
+
+
+def test_a_stale_entry_missing_from_the_name_map_falls_through_to_the_shape_rule():
+    """The name map is an addition, not a replacement: unnamed entries keep the old path."""
+    current = torch.nn.Parameter(torch.zeros(4, 3))
+    stale = torch.nn.Parameter(torch.zeros(4, 3))
+    model = _Model([('model.visual.patch_embed.proj.weight', current)])
+    optimizer = _optimizer(stale)
+
+    rebind(model, optimizer, {})
+
+    assert _same(_params_of(optimizer), [current]), 'the shape rule still repairs what it can prove'
+
+
+# ---------------------------------------------------------------------------------------------
+# The container accelerate actually returns.
+# ---------------------------------------------------------------------------------------------
+
+
+class _Accelerator:
+    process_index = 0
+
+    def __init__(self, prepared):
+        self._prepared = prepared
+
+    def prepare(self, *args):
+        return self._prepared
+
+
+def _wrap(prepared):
+    strategy = object.__new__(AccelerateStrategy)
+    strategy.accelerator = _Accelerator(prepared)
+    model = prepared[0] if isinstance(prepared, (list, tuple)) else prepared
+    return strategy, strategy.wrap_model(model, *([] if not isinstance(prepared, (list, tuple)) else prepared[1:]))
+
+
+def test_wrap_model_repairs_when_prepare_returns_a_list():
+    """``Accelerator.prepare`` ends with ``return result if len(result) > 1 else result[0]`` over a
+    list, so a tuple test silently skipped the wrap-time repair entirely."""
+    current = torch.nn.Parameter(torch.zeros(4, 3))
+    stale = torch.nn.Parameter(torch.zeros(4, 3))
+    model = _Model([('w', current)])
+    optimizer = _optimizer(stale)
+
+    strategy, result = _wrap([model, optimizer])
+
+    assert result == [model, optimizer], 'the prepared objects must be handed back untouched'
+    assert _same(_params_of(optimizer), [current])
+    assert strategy.__dict__['_optimizer_param_names'] == {id(current): 'w'}
+
+
+def test_wrap_model_accepts_a_bare_model_from_prepare():
+    """One argument comes back bare; indexing it as a sequence would raise."""
+    model = _Model([('w', torch.nn.Parameter(torch.zeros(4, 3)))])
+
+    strategy, result = _wrap(model)
+
+    assert result is model
+    assert '_optimizer_param_names' not in strategy.__dict__
+
+
+def test_wrap_model_still_repairs_a_tuple():
+    current = torch.nn.Parameter(torch.zeros(4, 3))
+    stale = torch.nn.Parameter(torch.zeros(4, 3))
+    model = _Model([('w', current)])
+    optimizer = _optimizer(stale)
+
+    _, result = _wrap((model, optimizer))
+
+    assert _same(_params_of(optimizer), [current])
+    assert isinstance(result, tuple)
+
+
+def test_remember_records_only_the_parameters_the_optimizer_holds():
+    trained = torch.nn.Parameter(torch.zeros(4, 3))
+    untrained = torch.nn.Parameter(torch.zeros(4, 3))
+    model = _Model([('trained', trained), ('untrained', untrained)])
+    optimizer = _optimizer(trained)
+
+    names = _named_map(model, optimizer)
+
+    assert names == {id(trained): 'trained'}
+
+
+# ---------------------------------------------------------------------------------------------
+# Which artifact counts as a saved optimizer.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_optimizer_checkpoint_exists_follows_the_strategies_own_layout(tmp_path):
+    from twinkle.model.transformers.strategy.deepspeed import DeepSpeedStrategy
+
+    default = _stub_strategy()  # AccelerateStrategy inherits the base's optimizer.pt layout
+    deepspeed = object.__new__(DeepSpeedStrategy)
+
+    plain = tmp_path / 'plain'
+    plain.mkdir()
+    (plain / 'optimizer.pt').write_bytes(b'x')
+    assert default.optimizer_checkpoint_exists(str(plain)) is True
+    assert deepspeed.optimizer_checkpoint_exists(str(plain)) is False
+
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    assert default.optimizer_checkpoint_exists(str(empty)) is False
+    assert deepspeed.optimizer_checkpoint_exists(str(empty)) is False
+
+    tagged = tmp_path / 'tagged'
+    (tagged / 'global_step15').mkdir(parents=True)
+    (tagged / 'latest').write_text('global_step15\n')
+    assert deepspeed.optimizer_checkpoint_exists(str(tagged)) is True
+    assert default.optimizer_checkpoint_exists(str(tagged)) is False
+
+    dangling = tmp_path / 'dangling'
+    dangling.mkdir()
+    (dangling / 'latest').write_text('global_step15')
+    assert deepspeed.optimizer_checkpoint_exists(str(dangling)) is False, 'the tag must name a real dir'
+
+    blank = tmp_path / 'blank'
+    blank.mkdir()
+    (blank / 'latest').write_text('   \n')
+    assert deepspeed.optimizer_checkpoint_exists(str(blank)) is False

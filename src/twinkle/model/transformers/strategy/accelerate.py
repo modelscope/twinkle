@@ -249,8 +249,11 @@ class AccelerateStrategy(TransformerStrategyBase):
             self._dump_probe(probe, 'after', prepared[0], prepared[1:])
         for optimizer in prepared[1:]:
             if isinstance(optimizer, torch.optim.Optimizer):
+                # Repair first, then record: the map has to describe an optimizer whose entries are
+                # the model's own objects, and an argument would be evaluated before the call.
                 self._rebind_unsharded_optimizer_params(
-                    prepared[0], optimizer, self._remember_optimizer_params(prepared[0], optimizer))
+                    prepared[0], optimizer, self.__dict__.get('_optimizer_param_names'))
+                self._remember_optimizer_params(prepared[0], optimizer)
         if probe:
             self._dump_probe(probe, 'rebound', prepared[0], prepared[1:])
         return result
