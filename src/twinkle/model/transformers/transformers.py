@@ -1544,7 +1544,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             optimizer_config.cur_step += 1
         should_sync = (optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
                        if sync_gradients is None else bool(sync_gradients))
-        no_sync_ctx = _no_sync_context(self.model, should_sync)
+        # A strategy that owns the update tells the engine where its accumulation window ends, and
+        # the engine then manages gradient synchronization itself. Entering no_sync beside it trips
+        # DeepSpeed's reentry assertion at ZeRO-1, where gradients are NOT partitioned and so the
+        # ZeRO-2/3 guard inside _no_sync_context does not fire.
+        no_sync_ctx = (contextlib.nullcontext() if self.strategy.owns_update_step() else
+                       _no_sync_context(self.model, should_sync))
 
         router_replay_mode = kwargs.pop('router_replay_mode', None)
         rr = None
@@ -1610,7 +1615,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         **kwargs,
     ):
         # DDP must see no_sync during the forward as well as the backward.
-        with _no_sync_context(getattr(self, "model", None), sync_gradients is not False):
+        no_sync = (contextlib.nullcontext() if self.strategy.owns_update_step() else
+                   _no_sync_context(getattr(self, "model", None), sync_gradients is not False))
+        with no_sync:
             outputs = self.forward(
                 inputs=inputs,
                 loss_key=loss_key,
