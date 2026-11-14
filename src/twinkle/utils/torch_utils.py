@@ -143,6 +143,49 @@ def _chunked_selective_log_softmax_function():
     return _CHUNKED_SELECTIVE_LOG_SOFTMAX
 
 
+def bits_fingerprint(tensor: 'torch.Tensor', block: int = 1 << 24) -> List[int]:
+    """Two order-independent exact integers that change if any element's bits change.
+
+    Float statistics over a *sample* can only prove a difference exists, never that one is absent.
+    Covering every element with exact float reductions instead costs minutes on a billion-element
+    tensor, because ``torch.sum`` reduces in parallel and its result then depends on the schedule.
+
+    Reinterpreting the bits as integers removes the trade-off. Integer addition modulo 2**64 is
+    commutative and associative, so unlike a float reduction its result does not depend on the order
+    torch adds in -- a parallel reduction over a block is bit-exact and reproducible. Summing the raw
+    bit patterns catches any change to any element; a difference could still cancel (swapping +a for
+    -a leaves the sum unchanged), so a second accumulator over the squared patterns is kept, and
+    cancelling in both at once would require a coincidence across billions of elements. Both are exact
+    over *every* element, so "equal" here means the tensors are bit-identical, not that a sample
+    agreed.
+
+    The tensor is walked in blocks because the int64 view of a multi-billion element tensor would not
+    fit in memory; Python integers accumulate the block sums, so the modulus is applied once at the
+    end and no precision is lost along the way.
+
+    Only float32 has an exact 4-byte integer reinterpretation, so anything else is widened first.
+    That is lossless for the float16 / bfloat16 / float32 a weight or a partition actually carries --
+    each is a subset of float32 -- but not for float64, which would collapse distinct values onto one
+    fingerprint; widening still covers every element rather than silently skipping the tensor.
+    """
+    import torch
+
+    numel = tensor.numel()
+    if numel == 0:
+        return [0, 0]
+    source = tensor.detach()
+    if source.dtype != torch.float32:
+        source = source.to(torch.float32)
+    total = 0
+    squared = 0
+    for start in range(0, numel, block):
+        bits = source[start:start + block].reshape(-1).view(torch.int32).to(torch.int64)
+        total += int(bits.sum())
+        squared += int((bits * bits).sum())
+    mask = (1 << 64) - 1
+    return [total & mask, squared & mask]
+
+
 def selective_log_softmax(logits, index, return_entropy: bool = False):
     """
     refer: trl/trainer/utils

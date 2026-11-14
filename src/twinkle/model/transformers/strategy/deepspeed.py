@@ -444,43 +444,13 @@ class DeepSpeedStrategy(TransformerStrategyBase):
     def _bits_fingerprint(flat, block: int = 1 << 24) -> list:
         """Two order-independent exact integers that change if any element's bits change.
 
-        Float statistics over a *sample* can only prove a difference exists, never that one is absent:
-        on a 4,538,761,984-element partition the default 64 chunks cover 0.0058%, and the difference
-        this instrument was built to find sat in the group that was barely covered. Covering every
-        element with the exact float reductions instead costs minutes per step, which is why they are
-        gated to one step.
-
-        Reinterpreting the float32 bits as integers removes the trade-off. Integer addition modulo
-        2**64 is commutative and associative, so unlike a float reduction its result does not depend on
-        the order torch adds in -- a parallel reduction over a block is bit-exact and reproducible.
-        Summing the raw bit patterns catches any change to any element; a difference could still cancel
-        (swapping +a for -a leaves the sum unchanged), so a second accumulator over the squared patterns
-        is kept, and cancelling in both at once would require a coincidence across billions of elements.
-        Both are exact over *every* element, so "equal" here means the partitions are bit-identical,
-        not that a sample agreed.
-
-        The flat tensor is walked in blocks because the int64 view of a multi-billion element partition
-        would not fit in memory; Python integers accumulate the block sums, so the modulus is applied
-        once at the end and no precision is lost along the way.
+        Delegates to :func:`twinkle.utils.torch_utils.bits_fingerprint`, which the weight-sync
+        engines use for the same purpose: an exact per-element comparison that does not depend on
+        the reduction schedule. See there for why integer accumulation is used instead of the exact
+        float reductions, which cost minutes on a billion-element partition.
         """
-        import torch
-
-        numel = flat.numel()
-        if numel == 0:
-            return [0, 0]
-        source = flat.detach()
-        if source.dtype != torch.float32:
-            # Only float32 has an exact 4-byte integer reinterpretation; anything else is widened first
-            # so the fingerprint still covers every element rather than silently skipping the partition.
-            source = source.to(torch.float32)
-        total = 0
-        squared = 0
-        for start in range(0, numel, block):
-            bits = source[start:start + block].view(torch.int32).to(torch.int64)
-            total += int(bits.sum())
-            squared += int((bits * bits).sum())
-        mask = (1 << 64) - 1
-        return [total & mask, squared & mask]
+        from twinkle.utils.torch_utils import bits_fingerprint
+        return bits_fingerprint(flat, block=block)
 
     @staticmethod
     def _full_coverage_chunks(numel: int, width: int = 4096) -> int:
