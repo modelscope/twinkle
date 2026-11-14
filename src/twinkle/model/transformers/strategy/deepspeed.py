@@ -552,8 +552,8 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         run's loss, grad_norm and gradients exactly, because the forward only ever sees the bf16
         weights, and the drift appears one step later.
 
-        Only a window of each partition is compared. These files are tens of gigabytes, so the read
-        goes through mmap and the comparison is bounded rather than materialising the artifact.
+        Every element of each partition is compared, in chunks. These files are tens of gigabytes, so
+        the read goes through mmap and the comparison streams rather than materialising the artifact.
         """
         prefix = os.environ.get('TWINKLE_OPT_MASTER_PROBE')
         if not prefix:
@@ -619,30 +619,57 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 detail.append({'group': index, 'skipped': True})
                 continue
             saved_group = saved[index]
-            window = min(live_group.numel(), saved_group.numel(), 1 << 20)
-            live_values = live_group.detach().flatten()[:window].to(torch.float32)
-            saved_values = saved_group.detach().flatten()[:window].to(torch.float32)
-            rounded = saved_values.to(torch.bfloat16).to(torch.float32)
-            entry = {
-                'group': index,
-                'numel': int(live_group.numel()),
-                'compared': window,
-                'exact': bool((live_values == saved_values).all()),
-                'worst_abs_diff': float((live_values - saved_values).abs().max()),
-                # True means the master holds bf16-rounded values, whether because the partition was
-                # never restored and was rebuilt from the bf16 parameters, or because it was restored
-                # through a narrowing copy. Either way the fp32 precision is gone.
-                'live_is_bf16_of_saved': bool((live_values == rounded).all()),
-            }
-            entry.update(self._compare_moments(live_state, live_group, saved_state, index, window))
+            entry = {'group': index}
+            entry.update(self._compare_flat(live_group, saved_group, check_bf16=True))
+            entry.update(self._compare_moments(live_state, live_group, saved_state, index))
             detail.append(entry)
         record['detail'] = detail
         with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
             handle.write(json.dumps(record) + '\n')
 
     @staticmethod
-    def _compare_moments(live_state, live_group, saved_state, index, window) -> dict:
-        """Compare the restored Adam moments against the checkpoint's, over the same window.
+    def _compare_flat(live_tensor, saved_tensor, *, chunk: int = 1 << 24, check_bf16: bool = False) -> dict:
+        """Compare two flat partitions element by element, in full, one chunk at a time.
+
+        A bounded window left most of a multi-gigabyte partition unexamined, so a restore that was
+        wrong past the first million elements still reported ``exact``. Chunking covers every element
+        while keeping peak memory at a chunk: the saved side is mmap-backed, so a slice reads only what
+        the comparison touches, and the live side is never copied whole.
+        """
+        import torch
+
+        live = live_tensor.detach().flatten()
+        saved = saved_tensor.detach().flatten()
+        total = min(live.numel(), saved.numel())
+        differing = 0
+        worst = 0.0
+        bf16_of_saved = True
+        for start in range(0, total, chunk):
+            stop = min(start + chunk, total)
+            live_values = live[start:stop].to(torch.float32)
+            saved_values = saved[start:stop].to(torch.float32)
+            differing += int((live_values != saved_values).sum())
+            if differing:
+                worst = max(worst, float((live_values - saved_values).abs().max()))
+            if check_bf16 and bf16_of_saved:
+                bf16_of_saved = bool((live_values == saved_values.to(torch.bfloat16).to(torch.float32)).all())
+        out = {
+            'numel': int(live_tensor.numel()),
+            'compared': int(total),
+            'differing': differing,
+            'exact': differing == 0,
+            'worst_abs_diff': worst,
+        }
+        if check_bf16:
+            # True means the master holds bf16-rounded values, whether because the partition was never
+            # restored and was rebuilt from the bf16 parameters, or because it was restored through a
+            # narrowing copy. Either way the fp32 precision is gone.
+            out['live_is_bf16_of_saved'] = bf16_of_saved
+        return out
+
+    @staticmethod
+    def _compare_moments(live_state, live_group, saved_state, index) -> dict:
+        """Compare the restored Adam moments against the checkpoint's, over their whole partition.
 
         A faithful master with unfaithful moments is indistinguishable from a faithful everything on
         the first resumed step: that step's loss, grad_norm and clipped gradients all reproduce the
@@ -668,15 +695,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                     'present': (torch.is_tensor(live_tensor), torch.is_tensor(saved_tensor)),
                 }
                 continue
-            n = min(live_tensor.numel(), saved_tensor.numel(), window)
-            live_values = live_tensor.detach().flatten()[:n].to(torch.float32)
-            saved_values = saved_tensor.detach().flatten()[:n].to(torch.float32)
-            out[key] = {
-                'numel': int(live_tensor.numel()),
-                'compared': n,
-                'exact': bool((live_values == saved_values).all()),
-                'worst_abs_diff': float((live_values - saved_values).abs().max()),
-            }
+            out[key] = DeepSpeedStrategy._compare_flat(live_tensor, saved_tensor)
         live_step = live_entry.get('step') if isinstance(live_entry, dict) else None
         saved_step = saved_entry.get('step') if isinstance(saved_entry, dict) else None
         out['step'] = {
