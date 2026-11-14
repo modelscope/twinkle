@@ -128,14 +128,14 @@ class Advantage:
                       ('rollout_importance_sampling_mode', rollout_importance_sampling_mode),
                       ('log_rollout_offpolicy_metrics', log_rollout_offpolicy_metrics)]
             if not kl_in_reward:
-                # 'k3' is this family's own default (the GAE branch below uses 'k1' because PPO
-                # passes that explicitly), so it is the value that means "not set" here.
-                unused.append(('kl_kind', kl_kind != 'k3'))
+                unused.append(('kl_kind', kl_kind != 'k1'))
         else:
             unused = [('gamma', gamma != 1.0), ('gae_lambda', gae_lambda != 0.95),
                       ('normalize', not normalize), ('kl_coef', kl_coef != 0.0)]
             if kl_coef == 0.0:
-                unused.append(('kl_kind', kl_kind != 'k1'))
+                # 'k3' is this family's own default (the GAE branch above uses 'k1' because PPO
+                # passes that explicitly), so 'k3' is what "not set" means here.
+                unused.append(('kl_kind', kl_kind != 'k3'))
             if teacher_reweight != 'expand':
                 unused.append(('teacher_kl_coef', teacher_kl_coef != 0.0))
             if teacher_reweight != 'rlsd':
