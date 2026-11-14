@@ -53,6 +53,14 @@ def _validate_model_task(kw: dict[str, Any]) -> None:
     task_type = kw.pop('task_type', None)
     if task_type is None:
         return
+    if task_type == 'decision':
+        loader = kw.get('model_loader')
+        head_factory = getattr(loader, 'task_head_loader', None)
+        if getattr(loader, 'task_type', None) != 'decision' or not callable(head_factory):
+            raise ValueError('decision requires a family model_loader with task_head_loader()')
+        kw['task'] = 'decision'
+        kw['task_head_loader'] = head_factory()
+        return
     from transformers import AutoConfig
     from twinkle.hub import HubOperation
 
@@ -112,19 +120,33 @@ def _make_model_class(base: type) -> type:
 
 def _make_transformers_model(kw: dict[str, Any]) -> Any:
     train_mode = kw.pop('train_mode', 'lora')
+    # Family-owned module paths keep all-linear LoRA on the language-model side
+    # of a multimodal backbone, as on the loader's native training path.
+    arch = getattr(kw.get('model_loader'), 'model_arch', None)
+    if arch is not None:
+        kw['model_arch'] = {name: getattr(arch, name) for name in
+                            ('language_model', 'vision_tower', 'aligner', 'lm_head')
+                            if getattr(arch, name, None)}
     # ``model_cls`` arrives as plain data and is resolved here, so the class object never reaches the
     # constructor -- it would either be rejected by the remote-class layer in safe mode
-    # (``TWINKLE_TRUST_REMOTE_CODE=0``) or leak into every worker's constructor kwargs. The schema only
-    # allows it for a LoRA-mode transformers deployment.
+    # (``TWINKLE_TRUST_REMOTE_CODE=0``) or leak into every worker's constructor kwargs. The schema
+    # allows it for non-hybrid transformers deployments.
     model_cls_spec = kw.pop('model_cls', None)
     if train_mode == 'full':
         from .backends.transformers_model import TwinkleCompatFullTransformersModel
         for key in _LORA_ONLY_CTOR_KWARGS:
             kw.pop(key, None)
-        # The plain TransformersModel attaches heads at add_adapter time -- a full-mode
-        # deployment has no adapter, so an attached-head task_type has nothing to ride on.
-        if kw.pop('task', None) is not None:
-            raise ValueError('the transformers full-mode backend serves no task head; use train_mode: lora')
+        num_labels = kw.pop('num_labels', None)
+        task = kw.pop('task', None)
+        if task == 'decision' and getattr(kw.get('model_loader'), 'task_type', None) == 'decision':
+            # The family loader attaches its single head while constructing the full model.
+            kw.pop('task_head_loader', None)
+        elif task is not None:
+            kw['task'] = task
+            if num_labels is not None:
+                kw['num_labels'] = num_labels
+        if model_cls_spec is not None:
+            return _make_model_class(_resolve_model_cls(model_cls_spec))(**kw)
         return TwinkleCompatFullTransformersModel(**kw)
     from .backends.transformers_model import (TwinkleCompatSpectralHybridTransformersModel,
                                               TwinkleCompatTransformersModel)
@@ -242,6 +264,7 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
             nproc_per_node=nproc_per_node,
             device_group=self.device_group,
             device_mesh_dict=device_mesh,
+            extra_torch_kwargs=kwargs.pop('extra_torch_kwargs', None),
         )
         self.replica_id = self.training_context.instance_id
         self.max_loras = kwargs.get('max_loras', 5)

@@ -511,6 +511,37 @@ Release models when training finishes; Twinkle clients can call `remove_adapter(
 
 Complete configurations are available in `cookbook/client/server/transformer/server_config.yaml` and `cookbook/client/server/megatron/server_config.yaml`.
 
+### Swift decision models
+
+Install the matching Swift dev version on the server and client. A decision family owns its loader, template, readout head and loss; Twinkle supplies training instances and tenant isolation. Add these fields to the `args` of a model application, keeping its device layout and instance limits:
+
+```yaml
+model_id: ms://StartLuxAI/StartLux-Decision-v1.1-4B-AutoThink
+backend: transformers
+train_mode: lora
+task_type: decision
+model_loader: swift.dev.model.loader:build_model_loader
+max_loras: 2
+env_vars:
+  TWINKLE_TRUST_REMOTE_CODE: '1'
+```
+
+The loader also supplies the multimodal module paths used by Transformers LoRA targeting. For Megatron, use `backend: megatron` and a supported model/bridge with a matching device group and parallelism layout. Loading through Swift does not add architectures missing from the Megatron bridge. Configure different tasks as separate model applications.
+
+Encode rows using Swift's `StartLuxPreprocessor` and `StartLuxTemplate`. Configure the existing processor and loss through explicit component imports, without a global registration hook:
+
+```python
+model.set_template('swift.dev.template.Template', template_spec=template_spec)
+model.set_processor('swift.dev.processor.server_plugin:DevInputProcessor', template_spec=template_spec)
+model.set_loss('swift.dev.loss.decision:ScoringLoss')
+```
+
+`template_spec` is the JSON representation of the same Swift `TemplateSpec` used by the client encoder. `DevInputProcessor` carries `target_probs` to the decision collator, which creates floating-point loss targets. Token `labels` on the HTTP wire remain integers. Explicit `module:Class` component imports require the trust switch, as does the configured model loader.
+
+Attached-head checkpoints save parameters and calibration buffers together, including nonpersistent buffers. Removing a LoRA resets both before its head slot is reused. Older parameter-only head checkpoints remain loadable, but cannot recover calibration values that were never saved.
+
+For full-parameter Megatron decision training, optimizer checkpoints use MCore's native model-space format with CPU aggregation. Reserve host memory for the complete optimizer state; restore uses the format recorded in checkpoint metadata. Other tasks and Megatron FSDP retain their existing formats.
+
 ### Automatic sampling scaling
 
 Set instance counts and the scaling target in the `args` of your `import_path: sampler` entry. For example:

@@ -45,18 +45,23 @@ def response_token_scores(outputs: Any, features: List[Dict[str, Any]], *, outpu
 
     ``outputs`` is the forward's return (a pending handle is resolved here) -- a dict whose
     ``output_key`` channel (``'logps'`` for a causal scorer, ``'logits'`` / ``'values'`` for a value
-    head) is a ``[B, T]`` tensor or a bare tensor. Full-sequence, right-padded rows are indexed at
-    each feature's own response positions, so right-padding never shifts them.
+    head) may contain a batch tensor or variable-length microbatches, including their JSON form.
+    Full-sequence, right-padded rows are indexed at each feature's response positions.
     """
     outputs = outputs.result() if hasattr(outputs, 'result') else outputs
     values = outputs.get(output_key) if isinstance(outputs, dict) else outputs
     if values is None:
         raise RuntimeError(f'the forward returned no {output_key!r} channel.')
-    values = torch.as_tensor(values).detach().float().cpu()
-    if values.dim() == 1:
-        values = values.unsqueeze(0)
-    if values.shape[0] != len(features):
-        raise RuntimeError(f'forward returned {values.shape[0]} rows for {len(features)} features; '
+    if isinstance(values, (list, tuple)) and values and isinstance(values[0], (list, tuple, np.ndarray, torch.Tensor)):
+        rows = []
+        for batch in values:
+            batch = torch.as_tensor(batch).detach().float().cpu()
+            rows.extend(batch.unbind(0) if batch.dim() > 1 else [batch])
+    else:
+        values = torch.as_tensor(values).detach().float().cpu()
+        rows = list(values.unbind(0)) if values.dim() > 1 else [values]
+    if len(rows) != len(features):
+        raise RuntimeError(f'forward returned {len(rows)} rows for {len(features)} features; '
                            'per-row alignment is impossible.')
-    return [_row_scores(values[i].reshape(-1), response_positions(feature), feature)
-            for i, feature in enumerate(features)]
+    return [_row_scores(row.reshape(-1), response_positions(feature), feature)
+            for row, feature in zip(rows, features, strict=True)]

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, ValidationInfo, field_validator, model_validator
@@ -58,9 +59,10 @@ class TrainingArguments(BaseModel):
     model_loader: str | None = None
     gradient_checkpointing: bool | None = Field(default=None, strict=True)
     mixed_precision: Literal["no", "fp8", "fp16", "bf16"] | None = None
+    extra_torch_kwargs: dict[str, Any] | None = None
     # The readout family names the head task this deployment serves (see
     # ``twinkle/model/tasks.py``); ``causal_lm`` carries no head.
-    task_type: Literal["causal_lm", "seq_cls", "reranker", "value"] | None = None
+    task_type: Literal["causal_lm", "embedding", "seq_cls", "reranker", "value", "decision"] | None = None
     num_labels: int | None = Field(default=None, gt=0, strict=True)
     language_model_only: bool | None = Field(default=None, strict=True)
 
@@ -70,6 +72,8 @@ class TrainingArguments(BaseModel):
             raise ValueError('task_type="seq_cls" requires num_labels')
         if self.num_labels is not None and self.task_type not in ("seq_cls", "reranker", "value"):
             raise ValueError('num_labels requires a readout task_type (seq_cls / reranker / value)')
+        if self.task_type == "decision" and self.model_loader is None:
+            raise ValueError('task_type="decision" requires a family model_loader')
         return self
 
     @model_validator(mode="after")
@@ -107,22 +111,28 @@ class ModelArgs(TrainingArguments, LoraArguments):
 
     @model_validator(mode="after")
     def _validate_spectral_backend(self):
+        if (self.task_type == 'embedding' and self.model_cls is None
+                and (Path(self.model_id) / 'modules.json').is_file()):
+            raise ValueError(
+                'native sentence-transformers checkpoint requires model_cls; '
+                'the generic embedding wrapper cannot preserve its module pipeline')
         if self.strategy is not None and self.backend != "transformers":
             raise ValueError("strategy is only supported by the transformers backend")
-        if self.backend != "transformers" and (
-            self.gradient_checkpointing is not None or self.mixed_precision is not None
-        ):
-            raise ValueError("gradient_checkpointing and mixed_precision require the transformers backend")
+        if self.gradient_checkpointing is not None and self.backend != "transformers":
+            raise ValueError("gradient_checkpointing requires the transformers backend")
+        if self.mixed_precision is not None and self.backend == "mock":
+            raise ValueError("mixed_precision requires the transformers or megatron backend")
         if self.hybrid is not None:
             if self.backend != "transformers":
                 raise ValueError("hybrid is only supported by the transformers backend")
             if self.train_mode == "full":
                 raise ValueError('hybrid is not supported with train_mode="full"')
         if self.model_cls is not None:
-            if self.backend != "transformers" or self.train_mode != "lora" or self.hybrid is not None:
-                raise ValueError("model_cls requires a transformers LoRA deployment without hybrid")
-        if self.model_loader is not None and self.backend != "transformers":
-            raise ValueError("model_loader requires the transformers backend")
+            if (self.backend != "transformers" or self.train_mode not in ("lora", "full")
+                    or self.hybrid is not None):
+                raise ValueError("model_cls requires a transformers LoRA/full deployment")
+        if self.model_loader is not None and self.backend == "mock":
+            raise ValueError("model_loader requires the transformers or megatron backend")
         if self.language_model_only is not None and self.backend != "megatron":
             raise ValueError("language_model_only requires the megatron backend")
         return self
@@ -208,17 +218,18 @@ class TrainingModelConfig(BaseModel):
             raise ValueError("device_mesh.device_type must match device_type")
         if self.config.strategy is not None and self.backend != "transformers":
             raise ValueError("strategy requires the transformers backend")
-        if self.backend != "transformers" and (
-            self.config.gradient_checkpointing is not None or self.config.mixed_precision is not None
-        ):
-            raise ValueError("gradient_checkpointing and mixed_precision require the transformers backend")
+        if self.config.gradient_checkpointing is not None and self.backend != "transformers":
+            raise ValueError("gradient_checkpointing requires the transformers backend")
+        if self.config.mixed_precision is not None and self.backend == "mock":
+            raise ValueError("mixed_precision requires the transformers or megatron backend")
         if isinstance(self.config, LoraTrainingConfig) and self.config.hybrid and self.backend != "transformers":
             raise ValueError("hybrid requires the transformers backend")
         if self.config.model_cls is not None:
-            if self.backend != "transformers" or self.mode != "lora" or self.config.hybrid is not None:
-                raise ValueError("model_cls requires a transformers LoRA deployment without hybrid")
-        if self.config.model_loader is not None and self.backend != "transformers":
-            raise ValueError("model_loader requires the transformers backend")
+            if (self.backend != "transformers" or self.mode not in ("lora", "full")
+                    or getattr(self.config, "hybrid", None) is not None):
+                raise ValueError("model_cls requires a transformers LoRA/full deployment")
+        if self.config.model_loader is not None and self.backend == "mock":
+            raise ValueError("model_loader requires the transformers or megatron backend")
         return self
 
     @property

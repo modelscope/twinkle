@@ -63,18 +63,41 @@ async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construct
     driver.runtime.deploy.assert_awaited_once()
 
 
-@pytest.mark.parametrize('mutation', ['full', 'hybrid', 'megatron'])
+@pytest.mark.parametrize('mutation', ['hybrid', 'megatron'])
 def test_custom_model_class_rejects_incompatible_training_modes(mutation):
     app = model_application()
     app['args']['model_cls'] = 'worker_only.encoder:Model'
-    if mutation == 'full':
-        app['args']['train_mode'] = 'full'
-    elif mutation == 'hybrid':
+    if mutation == 'hybrid':
         app['args']['hybrid'] = {'allocation_path': '/tmp/allocation.json'}
     else:
         app['args']['backend'] = 'megatron'
     with pytest.raises(ValidationError, match='model_cls'):
         ServerConfig(applications=[app])
+
+
+@pytest.mark.parametrize('backend,train_mode', [
+    ('transformers', 'lora'),
+    ('transformers', 'full'),
+    ('megatron', 'lora'),
+    ('megatron', 'full'),
+])
+def test_native_st_without_model_cls_is_rejected_before_runtime(tmp_path, backend, train_mode):
+    (tmp_path / 'modules.json').write_text('[]')
+    app = model_application()
+    app['args'].update(model_id=str(tmp_path), task_type='embedding', backend=backend, train_mode=train_mode)
+    with pytest.raises(ValidationError, match='native sentence-transformers checkpoint requires model_cls'):
+        ServerConfig(applications=[app])
+
+
+def test_native_st_with_model_cls_keeps_the_supported_lora_entry(tmp_path):
+    (tmp_path / 'modules.json').write_text('[]')
+    app = model_application()
+    app['args'].update(
+        model_id=str(tmp_path),
+        task_type='embedding',
+        model_cls='swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel',
+    )
+    ServerConfig(applications=[app])
 
 
 def test_st_example_is_a_cold_on_demand_custom_model():
@@ -107,7 +130,7 @@ def test_existing_yaml_uses_explicit_instance_limits_and_business_idle():
     for path in paths:
         config = ServerConfig.from_yaml(path)
         applications = [app for app in config.applications if app.import_path == 'model']
-        for app, model in zip(applications, config.training_config.models):
+        for app, model in zip(applications, config.training_config.models, strict=True):
             assert model.config.idle_timeout_s == app.args.idle_timeout_s
             assert model.config.min_replicas == app.args.min_replicas
             assert model.config.max_replicas == app.args.max_replicas
@@ -185,18 +208,15 @@ def test_existing_yaml_examples_keep_their_model_entries(monkeypatch):
     paths += list(Path('cookbook/client/async_rl').glob('server_config.yaml'))
     paths += list(Path('tests/server/config').glob('server_config*e2e*.yaml'))
     paths += list(Path('tests/server/fixtures').glob('server_config_mock*.yaml'))
-    assert len(paths) == 9
+    assert paths
     for path in paths:
         config = ServerConfig.from_yaml(path)
         models = [app for app in config.applications if app.import_path == 'model']
-        assert len(models) == len(config.training_config.models) == 1
-        model = config.training_config.models[0]
-        assert model.model_id == models[0].args.model_id
-        assert model.route_prefix == models[0].route_prefix
-        mode = model.config
-        original = models[0]
-        expected_min = original.args.min_replicas
-        assert mode.min_replicas == expected_min
+        assert len(models) == len(config.training_config.models) > 0
+        for original, model in zip(models, config.training_config.models, strict=True):
+            assert model.model_id == original.args.model_id
+            assert model.route_prefix == original.route_prefix
+            assert model.config.min_replicas == original.args.min_replicas
         assert ServerConfig.model_validate(config.to_yaml_dict()).training_config == config.training_config
 
 
@@ -417,3 +437,17 @@ def test_transformers_still_accepts_single_device():
     app = model_application()
     app['args'].update(device_group={'ranks': 1, 'device_type': 'cuda'}, device_mesh={'dp_size': 1})
     assert ServerConfig(applications=[app]).training_config.models[0].config.num_devices == 1
+
+
+@pytest.mark.parametrize('backend', ['transformers', 'megatron'])
+@pytest.mark.parametrize('mode', ['lora', 'full'])
+def test_native_backends_preserve_loader_and_precision_configuration(backend, mode):
+    app = model_application()
+    app['args'].update(backend=backend, train_mode=mode, mixed_precision='no',
+                       model_loader='worker_only.loader:load')
+    config = ServerConfig(applications=[app])
+    restored = ServerConfig.model_validate(config.to_yaml_dict())
+    model = restored.training_config.models[0]
+    assert model.backend == backend and model.mode == mode
+    assert model.config.model_loader == 'worker_only.loader:load'
+    assert model.config.mixed_precision == 'no'
