@@ -359,6 +359,16 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         get_logger().info('ZeRO-3: switched gradient checkpointing to use_reentrant=True '
                           '(non-reentrant recompute sees partitioned parameters).')
 
+    def optimizer_checkpoint_exists(self, output_dir: str) -> bool:
+        # ``engine.save_checkpoint`` records the tag it wrote in ``latest`` and puts the state under
+        # that subdirectory; both halves must be there for ``engine.load_checkpoint`` to find it.
+        latest = os.path.join(output_dir, 'latest')
+        if not os.path.exists(latest):
+            return False
+        with open(latest) as handle:
+            tag = handle.read().strip()
+        return bool(tag) and os.path.isdir(os.path.join(output_dir, tag))
+
     def owns_update_step(self) -> bool:
         return True
 

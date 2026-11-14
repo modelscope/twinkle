@@ -149,6 +149,19 @@ class TransformerStrategyBase(ABC):
             f'{type(self).__name__} does not support weight offload, which the colocation '
             'flow requires. Use a strategy with offload support (accelerate / native FSDP / deepspeed / megatron).')
 
+    def optimizer_checkpoint_exists(self, output_dir: str) -> bool:
+        """Whether this strategy's optimizer checkpoint is present in ``output_dir``.
+
+        The artifact's layout belongs to the strategy that wrote it: the default is a single
+        ``optimizer.pt``, while DeepSpeed's ``engine.save_checkpoint`` writes its own directory -- a
+        ``latest`` tag file plus ``global_step<N>/`` -- and never creates that filename. A caller that
+        hardcodes ``optimizer.pt`` therefore reads every DeepSpeed checkpoint as incomplete and refuses
+        a resume that would have worked.
+        """
+        import os
+
+        return os.path.exists(os.path.join(output_dir, 'optimizer.pt'))
+
     def owns_update_step(self) -> bool:
         """Whether this strategy, rather than the training loop, drives the parameter update.
 

@@ -2460,10 +2460,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_path = os.path.join(checkpoint_dir, 'optimizer.pt')
         scheduler_path = os.path.join(checkpoint_dir, 'scheduler.pt')
 
-        if strict and not os.path.exists(optimizer_path):
+        if strict and not self.strategy.optimizer_checkpoint_exists(checkpoint_dir):
             raise FileNotFoundError(
-                f'{optimizer_path} is missing although trainer_state.json marks a full checkpoint: '
-                'resuming would silently train on with a fresh optimizer. Restore the file from a '
+                f'{checkpoint_dir} holds no optimizer checkpoint although trainer_state.json marks a '
+                'full one: resuming would silently train on with a fresh optimizer. Restore it from a '
                 'healthy copy, or start a new run from the weights with the model-only load path '
                 '(e.g. --resume_only_model true).')
         if strict and optimizer_config.lr_scheduler is not None and not os.path.exists(scheduler_path):
@@ -2473,7 +2473,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 'copy, or start a new run from the weights with the model-only load path '
                 '(e.g. --resume_only_model true).')
 
-        if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
+        if self.strategy.optimizer_checkpoint_exists(checkpoint_dir) and optimizer_config.optimizer is not None:
             if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
                 self._lazy_wrap_model()
             optimizer = optimizer_config.optimizer

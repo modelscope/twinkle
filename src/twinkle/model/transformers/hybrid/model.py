@@ -244,9 +244,10 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             raise ValueError('Spectral Hybrid checkpoint was not saved at a supported optimizer-step boundary.')
         if optimizer_group.optimizer is None:
             raise ValueError('Spectral Hybrid optimizer must be configured before resuming training.')
-        optimizer_path = os.path.join(training_dir, 'optimizer.pt')
-        if not os.path.isfile(optimizer_path):
-            raise ValueError('Spectral Hybrid training state is missing optimizer.pt.')
+        # The strategy owns the optimizer artifact's layout (DeepSpeed writes its own directory and
+        # no optimizer.pt), so ask it rather than naming the file.
+        if not self.strategy.optimizer_checkpoint_exists(training_dir):
+            raise ValueError(f'Spectral Hybrid training state in {training_dir} has no optimizer checkpoint.')
         saved_scheduler = trainer_state.get('scheduler_class')
         if saved_scheduler != self._class_identity(optimizer_group.lr_scheduler):
             raise ValueError('Spectral Hybrid scheduler configuration does not match the checkpoint.')
