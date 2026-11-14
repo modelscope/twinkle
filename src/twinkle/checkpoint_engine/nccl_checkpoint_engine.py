@@ -355,10 +355,12 @@ class NCCLCheckpointEngine(CheckpointEngine):
         # Barrier via broadcast to ensure all workers are ready
         barrier_tensor = torch.zeros(1, dtype=torch.int32, device='cuda')
         # The barrier is the one place a missing participant turns into an infinite wait, so record
-        # the arrival with the store it is rendezvousing against.
+        # the arrival with the store it is rendezvousing against. A sampler actor spanning several
+        # GPUs has an ambiguous ambient device, so record which one the tensor landed on.
         logger.info(f'init_process_group: rank={rank} entering the barrier broadcast '
                     f'(world_size={world_size}, store={master_metadata.nccl_store_host}:'
-                    f'{master_metadata.nccl_store_port})')
+                    f'{master_metadata.nccl_store_port}, current_device={torch.cuda.current_device()}, '
+                    f'device_count={torch.cuda.device_count()}, tensor_device={barrier_tensor.device})')
         _pg_broadcast(self._pg, barrier_tensor, src=0)
         torch.cuda.synchronize()
 

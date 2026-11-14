@@ -316,6 +316,29 @@ class CheckpointEngineManager:
         self.model.offload_to_cpu(**self.offload_kwargs)
         self._wake_sampler(['kv_cache'])
 
+    def _abandon_channel(self) -> None:
+        """Mark the channel unusable and reset the peers without waiting for them.
+
+        Failure path only. A rendezvous one side never reached leaves the other blocked inside a
+        collective, and a Ray call to a blocked actor never returns, so a synchronous teardown here
+        would swallow the original error forever. It would also re-enter this actor through Ray
+        (:meth:`close` is a remote method) and wait on ``_sync_lock``, which the failing
+        :meth:`sync_weights` already holds. The reset is therefore dispatched on a daemon thread: it
+        lands when the peer can serve it and dies with the process when it cannot. Clearing
+        ``_members`` is what makes the next sync rebuild rather than reuse the broken transport.
+        """
+        self._members = None
+        self.base_sync_done = False
+
+        def reset():
+            try:
+                self._close_checkpoint_channel()
+            except Exception:
+                logger.warning('Failed to reset checkpoint channel %s after a sync failure.', self.channel,
+                               exc_info=True)
+
+        threading.Thread(target=reset, name='checkpoint-channel-reset', daemon=True).start()
+
     def _sync_channel(self, merge_and_sync):
         """Checkpoint-engine sync over the manager's channel, rebuilt when the replicas changed."""
         try:
@@ -331,15 +354,9 @@ class CheckpointEngineManager:
             self._transfer(self.sampler, len(self._members), merge_and_sync, self.base_sync_done)
         except BaseException:
             # A failed sync can leave the transport half-torn -- a NCCL group in error state, a
-            # dead socket. Close here so the next attempt rebuilds the channel instead of reusing
-            # the broken one.
-            try:
-                self.close()
-            except Exception:
-                # A failing close (e.g. the remote actor already died) must not replace the
-                # original sync failure -- warn and re-raise the root cause.
-                logger.warning('Failed to fully close checkpoint channel %s after sync failure.',
-                               self.channel, exc_info=True)
+            # dead socket. Abandon it rather than closing it synchronously, so the original error
+            # reaches the driver and the next attempt rebuilds instead of reusing the broken one.
+            self._abandon_channel()
             raise
         if not self.base_sync_done:
             self.base_sync_done = True
