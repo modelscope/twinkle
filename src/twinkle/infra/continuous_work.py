@@ -110,6 +110,10 @@ def _make_worker_async_companion(func, wrapper):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(_worker_executor(self), functools.partial(wrapper, self, *args, **kwargs))
 
+    # functools.wraps pins __wrapped__, and inspect.signature follows it -- so Ray would validate
+    # a call against the original method's parameters instead of this companion's (self, *args,
+    # **kwargs) and reject the _dispatch_context that _submit adds when the arguments carry refs.
+    del companion.__wrapped__
     companion.__name__ = _WORKER_ASYNC_PREFIX + func.__name__
     return companion
 

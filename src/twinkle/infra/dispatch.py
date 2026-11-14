@@ -849,6 +849,12 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     return _call_impl(self, *args, **kwargs)
             return _call_impl(self, *args, **kwargs)
 
+        # Same hazard as the continuous-work companion: __wrapped__ makes inspect.signature (and so
+        # Ray's argument validation) report the original method's parameters, so the
+        # _dispatch_context that _call_replicas adds for ref-carrying calls is rejected as an
+        # unexpected keyword. This wrapper takes *args/**kwargs by design.
+        del wrapper.__wrapped__
+
         def _worker_entry(self, *args, **kwargs):
             # What the awaitable companion runs on the replica: always the body, never a Future.
             dispatch_context = kwargs.pop('_dispatch_context', None)
