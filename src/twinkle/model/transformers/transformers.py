@@ -1946,6 +1946,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             'master_pre': engine_step.get('master_pre', master_pre or {}),
             'master_post': engine_step.get('master_post', master_post),
             'grad_partition_pre': engine_step.get('grad_partition_pre', {}),
+            'grad_partition_layout': engine_step.get('layout', {}),
         }
         with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
             handle.write(json.dumps(record) + '\n')

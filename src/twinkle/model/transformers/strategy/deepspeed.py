@@ -480,6 +480,29 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                         out['sources'].append(name)
         return out
 
+    def engine_grad_partition_layout(self, model) -> Dict[str, Any]:
+        """Where each parameter sits inside the flat fp32 gradient partition, per group.
+
+        A digest can only say that a range of the flat partition differs; turning that range into
+        parameter names is what points at a code path, since the flat layout follows the order the
+        parameters were registered. Gated by its own env flag because the layout is a few hundred
+        entries per group and is identical at every step -- it is read once, not tracked per step.
+        """
+        if not os.environ.get('TWINKLE_STEP_DELTA_PROBE_LAYOUT'):
+            return {}
+        optimizer = getattr(_resolve_engine(model), 'optimizer', None)
+        names = {id(param): name for name, param in model.named_parameters()}
+        out: Dict[str, Any] = {}
+        for index, params in enumerate(getattr(optimizer, 'params_in_partition', None) or []):
+            entries = []
+            offset = 0
+            for param in params:
+                numel = param.numel()
+                entries.append([names.get(id(param), '?'), offset, numel])
+                offset += numel
+            out[str(index)] = {'total': offset, 'params': entries}
+        return out
+
     def take_engine_step_probe(self) -> Dict[str, Any]:
         """The digests ``engine_backward`` recorded around ``engine.step``, consumed once."""
         return self.__dict__.pop('_engine_step_probe', {})
@@ -506,6 +529,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             if probe:
                 self.__dict__['_engine_step_probe'] = {
                     'grad_partition_pre': self.engine_grad_partition_digest(model),
+                    'layout': self.engine_grad_partition_layout(model),
                     'master_pre': self.engine_master_digest(model),
                 }
             engine.step()

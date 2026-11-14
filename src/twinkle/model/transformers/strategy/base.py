@@ -276,6 +276,15 @@ class TransformerStrategyBase(ABC):
         """
         return {}
 
+    def engine_grad_partition_layout(self, model) -> Dict[str, Any]:
+        """Where each parameter sits inside the engine's flat gradient partition, or an empty dict.
+
+        A digest localizes a difference to a range of a flat partition; the layout turns that range into
+        parameter names, which is what points at a code path. Only strategies that own a flat partition
+        have one to report.
+        """
+        return {}
+
     def take_engine_step_probe(self) -> Dict[str, Any]:
         """The digests bracketing the update this strategy last performed, consumed once.
 
