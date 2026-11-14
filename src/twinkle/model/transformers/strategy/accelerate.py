@@ -251,6 +251,21 @@ class AccelerateStrategy(TransformerStrategyBase):
                 self._remember_optimizer_params(prepared[0], optimizer)
         return result
 
+    def _remember_optimizer_params(self, model, optimizer):
+        """Record the name each optimizer parameter had while the model and the optimizer agreed.
+
+        Right after ``prepare`` every optimizer parameter IS one of the model's own objects, so
+        ``named_parameters`` gives each entry an exact name. A later mixed-precision cast can replace
+        a parameter object again, and for a tied weight it replaces the single object the tie covered
+        with one fresh object per name -- the embedding and the tied head then both sit outside the
+        optimizer with the SAME shape, so shape alone cannot say which of them the stale entry meant.
+        The name recorded here can, which is why the save-time repair is handed this map.
+        """
+        ids = {id(param) for group in optimizer.param_groups for param in group['params']}
+        names = {id(param): fqn for fqn, param in model.named_parameters() if id(param) in ids}
+        self.__dict__['_optimizer_param_names'] = names
+        return names
+
     @staticmethod
     def _rebind_unsharded_optimizer_params(model, optimizer, param_names=None) -> None:
         """Point the optimizer at the model's own objects for the parameters FSDP2 left unsharded.
