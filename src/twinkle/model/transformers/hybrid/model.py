@@ -338,8 +338,6 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
                 component_states=kwargs.get('component_states', {}),
             )
             self._write_hybrid_training_manifest(training_dir, adapter_name)
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            torch.save(self._get_training_rng_state(), os.path.join(training_dir, f'rng_state_rank_{rank}.pt'))
             if dist.is_initialized():
                 dist.barrier()
         return checkpoint_dir
@@ -381,13 +379,14 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             if current_config != checkpoint_config:
                 raise ValueError('Spectral Hybrid adapter config does not match checkpoint.')
 
-        rank = dist.get_rank() if dist.is_initialized() else 0
         adapter_state = load_file(adapter_path, device='cpu')
         self.multi_adapter.set_state_dict(adapter_name, adapter_state)
         self.fft_slots.set_fft_state_dict(adapter_name, adapter_state)
         if not resume_only_model:
+            # _restore_training_state loads this rank's RNG state (and falls back, with a warning, to
+            # a checkpoint written before RNG state became per rank); loading it again here repeated
+            # the read and raised on such a checkpoint instead of degrading.
             trainer_state = self._restore_training_state(training_dir, adapter_name=adapter_name)
-            self._load_rng_state(os.path.join(training_dir, f'rng_state_rank_{rank}.pt'))
         result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
