@@ -1946,6 +1946,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             'master_pre': engine_step.get('master_pre', master_pre or {}),
             'master_post': engine_step.get('master_post', master_post),
             'grad_partition_pre': engine_step.get('grad_partition_pre', {}),
+            # ZeRO-2 hands the CPU optimizer this step's reduced gradient inside ``step``, so the
+            # partition read before it is the PREVIOUS step's gradient; the one read after is the
+            # gradient this update actually consumed.
+            'grad_partition_post': engine_step.get('grad_partition_post', {}),
             'grad_partition_layout': engine_step.get('layout', {}),
         }
         with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:

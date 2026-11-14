@@ -537,7 +537,14 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 }
             engine.step()
             if probe:
-                self.__dict__['_engine_step_probe']['master_post'] = self.engine_master_digest(model)
+                step_probe = self.__dict__['_engine_step_probe']
+                step_probe['master_post'] = self.engine_master_digest(model)
+                # ZeRO-2 assigns this step's reduced gradient to the float32 partition's ``.grad``
+                # inside ``step`` and the CPU optimizer consumes it there, so the partition read BEFORE
+                # the step is the previous step's gradient -- on a first step after a restore it is a
+                # cold buffer that means something else entirely. The gradient the update actually used
+                # is only readable afterwards.
+                step_probe['grad_partition_post'] = self.engine_grad_partition_digest(model)
 
     def engine_grad_norm(self, model):
         engine = _resolve_engine(model)
@@ -849,6 +856,23 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         }
         return out
 
+    @staticmethod
+    def _has_optimizer_state(load_dir: str) -> bool:
+        """Whether the checkpoint carries a DeepSpeed optimizer-state artifact for this rank.
+
+        Distinguishes "this checkpoint has no optimizer state to restore" (a module-only resume, or a
+        checkpoint written by a different world size) from "it has one and loading it failed". Only the
+        first is a legitimate reason to keep going.
+        """
+        import glob
+
+        rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+        return any(
+            glob.glob(pattern) for pattern in (
+                os.path.join(load_dir, 'global_step*', f'*rank_{rank}_*optim_states.pt'),
+                os.path.join(load_dir, f'*rank_{rank}_*optim_states.pt'),
+            ))
+
     def load_optimizer_checkpoint(
         self,
         model,
@@ -868,7 +892,15 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         try:
             engine.load_checkpoint(load_dir)
         except (KeyError, FileNotFoundError, RuntimeError) as e:
-            logger.warning(f'Failed to load deepspeed checkpoint: {e}')
+            # A resume whose optimizer state did not load keeps training and looks healthy: the forward
+            # only reads the model weights, so the first resumed step reproduces the source run's loss
+            # and grad_norm exactly and the divergence appears one update later, with nothing in the log
+            # to explain it. Swallowing that into a warning turns a stopped run into a silently wrong one.
+            if self._has_optimizer_state(load_dir):
+                raise RuntimeError(
+                    f'Failed to load the DeepSpeed optimizer state from {load_dir}: {e}. Training on an '
+                    'unrestored optimizer diverges from the source run one step after the resume.') from e
+            logger.warning(f'{load_dir} carries no optimizer state for this rank; resumed the model only: {e}')
         self._probe_fp32_master(engine, load_dir)
 
     def get_full_state_dict(self, model) -> dict:
