@@ -869,14 +869,30 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     return _call_impl(self, *args, **kwargs)
             return _call_impl(self, *args, **kwargs)
 
-        # Ray's argument validation reads inspect.signature, which follows __wrapped__ and would then
-        # report the ORIGINAL method's parameters -- so the _dispatch_context that _call_replicas adds
-        # for ref-carrying calls gets rejected as an unexpected keyword. A pinned __signature__ takes
-        # precedence over __wrapped__ in inspect.signature, which keeps Ray on the var-args form this
-        # wrapper actually accepts while leaving __wrapped__ in place: reaching the undecorated body
-        # through it is how the test suite drives these methods at all.
+        # Ray validates an actor call against ``inspect.signature(inspect.unwrap(method))``: it
+        # unwraps first (``ray/actor.py``, ``method = inspect.unwrap(method)``) and only then reads
+        # the signature, so a pin on this wrapper never reaches the validator -- ``functools.wraps``
+        # set ``__wrapped__`` to the undecorated body and unwrap descends straight past the pin to
+        # it. The pin therefore belongs on the body, which is the object Ray ends up holding.
+        # ``__wrapped__`` stays in place: reaching the undecorated body through it is how the test
+        # suite drives these methods at all.
         #
-        # The pin must declare ``self``: Ray extracts an actor method's signature with
+        # The declared parameter is metadata only. ``_call_impl`` and ``_worker_entry`` both pop
+        # ``_dispatch_context`` before the body runs, so the body never receives it; declaring it is
+        # what lets the ref-carrying dispatch path put it on the wire. The body's own parameters are
+        # kept in the pin rather than replaced with a var-args form, so ``inspect.signature`` stays
+        # honest for anyone reading the component.
+        _params = list(inspect.signature(func).parameters.values())
+        if not any(_p.name == '_dispatch_context' for _p in _params):
+            _context = inspect.Parameter('_dispatch_context', inspect.Parameter.KEYWORD_ONLY,
+                                         default=None)
+            # A keyword-only parameter may not follow ``**kwargs``, so it goes just before one.
+            _at = next((_i for _i, _p in enumerate(_params)
+                        if _p.kind is inspect.Parameter.VAR_KEYWORD), len(_params))
+            _params.insert(_at, _context)
+        func.__signature__ = inspect.Signature(parameters=_params)
+
+        # ``self`` must be declared here: Ray extracts an actor method's signature with
         # ``extract_signature(func, ignore_first=True)``, which drops the first parameter on the
         # assumption that it is ``self``. Without it the pin loses ``args`` and every positional
         # argument is refused with "too many positional arguments".
