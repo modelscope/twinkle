@@ -89,10 +89,42 @@ class SGLangEngine(BaseSamplerEngine):
             tp_size=tensor_parallel_size,
             dp_size=data_parallel_size,
             enable_memory_saver=enable_memory_saver,
-            **engine_kwargs,
+            **self._accepted_engine_kwargs(engine_kwargs),
         )
         logger.info(f'Creating sglang Engine: tp_size={tensor_parallel_size}, dp_size={data_parallel_size}')
         self.engine = sgl.Engine(**kwargs)
+
+    @staticmethod
+    def _accepted_engine_kwargs(engine_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """The caller's passthrough args minus the ones the installed sglang does not have.
+
+        sglang retires and renames engine knobs across releases -- ``enable_ep_moe`` is gone from
+        0.5.x, which spells expert parallelism ``ep_size`` -- and ``Engine`` accepts ``**kwargs``
+        only to reject unknown names at startup. A caller therefore cannot forward a config block
+        wholesale: one retired knob, even left at its default, stops the engine before it starts.
+        Dropping is reported by name rather than silent, so a knob the caller did set on purpose is
+        still visible; the four arguments this class passes explicitly are its own business and are
+        never filtered here.
+        """
+        try:
+            from sglang.srt.server_args import ServerArgs
+        except Exception:
+            return dict(engine_kwargs)
+        accepted = set(getattr(ServerArgs, '__annotations__', {}) or {})
+        try:
+            accepted |= set(inspect.signature(ServerArgs).parameters)
+        except (TypeError, ValueError):
+            pass
+        if not accepted:
+            return dict(engine_kwargs)
+        unknown = sorted(key for key in engine_kwargs if key not in accepted)
+        if unknown:
+            import sglang
+            logger.warning(
+                f'sglang {getattr(sglang, "__version__", "?")} does not accept engine argument(s) '
+                f'{unknown}; dropping them. These are retired or renamed knobs, and one left at its '
+                'config default must not stop the engine from starting.')
+        return {key: value for key, value in engine_kwargs.items() if key not in unknown}
 
     @property
     def _manager(self):
