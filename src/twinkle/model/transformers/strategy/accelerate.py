@@ -235,14 +235,71 @@ class AccelerateStrategy(TransformerStrategyBase):
         clear_offload_record(self)
 
     def wrap_model(self, model, *args):
+        import torch
+
+        probe = os.environ.get('TWINKLE_FSDP2_PROBE')
+        if probe:
+            self._dump_probe(probe, 'before', model, args)
         result = self.accelerator.prepare(model, *args)
-        if isinstance(result, tuple):
-            for optimizer in result[1:]:
-                self._rebind_unsharded_optimizer_params(result[0], optimizer)
+        # ``Accelerator.prepare`` ends with ``return result if len(result) > 1 else result[0]``, and
+        # ``result`` is a list, so the container's type says nothing about what was prepared and a
+        # lone argument comes back bare. Testing for a tuple here silently skipped the repair.
+        prepared = result if isinstance(result, (tuple, list)) else (result,)
+        if probe:
+            self._dump_probe(probe, 'after', prepared[0], prepared[1:])
+        for optimizer in prepared[1:]:
+            if isinstance(optimizer, torch.optim.Optimizer):
+                self._rebind_unsharded_optimizer_params(
+                    prepared[0], optimizer, self._remember_optimizer_params(prepared[0], optimizer))
+        if probe:
+            self._dump_probe(probe, 'rebound', prepared[0], prepared[1:])
         return result
 
+    def _remember_optimizer_params(self, model, optimizer):
+        """Record the name each optimizer parameter had while the model and the optimizer agreed.
+
+        Right after ``prepare`` every optimizer parameter IS one of the model's own objects, so
+        ``named_parameters`` gives each entry an exact name. A later mixed-precision cast can replace
+        a parameter object again, and for a tied weight it replaces the single object the tie covered
+        with one fresh object per name -- the embedding and the tied head then both sit outside the
+        optimizer with the SAME shape, so shape alone cannot say which of them the stale entry meant.
+        The name recorded here can, which is why the save-time repair is handed this map.
+        """
+        ids = {id(param) for group in optimizer.param_groups for param in group['params']}
+        names = {id(param): fqn for fqn, param in model.named_parameters() if id(param) in ids}
+        self.__dict__['_optimizer_param_names'] = names
+        return names
+
+    def _dump_probe(self, path, stage, model, optimizers) -> None:
+        import json
+
+        import torch
+        from torch.distributed.tensor import DTensor
+
+        def describe(param):
+            return {
+                'id': id(param),
+                'ptr': param.data_ptr(),
+                'shape': list(param.shape),
+                'dtype': str(param.dtype),
+                'grad': bool(param.requires_grad),
+                'dtensor': isinstance(param, DTensor),
+            }
+
+        payload = {
+            'stage': stage,
+            'rank': self.accelerator.process_index,
+            'model': {name: describe(param) for name, param in model.named_parameters()},
+            'model_dup': {name: describe(param) for name, param in model.named_parameters(remove_duplicate=False)},
+            'optimizers': [[describe(p) for g in o.param_groups for p in g['params']]
+                           for o in optimizers if isinstance(o, torch.optim.Optimizer)],
+        }
+        suffix = f'.rank{self.accelerator.process_index}.{stage}.json'
+        with open(path + suffix, 'w') as handle:
+            json.dump(payload, handle)
+
     @staticmethod
-    def _rebind_unsharded_optimizer_params(model, optimizer) -> None:
+    def _rebind_unsharded_optimizer_params(model, optimizer, param_names=None) -> None:
         """Point the optimizer at the model's own objects for the parameters FSDP2 left unsharded.
 
         Casting a parameter to the mixed-precision compute dtype replaces the ``Parameter`` object,
@@ -278,6 +335,24 @@ class AccelerateStrategy(TransformerStrategyBase):
                  {id(owned) for _, owned in model_params}]
         if not stale:
             return
+        named = dict(model_params)
+        optimizer_ids = {id(param) for group in param_groups for param in group['params']}
+        by_name = {}
+        for param in list(stale):
+            fqn = (param_names or {}).get(id(param))
+            current = named.get(fqn)
+            # The name is exact where the shape is not: a tied weight's two names share one shape, so
+            # only the recorded name says which of them the stale entry stood for. The target must
+            # still be a weight the optimizer does not already hold, or the repair would duplicate.
+            if (current is not None and current.requires_grad and not isinstance(current, DTensor)
+                    and id(current) not in optimizer_ids):
+                by_name[id(param)] = current
+        if by_name:
+            for group in param_groups:
+                group['params'] = [by_name.get(id(param), param) for param in group['params']]
+            stale = [param for param in stale if id(param) not in by_name]
+            if not stale:
+                return
         candidates = [
             param for _, param in model_params
             if param.requires_grad and not isinstance(param, DTensor) and id(param) not in optimizer_ids
@@ -362,6 +437,13 @@ class AccelerateStrategy(TransformerStrategyBase):
         if not unreachable:
             return
         unsharded = [fqn for fqn, param in model_params if not isinstance(param, DTensor)]
+        # The other half of the divergence: a parameter the model trains but the optimizer never
+        # received. Reported beside the offenders because the two counts are what tell the reader
+        # whether the optimizer merely holds stale objects (offenders only) or also lost track of
+        # weights (offenders plus missing), which is a different and worse failure.
+        optimizer_ids = {id(param) for param in params}
+        missing = [fqn for fqn, param in model_params
+                   if param.requires_grad and id(param) not in optimizer_ids]
         # Name each offender two ways, because either alone can mislead:
         #   - BY POSITION: an optimizer is built over the model's trainable parameters in order, so the
         #     i-th optimizer parameter and the i-th trainable FQN are the same weight even when the
@@ -383,7 +465,7 @@ class AccelerateStrategy(TransformerStrategyBase):
             # are what decide whether a remaining offender was unprovable or merely unmatched.
             same_shape = [fqn for fqn, other in model_params if tuple(other.shape) == tuple(param.shape)]
             named = sum(1 for fqn, other in model_params
-                        if tuple(other.shape) == tuple(param.shape) and id(other) in model_ids)
+                        if tuple(other.shape) == tuple(param.shape) and id(other) in optimizer_ids)
             offenders.append(
                 f'#{index} {positional}: optimizer holds {tuple(param.shape)} {param.dtype}; '
                 f'model exposes '
@@ -394,7 +476,8 @@ class AccelerateStrategy(TransformerStrategyBase):
             f'{len(unreachable)} of {len(params)} optimizer parameter(s) are not reachable from the wrapped '
             f'model {type(model).__name__} (which exposes {len(trainable)} trainable parameter(s)), so its '
             f'FSDP2 optimizer state cannot be mapped to parameter names and no resumable checkpoint can be '
-            f'written. Offenders: {offenders}. The model still holds '
+            f'written. Offenders: {offenders}. The model trains {len(missing)} parameter(s) the '
+            f'optimizer never received: {missing[:12]}. The model still holds '
             f'{len(unsharded)} unsharded parameter(s): {unsharded[:12]}. This is the full-parameter FSDP2 '
             'path; an adapter run (--tuner lora) keeps every optimizer parameter inside a wrapped unit '
             'and saves normally.')
@@ -414,7 +497,8 @@ class AccelerateStrategy(TransformerStrategyBase):
             # object when it casts it, and that cast does not necessarily happen inside prepare. So
             # repair again here, where the divergence is observable, before torch maps state by
             # identity. Nothing to do when the wrap already covered it.
-            self._rebind_unsharded_optimizer_params(model, inner_optimizer)
+            self._rebind_unsharded_optimizer_params(
+                model, inner_optimizer, self.__dict__.get('_optimizer_param_names'))
             self._check_optimizer_params_reachable(model, inner_optimizer)
             optim_state = get_optimizer_state_dict(
                 model,

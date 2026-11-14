@@ -359,8 +359,37 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         get_logger().info('ZeRO-3: switched gradient checkpointing to use_reentrant=True '
                           '(non-reentrant recompute sees partitioned parameters).')
 
-    def unwrap_model(self, model):
-        return self.accelerator.unwrap_model(model, keep_torch_compile=False)
+    def owns_update_step(self) -> bool:
+        return True
+
+    def engine_backward(self, model, loss, *, sync_gradients: bool) -> None:
+        """Drive the engine for one micro-batch: backward always, the update at the boundary.
+
+        This is the split accelerate's own ``DeepSpeedEngineWrapper.backward`` performs, mapped onto
+        the loop's explicit backward-then-step sequence. ``set_gradient_accumulation_boundary`` tells
+        the engine whether this micro-batch closes an accumulation window, which is what makes
+        ``engine.step`` apply the update (and scale the loss by the window size) only there; the
+        engine's ``step`` then also does the clipping from ``gradient_clipping`` in the DeepSpeed
+        config and the zero_grad, so the loop's own ``step`` and ``zero_grad`` -- both no-ops on
+        accelerate's ``DeepSpeedOptimizerWrapper`` -- leave the update exactly once.
+        """
+        engine = _resolve_engine(model)
+        engine.set_gradient_accumulation_boundary(is_boundary=sync_gradients)
+        engine.backward(loss)
+        if sync_gradients:
+            engine.step()
+
+    def engine_grad_norm(self, model):
+        engine = _resolve_engine(model)
+        norm = engine.get_global_grad_norm()
+        # The engine keeps the norm as a tensor on the model's device, while the metric path mixes
+        # it with values gathered from the other ranks -- whose tensors stay on THEIR device -- so a
+        # tensor here dies with "Expected all tensors to be on the same device". Hand back a number.
+        if norm is None:
+            return None
+        return float(norm) if hasattr(norm, 'item') else norm
+
+    def unwrap_model(self, model):        return self.accelerator.unwrap_model(model, keep_torch_compile=False)
 
     def offload_to_cpu(self, model, optimizer=None, *, offload_model: bool = True) -> None:
         """Move this rank's ZeRO parameters and/or Adam state to CPU for colocation.

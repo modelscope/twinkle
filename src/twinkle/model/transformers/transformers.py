@@ -1549,7 +1549,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             rr = self._router_replay(RouterReplayAction.REPLAY_BACKWARD)
 
         with no_sync_ctx:
-            if scaler is not None:
+            if self.strategy.owns_update_step():
+                self.strategy.engine_backward(self.model, loss_value, sync_gradients=should_sync)
+            elif scaler is not None:
                 scaler.scale(loss_value).backward()
             else:
                 loss_value.backward()
@@ -1783,6 +1785,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config.require_finalized('clip gradients')
         if not optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps')):
             return
+
+        if self.strategy.owns_update_step():
+            # The engine clipped inside the step it just performed and owns the norm it computed;
+            # clipping again over ZeRO-partitioned parameters would be both wrong and a full gather.
+            grad_norm = self.strategy.engine_grad_norm(self.model)
+            optimizer_config._last_grad_norm = grad_norm
+            optimizer_config.train_status.num_tokens = 0
+            return grad_norm
 
         optimizer = optimizer_config.optimizer
         scaler = optimizer_config.scaler

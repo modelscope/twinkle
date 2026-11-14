@@ -148,3 +148,25 @@ class TransformerStrategyBase(ABC):
         raise NotImplementedError(
             f'{type(self).__name__} does not support weight offload, which the colocation '
             'flow requires. Use a strategy with offload support (accelerate / native FSDP / deepspeed / megatron).')
+
+    def owns_update_step(self) -> bool:
+        """Whether this strategy, rather than the training loop, drives the parameter update.
+
+        Accelerate's DeepSpeed integration hands back a ``DeepSpeedOptimizerWrapper`` whose ``step``
+        and ``zero_grad`` are ``pass``: the contract is that the caller drives the engine
+        (``engine.backward`` then ``engine.step``), which performs the gradient-accumulation
+        accounting, the clipping, the ZeRO optimizer step and the zeroing. A loop that instead calls
+        ``loss.backward()`` and ``optimizer.step()`` therefore trains without ever updating a weight,
+        and the engine's own step counter never advances -- so the checkpoint it writes is tagged
+        ``global_step0`` whatever the run reached. Strategies that own the update say so here, and
+        the loop then routes its backward and its gradient clipping through the hooks below.
+        """
+        return False
+
+    def engine_backward(self, model, loss, *, sync_gradients: bool) -> None:
+        """Run the backward for one micro-batch, applying the update at the accumulation boundary."""
+        raise NotImplementedError(f'{type(self).__name__} does not own the update step.')
+
+    def engine_grad_norm(self, model):
+        """The gradient norm the engine computed while stepping, in place of clipping a second time."""
+        raise NotImplementedError(f'{type(self).__name__} does not own the update step.')
