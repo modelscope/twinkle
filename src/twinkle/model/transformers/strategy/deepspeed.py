@@ -418,6 +418,26 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         sample = torch.cat(pieces).to(torch.float64)
         return [float(sample.sum()), float(sample.abs().max()), float(sample.norm())]
 
+    @staticmethod
+    def _chunk_sums(flat, chunks: int = 64, width: int = 4096) -> list:
+        """Per-chunk sums over the same strided sample ``_sample_digest`` takes.
+
+        The aggregate alone cannot say where inside a partition a difference lives: a stale region left
+        by a restore shows up in one chunk, while an accumulation-order difference shows up in all of
+        them, and the two call for opposite fixes. Reporting the chunks separately keeps that
+        distinction readable without digesting billions of elements.
+        """
+        import torch
+
+        numel = flat.numel()
+        if numel == 0:
+            return []
+        stride = max(numel // chunks, width)
+        starts = list(range(0, numel - width + 1, stride)) or [0]
+        if numel >= width and (numel - width) % stride and starts[-1] != numel - width:
+            starts.append(numel - width)
+        return [float(flat[s:s + width].to(torch.float64).sum()) for s in starts]
+
     def engine_master_digest(self, model) -> Dict[str, Any]:
         """Per-group ``[sum, absmax, norm]`` over samples spread across the whole fp32 partition."""
         _, partitions = self._fp32_partitions(model)
@@ -447,7 +467,8 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 grad = getattr(group, 'grad', None) if group is not None else None
                 if torch.is_tensor(grad):
                     name = f'{attr}[{index}].grad'
-                    out[name] = self._sample_digest(grad.detach().flatten())
+                    flat = grad.detach().flatten()
+                    out[name] = {'agg': self._sample_digest(flat), 'chunks': self._chunk_sums(flat)}
                     out['sources'].append(name)
         averaged = getattr(getattr(_resolve_engine(model), 'optimizer', None), 'averaged_gradients', None)
         if isinstance(averaged, dict):
