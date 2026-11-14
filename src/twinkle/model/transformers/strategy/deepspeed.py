@@ -441,6 +441,48 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         ]
 
     @staticmethod
+    def _bits_fingerprint(flat, block: int = 1 << 24) -> list:
+        """Two order-independent exact integers that change if any element's bits change.
+
+        Float statistics over a *sample* can only prove a difference exists, never that one is absent:
+        on a 4,538,761,984-element partition the default 64 chunks cover 0.0058%, and the difference
+        this instrument was built to find sat in the group that was barely covered. Covering every
+        element with the exact float reductions instead costs minutes per step, which is why they are
+        gated to one step.
+
+        Reinterpreting the float32 bits as integers removes the trade-off. Integer addition modulo
+        2**64 is commutative and associative, so unlike a float reduction its result does not depend on
+        the order torch adds in -- a parallel reduction over a block is bit-exact and reproducible.
+        Summing the raw bit patterns catches any change to any element; a difference could still cancel
+        (swapping +a for -a leaves the sum unchanged), so a second accumulator over the squared patterns
+        is kept, and cancelling in both at once would require a coincidence across billions of elements.
+        Both are exact over *every* element, so "equal" here means the partitions are bit-identical,
+        not that a sample agreed.
+
+        The flat tensor is walked in blocks because the int64 view of a multi-billion element partition
+        would not fit in memory; Python integers accumulate the block sums, so the modulus is applied
+        once at the end and no precision is lost along the way.
+        """
+        import torch
+
+        numel = flat.numel()
+        if numel == 0:
+            return [0, 0]
+        source = flat.detach()
+        if source.dtype != torch.float32:
+            # Only float32 has an exact 4-byte integer reinterpretation; anything else is widened first
+            # so the fingerprint still covers every element rather than silently skipping the partition.
+            source = source.to(torch.float32)
+        total = 0
+        squared = 0
+        for start in range(0, numel, block):
+            bits = source[start:start + block].view(torch.int32).to(torch.int64)
+            total += int(bits.sum())
+            squared += int((bits * bits).sum())
+        mask = (1 << 64) - 1
+        return [total & mask, squared & mask]
+
+    @staticmethod
     def _full_coverage_chunks(numel: int, width: int = 4096) -> int:
         """The chunk count that makes a strided sample cover every element of a ``numel``-long partition.
 
@@ -457,10 +499,13 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         return max(1, -(-numel // width))
 
     def engine_master_digest(self, model) -> Dict[str, Any]:
-        """Per-group ``[sum, absmax, norm]`` over samples spread across the whole fp32 partition.
+        """Per-group float statistics over a sample, plus an exact fingerprint of every element.
 
-        ``TWINKLE_STEP_DELTA_PROBE_FULL_STEP`` names one global step at which to read every element
-        instead of a sample, which is what turns "no difference found" into "no difference present".
+        ``agg`` is ``[sum, absmax, norm]`` over a strided sample and is what localizes and sizes a
+        difference; ``bits`` is exact over the whole partition and is what decides whether two runs are
+        identical at all. ``TWINKLE_STEP_DELTA_PROBE_FULL_STEP`` additionally names one global step at
+        which the float statistics are computed over every element, for when a difference has to be
+        sized and located rather than merely detected.
         """
         _, partitions = self._fp32_partitions(model)
         if not partitions:
@@ -475,8 +520,12 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 continue
             flat = group.detach().flatten()
             chunks = self._full_coverage_chunks(flat.numel()) if at_full_step else 64
-            entry = self._aggregate(self._chunk_stats(flat, chunks=chunks))
-            out[str(index)] = {'agg': entry, 'chunks': chunks, 'covered': at_full_step} if at_full_step else entry
+            out[str(index)] = {
+                'agg': self._aggregate(self._chunk_stats(flat, chunks=chunks)),
+                'chunks': chunks,
+                'covered': at_full_step,
+                'bits': self._bits_fingerprint(flat),
+            }
         return out
 
     def engine_optim_moment_digest(self, model) -> Dict[str, Any]:
@@ -514,8 +563,15 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 value = entry.get(moment)
                 if torch.is_tensor(value):
                     name = f'{moment}[{index}]'
-                    stats = self._chunk_stats(value.detach().flatten(), chunks=chunks)
-                    out[name] = {'agg': self._aggregate(stats), 'chunks': [s[0] for s in stats]}
+                    flat = value.detach().flatten()
+                    stats = self._chunk_stats(flat, chunks=chunks)
+                    out[name] = {
+                        'agg': self._aggregate(stats),
+                        'chunks': [s[0] for s in stats],
+                        # Exact over every element, so an identical fingerprint means the restored moments
+                        # are bit-identical rather than merely agreeing on a 0.37% sample.
+                        'bits': self._bits_fingerprint(flat),
+                    }
                     out['sources'].append(name)
         if not out['sources']:
             out['unreadable'] = ['<inner optimizer>.state[fp32_partition]']
@@ -543,8 +599,13 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 grad = getattr(group, 'grad', None) if group is not None else None
                 if torch.is_tensor(grad):
                     name = f'{attr}[{index}].grad'
-                    stats = self._chunk_stats(grad.detach().flatten(), chunks=chunks)
-                    out[name] = {'agg': self._aggregate(stats), 'chunks': [s[0] for s in stats]}
+                    flat = grad.detach().flatten()
+                    stats = self._chunk_stats(flat, chunks=chunks)
+                    out[name] = {
+                        'agg': self._aggregate(stats),
+                        'chunks': [s[0] for s in stats],
+                        'bits': self._bits_fingerprint(flat),
+                    }
                     out['sources'].append(name)
         averaged = getattr(getattr(_resolve_engine(model), 'optimizer', None), 'averaged_gradients', None)
         if isinstance(averaged, dict):
