@@ -243,31 +243,13 @@ class IPCCheckpointEngine(CheckpointEngine):
     def _record_fingerprint(self, side: str, seq: int, name: str, tensor: torch.Tensor) -> None:
         """Append one tensor's exact fingerprint to this side's reconciliation file, if the probe is on.
 
-        Set ``TWINKLE_WEIGHT_SYNC_FINGERPRINT`` to a directory to enable it. The sender and the
-        receiver are different processes, so each writes its own file and the two are compared
-        offline. The fingerprint covers every element exactly, so equal values for a name mean the
-        bytes that arrived are the bytes that were published -- which a checkpoint cannot show, since
-        it only proves the weights changed, not that the transport preserved them.
+        Delegates to the shared recorder. ``via='ipc'`` keeps these rows apart from the ones the
+        transport-agnostic sites write, because this pair brackets a different span -- the sender's
+        buffer and the receiver's mapping of it -- than the publish / sampler-arrival pair does, and
+        a run may legitimately produce both.
         """
-        root = os.environ.get('TWINKLE_WEIGHT_SYNC_FINGERPRINT')
-        if not root:
-            return
-        import json
-
-        from twinkle.utils.torch_utils import bits_fingerprint
-        os.makedirs(root, exist_ok=True)
-        path = os.path.join(root, f'weightsync.{side}.ch{self.channel}.rank{self.rank}.jsonl')
-        with open(path, 'a') as handle:
-            handle.write(json.dumps({
-                'side': side,
-                'channel': self.channel,
-                'rank': self.rank,
-                'seq': seq,
-                'name': name,
-                'shape': list(tensor.shape),
-                'dtype': str(tensor.dtype),
-                'bits': bits_fingerprint(tensor),
-            }) + '\n')
+        from twinkle.checkpoint_engine.weight_keys import record_weight_fingerprint
+        record_weight_fingerprint('ipc', side, seq, name, tensor, tag=f'ch{self.channel}.rank{self.rank}')
 
     async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
         """Pack weights into the buffer bucket by bucket and tell the receiver where they are."""

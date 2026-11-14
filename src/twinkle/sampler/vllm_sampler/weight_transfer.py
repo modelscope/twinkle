@@ -54,6 +54,20 @@ class VLLMWeightSender:
             if endpoint.startswith("ipc://") and os.path.exists(endpoint[6:]):
                 os.remove(endpoint[6:])
 
+    @staticmethod
+    async def _fingerprint_received(pairs, tag: str = ''):
+        """Record each weight's exact fingerprint as it reaches the sampler, if the probe is on.
+
+        Streaming is preserved: this yields each pair as it arrives rather than collecting the model,
+        so the bucket-by-bucket memory bound the caller relies on is unchanged.
+        """
+        from twinkle.checkpoint_engine.weight_keys import record_weight_fingerprint
+        seq = 0
+        async for name, tensor in pairs:
+            record_weight_fingerprint('sampler', 'recv', seq, name, tensor, tag=tag)
+            seq += 1
+            yield name, tensor
+
     async def update_weights(
         self,
         weights,
@@ -108,6 +122,13 @@ class VLLMWeightSender:
                     yield item
 
             weight_aiter = _sync_iter()
+
+        # The arrival point of the published stream: the trainer wraps the same pairs before they
+        # enter the transport (CheckpointEngineMixin._fingerprint_published), so equal fingerprints
+        # for a name across the two files mean the transport preserved every element -- which is the
+        # question a checkpoint cannot answer. Wrapped before the peek below so the first tensor,
+        # which the peek consumes, is recorded like every other.
+        weight_aiter = self._fingerprint_received(weight_aiter, tag=zmq_handle or '')
 
         # Peek first tensor to detect device (supported accelerator → IPC, CPU → SHM).
         try:
