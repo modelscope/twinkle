@@ -77,6 +77,8 @@ class vLLMSampler:
         sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
         adapter_name: str = '',
         adapter_uri: Optional[str] = None,
+        adapter_path: Optional[str] = None,
+        session_id: Optional[str] = None,
         num_samples: int = 1,
         token_only: bool = False,
     ) -> List[SampleResponseModel]:
@@ -86,7 +88,15 @@ class vLLMSampler:
             inputs: List of Trajectory or InputFeature to sample from.
             sampling_params: Sampling parameters mapping or Twinkle ``SamplingParams``.
             adapter_name: Adapter name for LoRA inference.
-            adapter_uri: Adapter URI (twinkle:// path or local path) for LoRA inference.
+            adapter_uri: Adapter URI (twinkle:// path or local path) for LoRA inference; ``None`` falls
+                back to the URI the weight-sync engine last stamped on this sampler
+                (``self.adapter_uri``), so a rollout that never names an adapter samples with the
+                freshest synced weights.
+            adapter_path: Alias of ``adapter_uri`` (the LOCAL sampler's spelling): the multi-turn
+                rollout passes its per-call adapter through this name, so the client face mirrors
+                the local one and the rollout stays mode-blind.
+            session_id: Accepted for signature parity with the local sampler and ignored: replica
+                routing is a server-side concern (the served engine routes sessions itself).
             num_samples: Number of completions to generate per prompt.
             token_only: Return the sampled tokens and logprobs only (no ``new_input_feature``); the
                 inputs are the ids the engine runs on, with their media alongside.
@@ -94,6 +104,8 @@ class vLLMSampler:
         Returns:
             SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
+        if adapter_uri is None:
+            adapter_uri = adapter_path if adapter_path is not None else getattr(self, 'adapter_uri', None)
         response = self._transport.post_model(
             f'{self.server_url}/sample',
             build_request(
