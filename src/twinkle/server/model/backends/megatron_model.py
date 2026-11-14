@@ -14,7 +14,6 @@ from tinker import types
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
-from twinkle.infra import collect_tensor_dict
 from twinkle.model.megatron import MegatronModel, MultiLoraMegatronModel
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
                                                   collect_forward_backward_results, to_cpu_safe_output)
@@ -117,14 +116,14 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
     # Twinkle-native methods (InputFeature/Trajectory-based I/O)
     # ------------------------------------------------------------------
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict')
     @nccl_safe_megatron
     def forward_only(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_only(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict', sync=True)
     @nccl_safe_megatron
     def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""

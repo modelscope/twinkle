@@ -125,26 +125,30 @@ class CheckContext:
         final_answer: text of the last assistant turn, for the ``answer_*`` kinds.
         env: where the ``shell`` / ``python`` kinds run -- the environment the
             episode acted in. ``None`` runs them locally in ``workspace``.
+        episode_id: the episode's session on ``env``.
     """
     workspace: str = ''
     final_answer: str = ''
     env: Optional['Env'] = None
+    episode_id: str = ''
 
 
-def _local_env(workspace: str) -> 'Env':
-    """Run checks in ``workspace`` on this machine.
+def _run_local(workspace: str, source: str, interpreter: str, timeout: int) -> Tuple[int, str]:
+    """Run a check in ``workspace`` on this machine.
 
-    The fallback for a :class:`CheckContext` with no env. It is a
-    :class:`~twinkle_agentic.envs.localenv.LocalEnv`, so a check that falls back to
-    here and a check that runs in a sandbox go through one interface -- and the
-    process isolation (own session, killpg on timeout, capped address space)
-    lives in one place instead of being restated by every caller that needs it.
+    The fallback for a :class:`CheckContext` with no env. It runs through
+    :class:`~twinkle_agentic.envs.localenv.LocalEnv`'s executor, so the process
+    isolation (own session, killpg on timeout, capped address space) lives in one
+    place instead of being restated by every caller that needs it. No session is
+    opened: the directory is the episode's, not one the env made and will delete.
     """
     # Imported here, not at module scope: the env package pulls in twinkle's
     # remote-class machinery, and a task declaring only file_* checks should not
     # pay a second of import time for an environment it never runs anything in.
-    from ..envs.localenv import LocalEnv
-    return LocalEnv(workspace=workspace or '.', command_timeout=DEFAULT_TIMEOUT, memory_limit_gb=_MEM_LIMIT_GB)
+    from ..envs.localenv import LocalEnv, _LocalSession
+    workspace = workspace or '.'
+    env = LocalEnv(root=workspace, command_timeout=DEFAULT_TIMEOUT, memory_limit_gb=_MEM_LIMIT_GB)
+    return env._run_script(_LocalSession(workspace), source, interpreter, timeout)
 
 
 def checks_from_dicts(raw: Sequence[Dict[str, Any]]) -> List[Check]:
@@ -243,11 +247,14 @@ def _eval_one(check: Check, ctx: CheckContext) -> CheckOutcome:
         return CheckOutcome(check, ok, '' if ok else f'{check.path}:{check.key} is {got!r}, expected {check.value!r}')
 
     if kind in ('shell', 'python'):
-        env = ctx.env or _local_env(ctx.workspace)
         try:
-            code, out = env.run_script(check.code, kind, check.timeout)
+            if ctx.env is not None:
+                code, out = ctx.env.run_script(ctx.episode_id, check.code, kind, check.timeout)
+            else:
+                code, out = _run_local(ctx.workspace, check.code, kind, check.timeout)
         except Exception as e:  # noqa
-            return CheckOutcome(check, False, f'{type(env).__name__} raised {type(e).__name__}: {e}')
+            where = type(ctx.env).__name__ if ctx.env is not None else 'LocalEnv'
+            return CheckOutcome(check, False, f'{where} raised {type(e).__name__}: {e}')
         if code != check.expect_exit:
             return CheckOutcome(check, False, f'exit {code} (expected {check.expect_exit}); output: {out[-300:]}')
         if check.pattern and re.search(check.pattern, out or '', re.S) is None:

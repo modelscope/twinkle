@@ -584,6 +584,9 @@ class DeviceMesh:
 
         Returns: One rank per data_rank, preferring PP last stage.
         """
+        cached = getattr(self, '_collect_ranks_cache', None)
+        if cached is not None:
+            return list(cached)
         data_ws = self.data_world_size
         collect_ranks = []
 
@@ -606,7 +609,11 @@ class DeviceMesh:
             # Take the smallest rank as representative
             collect_ranks.append(min(candidates))
 
-        return sorted(collect_ranks)
+        cached = sorted(collect_ranks)
+        # The mesh is fixed at construction, so the representatives never change; caching spares
+        # every slice_dp collect the O(world^2) rank->data_rank rescan of a large mesh.
+        self._collect_ranks_cache = cached
+        return list(cached)
 
     def has_dim(self, dim_name: str) -> bool:
         if self.mesh_dim_names is None:

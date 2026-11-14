@@ -6,10 +6,13 @@ student sampled -- into the group-relative advantage. They run at batch-construc
 the loss), so a caller expands the per-sequence base advantage ``[B]`` to the per-token frame ``[B, T]``
 and optionally adds or reweights it with the teacher-vs-student log-prob gap. Sunk from the legacy
 ``swift.rl_core.advantage`` path so the dev RL stack carries no cross-stack runtime dependency.
+:class:`TeacherReweight` applies them to ragged per-sample rows.
 """
-from typing import Optional
+from typing import List, Literal, Optional, Sequence
 
 import torch
+
+from twinkle import remote_class, remote_function
 
 
 def compute_teacher_logratio(
@@ -115,3 +118,55 @@ def apply_rlsd_reweight(
         seq_neg = (base_advantages < 0).float().unsqueeze(1)
         reweight = seq_neg * reweight + (1.0 - seq_neg)
     return base_bt * reweight.detach() * mask
+
+
+@remote_class(execute='first')
+class TeacherReweight:
+    """Per-token advantages from per-sequence ones and a teacher-vs-policy logp lane.
+
+    ``mode='rlsd'`` reweights each sequence's advantage inside its tokens (:func:`apply_rlsd_reweight`
+    with ``lam`` / ``clip_range`` / ``negative_only``); ``mode='expand'`` broadcasts it and adds
+    ``teacher_kl_coef`` times the per-token log-ratio (:func:`expand_advantage_to_per_token`).
+    ``old_logps`` / ``teacher_logps`` are ragged per-sample rows over the same response tokens; the
+    result is one per-token row per sample, each as long as its ``old_logps`` row.
+    """
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=True)
+    def __call__(self,
+                 advantages: Sequence[float],
+                 old_logps: Sequence[Sequence[float]],
+                 teacher_logps: Sequence[Sequence[float]],
+                 *,
+                 mode: Literal['rlsd', 'expand'] = 'expand',
+                 lam: float = 0.0,
+                 clip_range: float = 5.0,
+                 negative_only: bool = False,
+                 teacher_kl_coef: float = 0.0,
+                 **kwargs) -> List[List[float]]:
+        if mode not in ('rlsd', 'expand'):
+            raise ValueError(f"teacher reweight mode {mode!r} not in ('rlsd', 'expand').")
+        if not len(advantages) == len(old_logps) == len(teacher_logps):
+            raise ValueError(f'{len(advantages)} advantages, {len(old_logps)} policy rows and '
+                             f'{len(teacher_logps)} teacher rows must align.')
+        lengths = [len(row) for row in old_logps]
+        for index, (row, length) in enumerate(zip(teacher_logps, lengths)):
+            if len(row) != length:
+                raise RuntimeError(f'row {index}: {len(row)} teacher logps vs {length} policy logps; '
+                                   'teacher and policy must score the same response tokens.')
+        max_len = max(lengths, default=0)
+
+        def _pad(rows: Sequence[Sequence[float]]) -> torch.Tensor:
+            return torch.tensor([[float(v) for v in row] + [0.0] * (max_len - len(row)) for row in rows],
+                                dtype=torch.float32).reshape(len(rows), max_len)
+
+        mask = torch.tensor([[True] * length + [False] * (max_len - length) for length in lengths],
+                            dtype=torch.bool).reshape(len(lengths), max_len)
+        # The estimators take the per-sequence base advantage as [B] and broadcast it to [B, T].
+        base = torch.tensor([float(value) for value in advantages], dtype=torch.float32)
+        old, teacher = _pad(old_logps), _pad(teacher_logps)
+        if mode == 'rlsd':
+            out = apply_rlsd_reweight(base, mask, teacher, old, lam=lam, clip_range=clip_range,
+                                      negative_only=negative_only)
+        else:
+            out = expand_advantage_to_per_token(base, mask, teacher, old, teacher_kl_coef=teacher_kl_coef)
+        return [out[i, :length].tolist() for i, length in enumerate(lengths)]

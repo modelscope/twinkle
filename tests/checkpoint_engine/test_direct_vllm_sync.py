@@ -28,13 +28,12 @@ def manager(devices=None, targets=None, failure=False):
     state._auth_key = 'authenticated'
     state._model_keys = ['weight']
     state.base_sync_done = False
+    state._peft_config = None
     state.colocate_trainer_ranks = None
     state.model = NS(direct_weight_sync_device=lambda: devices,
                      send_weights_to_vllm=lambda *args, **kwargs: submit('send', *args, **kwargs))
     state.sampler = NS(direct_weight_sync_metadata=lambda: targets)
     state._ensure_model_keys = lambda: None
-    state._sampler_call = lambda method, *args, **kwargs: (
-        targets if method == 'direct_weight_sync_metadata' else submit('receive', *args, **kwargs))
     return state, events
 
 
@@ -93,15 +92,30 @@ def test_each_tp_worker_has_a_local_sender_and_explicit_leaders_still_match():
     assert len(events[0][1][0]) == 4
 
 
-def test_non_cuda_lora_and_standalone_keep_existing_transport(monkeypatch):
+def test_lora_only_update_also_uses_the_direct_transport():
     state, events = manager()
-    assert state._sync_weights_direct_vllm(False) is False
-    state.mode = 'standalone'
+    state.base_sync_done = True
+    state._peft_config = {'r': 16}
+    assert state._sync_weights_direct_vllm(False)
+    assert [row[0] for row in events] == ['send', 'receive', 'send_done', 'receive_done']
+    assert events[0][2]['merge_and_sync'] is False
+    assert events[0][2]['peft_config'] == {'r': 16}
+    assert events[1][2]['peft_config'] == {'r': 16}
+    assert state.base_sync_done
+
+
+def test_unsupported_backends_and_kill_switch_keep_existing_transport(monkeypatch):
+    # A non-vLLM sampler carries no direct metadata at all (standalone never reaches here:
+    # sync_weights routes only colocate through the direct path).
+    state, events = manager()
+    del state.sampler.direct_weight_sync_metadata
     assert state._sync_weights_direct_vllm(True) is False
-    state.mode = 'colocate'
-    state._sampler_call = lambda *args, **kwargs: [None]
+    # An engine that cannot report per-worker endpoints yields None targets.
+    state, _ = manager()
+    state.sampler = NS(direct_weight_sync_metadata=lambda: [None])
     assert state._sync_weights_direct_vllm(True) is False
     monkeypatch.setenv('TWINKLE_DISABLE_DIRECT_VLLM_SYNC', '1')
+    state, _ = manager()
     assert state._sync_weights_direct_vllm(True) is False
     assert not events
 

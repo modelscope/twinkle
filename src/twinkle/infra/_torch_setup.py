@@ -4,11 +4,7 @@ import os
 from typing import Any, Dict, Optional
 
 from twinkle.utils import framework_util
-
-#: Env var carrying the JSON-encoded torch-init knobs across the process boundary (driver -> Ray worker
-#: runtime_env). One blob replaces the old separate TWINKLE_SEED / TWINKLE_FULL_DETERMINISM /
-#: TWINKLE_TF32 vars.
-EXTRA_TORCH_KWARGS_ENV = 'EXTRA_TORCH_KWARGS'
+from twinkle.utils.utils import EXTRA_TORCH_KWARGS_ENV
 
 _DEFAULT_SEED = 42
 
@@ -93,8 +89,3 @@ def apply_in_worker(fallback: Optional[Dict[str, Any]] = None) -> None:
         # Keep tokenizers in its parallel mode.
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-
-def seed_from_env(default: int = _DEFAULT_SEED) -> int:
-    """The configured RNG seed from ``EXTRA_TORCH_KWARGS``, or *default* when it is absent or None."""
-    seed = from_env().get('seed')
-    return default if seed is None else int(seed)

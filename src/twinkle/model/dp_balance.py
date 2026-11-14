@@ -360,7 +360,7 @@ def exchange_call(
 ) -> tuple[tuple, dict[str, Any]]:
     """This rank's share of the reordered batch, built from every data rank's leaves (in data-rank order).
 
-    Tensors are joined the way ``collect_tensor_dict`` joins them for the Ray driver, padding the
+    Tensors are joined the way ``tensor_dict`` joins them for the Ray driver, padding the
     trailing dims to the longest rank, and land on the device the local value was on.
     """
     from twinkle.utils import pad_and_stack_tensors

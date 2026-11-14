@@ -1,48 +1,42 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""An OpenAI-shaped door onto a sampler, for agents that drive their own loop.
+"""An OpenAI-shaped door onto the rollout, for agents that drive their own loop.
 
 A coding agent that ships as its own program cannot be called turn by turn: it
 owns its loop, its tools and its context, and the only thing it will accept from
-us is a base URL. This puts one in front of a sampler, in the same process that
-holds the weights -- which is the whole point. Point such an agent at a model
-served somewhere else and it trains on a policy that is not the one being
-updated; every generation is off-policy by however far the two have drifted, and
-nothing reports it. Here there is no copy to drift: the sampler answering the
-request is the sampler the trainer just synced.
+us is a base URL. This puts one in front of the rollout that holds the episode --
+which is the whole point. Point such an agent at a model served somewhere else
+and it trains on a policy that is not the one being updated; every generation is
+off-policy by however far the two have drifted, and nothing reports it.
 
-Two things this deliberately does not do.
-
-It does not keep an account. What makes an externally driven episode trainable is
-recorded through ``on_round``, and the endpoint's only obligation is to report
-each round honestly -- which key it came in under, which prompt ids the model
-actually ran on, which tokens came back. Whether that is banked into a
-:class:`~.ledger.TurnLedger`, written to disk, or ignored is the caller's
-business. So this is equally usable as a plain inference server, and equally
-usable by code that has its own idea of what a trajectory is.
-
-It does not require a twinkle sampler. Anything with ``sample(inputs, params) ->
-[SampleResponse]`` will do, so an outside generation backend can be dropped in
-without inheriting anything.
+The endpoint never samples. A request is parsed into an :class:`EndpointRequest`
+and put on the queue of the episode its API key names; the rollout's next step
+takes it, samples (token-in: only the part of the conversation it has not seen
+is encoded), records the round, and completes ``reply``. The endpoint then writes
+that reply out in its protocol's wire format. So one step of the episode is one
+request of the agent, and everything about accounting lives in the rollout.
 
 Which episode a request belongs to is decided by the API key, never by matching
 the conversation. Two episodes on the same task open with the same messages, so a
-prefix match would hand one episode's tokens to the other's account -- and the
-tokens would fit, which is why nothing would catch it. The key names the account;
-the prefix check inside the ledger then asks the different question of whether
-*this* account is still being extended, or whether the agent rewrote its history
-behind our back.
+prefix match would hand one episode's tokens to the other.
+
+Two protocols, one subclass each: :class:`ChatEndpoint` (``/v1/chat/completions``)
+and :class:`ResponsesEndpoint` (``/v1/responses``).
 """
+import asyncio
 import json
+import queue
 import socket
 import threading
 import time
 import uuid
-from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from abc import ABC, abstractmethod
+from concurrent.futures import Future
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from twinkle.data_format.sampling import SampledSequence, SamplingParams
-from twinkle.sampler.base import Sampler
-from twinkle.template.base import Template
+from twinkle.utils import find_node_ip, get_logger
+
+logger = get_logger()
 
 # How long to wait for the server thread to report itself up, and to wind down.
 _STARTUP_TIMEOUT = 60.0
@@ -50,33 +44,18 @@ _SHUTDOWN_TIMEOUT = 10.0
 
 
 @dataclass
-class Round:
-    """One request answered, described in the terms an account needs.
+class EndpointRequest:
+    """One request of an agent, waiting for the rollout step that answers it.
 
-    A dataclass rather than four positional arguments because this is the seam
-    between the endpoint and whoever is keeping score: adding a field later must
-    not break every existing callback.
+    ``reply`` resolves to ``{'message': <assistant message, chat shape>,
+    'finish_reason': 'stop' | 'tool_calls' | 'length', 'usage': {'prompt_tokens',
+    'completion_tokens'}}``, or raises when the episode ended without answering.
     """
-
-    key: str
-    """The API key the request arrived under -- the identity of the episode."""
-
-    prompt_token_ids: List[int]
-    """The ids the model was actually run on, straight from the sampler.
-
-    Not the request's messages re-encoded afterwards. Re-encoding is where a
-    trajectory quietly stops matching what was sampled; see
-    :mod:`twinkle_agentic.utils.token_utils`.
-    """
-
-    sequence: SampledSequence
-    """What came back: tokens, logprobs, stop reason."""
 
     messages: List[Dict[str, Any]]
-    """The conversation as the agent sent it, plus the reply we returned.
-
-    For traces and reward functions. The ids above are what gets trained.
-    """
+    tools: List[Dict[str, Any]]
+    params: Dict[str, Any]
+    reply: Future = field(default_factory=Future)
 
 
 def _tool_calls_for_wire(parsed: List[Dict[str, Any]], turn_id: str) -> List[Dict[str, Any]]:
@@ -106,94 +85,77 @@ def _tool_calls_for_wire(parsed: List[Dict[str, Any]], turn_id: str) -> List[Dic
     return calls
 
 
-class PolicyEndpoint:
-    """An OpenAI ``/v1/chat/completions`` server over one sampler.
+def assistant_message(text: str, parsed_calls: List[Dict[str, Any]], cleaned: str) -> Dict[str, Any]:
+    """The assistant message a reply carries: ``cleaned`` text plus wire-shaped tool calls when there are any."""
+    message: Dict[str, Any] = {'role': 'assistant', 'content': cleaned if parsed_calls else text}
+    if parsed_calls:
+        message['tool_calls'] = _tool_calls_for_wire(parsed_calls, uuid.uuid4().hex[:12])
+    return message
 
-    Usage is two lines: ``start()`` returns the base URL to hand the agent, and
-    ``stop()`` takes it down. Also a context manager, which is the form to prefer
-    when an episode owns the endpoint's lifetime.
+
+def _bearer(authorization: Optional[str]) -> str:
+    if not authorization:
+        return ''
+    return authorization.split(' ', 1)[-1].strip() if ' ' in authorization else authorization.strip()
+
+
+class PolicyEndpoint(ABC):
+    """An OpenAI-protocol server whose requests are answered by rollout steps.
+
+    One per rollout shard, started on first use. :meth:`open` gives an episode
+    its queue under its key, :meth:`close` takes it away (failing whatever was
+    still waiting); a request under an unknown key is refused with 401.
 
     Args:
-        sampler: Anything exposing ``sample(inputs, sampling_params)`` and
-            returning ``SampleResponse`` objects carrying ``prompt_token_ids``.
-        template: Used to read tool calls out of the reply text. Defaults to the
-            sampler's own, which is normally the one that encoded the prompt --
-            pass it explicitly only if the sampler has none.
-        host: Bound loopback by default. This serves the training policy; there
-            is no authentication here beyond the key naming an account.
+        host: where to bind; defaults to this node's address, which an agent in
+            a sandbox on another machine can route back to.
         port: 0 picks a free one, which is what lets many endpoints coexist.
-        sampling_params: The defaults every request starts from. Requests may
-            override the usual decoding knobs, but not ``logprobs``: whether
-            logprobs are collected is a training decision, and an agent that
-            asked for a different number would silently change what is trainable.
-        on_round: Called with a :class:`Round` after each reply, on the thread
-            that served the request. Raising from it fails the request, so a
-            callback that keeps an account should handle its own disagreements
-            rather than let them reach the agent.
-        max_concurrent_requests: How many requests may be generating at once.
-            The handler is a blocking ``def``, so this is the size of the thread
-            pool starlette runs it in; anyio's default is 40, and request 41
-            waits for a thread rather than for the sampler. Raise it above the
-            number of agents that can be running at the same time. It is a
-            ceiling on requests in flight, not a promise about throughput: what
-            they are all waiting on is one sampler, which does its own batching.
-            None leaves the default alone.
     """
 
-    def __init__(
-        self,
-        sampler: Any,
-        *,
-        template: Optional[Template] = None,
-        host: str = '127.0.0.1',
-        port: int = 0,
-        sampling_params: Optional[SamplingParams] = None,
-        on_round: Optional[Callable[[Round], None]] = None,
-        max_concurrent_requests: Optional[int] = None,
-    ) -> None:
-        self.sampler = sampler
-        # A twinkle sampler is asked whether it tolerates one request at a time:
-        # this serves them as they arrive, and a slice_dp sampler spreads a batch
-        # of one over every worker and raises on the ranks that get nothing.
-        # Anything else is taken at its word -- the attribute is twinkle's, and
-        # its absence means the sampler is not one rather than that it is broken.
-        sample = getattr(type(sampler), 'sample', None)
-        if isinstance(sampler, Sampler) and not getattr(sample, '_enable_continous_work', False):
-            raise ValueError(f'{type(sampler).__name__}.sample must be declared with '
-                             'enable_continous_work=True to serve an endpoint: requests arrive '
-                             'one at a time, and a slice_dp sampler raises when a worker gets '
-                             'nothing from a batch of one.')
-        self.template = template if template is not None else getattr(sampler, 'template', None)
-        if self.template is None:
-            raise ValueError('PolicyEndpoint needs a template to read tool calls out of replies, '
-                             'and the sampler does not carry one: pass template=...')
-        params = sampling_params or SamplingParams()
-        if params.num_samples != 1:
-            # Each request is one turn of one conversation; a second sequence
-            # would have nowhere to go and no account to be banked into.
-            raise ValueError(f'PolicyEndpoint serves num_samples=1 only, got {params.num_samples}')
-        self.sampling_params = params
-        self.on_round = on_round
-        self.host = host
+    #: The route this protocol serves.
+    path: str = ''
+
+    def __init__(self, *, host: Optional[str] = None, port: int = 0) -> None:
+        self.host = host or find_node_ip()
         self.port = port
-        if max_concurrent_requests is not None and max_concurrent_requests < 1:
-            raise ValueError(f'max_concurrent_requests must be >= 1 or None, '
-                             f'got {max_concurrent_requests}')
-        self.max_concurrent_requests = max_concurrent_requests
+        self._queues: Dict[str, 'queue.Queue[EndpointRequest]'] = {}
+        self._lock = threading.Lock()
         self._socket: Optional[socket.socket] = None
         self._server: Optional[Any] = None
         self._thread: Optional[threading.Thread] = None
+
+    # ---------------------------------------------------------------- episodes
+
+    def open(self, key: str) -> 'queue.Queue':
+        """Start taking requests under ``key``; returns the queue they arrive on.
+
+        The episode may put its own markers on the same queue (an agent that exited, say), so that
+        one ``get`` waits for whichever comes first.
+        """
+        with self._lock:
+            return self._queues.setdefault(key, queue.Queue())
+
+    def close(self, key: str) -> None:
+        """Stop taking requests under ``key``; requests still queued fail."""
+        with self._lock:
+            pending = self._queues.pop(key, None)
+        while pending is not None:
+            try:
+                request = pending.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(request, EndpointRequest) and not request.reply.done():
+                request.reply.set_exception(RuntimeError(f'episode {key!r} ended before this request was answered'))
 
     # ---------------------------------------------------------------- lifetime
 
     @property
     def running(self) -> bool:
-        """Is the server up? Lets a caller start it once without racing to check."""
         return self._server is not None
 
     @property
     def base_url(self) -> str:
-        """What to put in the agent's ``OPENAI_BASE_URL``."""
+        """What to hand the agent as its endpoint."""
         if self._server is None:
             raise RuntimeError('the endpoint is not running: call start() first')
         return f'http://{self.host}:{self.port}/v1'
@@ -203,9 +165,7 @@ class PolicyEndpoint:
 
         The listening socket is bound here, before the server thread starts, so
         ``port=0`` can be resolved to a real port without racing: bind, read the
-        port, then hand the already-bound socket to uvicorn. Asking uvicorn to
-        bind and then reading the port back leaves a window in which the agent
-        has a URL that nothing is listening on yet.
+        port, then hand the already-bound socket to uvicorn.
         """
         if self._server is not None:
             raise RuntimeError('the endpoint is already running')
@@ -236,7 +196,11 @@ class PolicyEndpoint:
         return self.base_url
 
     def stop(self) -> None:
-        """Take the server down. Safe to call when it is not running."""
+        """Take the server down and fail every waiting request. Safe to call when it is not running."""
+        with self._lock:
+            keys = list(self._queues)
+        for key in keys:
+            self.close(key)
         if self._server is None:
             return
         self._server.should_exit = True
@@ -248,106 +212,105 @@ class PolicyEndpoint:
         self._server = None
         self._thread = None
 
-    def __enter__(self) -> 'PolicyEndpoint':
-        self.start()
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self.stop()
-
     # ----------------------------------------------------------------- serving
 
     def _build_app(self) -> Any:
-        from contextlib import asynccontextmanager
         from fastapi import Body, FastAPI, Header
-        from fastapi.responses import StreamingResponse
+        from fastapi.responses import JSONResponse, StreamingResponse
 
-        @asynccontextmanager
-        async def lifespan(_app: Any) -> Any:
-            # Set here rather than in __init__ because the limiter lives in a
-            # RunVar: it belongs to whichever event loop is running, and the one
-            # that matters is the loop uvicorn started on the server thread.
-            if self.max_concurrent_requests is not None:
-                import anyio.to_thread
-                anyio.to_thread.current_default_thread_limiter().total_tokens = self.max_concurrent_requests
-            yield
+        app = FastAPI()
 
-        app = FastAPI(lifespan=lifespan)
-
-        # A plain ``def``: the sampler call blocks, and FastAPI runs sync handlers
-        # in a thread pool. Declared async it would hold the event loop for the
-        # length of a generation and serialise every concurrent episode.
-        @app.post('/v1/chat/completions')
-        def chat_completions(payload: Dict[str, Any] = Body(...),
-                             authorization: Optional[str] = Header(default=None)) -> Any:
-            key = ''
-            if authorization:
-                key = authorization.split(' ', 1)[-1].strip() if ' ' in authorization else authorization.strip()
-            completion = self.complete(payload, key=key)
+        # Async: the handler only waits for the step that answers it, so a
+        # thousand agents waiting on their episodes cost no threads.
+        @app.post(self.path)
+        async def serve(payload: Dict[str, Any] = Body(...), authorization: Optional[str] = Header(default=None)) -> Any:
+            key = _bearer(authorization)
+            with self._lock:
+                pending = self._queues.get(key)
+            if pending is None:
+                return JSONResponse({'error': {'message': f'unknown api key {key!r}'}}, status_code=401)
+            try:
+                messages, tools, params = self.parse(payload)
+            except ValueError as e:
+                return JSONResponse({'error': {'message': str(e)}}, status_code=400)
+            request = EndpointRequest(messages=messages, tools=tools, params=params)
+            pending.put(request)
+            try:
+                reply = await asyncio.wrap_future(request.reply)
+            except Exception as e:  # noqa
+                return JSONResponse({'error': {'message': f'{type(e).__name__}: {e}'}}, status_code=500)
+            body = self.render(payload, reply)
             if payload.get('stream'):
-                return StreamingResponse(_stream(completion), media_type='text/event-stream')
-            return completion
+                return StreamingResponse(self.stream(body), media_type='text/event-stream')
+            return body
 
         return app
 
-    def complete(self, payload: Dict[str, Any], *, key: str = '') -> Dict[str, Any]:
-        """Answer one chat-completions request and report the round.
+    @abstractmethod
+    def parse(self, payload: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+        """``(messages, tools, params)`` in chat shape, from one request body; ValueError when malformed.
 
-        Public because it is the whole endpoint minus HTTP: a caller that already
-        has a transport, or a test that wants no sockets, drives this directly.
+        ``params`` holds only the decoding knobs the request may adjust (``max_tokens``,
+        ``temperature``, ``top_p``, ``stop``) -- never ``logprobs``, whose collection is a
+        training decision an agent must not change.
         """
+
+    @abstractmethod
+    def render(self, payload: Dict[str, Any], reply: Dict[str, Any]) -> Dict[str, Any]:
+        """The response body for ``reply`` (see :class:`EndpointRequest`)."""
+
+    @abstractmethod
+    def stream(self, body: Dict[str, Any]) -> Iterator[str]:
+        """The rendered body re-served as the protocol's event stream.
+
+        There is nothing to stream incrementally: a step returns a generation
+        whole. So the reply goes out as one complete stream of events, which is a
+        valid stream, not a partial implementation of a different protocol.
+        """
+
+
+def _decoding_params(payload: Dict[str, Any], max_tokens_keys: Tuple[str, ...]) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    for key in max_tokens_keys:
+        if payload.get(key) is not None:
+            params['max_tokens'] = int(payload[key])
+            break
+    if payload.get('temperature') is not None:
+        params['temperature'] = float(payload['temperature'])
+    if payload.get('top_p') is not None:
+        params['top_p'] = float(payload['top_p'])
+    if payload.get('stop'):
+        params['stop'] = payload['stop']
+    return params
+
+
+class ChatEndpoint(PolicyEndpoint):
+    """``/v1/chat/completions``, plain and streamed."""
+
+    path = '/v1/chat/completions'
+
+    def parse(self, payload):
         messages = list(payload.get('messages') or [])
         if not messages:
             raise ValueError('a chat-completions request must carry at least one message')
         if payload.get('n', 1) != 1:
-            raise ValueError(f"PolicyEndpoint serves n=1 only, got {payload.get('n')}")
+            raise ValueError(f"this endpoint serves n=1 only, got {payload.get('n')}")
+        return messages, list(payload.get('tools') or []), _decoding_params(payload,
+                                                                            ('max_completion_tokens', 'max_tokens'))
 
-        request: Dict[str, Any] = {'messages': messages}
-        tools = payload.get('tools')
-        if tools:
-            request['tools'] = list(tools)
-        response = self.sampler.sample([request], self._params_for(payload))[0]
-        seq = response.sequences[0]
-
-        turn_id = uuid.uuid4().hex[:12]
-        # Decoded off the sampled ids rather than taken from ``seq.decoded``,
-        # which keeps the template's end-of-turn marker. That marker reaching an
-        # agent's message content is not cosmetic: it ends up in the files and
-        # answers the agent writes from it.
-        tokenizer = getattr(self.template, 'tokenizer', None)
-        if tokenizer is not None and seq.tokens:
-            text = tokenizer.decode(seq.tokens, skip_special_tokens=True)
-        else:
-            text = seq.decoded or ''
-        parsed = self.template.parse_tool_call(text)
-        message: Dict[str, Any] = {
-            'role': 'assistant',
-            'content': self.template.clean_tool_call(text) if parsed else text,
-        }
-        if parsed:
-            message['tool_calls'] = _tool_calls_for_wire(parsed, turn_id)
-        finish_reason = 'tool_calls' if parsed else ('length' if seq.stop_reason == 'length' else 'stop')
-
-        if self.on_round is not None:
-            self.on_round(
-                Round(
-                    key=key,
-                    prompt_token_ids=list(response.prompt_token_ids or []),
-                    sequence=seq,
-                    messages=messages + [message],
-                ))
-
-        prompt_tokens = len(response.prompt_token_ids or [])
-        completion_tokens = len(seq.tokens or [])
+    def render(self, payload, reply):
+        usage = reply.get('usage') or {}
+        prompt_tokens = int(usage.get('prompt_tokens', 0))
+        completion_tokens = int(usage.get('completion_tokens', 0))
         return {
-            'id': f'chatcmpl-{turn_id}',
+            'id': f'chatcmpl-{uuid.uuid4().hex[:12]}',
             'object': 'chat.completion',
             'created': int(time.time()),
             'model': payload.get('model') or 'twinkle-policy',
             'choices': [{
                 'index': 0,
-                'message': message,
-                'finish_reason': finish_reason,
+                'message': reply['message'],
+                'finish_reason': reply['finish_reason'],
             }],
             'usage': {
                 'prompt_tokens': prompt_tokens,
@@ -356,42 +319,182 @@ class PolicyEndpoint:
             },
         }
 
-    def _params_for(self, payload: Dict[str, Any]) -> SamplingParams:
-        """Let the request adjust decoding, but not what is trainable."""
-        overrides: Dict[str, Any] = {}
-        if payload.get('max_tokens') is not None:
-            overrides['max_tokens'] = int(payload['max_tokens'])
-        if payload.get('temperature') is not None:
-            overrides['temperature'] = float(payload['temperature'])
-        if payload.get('top_p') is not None:
-            overrides['top_p'] = float(payload['top_p'])
-        if payload.get('stop'):
-            overrides['stop'] = payload['stop']
-        return replace(self.sampling_params, **overrides) if overrides else self.sampling_params
+    def stream(self, body):
+        choice = body['choices'][0]
+        chunk = {
+            'id': body['id'],
+            'object': 'chat.completion.chunk',
+            'created': body['created'],
+            'model': body['model'],
+            'choices': [{
+                'index': 0,
+                'delta': dict(choice['message']),
+                'finish_reason': choice['finish_reason'],
+            }],
+            'usage': body['usage'],
+        }
+        yield f'data: {json.dumps(chunk, ensure_ascii=False)}\n\n'
+        yield 'data: [DONE]\n\n'
 
 
-def _stream(completion: Dict[str, Any]) -> Iterator[str]:
-    """Re-serve a finished completion as the event stream clients ask for.
+def _content_text(content: Any) -> str:
+    """The text of a Responses content field: a string, or a list of ``*_text`` parts."""
+    if content is None:
+        return ''
+    if isinstance(content, str):
+        return content
+    texts = []
+    for part in content:
+        if isinstance(part, dict) and isinstance(part.get('text'), str):
+            texts.append(part['text'])
+    return ''.join(texts)
 
-    Streaming is a client-side default -- ms-agent ships with it on -- and a
-    client that asked for a stream will not read a plain body. There is nothing
-    to stream incrementally: the sampler returns a generation whole. So the reply
-    goes out as one chunk in the streaming shape, which is a valid stream of one
-    event, not a partial implementation of a different protocol.
+
+class ResponsesEndpoint(PolicyEndpoint):
+    """``/v1/responses``, plain and as SSE events.
+
+    Stateless: every request must carry the whole conversation in ``input``
+    (``store=false``, which is what agents like codex send), since the episode's
+    history lives in the rollout, not here. ``function_call`` items are produced;
+    ``reasoning`` items in the input (encrypted or not) are dropped; tools other
+    than ``type: function`` are not advertised to the policy.
     """
-    choice = completion['choices'][0]
-    delta = dict(choice['message'])
-    chunk = {
-        'id': completion['id'],
-        'object': 'chat.completion.chunk',
-        'created': completion['created'],
-        'model': completion['model'],
-        'choices': [{
-            'index': 0,
-            'delta': delta,
-            'finish_reason': choice['finish_reason'],
-        }],
-        'usage': completion['usage'],
-    }
-    yield f'data: {json.dumps(chunk, ensure_ascii=False)}\n\n'
-    yield 'data: [DONE]\n\n'
+
+    path = '/v1/responses'
+
+    def parse(self, payload):
+        if payload.get('previous_response_id'):
+            raise ValueError('this endpoint keeps no responses: send the whole conversation in input '
+                             '(store=false) instead of previous_response_id')
+        messages: List[Dict[str, Any]] = []
+        if payload.get('instructions'):
+            messages.append({'role': 'system', 'content': str(payload['instructions'])})
+        items = payload.get('input')
+        if isinstance(items, str):
+            items = [{'role': 'user', 'content': items}]
+        for item in items or []:
+            kind = item.get('type', 'message')
+            if kind == 'message':
+                role = item.get('role', 'user')
+                messages.append({'role': 'system' if role == 'developer' else role,
+                                 'content': _content_text(item.get('content'))})
+            elif kind == 'function_call':
+                call = {
+                    'id': item.get('call_id') or item.get('id') or f'call_{uuid.uuid4().hex[:12]}',
+                    'type': 'function',
+                    'function': {
+                        'name': item.get('name', ''),
+                        'arguments': item.get('arguments') or '{}'
+                    },
+                }
+                if messages and messages[-1]['role'] == 'assistant':
+                    messages[-1].setdefault('tool_calls', []).append(call)
+                else:
+                    messages.append({'role': 'assistant', 'content': '', 'tool_calls': [call]})
+            elif kind == 'function_call_output':
+                output = item.get('output')
+                messages.append({
+                    'role': 'tool',
+                    'tool_call_id': item.get('call_id', ''),
+                    'content': output if isinstance(output, str) else _content_text(output),
+                })
+            # 'reasoning' and anything else carries nothing the policy is to be prompted with.
+        if not any(m['role'] != 'system' for m in messages):
+            raise ValueError('a responses request must carry input')
+        tools = []
+        for tool in payload.get('tools') or []:
+            if tool.get('type') != 'function':
+                continue
+            tools.append({
+                'type': 'function',
+                'function': {
+                    'name': tool.get('name', ''),
+                    'description': tool.get('description', ''),
+                    'parameters': tool.get('parameters') or {
+                        'type': 'object',
+                        'properties': {}
+                    },
+                },
+            })
+        return messages, tools, _decoding_params(payload, ('max_output_tokens', ))
+
+    def render(self, payload, reply):
+        message = reply['message']
+        output: List[Dict[str, Any]] = []
+        if message.get('content'):
+            output.append({
+                'type': 'message',
+                'id': f'msg_{uuid.uuid4().hex[:12]}',
+                'status': 'completed',
+                'role': 'assistant',
+                'content': [{
+                    'type': 'output_text',
+                    'text': message['content'],
+                    'annotations': []
+                }],
+            })
+        for call in message.get('tool_calls') or []:
+            output.append({
+                'type': 'function_call',
+                'id': f'fc_{uuid.uuid4().hex[:12]}',
+                'status': 'completed',
+                'call_id': call['id'],
+                'name': call['function']['name'],
+                'arguments': call['function']['arguments'],
+            })
+        usage = reply.get('usage') or {}
+        input_tokens = int(usage.get('prompt_tokens', 0))
+        output_tokens = int(usage.get('completion_tokens', 0))
+        truncated = reply['finish_reason'] == 'length'
+        return {
+            'id': f'resp_{uuid.uuid4().hex[:12]}',
+            'object': 'response',
+            'created_at': int(time.time()),
+            'status': 'incomplete' if truncated else 'completed',
+            'incomplete_details': {
+                'reason': 'max_output_tokens'
+            } if truncated else None,
+            'model': payload.get('model') or 'twinkle-policy',
+            'output': output,
+            'parallel_tool_calls': True,
+            'tool_choice': payload.get('tool_choice', 'auto'),
+            'tools': payload.get('tools') or [],
+            'store': False,
+            'usage': {
+                'input_tokens': input_tokens,
+                'output_tokens': output_tokens,
+                'total_tokens': input_tokens + output_tokens,
+            },
+        }
+
+    def stream(self, body):
+        sequence = iter(range(1 << 30))
+
+        def event(kind: str, **data: Any) -> str:
+            data = {'type': kind, 'sequence_number': next(sequence), **data}
+            return f'event: {kind}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n'
+
+        yield event('response.created', response={**body, 'status': 'in_progress', 'output': []})
+        for index, item in enumerate(body['output']):
+            if item['type'] == 'message':
+                yield event('response.output_item.added', output_index=index, item={**item, 'content': []})
+                part = item['content'][0]
+                yield event('response.content_part.added', item_id=item['id'], output_index=index, content_index=0,
+                            part={**part, 'text': ''})
+                yield event('response.output_text.delta', item_id=item['id'], output_index=index, content_index=0,
+                            delta=part['text'])
+                yield event('response.output_text.done', item_id=item['id'], output_index=index, content_index=0,
+                            text=part['text'])
+                yield event('response.content_part.done', item_id=item['id'], output_index=index, content_index=0,
+                            part=part)
+            else:
+                yield event('response.output_item.added', output_index=index, item={**item, 'arguments': ''})
+                yield event('response.function_call_arguments.delta', item_id=item['id'], output_index=index,
+                            delta=item['arguments'])
+                yield event('response.function_call_arguments.done', item_id=item['id'], output_index=index,
+                            arguments=item['arguments'])
+            yield event('response.output_item.done', output_index=index, item=item)
+        yield event('response.incomplete' if body['status'] == 'incomplete' else 'response.completed', response=body)
+
+
+ENDPOINTS = {'chat': ChatEndpoint, 'responses': ResponsesEndpoint}

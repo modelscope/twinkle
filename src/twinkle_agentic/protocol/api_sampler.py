@@ -5,7 +5,7 @@ from dataclasses import replace
 from typing import Any, Literal, Optional, Union
 
 from twinkle.data_format import Trajectory
-from twinkle.data_format.sampling import SampledSequence, SamplingParams, StopReason
+from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams, StopReason
 from twinkle.template import Template
 from twinkle.template.contract import RolloutState
 from twinkle_agentic.utils.token_utils import _to_plain, encode_appended_turn
@@ -53,7 +53,12 @@ class APISampler:
     Holds the local ``template`` (an API turn's text must be tokenised the way
     the trainer reads it back, not by the endpoint) and the tool schema the
     endpoint should see (a rollout's ``pif`` no longer carries it after encode).
+
+    Also sampler-shaped (:meth:`sample`), so a rollout takes it in place of a sampler.
     """
+
+    #: It reads the conversation off a ``RolloutState``, which a bare encoded feature does not carry.
+    accepts_rollout_state = True
 
     def __init__(
         self,
@@ -143,3 +148,11 @@ class APISampler:
             new_input_feature=new_input_feature,
             new_state=new_state,
         )
+
+    def sample(self, inputs: list[Any], sampling_params: SamplingParams | None = None, **kwargs) -> list[SampleResponse]:
+        """One API turn per input, in the sampler's return shape.
+
+        ``kwargs`` (``adapter_path`` / ``use_base_model`` / ``session_id``) name things the API
+        does not have, and are ignored.
+        """
+        return [SampleResponse(sequences=[self(item, sampling_params)]) for item in inputs]

@@ -136,10 +136,6 @@ class ToolManager:
             return str(tool(name, args))
         except Exception as e:  # noqa
             return f'Error: tool {name!r} raised {type(e).__name__}: {e}'
-        finally:
-            env = getattr(tool, '_env', None)
-            if env is not None:
-                env.ensure_idle()
 
     def call_many(
         self,
@@ -150,9 +146,10 @@ class ToolManager:
 
         ``tool_calls`` are the OpenAI-shaped dicts produced by
         :meth:`~twinkle.template.base.Template.parse_tool_call`. This method
-        unpacks them to ``(name, arguments)`` and, when the tools wrap the same
-        :class:`~twinkle_agentic.envs.base.Env`, dispatches through
-        ``Env.step_batch``. Otherwise a thread pool of :meth:`__call__`.
+        unpacks them to ``(name, arguments)``; the calls whose tools are bound to
+        the same :class:`~twinkle_agentic.envs.base.Env` session (``tool.session``)
+        run as one ``Env.step_batch``, in order. The others go through a thread
+        pool of :meth:`__call__`.
 
         A call this manager can answer by itself -- an unknown name, a malformed
         payload -- is answered here and *excluded* from the batch rather than
@@ -164,10 +161,10 @@ class ToolManager:
         when it never did. Nothing in that turn needed concurrency -- the reason
         it was used was a tool name the host could have refused on the spot.
 
-        Once the tools share an Env, ``step_batch`` is the only way the batch
-        runs: a raise or a short result list is reported as the result of those
+        For calls bound to a session, ``step_batch`` is the only way they
+        run: a raise or a short result list is reported as the result of those
         calls, not retried down the thread pool. The thread pool is for tools
-        that have no Env in common.
+        that have no session.
         """
         calls = list(tool_calls)
         if not calls:
@@ -175,84 +172,55 @@ class ToolManager:
         if len(calls) == 1:
             return [self(calls[0])]
 
-        unpacked = [_unpack_tool_call(tc) for tc in calls]
-        env = self._shared_env()
-        if env is not None:
-            out: List[Optional[str]] = [None] * len(calls)
-            batched: List[Tuple[int, str, Dict[str, Any]]] = []
-            for i, (name, args, err) in enumerate(unpacked):
-                if err is None and name in self._tools:
-                    batched.append((i, name, args))
-                else:
-                    out[i] = self(calls[i])
-            try:
-                results = env.step_batch([(name, args) for _i, name, args in batched])
-            except Exception as e:  # noqa
-                # The exception text is the only account of why the batch did not
-                # run, and the model is what has to react to it, so it goes back
-                # as the result of every call in the batch. Retrying down the
-                # thread pool instead -- which is what this used to do, silently
-                # and without even a log line -- sends the turn along the path the
-                # docstring above exists to keep it off.
-                logger.warning(f'{type(env).__name__}.step_batch raised '
-                               f'{type(e).__name__}: {e}')
-                failure = f'Error: tool batch did not run: {type(e).__name__}: {e}'
-                for i, _name, _args in batched:
-                    out[i] = failure
-                return ['' if x is None else x for x in out]
-            finally:
-                env.ensure_idle()
-            if len(results) != len(batched):
-                # Same reasoning: a short result list means the calls did not all
-                # run, and pairing them up by position would report one call's
-                # result under another's name.
-                logger.warning(f'{type(env).__name__}.step_batch returned '
-                               f'{len(results)} results for {len(batched)} calls')
-                failure = (f'Error: tool batch did not run: the environment returned '
-                           f'{len(results)} results for {len(batched)} calls.')
-                for i, _name, _args in batched:
-                    out[i] = failure
-                return ['' if x is None else x for x in out]
-            from twinkle_agentic.envs.env_tool import EnvTool
-
-            for (i, name, _args), r in zip(batched, results):
-                tool = self._tools[name]
-                if isinstance(tool, EnvTool):
-                    tool.last_result = r
-                out[i] = r.observation if hasattr(r, 'observation') else str(r)
-            return ['' if x is None else x for x in out]
-
-        workers = max_workers or min(32, len(calls))
-        out = [None] * len(calls)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(self, tc): i for i, tc in enumerate(calls)}
-            for fut in as_completed(futs):
-                out[futs[fut]] = fut.result()
+        out: List[Optional[str]] = [None] * len(calls)
+        batches: Dict[Tuple[int, str], List[Tuple[int, str, Dict[str, Any]]]] = {}
+        rest: List[int] = []
+        for i, (name, args, err) in enumerate(_unpack_tool_call(tc) for tc in calls):
+            session = getattr(self._tools.get(name), 'session', None) if err is None else None
+            if session is None:
+                rest.append(i)
+            else:
+                batches.setdefault((id(session[0]), session[1]), []).append((i, name, args))
+        for batched in batches.values():
+            self._run_batch(batched, out)
+        if len(rest) == 1:
+            out[rest[0]] = self(calls[rest[0]])
+        elif rest:
+            with ThreadPoolExecutor(max_workers=max_workers or min(32, len(rest))) as pool:
+                futs = {pool.submit(self, calls[i]): i for i in rest}
+                for fut in as_completed(futs):
+                    out[futs[fut]] = fut.result()
         return ['' if x is None else x for x in out]
 
-    def bound_envs(self):
-        """Return the distinct environments borrowed by the registered tools."""
-        environments = {}
-        for tool in self._tools.values():
-            env = getattr(tool, '_env', None)
-            if env is not None:
-                environments[id(env)] = env
-        return tuple(environments.values())
-
-    def ensure_idle(self):
-        """Confirm every distinct borrowed environment has no known active execution."""
-        for env in self.bound_envs():
-            env.ensure_idle()
-
-    def _shared_env(self):
-        """Return the Env shared by every registered EnvTool, else None."""
-        env = None
-        for tool in self._tools.values():
-            wrapped = getattr(tool, '_env', None)
-            if wrapped is None:
-                return None
-            if env is None:
-                env = wrapped
-            elif wrapped is not env:
-                return None
-        return env
+    def _run_batch(self, batched: List[Tuple[int, str, Dict[str, Any]]], out: List[Optional[str]]) -> None:
+        """Run the calls bound to one env session as one ``step_batch``, writing observations into ``out``."""
+        tool = self._tools[batched[0][1]]
+        env, episode_id = tool.session
+        try:
+            results = env.step_batch(episode_id, [(name, args) for _i, name, args in batched])
+        except Exception as e:  # noqa
+            # The exception text is the only account of why the batch did not
+            # run, and the model is what has to react to it, so it goes back
+            # as the result of every call in the batch. Retrying down the
+            # thread pool instead sends the turn along the concurrent path the
+            # docstring above exists to keep it off.
+            logger.warning(f'{type(env).__name__}.step_batch raised '
+                           f'{type(e).__name__}: {e}')
+            failure = f'Error: tool batch did not run: {type(e).__name__}: {e}'
+            for i, _name, _args in batched:
+                out[i] = failure
+            return
+        if len(results) != len(batched):
+            # Same reasoning: a short result list means the calls did not all
+            # run, and pairing them up by position would report one call's
+            # result under another's name.
+            logger.warning(f'{type(env).__name__}.step_batch returned '
+                           f'{len(results)} results for {len(batched)} calls')
+            failure = (f'Error: tool batch did not run: the environment returned '
+                       f'{len(results)} results for {len(batched)} calls.')
+            for i, _name, _args in batched:
+                out[i] = failure
+            return
+        for (i, name, _args), r in zip(batched, results):
+            self._tools[name].last_result = r
+            out[i] = r.observation if hasattr(r, 'observation') else str(r)

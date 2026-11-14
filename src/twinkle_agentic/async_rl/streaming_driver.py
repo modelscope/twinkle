@@ -1,1315 +1,787 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+"""The streaming driver: keeps episodes running and hands the trainer whole groups, batch by batch.
+
+One driver per run. It reads the dataloader, turns each row into ``num_generations`` episodes and
+steps them through the rollout; a finished episode is scored by every ORM, a closed PRM segment by
+every PRM, and a group whose members are all scored becomes ready. ``__next__`` hands out
+``batch_size`` rows of ready groups as ``(rows, facts)``: the rows are the rollout's own artefacts,
+handed out exactly as they travel (a reference under ray -- the driver never opens one; the
+identity fields were stamped on them at admission), and the light facts (row lengths, the named
+score columns aligned row for row, version spans) ride the SAME yield, so the consumer never
+calls back for them. The scores land on ``facts['scores']`` -- one row-shaped entry per trajectory
+(``rewards.orm`` / ``rewards.baseline``, optionally ``prm_segments``) -- and meet the rows again
+inside the advantage worker, which receives both.
+
+How far ahead of the trainer the driver runs is bounded by the policy version ``v`` (the checkpoint
+manager's sync count): the rows admitted and not dropped never exceed
+``(v + max_staleness + 1) * sync_interval * batch_size``. A group older than ``max_staleness``
+versions when it is handed out is dropped.
+
+All the waiting happens through completion callbacks: every step / score Future puts itself on one
+queue when it finishes, and the driver's thread only reads that queue, so its cost does not grow
+with the number of episodes in flight.
+"""
 from __future__ import annotations
 
+import copy
 import math
 import queue
-import shutil
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
-from .types import PartitionAdmission, RolloutPolicy
+from twinkle import remote_class, remote_function
+from twinkle.data_format import user_data_get
+from twinkle.utils import get_logger
+from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutSample
 
-if TYPE_CHECKING:
-    # Type-only imports (the annotations below are never evaluated at runtime): the seams speak the
-    # rollout domain's vocabulary and the collaborators are twinkle's own classes.
-    from .cluster_adapter import ClusterAdapter
-    from .score_worker import ScoreWorker
-    from ..rollout import Rollout, RolloutSample, SampleHandle
-    from twinkle.model.base import TrainableModel
+logger = get_logger()
 
-#: One in-flight trajectory: the sampler handle to poll/collect it by, the policy it was pinned to
-#: (released once collected or cancelled, so its adapter path can then be pruned), and the training
-#: group key it will carry into the ready buffer (every trajectory of one prompt shares it, see
-#: :class:`BufferRecord`).
-_Inflight = Tuple[Any, RolloutPolicy, str]
+__all__ = ['StreamingDriver', 'PRM_SEGMENT_TURNS']
 
+#: The ``RolloutSample.extra`` key recording each PRM segment's end: the episode's ``turns`` when the
+#: segment closed, one per column of ``prm_rewards``.
+PRM_SEGMENT_TURNS = 'prm_segment_turns'
 
-#: Internal marker the iterator bridge pushes onto its batch queue once the background :meth:`run` thread
-#: has finished, so a blocked :meth:`StreamingDriver.__next__` wakes and ends the iteration (or re-raises
-#: the run's error) instead of waiting forever.
-_ITER_DONE = object()
+_BASELINE = 'baseline'
 
 
-@dataclass(frozen=True)
-class PromptRef:
-    """One prompt row drawn from the stream, paired with the driver-assigned ``ordinal``.
+def _is_episode_error(exc: BaseException) -> bool:
+    return isinstance(exc, EpisodeError) or isinstance(getattr(exc, 'cause', None), EpisodeError)
 
-    The driver eats a dataloader of prompt ROWS (opaque payloads) and assigns each fresh draw a monotonic
-    ordinal: a stable per-draw identifier that seeds the group key (so every trajectory of one prompt shares
-    it, and the SAME row re-drawn in a later epoch gets a NEW ordinal and therefore a NEW group) and is what
-    the consumer stamps as the sample's ``prompt_id``. The driver never inspects ``row`` -- it only pairs it
-    with the ordinal and hands the pair to ``submit``, so the consumer builds a trajectory from the row it is
-    given instead of looking one up by index in a resident prompt table.
+
+def _role_of(traj: Any) -> str:
+    """A trajectory's role: the top-level field first, the legacy ``user_data`` spelling second.
+
+    The group verdict returns baseline rows to the driver before they are submitted; those rows
+    may carry either spelling, so both are read -- writing is top-level only.
     """
-    ordinal: int
-    row: Any
+    role = traj.get('role')
+    if role is None:
+        role = user_data_get(traj.get('user_data'), 'role')
+    return str(role or '')
 
 
-@dataclass(eq=False)
-class BufferRecord:
-    """One completed trajectory sitting in the driver's ready buffer.
+def _sample_facts(samples: Sequence[RolloutSample], scores: Sequence[Dict[str, Any]],
+                   version_spans: Sequence[int]) -> Dict[str, Any]:
+    """The delivery facts of one batch, off the samples -- never the trajectories.
 
-    The unit ``assembly_ready`` inspects and pulls. ``version`` is the policy version the trajectory
-    was admitted under (its lag vs the current version is what the post-publish stale scan and the
-    consumer's metrics read); ``group_key`` identifies the training group the sample belongs to --
-    every trajectory of one prompt EXPANSION shares it (all are admitted back-to-back under one policy,
-    so all carry the same ``version``), which is what lets a group consumer require whole groups and the
-    stale scan treat a stale group as dropped whole. ``sample`` is opaque to the driver (a dev
-    ``RolloutSample``).
-
-    A record carries NO pin: its version pin was acquired at admission and released the moment the
-    trajectory was COLLECTED (see :meth:`StreamingDriver.run`), because the pin guards the SAMPLER-side
-    adapter path and a collected sample is trained in-process. So leaving the buffer (consumed, stale-
-    dropped or drained) is pure bookkeeping -- releasing again there would double-release and raise.
+    The rows are never opened for this (under ray they are references): the lengths /
+    truncation / turns / identity facts come off the light sample records, and the named score
+    columns arrive row-aligned in ``scores`` -- the one payload-adjacent lane, which the advantage
+    estimator and the reward metrics consume without materialising a trajectory.
     """
-    sample: Any
-    version: int
-    group_key: str
-    #: The in-flight score reference from the poll-batch submission: ``(outcome, index, prm)`` -- the
-    #: shared lazy outcome, this record's position in the submitted batch, and whether the PRM channel
-    #: rides it. ``None`` once reaped (or never submitted: no remote score shape).
-    score_ref: Any = None
+    prompt_lengths: List[int] = []
+    response_lengths: List[int] = []
+    for sample in samples:
+        tokens = sample.token_lengths
+        # None means the episode never produced an encoded frame (an empty prompt); a delivered
+        # batch is finished, so the lengths are final.
+        prompt_lengths.append(tokens[0] if tokens else 0)
+        response_lengths.append(tokens[1] if tokens else 0)
+    truncated = [bool(sample.truncated) for sample in samples]
+    return {
+        'num_rows': len(samples),
+        'episode_ids': [sample.episode_id for sample in samples],
+        'prompt_lengths': prompt_lengths,
+        'response_lengths': response_lengths,
+        'response_length_min': min(response_lengths) if response_lengths else 0,
+        'response_length_max': max(response_lengths) if response_lengths else 0,
+        'response_length_sum': sum(response_lengths),
+        'policy_versions': sorted({sample.policy_version for sample in samples}),
+        'truncated': truncated,
+        'num_truncated': sum(truncated),
+        'turns': [sample.turns for sample in samples],
+        'version_spans': list(version_spans),
+        'scores': list(scores),
+    }
 
 
 @dataclass
-class DriverStats:
-    """Lifetime counters of one :meth:`StreamingDriver.run` (the consumer's metrics source)."""
-    admitted: int = 0               # trajectories submitted to the sampler
-    collected: int = 0              # completions fetched from the sampler (a stale one is then dropped)
-    consumed: int = 0               # buffered samples handed to ``consume``
-    off_policy_consumed: int = 0    # consumed samples whose version lagged the training version
-    dropped_stale: int = 0          # samples dropped for exceeding max_staleness (at collect or by a scan)
-    dropped_incomplete: int = 0     # samples left in the buffer at drain (no future batch to join)
-    train_pulls: int = 0            # ``consume`` calls that returned a positive step count
-    optimizer_steps: int = 0        # optimizer steps reported by ``consume``
-    publishes: int = 0              # weight publications (partition cycles closed)
-    final_version: int = 0          # policy version at exit (= publishes)
-    #: Wall-clock seconds the driver thread spent blocked inside ``consume`` (training). The generation
-    #: itself runs on the (disaggregated) sampler in the background and is NOT measured here -- the
-    #: algorithm-agnostic driver cannot see sampler GPU time without instrumenting the data plane.
-    train_active_time: float = 0.0
-    #: Wall-clock seconds spent in the idle ``sleep`` branch: trajectories in flight, none completed this
-    #: pass, buffer not yet trainable -- i.e. the trainer starved for ready work (the trainer bubble).
-    idle_time: float = 0.0
-    #: Wall-clock seconds trajectories spent in flight (admit -> collect), driver-side bookkeeping
-    #: with NO RPC. It includes engine queueing, so it measures the generation channel's OCCUPANCY
-    #: (the resource adapter's elasticity signal), not the sampler's pure service time.
-    generation_time: float = 0.0
-    #: The previous pull's trainer-bubble ratio, folded BY THE DRIVER at each batch boundary:
-    #: ``idle_delta / (train_delta + idle_delta)`` where the deltas are taken exactly at the pull
-    #: return (train time is accumulated only AFTER a pull returns, so the train delta here is the
-    #: PREVIOUS pull's training and the idle delta is the starvation bubble spent waiting for THIS
-    #: pull). This keeps the driver-internal accounting order inside the driver -- a consumer that
-    #: folded per-step deltas itself would read a constant 0.0. ``0.0`` before the first pull.
-    last_pull_idle_ratio: float = 0.0
-    submit_time: float = 0.0
-    poll_time: float = 0.0
-    collect_time: float = 0.0
-    score_time: float = 0.0
-    publish_time: float = 0.0
-    capacity_blocked_passes: int = 0
-    staleness_blocked_passes: int = 0
-    ready_high_watermark: int = 0
-    inflight_high_watermark: int = 0
-    #: Wall-clock seconds for the whole :meth:`StreamingDriver.run`, set in its ``finally`` (so it is
-    #: defined on every exit path: drain, budget hit, or error). ``total >= train_active + idle``; the
-    #: residual is the driver's own admit/poll/collect/publish overhead.
-    total_time: float = 0.0
+class _Group:
+    """One prompt row's episodes: the current attempt's members and the baseline episodes it waits for."""
+    key: str
+    row: Any
+    attempt: int = 0
+    #: The current attempt's member trajectories, aligned with ``members`` (a lost one is redone from here).
+    source: List[Any] = field(default_factory=list)
+    members: List['_Episode'] = field(default_factory=list)
+    baselines: List['_Episode'] = field(default_factory=list)
+    #: Members of the current attempt that will not produce a sample (failed, stopped, dropped).
+    missing: int = 0
 
 
-def _no_prune() -> None:
-    """Default ``prune`` seam: in-place publication keeps no per-version artifacts to drop."""
+@dataclass
+class _Episode:
+    episode_id: str
+    group: _Group
+    role: str
+    version: int
+    traj: Any = None
+    sample: Optional[RolloutSample] = None
+    done: bool = False
+    #: Set once the episode has no further work: scored (``finished``) or given up (``lost``).
+    finished: bool = False
+    lost: bool = False
+    orm: Optional[List[Any]] = None
+    orm_pending: int = 0
+    prm: Optional[List[List[Any]]] = None
+    prm_turns: List[int] = field(default_factory=list)
+    prm_pending: int = 0
+    #: The PRM segment the episode waits for before its next step (only with ``on_step``).
+    held: Optional[int] = None
 
 
-def _no_initial_path() -> None:
-    """Default ``initial_adapter_path`` seam: in-place has no version-0 adapter path to pin."""
-
-
-def _prompt_ordinal_key(ref: PromptRef) -> str:
-    """Default ``group_key`` seam: the driver-assigned draw ordinal (a stable per-draw group identifier)."""
-    return str(ref.ordinal)
-
-
-#: The single policy token a driver with NO control plane (infer) pins every trajectory to: version 0, no
-#: adapter path. ``_acquire_policy`` hands this out and ``_release_pin`` ignores it, so the run loop's
-#: acquire/release pair is a no-op without branching on the regime.
-_NULL_POLICY = RolloutPolicy(None, 0, None)
-
-
+@remote_class(execute='first', max_concurrency=8)
 class StreamingDriver:
-    """Per-sample streaming control flow -- a PURE rollout pump over an optional control plane.
+    """Stream episodes through ``rollout`` and hand out scored groups; iterate it for training batches.
 
-    Construct with the prompt stream (``prompt_stream``, a dataloader yielding BATCHES of prompt rows, which
-    the driver flattens and reads for ``num_train_epochs`` passes), the
-    regime knobs (``max_staleness``; ``num_generations`` trajectories per prompt; ``groups_per_partition``
-    = the groups one publish cycle is expected to train, used as the window's sizing declaration;
-    ``buffer_depth`` = the in-flight + ready backpressure cap in samples), and the data-plane seams.
-    ``max_rows_per_pull`` optionally limits each built-in pull to whole training quanta, keeping
-    prefetched batches separate so the recipe can publish between optimizer updates.
-    ``version_control=True`` selects the RL regime (the driver builds its own version ledger); False
-    is the infer regime: the driver then pins the version at 0 with no windows and no pins, and
-    never publishes, so it carries no RL scaffolding.
-
-    The driver owns NO weight/model control and NO publish cadence: publication is an external signal
-    (:meth:`request_publish`) carrying the caller's own push callable, which the driver brackets with its
-    version/window accounting. Then call :meth:`run` once (or iterate); :attr:`stats` holds the lifetime
-    counters afterwards.
+    Args:
+        dataloader: yields batches of prompt rows (trajectories); read for ``num_epochs`` passes.
+        rollout: the :class:`~twinkle_agentic.rollout.MultiTurnRollout` whose ``step`` advances an episode.
+        batch_size: rows (trajectories) per batch; a multiple of ``num_generations``.
+        num_generations: episodes per prompt row (one group).
+        num_epochs: passes over the dataloader (a fraction still reads a whole pass; bound it with
+            ``max_steps``).
+        max_steps: batches to hand out before stopping (``None``: until the data ends).
+        max_staleness: how many policy versions a handed-out group may lag behind.
+        sync_interval: batches the trainer trains between two weight syncs.
+        checkpoint_manager: its ``version()`` is the policy version; without one the version is the
+            number of batches handed out divided by ``sync_interval`` and only paces admission (at
+            most ``(max_staleness + 1) * sync_interval * batch_size`` rows ahead), nothing is dropped
+            as stale.
+        orms: outcome scorers, ``scorer([traj]) -> [score]``, run on every finished episode.
+        orm_names: each ORM's name in the handed-out ``facts['scores']`` rows' ``rewards.orm``
+            column; ``None`` names them by position (``orm_0`` ...).
+        prms: process scorers, run on the trajectory so far at every closed segment.
+        prm_names: each PRM's name in the handed-out ``prm_segments['scores']``; ``None`` names
+            them by position (``prm_0`` ...).
+        prm_segment: ``prm_segment(sample) -> bool``, whether the step just finished closes a PRM
+            segment (default: every step; the last step always does).
+        on_step: ``on_step(sample, prm_scores) -> bool``, called with a closed segment's scores;
+            ``False`` stops the episode (it is dropped like a failed one).
+        on_sample: ``on_sample(sample) -> Optional[bool]``, called on every scored episode;
+            ``False`` drops it.
+        on_group: ``on_group(row, samples, attempt) -> list[traj]``, called on every complete group:
+            an empty list accepts it; trajectories to run are returned built from ``row``
+            (``user_data.sampling_params`` overrides the sampling, ``user_data.role='baseline'``
+            marks a baseline). Returning non-baseline trajectories replaces the group with them (the
+            new group is offered to ``on_group`` again); once replacing is no longer allowed, or when
+            only baselines are returned, the baselines run and their ORM rows are attached to the
+            group's samples (``RolloutSample.baseline``) once they are scored.
+        max_group_regenerations: how many times a group may be replaced (by ``on_group`` or to make
+            up for missing members) before it is accepted as is, or dropped if incomplete.
+        cluster_adapter: rebalances replicas after each version change (``adjust``), lends the
+            trainer's devices while it waits for a batch (``lend``) and takes them back before the
+            batch is handed out (``reclaim``).
     """
 
+    #: Stop after this many episode failures in a row.
+    MAX_CONSECUTIVE_FAILURES = 32
+    #: ... or when more than ``MAX_FAILURE_RATE`` of the last ``FAILURE_WINDOW`` episodes failed.
+    FAILURE_WINDOW = 256
+    MAX_FAILURE_RATE = 0.5
+
     def __init__(self,
+                 dataloader: Any,
+                 rollout: Any,
                  *,
-                 prompt_stream: Iterable[Any],
-                 num_train_epochs: float = 1.0,
-                 max_staleness: int,
-                 num_generations: int,
-                 groups_per_partition: int,
-                 buffer_depth: int,
-                 submit: Optional[Callable[[PromptRef, int, RolloutPolicy], SampleHandle]] = None,
-                 poll: Optional[Callable[[Sequence[SampleHandle]], Sequence[SampleHandle]]] = None,
-                 collect: Optional[Callable[[SampleHandle], RolloutSample]] = None,
-                 assembly_ready: Optional[Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]] = None,
-                 rollout: Optional[Rollout] = None,
-                 group_pull: Optional[bool] = None,
-                 need_rows: Optional[int] = None,
-                 max_rows_per_pull: int | None = None,
-                 version_control: bool = False,
-                 consume: Optional[Callable[[List[BufferRecord]], Optional[int]]] = None,
-                 group_key: Optional[Callable[[Any], str]] = None,
-                 score: Optional[Union[Callable[[RolloutSample], Optional[RolloutSample]], ScoreWorker]] = None,
-                 max_group_regenerations: int = 0,
-                 regenerate: Optional[Callable[[str, List[Any]], bool]] = None,
-                 baseline_fn: Optional[Callable[[str, List[Any]], Optional[float]]] = None,
-                 prune: Optional[Callable[[], None]] = None,
-                 initial_adapter_path: Optional[Callable[[], Optional[str]]] = None,
-                 snapshot_model: Optional[TrainableModel] = None,
-                 snapshot_dir: Optional[str] = None,
-                 adapter_name: Optional[str] = None,
+                 batch_size: int,
+                 num_generations: int = 1,
+                 num_epochs: float = 1.0,
                  max_steps: Optional[int] = None,
-                 resource_adapter: Optional[ClusterAdapter] = None,
-                 on_iteration_start: Optional[Callable[[], None]] = None,
-                 on_iteration_end: Optional[Callable[[bool], None]] = None,
-                 sleep: Optional[Callable[[float], None]] = None) -> None:
-        # Observers run on the driver thread. End follows ACTUAL publication,
-        # including the terminal case where the budget deliberately skips it.
-        self.on_iteration_start = on_iteration_start
-        self.on_iteration_end = on_iteration_end
-        # Fail loudly on a mis-wired seam: a non-callable injected here would otherwise surface deep
-        # inside the run loop (or silently skip a lifecycle step), far from the construction that caused it.
-        # The group-barrier algorithm hooks: PRM scoring is the remote ``score`` shape's own channel,
-        # the variance-style verdict is ``regenerate`` and the remax-style baseline is ``baseline_fn``. All
-        # three are optional and stack freely.
-        self._regenerate = regenerate
-        self._baseline_fn = baseline_fn
-        for name, fn in (('regenerate', regenerate), ('baseline_fn', baseline_fn)):
-            if fn is not None and not callable(fn):
-                raise TypeError(f'StreamingDriver optional seam {name!r} must be callable or None, '
-                                f'got {type(fn).__name__}')
-        # The four engine seams default-bind to ``rollout`` (admit/poll/collect) when omitted;
-        # an explicitly injected seam overrides its default, so dev's hand-wired builders keep working.
-        # Teardown ending is NOT a seam: it always goes through the rollout's stop (abort + settle),
-        # so the engine work behind an uncollected handle is actually ended, not just dereferenced.
-        self._rollout = rollout
-        if submit is None and rollout is not None:
-            submit = self._default_submit
-        if poll is None and rollout is not None:
-            poll = rollout.poll
-        if collect is None and rollout is not None:
-            collect = self._default_collect
-        # The pull rule is the same kind of defaulted knob: group_pull=True waits for whole
-        # num_generations groups and re-emits them contiguous; False takes a whole-unit multiple of
-        # the buffer front without waiting for any group. An explicit assembly_ready callable
-        # overrides either built-in.
-        if group_pull is not None and not isinstance(group_pull, bool):
-            raise TypeError(f'group_pull must be a bool or None, got {type(group_pull).__name__}')
-        if group_pull is not None and need_rows is None:
-            raise ValueError(f'group_pull={group_pull!r} needs need_rows (train_batch_size * ga) to size a pull')
-        if need_rows is not None and need_rows <= 0:
-            raise ValueError(f'need_rows must be positive, got {need_rows}')
-        # A prefetch window can contain multiple completed batches. Bound each handoff when
-        # the recipe must train/publish after one batch, rather than draining that window.
-        if max_rows_per_pull is not None:
-            if group_pull is None or need_rows is None or assembly_ready is not None:
-                raise ValueError('max_rows_per_pull requires a built-in group_pull rule and need_rows.')
-            if isinstance(max_rows_per_pull, bool) or not isinstance(max_rows_per_pull, int):
-                raise TypeError('max_rows_per_pull must be an integer trajectory count.')
-            if num_generations <= 0:
-                raise ValueError(f'num_generations must be positive, got {num_generations}')
-            import math
-            quantum = math.lcm(need_rows, num_generations) if group_pull else need_rows
-            if max_rows_per_pull < quantum or max_rows_per_pull % quantum:
-                raise ValueError(f'max_rows_per_pull must be a positive multiple of the pull quantum {quantum}.')
-        if assembly_ready is None and group_pull:
-            assembly_ready = self._make_group_pull_rule(num_generations, need_rows, max_rows_per_pull)
-        if assembly_ready is None and group_pull is False:
-            assembly_ready = self._make_no_group_pull_rule(need_rows, max_rows_per_pull)
-        # The scoring collaborator takes ONE parameter with two mutually-exclusive shapes: a LOCAL
-        # callable (single sample in, replacement sample or None out -- the lightweight rule channel,
-        # applied per trajectory inside the collection loop) or a remote score worker handle (batch in,
-        # [N][n_scorers] matrix out, submitted per poll batch and reaped non-blockingly, so scoring
-        # overlaps generation and training instead of blocking a barrier). ``callable()`` picks the
-        # local shape; anything else must carry ``score_group``. ``resource_adapter`` (protocol:
-        # ``observe/decide/register_decision``) is fed at every pull boundary and inside the publish
-        # bracket BEFORE the push, so its scaling decision is produced and consumed in the same
-        # publication.
-        self._score = score if callable(score) else None
-        self._score_worker = None if callable(score) else score
-        if self._score_worker is not None and not callable(getattr(score, 'score_group', None)):
-            raise TypeError(f'StreamingDriver score needs to be a callable (local seam) or carry a '
-                            f'score_group(samples) method (score worker), got {type(score).__name__}')
-        self._resource_adapter = resource_adapter
-        if resource_adapter is not None:
-            missing = [name for name in ('observe', 'decide', 'register_decision')
-                       if not callable(getattr(resource_adapter, name, None))]
-            if missing:
-                raise TypeError(f'StreamingDriver resource_adapter needs observe/decide/register_decision '
-                                f'methods, {type(resource_adapter).__name__} lacks {missing}')
-        for name, fn in (('submit', submit), ('poll', poll), ('collect', collect),
-                         ('assembly_ready', assembly_ready)):
-            if not callable(fn):
-                raise TypeError(f'StreamingDriver seam {name!r} must be callable, got {type(fn).__name__} '
-                                f'-- inject it explicitly or pass a rollout to default-bind it')
-        # ``consume`` is optional: providing it selects the blocking regime (run() trains in-process, the
-        # PPO/RFT/distill path); omitting it selects the iterator regime (run() is bridged to __next__ and
-        # the recipe trains, see __iter__). ``score`` is the iterator regime's scoring seam -- optional and
-        # algorithm-agnostic -- but it is NOT validated here: it was already checked above against its TWO
-        # legal shapes (a local callable, or a score worker carrying ``score_group``). Re-checking ``score``
-        # for plain callability would wrongly reject the score-worker shape this driver explicitly supports
-        # (``self._score_worker``), which is what the disaggregated GRPO/PPO assemblies inject.
-        if consume is not None and not callable(consume):
-            raise TypeError(f'StreamingDriver optional seam \'consume\' must be callable or None, '
-                            f'got {type(consume).__name__}')
-        if max_group_regenerations < 0:
-            raise ValueError(f'max_group_regenerations must be non-negative, got {max_group_regenerations}')
-        # The control plane is OPTIONAL: version_control=True is the RL regime; False is the infer regime
-        # (version pinned at 0, no windows, no pins, nothing publishes).
-        if not isinstance(version_control, bool):
-            raise TypeError(f'version_control must be a bool, got {type(version_control).__name__}')
-        if max_staleness < 0:
-            raise ValueError(f'max_staleness must be non-negative, got {max_staleness}')
-        if num_generations <= 0:
-            raise ValueError(f'num_generations must be positive, got {num_generations}')
-        if groups_per_partition <= 0:
-            raise ValueError(f'groups_per_partition must be positive, got {groups_per_partition}')
-        if buffer_depth <= 0:
-            raise ValueError(f'buffer_depth must be positive, got {buffer_depth}')
-        if num_train_epochs <= 0:
-            raise ValueError(f'num_train_epochs must be > 0, got {num_train_epochs}')
-        # The version/window/pin accounting the run loop drives, inlined as plain fields: version_control=False
-        # pins everything to _NULL_POLICY (version 0, no windows, no pins) so the infer regime runs the same loop
-        # with no branching. The driver no longer stores the weight push or the publish cadence: publication is an
-        # EXTERNAL, per-call request (see :meth:`request_publish`), and the weight push itself never lives here.
-        self._version_control = version_control
-        self._policy = _NULL_POLICY
-        self._policy_pins: dict = {}
-        self._windows: List[PartitionAdmission] = []
-        self._next_step = 0
-        self._training_partition_id: Optional[str] = None
-        self._registered = False
-        self._prompt_stream = prompt_stream
-        #: Passes over ``prompt_stream`` before it counts as exhausted (a fractional epoch still runs one
-        #: truncated pass, ceil). The driver loops them itself because a dataloader reads one pass per
-        #: ``iter()`` and does not count epochs -- see :meth:`_iter_rows`.
-        self._num_train_epochs = num_train_epochs
-        #: Monotonic counter assigning each freshly-drawn prompt row its ordinal (see :class:`PromptRef`).
+                 max_staleness: int = 0,
+                 sync_interval: int = 1,
+                 checkpoint_manager: Any = None,
+                 orms: Sequence[Any] = (),
+                 orm_names: Optional[Sequence[str]] = None,
+                 prms: Sequence[Any] = (),
+                 prm_names: Optional[Sequence[str]] = None,
+                 prm_segment: Optional[Callable[[RolloutSample], bool]] = None,
+                 on_step: Optional[Callable[[RolloutSample, List[Any]], bool]] = None,
+                 on_sample: Optional[Callable[[RolloutSample], Optional[bool]]] = None,
+                 on_group: Optional[Callable[[Any, List[RolloutSample], int], List[Any]]] = None,
+                 max_group_regenerations: int = 0,
+                 cluster_adapter: Any = None):
+        if num_generations < 1 or batch_size < 1 or batch_size % num_generations:
+            raise ValueError(f'batch_size ({batch_size}) must be a positive multiple of num_generations '
+                             f'({num_generations}): a batch holds whole groups.')
+        if num_epochs <= 0:
+            raise ValueError(f'num_epochs must be > 0, got {num_epochs}.')
+        if max_staleness < 0 or sync_interval < 1:
+            raise ValueError(f'max_staleness must be >= 0 and sync_interval >= 1, got {max_staleness} / '
+                             f'{sync_interval}.')
+        if on_step is not None and not prms:
+            raise ValueError('on_step reads PRM scores; pass prms= or drop on_step.')
+        self.orms = list(orms)
+        self.orm_names = list(orm_names) if orm_names is not None else [f'orm_{i}' for i in range(len(self.orms))]
+        if len(self.orm_names) != len(self.orms):
+            raise ValueError(f'orm_names ({len(self.orm_names)}) must name every ORM ({len(self.orms)}).')
+        self.prms = list(prms)
+        self.prm_names = list(prm_names) if prm_names is not None else [f'prm_{i}' for i in range(len(self.prms))]
+        if len(self.prm_names) != len(self.prms):
+            raise ValueError(f'prm_names ({len(self.prm_names)}) must name every PRM ({len(self.prms)}).')
+        self.dataloader = dataloader
+        self.rollout = rollout
+        self.batch_size = batch_size
+        self.num_generations = num_generations
+        self.num_epochs = num_epochs
+        self.max_steps = max_steps
+        self.max_staleness = max_staleness
+        self.sync_interval = sync_interval
+        self.checkpoint_manager = checkpoint_manager
+        self.prm_segment = prm_segment
+        self.on_step = on_step
+        self.on_sample = on_sample
+        self.on_group = on_group
+        self.max_group_regenerations = max_group_regenerations
+        self.cluster_adapter = cluster_adapter
+
+        self._lock = threading.Condition()
+        self._events: 'queue.Queue[Tuple[Any, ...]]' = queue.Queue()
+        self._ready: deque = deque()
+        self._ready_rows = 0
+        self._thread: Optional[threading.Thread] = None
+        self._closed = False
+        self._exhausted = False
+        self._error: Optional[BaseException] = None
+        self._rows: Optional[Iterator[Any]] = None
         self._prompt_seq = 0
-        self._max_staleness = max_staleness
-        self._num_generations = num_generations
-        self._groups_per_partition = groups_per_partition
-        self._buffer_depth = buffer_depth
-        self._submit = submit
-        self._poll = poll
-        self._collect = collect
-        self._assembly_ready = assembly_ready
-        self._consume = consume
-        self._max_group_regenerations = max_group_regenerations
-        # The PRM pass at the group barrier runs whenever the worker carries a wired channel -- its
-        # consumer may be a hook here (regenerate / baseline_fn) OR
-        # the training half reading ``sample.prm_process`` downstream (advantage fusion); the
-        # channel's own wiring is the signal, probed on the worker once (a Ray proxy shell exposes
-        # no fields, so this cannot be a driver-side attribute read).
-        self._prm_ready = (self._score_worker is not None and bool(self._score_worker.prm_ready()))
-        self._group_key = group_key if group_key is not None else _prompt_ordinal_key
-        # Snapshot lifecycle, defaulted from snapshot_model: a publish push that saves the next adapter
-        # version, a v0 pin, and a prune of paths no pin references. Explicit callables override all three.
-        self._snapshot_model = snapshot_model
-        self._snapshot_dir = snapshot_dir
-        self._snapshot_adapter_name = adapter_name
-        self._snapshot_paths: set = set()
-        if snapshot_model is not None:
-            if initial_adapter_path is None:
-                initial_adapter_path = self._save_snapshot_version0
-            if prune is None:
-                prune = self._default_prune_snapshots
-        self._prune = prune if prune is not None else _no_prune
-        self._initial_adapter_path = initial_adapter_path if initial_adapter_path is not None else _no_initial_path
-        # The optimizer-step budget: a plain max_steps number compared against the steps commit() has
-        # reported so far.
-        self._max_steps = max_steps
-        self._budget_steps = 0
-        self._sleep = sleep if sleep is not None else time.sleep
-        self.stats = DriverStats()
-        #: Optimizer steps the most recent ``_train_pull`` consume reported (its return channel).
-        self._last_pull_steps = 0
-        #: Iterator regime: ``consume is None`` means the recipe drives training via ``for batch in driver``
-        #: (run() is bridged onto a background thread; see :meth:`__iter__`). ``consume`` provided means the
-        #: blocking regime, where run() trains in-process and the driver is NOT iterable.
-        self._iterating = consume is None
-        #: Iterator-bridge state (only used when ``self._iterating``): the single-slot batch queue the
-        #: background run() thread fills and __next__ drains, the ack event that unblocks the bridge's
-        #: consume once the recipe has trained the batch, and the step count the recipe reported via
-        #: :meth:`commit` (the bridge's consume return, driving the publish cadence).
-        self._batch_queue: Optional[queue.Queue] = None
-        self._ack_event = threading.Event()
-        self._committed_steps = 0
-        self._iter_thread: Optional[threading.Thread] = None
-        self._run_error: Optional[BaseException] = None
-        #: Set by :meth:`abort` (recipe-side exception teardown): the run loop checks it at every pass
-        #: boundary and breaks, so its own finally stops the in-flight generations and unpins windows.
-        self._aborted = False
-        #: External publication request (see :meth:`request_publish`): a one-shot push callable the run loop
-        #: consumes at the next pass boundary. Guarded by ``_publish_lock`` because the request is SET from the
-        #: consumer thread (the recipe / UI) and TAKEN on the run-loop thread. ``None`` when no publish is due;
-        #: the infer regime never sets it, so its version stays 0 and no weight push ever runs here.
-        self._publish_lock = threading.Lock()
-        self._pending_push: Optional[Callable[[Any], Optional[str]]] = None
-        #: Fold-point snapshots for DriverStats.last_pull_idle_ratio (see the pull boundary in run()).
-        self._train_at_pull = 0.0
-        self._idle_at_pull = 0.0
+        self._groups: Dict[str, _Group] = {}
+        #: Member rows admitted and not dropped (baselines excluded): what the version bound caps.
+        self._live = 0
+        self._inflight = 0
+        self._handed = 0
+        self._version = 0
+        self._base_version = 0
+        self._failures: deque = deque(maxlen=self.FAILURE_WINDOW)
+        self._consecutive_failures = 0
+        self._counters: Dict[str, int] = {
+            'admitted': 0, 'dropped_stale': 0, 'dropped_sample': 0, 'dropped_group': 0, 'episode_errors': 0,
+            'stopped': 0, 'regenerated': 0
+        }
+        self._adjusting = False
+        self._wait_time = 0.0
+        self._returned_at: Optional[float] = None
+        self._idle_ratio = 0.0
+        self._iter_started = False
 
-    @staticmethod
-    def _make_group_pull_rule(
-        num_generations: int, need_rows: int, max_rows_per_pull: int | None = None
-    ) -> Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]:
-        """Pull whole groups only, a lcm(need_rows, num_generations) quantum, group-contiguous.
+    # ------------------------------------------------------------------ iteration
 
-        Group-relative consumers (GRPO/RFT) normalise each consecutive block of
-        num_generations records by POSITION, so the pulled records are re-emitted
-        with all siblings of one group adjacent; a partial group stays buffered.
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=(0,))
+    def __iter__(self):
+        """Iterate the driver once: ``(rows, facts)`` per batch, delivered together."""
+        if self._iter_started:
+            raise RuntimeError('StreamingDriver serves ONE iteration per run; a second one would re-read '
+                               'the dataloader from an unrelated position. Wrap the single iterator instead.')
+        self._iter_started = True
+        return self._batches()
+
+    def _batches(self) -> Iterator[List[Any]]:
+        while True:
+            batch = self._next_batch()
+            if batch is None:
+                return
+            yield batch
+
+    def _next_batch(self) -> Optional[tuple]:
+        """Wait for ``batch_size`` rows of complete, fresh groups; ``None`` once nothing more will come.
+
+        A delivery is ``(rows, facts)``: the rows exactly as they travel (a reference under ray,
+        a dict in-process -- never opened here), and the light per-batch facts (row lengths, the
+        row-aligned score column, version spans) built in the same locked section.
         """
-        import math
-
-        def _rule(buffer: List[BufferRecord]) -> Optional[List[BufferRecord]]:
-            counts: Dict[Any, int] = {}
-            pending: Dict[Any, bool] = {}
-            order: List[Any] = []
-            for record in buffer:
-                key = record.group_key
-                if key not in counts:
-                    counts[key] = 0
-                    order.append(key)
-                counts[key] += 1
-                if record.score_ref is not None:
-                    pending[key] = True
-            # A group is complete only when its siblings are all present AND all scored: an unscored
-            # group stays buffered (the re-probe re-enters the group barrier the pass after landing).
-            complete = [key for key in order if counts[key] >= num_generations and not pending.get(key)]
-            groups_per_pull = need_rows // math.gcd(num_generations, need_rows)
-            n_pull = groups_per_pull * (len(complete) // groups_per_pull)
-            if max_rows_per_pull is not None:
-                n_pull = min(n_pull, max_rows_per_pull // num_generations)
-            if n_pull < 1:
-                return None
-            selected = complete[:n_pull]
-            selected_set = set(selected)
-            by_group: Dict[Any, List[BufferRecord]] = {}
-            for record in buffer:
-                if record.group_key in selected_set:
-                    by_group.setdefault(record.group_key, []).append(record)
-            pulled: List[BufferRecord] = []
-            for key in selected:
-                pulled.extend(by_group[key])
-            return pulled
-
-        return _rule
-
-    @staticmethod
-    def _make_no_group_pull_rule(
-        need_rows: int, max_rows_per_pull: int | None = None
-    ) -> Callable[[List[BufferRecord]], Optional[List[BufferRecord]]]:
-        """Pull the buffer prefix in whole need_rows multiples (per-sample consumers).
-
-        PPO / distillation score each sample independently, so there is no group
-        to wait for: the largest whole-unit prefix is pulled, the remainder stays
-        buffered. Order is already completion order, so no reordering is needed.
-        """
-
-        def _rule(buffer: List[BufferRecord]) -> Optional[List[BufferRecord]]:
-            if len(buffer) < need_rows:
-                return None
-            n_pull = (len(buffer) // need_rows) * need_rows
-            if max_rows_per_pull is not None:
-                n_pull = min(n_pull, max_rows_per_pull)
-            return buffer[:n_pull]
-
-        return _rule
-
-    def _save_snapshot(self, name: str) -> str:
-        """Save one adapter snapshot via snapshot_model and track it for pruning."""
-        path = self._snapshot_model.save(name, output_dir=self._snapshot_dir,
-                                         adapter_name=self._snapshot_adapter_name, save_optimizer=False)
-        self._snapshot_paths.add(path)
-        return path
-
-    def _save_snapshot_version0(self) -> str:
-        """The version-0 pin: the pre-training adapter snapshot."""
-        return self._save_snapshot('v0')
-
-    def _default_publish_push(self, window: Any) -> Optional[str]:
-        """The default push: save the NEXT adapter version as the window's snapshot."""
-        return self._save_snapshot(f'v{self._current_version() + 1}')
-
-    def _default_prune_snapshots(self) -> None:
-        """Drop tracked snapshot paths no live version or in-flight pin references."""
-        if not self._snapshot_paths:
-            return
-        keep = self._adapter_paths_to_keep()
-        for path in list(self._snapshot_paths):
-            if path not in keep:
-                shutil.rmtree(path, ignore_errors=True)
-                self._snapshot_paths.discard(path)
-
-    def _default_reached_max(self) -> bool:
-        """The step budget: max_steps compared against what commit() has reported."""
-        return self._max_steps is not None and self._budget_steps >= self._max_steps
-
-    def _default_submit(self, prompt_ref: Any, trajectory_idx: int, policy: Any) -> Any:
-        """Engine-default admit: extract the prompt row and pin the policy onto the rollout."""
-        row = prompt_ref.row
-        extras = {key: value for key, value in row.items() if key != 'messages'}
-        return self._rollout.admit(
-            row['messages'], trajectory_idx, prompt_idx=prompt_ref.ordinal,
-            prompt_extras=(extras or None),
-            adapter_path=getattr(policy, 'adapter_path', None),
-            policy_version=getattr(policy, 'version', 0))
-
-    def _default_collect(self, handle: Any) -> Any:
-        """Engine-default collect: resolve the sample and stamp its version span here.
-
-        The span (how many publishes the policy advanced between admission and
-        collection) needs the version ledger this driver owns, so the stamp
-        belongs in the default seam rather than in every recipe closure.
-        """
-        sample = self._rollout.collect(handle)
-        if getattr(handle, 'adapter_path', None) is None:
-            # in_place: the episode may have been aborted-and-resumed across publishes. A pinned
-            # adapter path (adapter_snapshot) spans nothing; without version control the version stays 0.
-            sample.version_span = max(0, self._current_version() - sample.policy_version)
-        return sample
-
-    # --- lifecycle --------------------------------------------------------------------------------------
-
-    def run(self) -> None:
-        """Stream the prompt set: admit per-sample, train whatever is ready, publish on external request.
-
-        Each pass: (1) publish phase -- when an external caller has requested a publication (see
-        :meth:`request_publish`; the driver owns neither the cadence nor the weight push), close the OLDEST
-        live window (FIFO, as ``on_partition_training_started`` requires), run the caller-supplied push
-        through that version/window bracket, bump the tracked version, prune unreferenced artifacts, and
-        drop buffered samples whose version lag now exceeds ``max_staleness``; (2) admission -- open a fresh
-        window while the staleness gate stays open,
-        then admit trajectories one at a time (each prompt expanded into ``num_generations`` of them,
-        back-to-back under one pinned policy) until the prompt stream ends or ``buffer_depth`` caps the
-        in-flight + ready count; (3) collection -- one non-blocking poll, fetching every completion,
-        releasing its pin, and moving it into the ready buffer unless its version lag already exceeds
-        ``max_staleness`` (a straggler that aged past the bound while in flight is dropped, not buffered);
-        (4) consumption -- when ``assembly_ready`` pulls a
-        batch, train it and count the optimizer steps it reports. A pass with in-flight work but no
-        completion and no ready batch sleeps briefly instead of spinning.
-
-        Exits when the budget (``max_steps``) is hit, or one pass after the prompt stream is
-        exhausted, the in-flight set has drained and ``assembly_ready`` declines the remaining buffer
-        (the leftover -- an incomplete group or a sub-batch remainder -- is dropped in the ``finally``,
-        counted as ``stats.dropped_incomplete``). The ``finally`` also ends (stop) and unpins whatever is
-        still generating and clears every live window, so a budget hit or an error leaks neither a pin
-        nor a sampler submission nor a partition.
-        """
-        # Version 0: pin the initial (pre-training) policy so the first admissions reference a real version
-        # and the sampler generates from it, never an unpinned base model (None for in-place; a no-op
-        # without version control, where the version is pinned at 0 and nothing publishes).
-        self._register_initial_policy()
-        if self.on_iteration_start is not None:
-            self.on_iteration_start()
-        # A second run() on the same driver must not inherit the previous run's fold snapshots.
-        self.stats.last_pull_idle_ratio = 0.0
-        self._train_at_pull = 0.0
-        self._idle_at_pull = 0.0
-        self._budget_steps = 0
-        _run_start = time.perf_counter()
-        prompts = self._iter_rows()
-        # The prompt currently being expanded into trajectories: (prompt_ref, trajectory_idx, group_key),
-        # where prompt_ref is the drawn :class:`PromptRef` (row + driver-assigned ordinal). A backpressure cap
-        # can interrupt the expansion mid-prompt; the cursor resumes it (carrying the SAME group_key) instead
-        # of dropping the remaining trajectories. The group_key is namespaced by a per-expansion ordinal
-        # (group_seq) so the SAME prompt re-emitted in a later epoch is a DIFFERENT group: its siblings are
-        # admitted under a later policy version and must never be assembled, advantage-scored or stale-dropped
-        # together with the earlier epoch's group.
-        partial: Optional[Tuple[PromptRef, int, str]] = None
-        pending: Optional[PromptRef] = self._draw(prompts)
-        group_seq = 0
-        # The in-flight set, keyed by sampler handle -- the SINGLE source of truth for what is still
-        # generating. A handle is removed the instant it is collected, so the backpressure count, the
-        # drain condition and the teardown below all see the CURRENT in-flight set, never a cumulative one.
-        handles: Dict[Any, _Inflight] = {}
-        ready: List[BufferRecord] = []
-        stream_done = pending is None
-        exhausted = False
-        # Group-completion bookkeeping (only load-bearing when a group-barrier hook is wired; the
-        # counters are cheap and stay correct regardless). ``group_counts`` is the per-group collected count
-        # in the ready buffer (the intra-group barrier reads it); ``group_prompt`` maps a group_key to the
-        # prompt it expands (a regenerate verdict re-admits that prompt); ``resolved_groups`` fires the
-        # barrier at most once per group; ``regen_queue`` holds (prompt, group_key) re-admissions a
-        # regenerate verdict queued; ``regen_counts`` caps them at ``max_group_regenerations``.
-        group_counts: Dict[str, int] = {}
-        group_prompt: Dict[str, Any] = {}
-        resolved_groups: set = set()
-        regen_queue: List[Tuple[Any, str]] = []
-        regen_counts: Dict[str, int] = {}
-        iteration_pending = False
+        self._start()
+        started = time.monotonic()
+        if self._returned_at is not None:
+            busy = started - self._returned_at
+            self._idle_ratio = self._wait_time / max(self._wait_time + busy, 1e-9)
+        # the trainer may have synced just before asking: judge staleness against that version
+        version = self._read_version()
+        with self._lock:
+            self._version = max(self._version, version)
+            short = self._ready_rows < self.batch_size
+        # the trainer waits from here on: its devices may be lent until the batch is ready
+        lending = None
+        if self.cluster_adapter is not None and short:
+            lending = threading.Thread(target=self._lend, name='twinkle-cluster-lend', daemon=True)
+            lending.start()
         try:
-            while True:
-                if exhausted or self._aborted or self._default_reached_max():
-                    if iteration_pending and self.on_iteration_end is not None:
-                        self.on_iteration_end(True)
-                    break
-
-                # (1) Publish phase: run an EXTERNALLY-requested publication (see request_publish). The driver
-                #     no longer owns the cadence or the weight push -- it brackets a caller-supplied push with
-                #     its own version/window accounting, on this thread, at the pass boundary. A request with
-                #     no live window (the stream drained) is dropped: training is done, nothing left to
-                #     publish to.
-                push = self._take_pending_publish()
-                if push is not None:
-                    live_windows = self._live_windows()
-                    if live_windows:
-                        window = live_windows[0]
-                        # Produce the resource adapter's scaling decision INSIDE the same bracket
-                        # that runs the push: the push (an in-place weight sync the recipe supplies)
-                        # reaches the adapter's prepare_publish, which consumes the decision --
-                        # produced and consumed in one publication, never split across passes.
-                        if self._resource_adapter is not None:
-                            decision = self._resource_adapter.decide(
-                                step=self.stats.optimizer_steps, publish_boundary=True)
-                            self._resource_adapter.register_decision(
-                                decision, step=self.stats.optimizer_steps)
-                        self._begin_publish(window)
-                        _t = time.perf_counter()
-                        new_path = push(window)
-                        self.stats.publish_time += time.perf_counter() - _t
-                        self._finish_publish(window, new_path)
-                        self.stats.publishes += 1
-                        self._drop_stale(ready, group_counts, group_prompt, resolved_groups)
-                        # Drop published artifacts no live version, in-flight pin or buffered sample still
-                        # references (runs AFTER the stale scan, which released the dropped pins).
-                        self._prune()
-
-                if iteration_pending:
-                    iteration_pending = False
-                    if self.on_iteration_end is not None:
-                        self.on_iteration_end(False)
-                    if self.on_iteration_start is not None:
-                        self.on_iteration_start()
-
-                # (2) Admission: open a fresh window while the staleness gate is open, then admit
-                #     per-sample until the stream ends or the backpressure cap is reached.
-                if not stream_done or regen_queue:
-                    if not self._open_window():
-                        self.stats.staleness_blocked_passes += 1
-                    capacity = self._buffer_depth - len(handles) - len(ready)
-                    if capacity <= 0:
-                        self.stats.capacity_blocked_passes += 1
-                    while capacity > 0:
-                        if partial is None:
-                            if regen_queue:
-                                # A group the regenerate verdict rejected: re-admit its
-                                # prompt under the CURRENT policy version, REUSING its group_key (the same
-                                # logical group, retried) so its fresh siblings are counted, assembled and
-                                # barrier-checked together. No group_seq bump -- it is not a new epoch.
-                                prompt_ref, group_key = regen_queue.pop(0)
-                                partial = (prompt_ref, 0, group_key)
-                            elif pending is None:
-                                stream_done = True
-                                break
-                            else:
-                                # Resolve this expansion's group key ONCE (namespaced by the emission ordinal,
-                                # see the cursor comment) so every sibling trajectory shares it and a prompt
-                                # re-emitted in a later epoch never collides with its earlier group.
-                                group_key = f'{self._group_key(pending)}#{group_seq}'
-                                group_seq += 1
-                                group_prompt[group_key] = pending
-                                partial = (pending, 0, group_key)
-                                pending = self._draw(prompts)
-                        prompt_ref, trajectory_idx, group_key = partial
-                        policy = self._acquire_policy()
-                        try:
-                            _t = time.perf_counter()
-                            handle = self._submit(prompt_ref, trajectory_idx, policy)
-                            self.stats.submit_time += time.perf_counter() - _t
-                        except BaseException:
-                            # A failed submit must not leak the pin it just acquired.
-                            self._release_pin(policy)
-                            raise
-                        handles[handle] = (handle, policy, group_key, _t)
-                        self.stats.admitted += 1
-                        capacity -= 1
-                        trajectory_idx += 1
-                        partial = ((prompt_ref, trajectory_idx, group_key)
-                                   if trajectory_idx < self._num_generations else None)
-
-                # (3) Collection: one non-blocking poll; every completion is fetched, its pin released,
-                #     and -- unless it is already too stale to train -- moved into the ready buffer.
-                progressed = False
-                if handles:
-                    fresh: List[BufferRecord] = []
-                    # The version cannot change during collection (a publish is phase (1), never here),
-                    # so read it once for the whole poll's staleness decision.
-                    current = self._current_version()
-                    _t = time.perf_counter()
-                    completed = self._poll(list(handles))
-                    self.stats.poll_time += time.perf_counter() - _t
-                    for handle in completed:
-                        entry = handles.pop(handle, None)
-                        if entry is None:
-                            continue  # a handle this driver does not know: ignore, never double-collect
-                        _, policy, group_key, admitted_at = entry
-                        try:
-                            _t = time.perf_counter()
-                            sample = self._collect(handle)
-                            self.stats.collect_time += time.perf_counter() - _t
-                        finally:
-                            # The sampler is done with this trajectory, so its version pin is released
-                            # HERE (acquire's contract is "pin while one sampler request is using it"): the
-                            # pin guards the SAMPLER-side adapter path against pruning, and the collected
-                            # sample is now in-process (training never reloads the behaviour adapter). This
-                            # is the pin's ONLY release on the collected path -- releasing again when the
-                            # record leaves the buffer would double-release and raise. In a finally so a
-                            # collect failure leaks no pin either.
-                            self._release_pin(policy)
-                        self.stats.collected += 1
-                        self.stats.generation_time += time.perf_counter() - admitted_at
-                        progressed = True
-                        # A straggler can stay in flight across MORE than ``max_staleness`` publishes -- the
-                        # post-publish stale scan (phase (1)) only sees the BUFFER, never the in-flight set
-                        # -- so by the time it completes, its version lag may already exceed the bound. Drop
-                        # it HERE instead of buffering it: a record must never ENTER the buffer untrainable,
-                        # or -- if its group completes the same pass -- ``assembly_ready`` would pull it and
-                        # ``consume`` would train it stale before the next scan could catch it. Its siblings
-                        # (admitted back-to-back, same version) are dropped the same way, so the stale group
-                        # is dropped WHOLE and never assembled. Counted with the scan's drops.
-                        if current - policy.version > self._max_staleness:
-                            self.stats.dropped_stale += 1
-                            continue
-                        # Per-sample scoring seam: the LOCAL ``score`` shape, applied to each trajectory
-                        # the instant it is collected, BEFORE it enters the ready buffer. The REMOTE score
-                        # shape is separate bookkeeping: it is submitted per poll batch after this loop and
-                        # reaped onto the samples non-blockingly (score_ref). A returned value replaces
-                        # the sample (one that mutates in place and returns None keeps the original). This
-                        # is per-SAMPLE, not per-group -- group-relative advantage is the assembler's job.
-                        if self._score is not None:
-                            _t = time.perf_counter()
-                            scored = self._score(sample)
-                            self.stats.score_time += time.perf_counter() - _t
-                            if scored is not None:
-                                sample = scored
-                        # The kernel stamps its own group identity onto the sample (the admission expansion
-                        # key) so the fixed-format batch is self-describing; positions, not this field,
-                        # are the training contract.
-                        sample.group_key = group_key
-                        record = BufferRecord(sample=sample, version=policy.version, group_key=group_key)
-                        ready.append(record)
-                        fresh.append(record)
-                        group_counts[group_key] = group_counts.get(group_key, 0) + 1
-                        # A score worker submits this poll's survivors only after the loop; an
-                        # in-loop barrier would resolve a freshly completed group unscored
-                        # (score_ref is None both before submission and after reap). Defer to the
-                        # post-submission re-probe and the pull boundary's blocking reap; the
-                        # in-loop call stays only for the inline-score seam, which has already
-                        # scored each sample at this point.
-                        if self._score_worker is None:
-                            self._maybe_group_complete(group_key, ready, group_counts, group_prompt,
-                                                       resolved_groups, regen_queue, regen_counts)
-                    # Submit this poll's survivors as ONE batched scoring call (lazy: the call returns
-                    # a reference, the actors keep scoring while the driver moves on) and probe the
-                    # whole buffer non-blockingly: whatever landed re-enters the group barrier.
-                    if fresh and self._score_worker is not None:
-                        outcome = (self._score_worker.score_group_prm([r.sample for r in fresh])
-                                   if self._prm_ready else self._score_worker.score_group([r.sample for r in fresh]))
-                        for index, record in enumerate(fresh):
-                            record.score_ref = (outcome, index, self._prm_ready)
-                        for key in self._reap_scores(ready, blocking=False):
-                            self._maybe_group_complete(key, ready, group_counts, group_prompt,
-                                                       resolved_groups, regen_queue, regen_counts)
-
-                # Drain-path tail wait: the stream is over, nothing is generating, and the last poll's
-                # score submissions may still be in flight. Block for them here (the pull boundary does
-                # the same for a batch about to be trained) so the final groups complete and train in
-                # this pass's consumption phase instead of the finally below dropping them unscored.
-                if (stream_done and not handles and not regen_queue and ready
-                        and self._score_worker is not None
-                        and any(record.score_ref is not None for record in ready)):
-                    for key in self._reap_scores(ready, blocking=True):
-                        self._maybe_group_complete(key, ready, group_counts, group_prompt,
-                                                   resolved_groups, regen_queue, regen_counts)
-
-                # (4) Consumption: train whatever the assembly rule says is ready (exact-global-batch
-                #     pulls only; the remainder stays buffered for the next batch).
-                records = self._assembly_ready(ready) if ready else None
-                if records:
-                    if self._score_worker is not None:
-                        # The pull-boundary TAIL wait: scores were submitted at collection time, so this
-                        # only resolves the stragglers still in flight -- the batch about to be trained
-                        # must carry its scores. Under a group pull rule the score-ready condition has
-                        # already kept unscored groups buffered, so this is a no-op guard; under the
-                        # per-sample rule it is the guarantee that the pulled prefix is fully scored.
-                        self._reap_scores(records, blocking=True)
-                    _t = time.perf_counter()
-                    self._train_pull(records, ready, group_counts, group_prompt, resolved_groups)
-                    iteration_pending = not self._iterating or self._iteration_committed
-                    train_now = time.perf_counter()
-                    # Fold the bubble ratio at the pull boundary, where the pairing is exact: the
-                    # train delta is the PREVIOUS pull's training (already accumulated into the
-                    # lifetime counter; this pull's own duration is added only below) and the idle
-                    # delta is the starvation bubble spent reaching THIS pull. See
-                    # DriverStats.last_pull_idle_ratio.
-                    train_delta = self.stats.train_active_time - self._train_at_pull
-                    idle_delta = self.stats.idle_time - self._idle_at_pull
-                    denominator = train_delta + idle_delta
-                    # The FIRST fold has no previous-pull train time, so the ratio would read 1.0
-                    # (pure starvation) -- ambiguous, so report 0.0 until the pairing exists.
-                    if train_delta > 0 and denominator > 0:
-                        self.stats.last_pull_idle_ratio = idle_delta / denominator
-                    else:
-                        self.stats.last_pull_idle_ratio = 0.0
-                    self._train_at_pull = self.stats.train_active_time
-                    self._idle_at_pull = self.stats.idle_time
-                    self.stats.train_active_time += train_now - _t
-                    # Feed the resource adapter's decision window at the same boundary the idle
-                    # ratio folds (the commit boundary): one window per pull, purely from stats
-                    # that live here -- the adapter itself only decides at publish boundaries.
-                    if self._resource_adapter is not None:
-                        self._resource_adapter.observe(
-                            step=self.stats.optimizer_steps, driver_stats=self.stats)
-                    progressed = True
-                elif (stream_done and partial is None and pending is None and not handles
-                      and not regen_queue):
-                    # The stream drained, nothing is generating and the buffer is not (or no longer)
-                    # trainable: this run is over. Break at the top of the next pass; the finally then
-                    # drops the unusable remainder and clears every live window. No trailing publish is
-                    # needed -- training is done, so there is no further generation to publish to.
-                    exhausted = True
-
-                self.stats.ready_high_watermark = max(self.stats.ready_high_watermark, len(ready))
-                self.stats.inflight_high_watermark = max(self.stats.inflight_high_watermark, len(handles))
-                if not progressed and handles:
-                    # Generations in flight, none completed, buffer not (yet) trainable: wait briefly
-                    # instead of hot-spinning the poll.
-                    _t = time.perf_counter()
-                    self._sleep(0.01)
-                    self.stats.idle_time += time.perf_counter() - _t
+            with self._lock:
+                while True:
+                    if self._error is not None:
+                        raise self._error
+                    if self.max_steps is not None and self._handed >= self.max_steps:
+                        return None
+                    self._drop_stale()
+                    if self._ready_rows >= self.batch_size:
+                        break
+                    if self._exhausted and self._inflight == 0:
+                        return None
+                    self._lock.wait(0.5)
         finally:
-            # Budget hit, drained, or an error: end and unpin everything STILL generating (uncollected
-            # handles -- a collected one already released its pin at collect), drop the unusable buffer
-            # remainder, and clear every live window so the control plane ends empty. stop (abort +
-            # settle) actually ends the engine work instead of merely dropping the reference, so no
-            # generation keeps burning sampler GPU past the driver's lifetime.
-            for handle, (_, policy, _, _) in list(handles.items()):
-                if self._rollout is not None:
-                    self._rollout.stop(handle.submission_id)
-                self._release_pin(policy)
-            handles.clear()
-            # Buffered records were collected, so their pins are already released; only count the drop.
-            self.stats.dropped_incomplete += len(ready)
-            ready.clear()
-            for window in self._live_windows():
-                self._clear_window(window)
-            # Drop any publication request that never reached a pass boundary (drain / budget hit / error).
-            with self._publish_lock:
-                self._pending_push = None
-            self.stats.final_version = self._current_version()
-            self.stats.total_time = time.perf_counter() - _run_start
+            if self.cluster_adapter is not None:
+                if lending is not None:
+                    lending.join()
+                self.cluster_adapter.reclaim()
+        # ONE locked section: collect the batch and build its light facts. The rows are handed
+        # out exactly as they travel (a reference under ray, a dict in-process) -- the driver
+        # never opens one; the score columns ride the facts instead, aligned row for row, and
+        # the identity fields were stamped on the rows at admission. Nothing here scales with
+        # the tokens, so the event thread is never held up; collecting and counting move
+        # together, so the batch is never half-published.
+        with self._lock:
+            self._drop_stale()
+            trajs: List[Any] = []
+            samples: List[RolloutSample] = []
+            scores: List[Dict[str, Any]] = []
+            version_spans: List[int] = []
+            while len(trajs) < self.batch_size and self._ready:
+                for episode in self._ready.popleft():
+                    episode.sample.version_span = self._version - episode.sample.policy_version
+                    trajs.append(episode.traj)
+                    samples.append(episode.sample)
+                    scores.append(self._score_update(episode))
+                    version_spans.append(episode.sample.version_span)
+            self._ready_rows -= len(trajs)
+            self._handed += 1
+            self._lock.notify_all()
+        self._returned_at = time.monotonic()
+        self._wait_time = self._returned_at - started
+        return trajs, _sample_facts(samples, scores, version_spans)
 
-    # --- internals ---------------------------------------------------------------------------------------
+    def _score_update(self, episode: _Episode) -> Dict[str, Any]:
+        """One row's light score entry, off the private bookkeeping -- never written onto the row.
 
-    def _train_pull(self, records: List[BufferRecord], ready: List[BufferRecord],
-                    group_counts: Optional[Dict[str, int]] = None,
-                    group_prompt: Optional[Dict[str, Any]] = None,
-                    resolved_groups: Optional[set] = None) -> None:
-        """Remove one pulled batch from the buffer, train it, and account the steps it reports.
-
-        ``self._last_pull_steps`` carries the consume return back to the caller (0 when the consumer
-        reports doing no optimizer step, which then also does not advance the publish cadence). No pin is
-        released here: each record's version pin was already released when its trajectory was COLLECTED
-        (the pin guards the SAMPLER-side adapter path, and training reads the samples in-process), so a
-        record leaving the buffer is pure bookkeeping. A pulled group is complete (``assembly_ready`` pulls
-        whole groups for a group consumer) and now TERMINAL -- it will never be re-collected, regenerated
-        or barrier-checked again -- so all of its per-group bookkeeping is dropped with it: ``group_counts``
-        (the intra-group barrier count), ``group_prompt`` (the regenerate re-admission prompt, already read
-        by the time a group is terminal) and ``resolved_groups`` (the once-per-group barrier guard). Pruning
-        only ``group_counts`` would leave the other two growing by one entry per group for the whole run.
+        The entry mirrors the row's column contract (``rewards.orm`` / ``rewards.baseline`` map
+        scorer name -> float-or-None; ``prm_segments`` carries each segment's end turn and every
+        scorer's raw segment scores) but rides the delivery facts instead of the trajectory: the
+        driver holds the row as a reference under ray and never opens it, so the scores meet the
+        row again inside the advantage worker, which receives both. A missing judge verdict stays
+        ``None`` (never a silent 0), an unparseable one keeps its nan. The rollout's own
+        ``rewards.env`` stays on the row, where its producer wrote it.
         """
-        for record in records:
-            ready.remove(record)
-            if group_counts is not None:
-                group_counts.pop(record.group_key, None)
-            if group_prompt is not None:
-                group_prompt.pop(record.group_key, None)
-            if resolved_groups is not None:
-                resolved_groups.discard(record.group_key)
-        steps = self._consume_batch(records)
-        # None means the consumer did not report a count. An explicit 0 is a real report.
-        steps = 1 if steps is None else int(steps)
-        self._last_pull_steps = steps
-        current = self._current_version()
-        if steps > 0:
-            self.stats.train_pulls += 1
-        self.stats.optimizer_steps += steps
-        for record in records:
-            self.stats.consumed += 1
-            if current - record.version > 0:
-                self.stats.off_policy_consumed += 1
+        sample = episode.sample
+        rewards: Dict[str, Any] = {
+            'orm': {name: (None if value is None else float(value))
+                    for name, value in zip(self.orm_names, episode.orm or ())},
+        }
+        if sample.baseline is not None:
+            rows = sample.baseline if (sample.baseline and isinstance(sample.baseline[0], (list, tuple))) \
+                else [sample.baseline]
+            if len(rows) != 1:
+                raise RuntimeError(f'episode {episode.episode_id} carries {len(rows)} baseline rows; the named '
+                                   'baseline column carries one. Return a single baseline per group.')
+            rewards['baseline'] = {name: (None if value is None else float(value))
+                                   for name, value in zip(self.orm_names, rows[0])}
+        score: Dict[str, Any] = {'rewards': rewards}
+        if episode.prm is not None:
+            score['prm_segments'] = {
+                'end_turns': [int(turns) for turns in episode.prm_turns],
+                'scores': {name: [(None if value is None else float(value)) for value in column]
+                           for name, column in zip(self.prm_names, episode.prm)},
+            }
+        return score
 
-    def _register_initial_policy(self) -> None:
-        """Pin the version-0 policy so the first admissions reference a real version, never an unpinned base.
+    def _drop_stale(self) -> None:
+        """Drop ready groups more than ``max_staleness`` versions behind (under the lock).
 
-        Idempotent across re-runs of run(): the second run inherits the bookkeeping, matching the old
-        control plane's register idempotence. A no-op without version control.
+        Without a checkpoint manager the policy never changes, so nothing is stale: the version then
+        only paces admission.
         """
-        if not self._version_control or self._registered:
+        if self.checkpoint_manager is None:
             return
-        self._registered = True
-        self._policy = RolloutPolicy(None, 0, self._initial_adapter_path())
+        kept = deque()
+        for members in self._ready:
+            if self._version - min(episode.version for episode in members) > self.max_staleness:
+                self._ready_rows -= len(members)
+                self._live -= len(members)
+                self._counters['dropped_stale'] += len(members)
+            else:
+                kept.append(members)
+        self._ready = kept
 
-    def _acquire_policy(self) -> RolloutPolicy:
-        """Pin the current policy while one sampler request uses it (refcount++ on its adapter path)."""
-        if self._policy.adapter_path is not None:
-            pins = self._policy_pins
-            pins[self._policy.adapter_path] = pins.get(self._policy.adapter_path, 0) + 1
-        return self._policy
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def stats(self) -> Dict[str, Any]:
+        """Counters of the run so far (small; for logging)."""
+        with self._lock:
+            return dict(self._counters, version=self._version, handed=self._handed, inflight=self._inflight,
+                        live=self._live, ready_rows=self._ready_rows, train_idle_ratio=self._idle_ratio)
 
-    def _release_pin(self, policy: RolloutPolicy) -> None:
-        """Release a pin from :meth:`_acquire_policy` (a collected/cancelled trajectory's ONLY release)."""
-        if policy.adapter_path is None:
-            return
-        count = self._policy_pins.get(policy.adapter_path, 0)
-        if count <= 0:
-            raise RuntimeError(f'rollout policy was not acquired: {policy.adapter_path}')
-        if count == 1:
-            self._policy_pins.pop(policy.adapter_path)
-        else:
-            self._policy_pins[policy.adapter_path] = count - 1
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def state_dict(self) -> Dict[str, Any]:
+        """What a resumed run restores: the batches handed out and the prompt rows drawn.
 
-    def _begin_publish(self, window: PartitionAdmission) -> None:
-        """Mark the oldest live window as training (FIFO: only the oldest window may publish)."""
-        if self._training_partition_id not in (None, window.partition_id):
-            raise RuntimeError(f'already training {self._training_partition_id}')
-        if not any(w.partition_id == window.partition_id for w in self._windows):
-            raise KeyError(f'unknown live partition {window.partition_id}')
-        oldest = min(self._windows, key=lambda w: w.step)
-        if oldest.partition_id != window.partition_id:
-            raise RuntimeError(f'{window.partition_id} cannot train before {oldest.partition_id}')
-        self._training_partition_id = window.partition_id
-
-    def _finish_publish(self, window: PartitionAdmission, new_path: Optional[str]) -> None:
-        """Bump the tracked version to the just-published policy (``new_path``) and retire the window."""
-        self._policy = RolloutPolicy(None, self._policy.version + 1, new_path)
-        self._clear_window(window)
-
-    def _clear_window(self, window: PartitionAdmission) -> None:
-        """Retire a live window (teardown uses this without a version bump)."""
-        self._windows = [w for w in self._windows if w.partition_id != window.partition_id]
-        if self._training_partition_id == window.partition_id:
-            self._training_partition_id = None
-
-    def _adapter_paths_to_keep(self) -> set:
-        """Paths a live version, an in-flight pin or a buffered sample still references."""
-        paths = set(self._policy_pins)
-        if self._policy.adapter_path is not None:
-            paths.add(self._policy.adapter_path)
-        return paths
-
-    def _live_windows(self) -> List[PartitionAdmission]:
-        """The live admission windows (partitions), oldest step first (the FIFO publish order)."""
-        return list(self._windows)
-
-    def _open_window(self) -> bool:
-        """Open one fresh admission window if the staleness gate allows (bounded by ``max_staleness``).
-
-        ``target_groups`` is the window's sizing DECLARATION (the groups one publish cycle trains,
-        ``groups_per_partition``); membership is not fixed -- the ready buffer fills it in completion
-        order, which is why a straggler never blocks a window and the FIFO publish order never waits on
-        a specific sample. A no-op without version control (infer: no windows, admission gated only by
-        ``buffer_depth``).
+        TODO: resuming re-reads the dataloader from its own saved position, which is ahead of the rows
+        that were drawn but not yet trained (in flight or buffered); up to one buffer of prompts,
+        ``(max_staleness + 1) * sync_interval * batch_size`` rows, is skipped. Keeping them would mean
+        saving the in-flight episodes, which live in the rollout and env sessions.
         """
-        if not self._version_control:
-            return True
-        oldest_step = self._windows[0].step if self._windows else self._next_step
-        if self._next_step - oldest_step > self._max_staleness:
-            return False
-        admission = PartitionAdmission(
-            partition_id=f'train_{self._next_step}', step=self._next_step,
-            target_groups=self._groups_per_partition, num_generations=self._num_generations)
-        self._next_step += 1
-        self._windows.append(admission)
-        return True
+        with self._lock:
+            return {'handed': self._handed, 'prompts_drawn': self._prompt_seq}
 
-    def _current_version(self) -> int:
-        return self._policy.version
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def close(self) -> None:
+        """Stop admitting, stop the episodes in flight and end the background thread."""
+        with self._lock:
+            self._closed = True
+            episodes = [episode for group in self._groups.values()
+                        for episode in group.members + group.baselines if not episode.finished]
+            self._lock.notify_all()
+        for episode in episodes:
+            if not episode.done:
+                try:
+                    self.rollout.stop(episode.traj or {}, episode_id=episode.episode_id)
+                except Exception as exc:  # noqa: BLE001 -- best effort on the way out
+                    logger.warning(f'StreamingDriver.close: stopping {episode.episode_id} failed: {exc}')
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+
+    # ------------------------------------------------------------------ background loop
+
+    def _start(self) -> None:
+        with self._lock:
+            if self._thread is not None:
+                return
+            self._version = self._read_version()
+            # the bound counts versions from here: a manager synced before the run starts above 0
+            self._base_version = self._version
+            self._thread = threading.Thread(target=self._run, name='twinkle-streaming-driver', daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            # _next_batch also advances self._version, so version changes are tracked here on their own
+            adjusted = self._version
+            while True:
+                with self._lock:
+                    if self._closed:
+                        return
+                version = self._read_version()
+                with self._lock:
+                    self._version = max(self._version, version)
+                    self._admit()
+                    self._lock.notify_all()
+                if version != adjusted:
+                    adjusted = version
+                    self._maybe_adjust()
+                try:
+                    event = self._events.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                while event is not None:
+                    self._handle(*event)
+                    try:
+                        event = self._events.get_nowait()
+                    except queue.Empty:
+                        event = None
+        except BaseException as exc:  # noqa
+            logger.error(f'StreamingDriver stopped: {type(exc).__name__}: {exc}')
+            with self._lock:
+                self._error = exc
+                self._lock.notify_all()
+
+    def _read_version(self) -> int:
+        if self.checkpoint_manager is not None:
+            return int(self.checkpoint_manager.version())
+        return self._handed // self.sync_interval
+
+    def _maybe_adjust(self) -> None:
+        """Hand ``adjust`` to a thread of its own; skipped while the previous one still runs."""
+        if self.cluster_adapter is None or self._adjusting:
+            return
+        self._adjusting = True
+
+        def _adjust():
+            try:
+                self.cluster_adapter.adjust()
+            except Exception as exc:  # noqa: BLE001 -- rebalancing is an optimisation, never fatal
+                logger.warning(f'cluster adapter adjust failed: {type(exc).__name__}: {exc}')
+            finally:
+                self._adjusting = False
+
+        threading.Thread(target=_adjust, name='twinkle-cluster-adjust', daemon=True).start()
+
+    def _lend(self) -> None:
+        """Run ``lend`` while the trainer waits; ``reclaim`` joins this thread before undoing it."""
+        try:
+            self.cluster_adapter.lend(self._idle_ratio)
+        except Exception as exc:  # noqa: BLE001 -- lending is an optimisation, never fatal
+            logger.warning(f'cluster adapter lend failed: {type(exc).__name__}: {exc}')
+
+    # ------------------------------------------------------------------ admission
+
+    def _capacity(self) -> int:
+        return (self._version - self._base_version + self.max_staleness + 1) * self.sync_interval * self.batch_size
+
+    def _admit(self) -> None:
+        """Open groups while the admitted-and-alive rows stay within the version bound (under the lock)."""
+        if self.max_steps is not None and self._handed >= self.max_steps:
+            self._exhausted = True
+        while not self._exhausted and self._live + self.num_generations <= self._capacity():
+            row = self._next_row()
+            if row is None:
+                self._exhausted = True
+                return
+            key = str(self._prompt_seq)
+            self._prompt_seq += 1
+            group = _Group(key=key, row=row)
+            self._groups[key] = group
+            self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
+
+    def _next_row(self) -> Any:
+        # TODO: rows are drawn here, ahead of training; see state_dict for what a resume skips.
+        if self._rows is None:
+            self._rows = self._iter_rows()
+        return next(self._rows, None)
 
     def _iter_rows(self) -> Iterator[Any]:
-        """Flatten ``prompt_stream``'s batches into one row stream spanning ``num_train_epochs`` passes.
-
-        ``prompt_stream`` is a dataloader: it yields a BATCH of prompt rows per step (a list, the shape
-        twinkle's ``DataLoader`` produces with an identity collate) and reads ONE pass per ``iter()`` -- it
-        does not count epochs itself (``set_epoch`` is caller-driven). The driver runs once and drains its
-        prompt stream, so the epoch loop lives here: ``ceil(num_train_epochs)`` passes, each announced to the
-        dataloader's ``set_epoch`` (its per-pass reshuffle seed) when it has one, every batch flattened to its
-        rows so :meth:`_draw` still admits one trajectory group per row. A stream yielding bare rows (not
-        lists) passes through unchanged, so a plain row iterable also works.
-        """
-        for epoch in range(max(1, math.ceil(self._num_train_epochs))):
-            set_epoch = getattr(self._prompt_stream, 'set_epoch', None)
+        for epoch in range(max(1, math.ceil(self.num_epochs))):
+            set_epoch = getattr(self.dataloader, 'set_epoch', None)
             if set_epoch is not None:
                 set_epoch(epoch)
-            for batch in self._prompt_stream:
+            for batch in self.dataloader:
                 if isinstance(batch, (list, tuple)):
                     yield from batch
                 else:
                     yield batch
 
-    def _draw(self, prompts) -> Optional[PromptRef]:
-        """Pull the next prompt ROW from the stream and pair it with a fresh ordinal; ``None`` when exhausted.
+    def _start_attempt(self, group: _Group, trajectories: List[Any]) -> None:
+        """Submit one attempt's trajectories: the non-baseline ones replace the members (under the lock)."""
+        members = [traj for traj in trajectories if _role_of(traj) != _BASELINE]
+        baselines = [traj for traj in trajectories if _role_of(traj) == _BASELINE]
+        if members:
+            group.source = members
+            group.members = []
+            group.missing = 0
+            self._live += len(members)
+            self._counters['admitted'] += len(members)
+        group.baselines = []
+        for traj in members:
+            group.members.append(self._submit(group, traj, ''))
+        for traj in baselines:
+            group.baselines.append(self._submit(group, traj, _BASELINE))
 
-        The ordinal is a monotonic per-draw counter (never reused, so the same row re-drawn in a later epoch
-        is a distinct :class:`PromptRef` with a distinct group). The driver does not inspect the row -- the
-        consumer's ``submit`` seam reads ``ref.row`` to build its trajectory and ``ref.ordinal`` to stamp the
-        sample's ``prompt_id``.
-        """
-        row = next(prompts, None)
-        if row is None:
-            return None
-        ref = PromptRef(self._prompt_seq, row)
-        self._prompt_seq += 1
-        return ref
+    def _submit(self, group: _Group, traj: Any, role: str) -> _Episode:
+        episode = _Episode(episode_id=uuid.uuid4().hex, group=group, role=role, version=self._version)
+        # The identity travels on top of the trajectory: episode / group / role / the admission
+        # version. The rollout reads the episode id to route its steps back to this episode.
+        traj = dict(traj)
+        traj.update(episode_id=episode.episode_id, group_key=group.key, role=role,
+                    policy_version=episode.version)
+        self._inflight += 1
+        self._step(episode, traj)
+        return episode
 
-    def _drop_stale(self, ready: List[BufferRecord], group_counts: Optional[Dict[str, int]] = None,
-                    group_prompt: Optional[Dict[str, Any]] = None,
-                    resolved_groups: Optional[set] = None) -> None:
-        """Post-publish stale scan: drop every BUFFERED sample whose version lag exceeds the bound.
+    def _step(self, episode: _Episode, traj: Any) -> None:
+        future = self.rollout.step(traj, episode_id=episode.episode_id)
+        future.add_done_callback(lambda f, episode=episode: self._events.put(('step', episode, None, f)))
 
-        This is the SECOND of the two staleness guards -- the first drops a straggler AT COLLECT, before
-        it can enter the buffer (see :meth:`run`); this one covers records that were within the bound when
-        buffered and then aged past ``max_staleness`` as later publishes bumped the version. Per-record
-        but group-sound: every trajectory of a group is admitted back-to-back under one pinned policy, so
-        siblings share one version and a stale group is dropped whole across this scan. No pin is released
-        here -- a collected record's pin was already released at collect. ``group_counts`` is decremented
-        for each dropped record so the group barrier never fires on a group the scan has thinned out; when
-        the last sibling drops the group is TERMINAL (fully gone from the buffer, never re-collected), so its
-        ``group_prompt`` and ``resolved_groups`` entries are dropped with it -- mirroring :meth:`_train_pull`
-        so a stale-dropped group does not leak per-group bookkeeping either.
-        """
-        current = self._current_version()
-        kept: List[BufferRecord] = []
-        for record in ready:
-            if current - record.version > self._max_staleness:
-                self.stats.dropped_stale += 1
-                if group_counts is not None:
-                    remaining = group_counts.get(record.group_key, 0) - 1
-                    if remaining > 0:
-                        group_counts[record.group_key] = remaining
-                    else:
-                        group_counts.pop(record.group_key, None)
-                        if group_prompt is not None:
-                            group_prompt.pop(record.group_key, None)
-                        if resolved_groups is not None:
-                            resolved_groups.discard(record.group_key)
-            else:
-                kept.append(record)
-        ready[:] = kept
+    # ------------------------------------------------------------------ completions
 
-    def _maybe_group_complete(self, group_key: str, ready: List[BufferRecord], group_counts: Dict[str, int],
-                              group_prompt: Dict[str, Any], resolved_groups: set,
-                              regen_queue: List[Tuple[Any, str]], regen_counts: Dict[str, int]) -> None:
-        """Run the kernel's group-barrier verdict pipeline once a group is fully collected AND scored.
-
-        Intra-group barrier (never a batch barrier): fires when ``group_key`` has ``num_generations``
-        records in the ready buffer with no score still in flight (scoring itself was submitted per
-        poll batch at collection time; the non-blocking reap loop re-enters this barrier the pass
-        after the scores land), at most once per group (``resolved_groups``), while every other
-        group keeps streaming and overlapping. No-op when nothing is wired (the infer / PPO /
-        blocking path). What runs here is the verdict half only: the optional ``regenerate``
-        verdict, then -- once the group is final (accepted, or a regeneration verdict past the cap
-        accepted as-is) -- the optional ``baseline_fn`` write. On a ``True`` regenerate verdict
-        within the attempt cap the group's records are dropped from the buffer and its prompt
-        re-queued for admission under the current policy version (the conservative staleness
-        anchor); the group_key is reused so the retried siblings are counted and barrier-checked
-        as one group. A verdict past the cap is accepted as-is, matching the fixed-batch
-        dynamic-sampling fallback.
-        """
-        if (self._score_worker is None
-                and self._regenerate is None and self._baseline_fn is None):
-            return
-        if group_key in resolved_groups:
-            return
-        if group_counts.get(group_key, 0) < self._num_generations:
-            return
-        group_records = [record for record in ready if record.group_key == group_key]
-        # Score guard: a submitted-but-unreaped score (score_ref) means the verdict hooks would read a
-        # scoreless sample. Return and wait: the non-blocking re-probe re-enters this barrier the pass
-        # after the scores land (the reap loop above drives it), so no group is ever resolved unscored.
-        if any(record.score_ref is not None for record in group_records):
-            return
-        samples = [record.sample for record in group_records]
-        if (self._regenerate is not None and self._regenerate(group_key, samples)
-                and regen_counts.get(group_key, 0) < self._max_group_regenerations):
-            for record in group_records:
-                ready.remove(record)
-            group_counts.pop(group_key, None)
-            regen_counts[group_key] = regen_counts.get(group_key, 0) + 1
-            resolved_groups.discard(group_key)
-            regen_queue.append((group_prompt[group_key], group_key))
-        else:
-            # The group is FINAL now (plainly accepted, or a regenerate verdict past the cap that
-            # is accepted as-is): a remax-style baseline must land on every kept sibling here, or
-            # this group would train with no baseline while its batch peers carry one.
-            if self._baseline_fn is not None:
-                baseline = self._baseline_fn(group_key, samples)
-                if baseline is not None:
-                    for sample in samples:
-                        sample.baseline = baseline
-            resolved_groups.add(group_key)
-
-    def _reap_scores(self, records: List[BufferRecord], *, blocking: bool) -> set:
-        """Reap submitted scores onto their samples; returns the group keys whose scores landed.
-
-        ``blocking=True`` is the pull-boundary tail wait: the batch about to be trained must carry
-        its scores, so unfinished references are resolved here (this wait is the real score cost the
-        trainer pays -- ``stats.score_time`` counts exactly this). ``blocking=False`` (the every-pass
-        probe) skips records whose score is not ready yet; the next pass re-probes them, and the keys
-        returned here re-enter the group barrier from the collection phase.
-        """
-        landed: set = set()
-        if not records:
-            return landed
-        _t = time.perf_counter()
-        for record in records:
-            ref = record.score_ref
-            if ref is None:
-                continue
-            outcome, index, prm = ref
-            if not blocking and not self._score_ready(outcome):
-                continue
-            result = self._score_deref(outcome)
-            if prm:
-                matrix, process = result
-                record.sample.orm_reward = matrix[index]
-                record.sample.prm_process = process[index]
-            else:
-                record.sample.orm_reward = result[index]
-            record.score_ref = None
-            landed.add(record.group_key)
-        self.stats.score_time += time.perf_counter() - _t
-        return landed
-
-    @staticmethod
-    def _score_ready(outcome: Any) -> bool:
-        """Non-materialising readiness probe: ``LazyCollect.ready()`` when available, values pass through."""
-        ready = getattr(outcome, 'ready', None)
-        return bool(ready()) if callable(ready) else True
-
-    @staticmethod
-    def _score_deref(outcome: Any) -> Any:
-        """Resolve a ``LazyCollect`` (call it) or pass a plain value through (the local-mode shape)."""
-        return outcome() if callable(outcome) and getattr(outcome, '_is_lazy_collect', False) else outcome
-
-    def _consume_batch(self, records: List[BufferRecord]) -> Optional[int]:
-        """Train one pulled batch: the injected blocking ``consume`` seam, or the iterator bridge.
-
-        In the blocking regime (``consume`` provided) this is the consumer's own score-and-train half. In
-        the iterator regime (``consume=None``) the batch is assembled and handed to ``__next__`` through the
-        queue, and this call BLOCKS until the recipe trains it and calls :meth:`commit`, returning the real
-        optimizer-step count the recipe reported -- so twinkle's contract (publish happens after consume
-        returns) makes the version bump wait for training to finish.
-        """
-        if self._consume is not None:
-            return self._consume(records)
-        return self._bridge_consume(records)
-
-    def _bridge_consume(self, records: List[BufferRecord]) -> int:
-        """Iterator-regime consume: assemble the batch, hand it to ``__next__``, block for the recipe's ack.
-
-        The FIXED output format is the list of scored samples (``group_key`` / ``policy_version`` stamped
-        by the kernel, scoring fields written by the hooks). The batch goes on the single-slot queue (the driver thread blocks on
-        the ack right after, so the queue never overflows and generation keeps overlapping on the sampler
-        actor), and the step count the recipe reports via :meth:`commit` becomes this consume's return --
-        the publish cadence unit.
-        """
-        batch = [record.sample for record in records]
-        self._committed_steps = 0
-        self._iteration_committed = False
-        self._ack_event.clear()
-        self._batch_queue.put(batch)
-        # A single wait() would deadlock against abort(): abort's lone set() can land before this
-        # clear() (the whole pass between two consumes is that window) and be erased, leaving the
-        # wait blocked forever while abort() joins this thread. Polling the flag closes the window:
-        # an aborted run returns 0 and run() breaks at the next pass boundary.
-        while not self._ack_event.wait(timeout=1.0):
-            if self._aborted:
-                return 0
-        return self._committed_steps
-
-    # --- iterator regime (``for batch in driver:``) ------------------------------------------------------
-
-    def performance_snapshot(self) -> dict:
-        """Export plain observations without exposing driver internals to recorders."""
-        adapter = self._resource_adapter
-        return {
-            'stream_stats': asdict(self.stats),
-            'resource_metrics': adapter.performance_snapshot() if adapter is not None else {},
-        }
-
-    def __iter__(self) -> 'StreamingDriver':
-        """Drive the blocking :meth:`run` on a background thread and yield assembled, scored batches.
-
-        Only valid in the iterator regime (constructed with ``consume=None``); a driver built with a
-        blocking ``consume`` is already driven by :meth:`run` and is not iterable. Single-use: starting
-        iteration twice raises. The recipe trains each yielded batch and calls :meth:`commit` to release the
-        driver thread blocked in the bridge and report the optimizer steps it ran.
-        """
-        if not self._iterating:
-            raise RuntimeError(
-                'StreamingDriver was constructed with a blocking consume seam, so it is driven by run() and '
-                'is not iterable. To iterate (`for batch in driver:`), construct it with consume=None and '
-                'inject the score seam instead.')
-        if self._iter_thread is not None:
-            raise RuntimeError('StreamingDriver iteration was already started; a driver instance is single-use.')
-        self._batch_queue = queue.Queue(maxsize=1)
-        self._committed_steps = 0
-        self._ack_event.clear()
-        self._run_error = None
-
-        def _runner() -> None:
-            try:
-                self.run()
-            except BaseException as exc:  # re-raised on the recipe thread by __next__
-                self._run_error = exc
-            finally:
-                self._batch_queue.put(_ITER_DONE)
-
-        self._iter_thread = threading.Thread(target=_runner, name='streaming-driver', daemon=True)
-        self._iter_thread.start()
-        return self
-
-    def abort(self) -> None:
-        """Stop the background run from outside -- the recipe-side exception teardown.
-
-        In the iterator regime the driver thread blocks on the bridge ack right after handing a
-        batch to ``__next__``; if the recipe thread leaves the loop with an exception (training
-        kernel error, OOM, KeyboardInterrupt), no ``commit`` ever arrives, and neither that wait
-        nor ``run``'s own teardown would execute -- the run would leak its in-flight generations
-        and race the recipe's sampler shutdown. This releases the ack wait, asks the run loop to
-        break at the next pass boundary (its finally then stops and unpins everything), and joins
-        the background thread. Safe when not iterating and safe to call repeatedly.
-
-        The join is kept drain-fed: a batch the consumer never took (or the terminal sentinel
-        the runner's finally puts) can leave the run thread blocked on the single-slot queue's
-        put, so the queue is emptied non-blockingly while waiting. An EMPTY queue never blocks
-        here -- the flags above release the thread's other waits and it exits on its own.
-        """
-        self._aborted = True
-        self._ack_event.set()
-        thread = self._iter_thread
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            while thread.is_alive():
-                self._drain_batch_queue()
-                thread.join(timeout=1.0)
-
-    def _drain_batch_queue(self) -> None:
-        """Empty the single-slot delivery queue without blocking (teardown only)."""
-        batch_queue = self._batch_queue
-        if batch_queue is None:
-            return
-        while True:
-            try:
-                batch_queue.get_nowait()
-            except queue.Empty:
+    def _handle(self, kind: str, episode: _Episode, index: Optional[int], future: Any) -> None:
+        exc = future.exception()
+        with self._lock:
+            if self._closed:
                 return
+            if episode.lost:
+                if kind == 'step' and exc is None and not future.result()[1].done:
+                    # dropped while this step ran: release its rollout state now
+                    self.rollout.stop(future.result()[0], episode_id=episode.episode_id)
+                return
+            if exc is not None and not (kind == 'step' and _is_episode_error(exc)):
+                raise exc
+            if kind == 'step':
+                if exc is not None:
+                    self._fail(episode, exc)
+                else:
+                    self._on_step(episode, *future.result())
+            elif kind == 'orm':
+                episode.orm[index] = future.result()[0]
+                episode.orm_pending -= 1
+                self._maybe_finish(episode)
+            else:
+                segment, scorer = index
+                episode.prm[scorer][segment] = future.result()[0]
+                episode.prm_pending -= 1
+                if episode.held == segment and not any(
+                        episode.prm[k][segment] is _PENDING for k in range(len(self.prms))):
+                    self._release(episode, segment)
+                self._maybe_finish(episode)
+            self._lock.notify_all()
 
-    def __next__(self) -> Any:
-        """The next assembled batch, blocking until the driver thread produces one or the run ends.
+    def _on_step(self, episode: _Episode, traj: Any, sample: RolloutSample) -> None:
+        episode.traj = traj
+        episode.sample = sample
+        episode.done = bool(sample.done)
+        if self.prms and episode.role != _BASELINE and (episode.done or self.prm_segment is None
+                                                         or self.prm_segment(sample)):
+            segment = self._score_prm(episode)
+            if self.on_step is not None and not episode.done:
+                episode.held = segment
+                return
+        if episode.done:
+            self._consecutive_failures = 0
+            self._failures.append(False)
+            self._score_orm(episode)
+        else:
+            self._step(episode, traj)
 
-        Ends the iteration (``StopIteration``) when the background run drains; if the run raised, its
-        exception is re-raised here on the recipe thread so a failure is never silently swallowed.
-        """
-        if self._batch_queue is None:
-            raise StopIteration
-        batch = self._batch_queue.get()
-        if batch is _ITER_DONE:
-            if self._run_error is not None:
-                raise self._run_error
-            raise StopIteration
-        return batch
+    def _score_prm(self, episode: _Episode) -> int:
+        if episode.prm is None:
+            episode.prm = [[] for _ in self.prms]
+        segment = len(episode.prm_turns)
+        episode.prm_turns.append(int(episode.sample.turns))
+        for scorer, prm in enumerate(self.prms):
+            episode.prm[scorer].append(_PENDING)
+            episode.prm_pending += 1
+            future = prm([episode.traj])
+            future.add_done_callback(
+                lambda f, episode=episode, key=(segment, scorer): self._events.put(('prm', episode, key, f)))
+        return segment
 
-    def commit(self, optimizer_steps: Optional[int] = 1) -> None:
-        """Release the driver thread blocked in the bridge, reporting the real optimizer steps just run.
+    def _release(self, episode: _Episode, segment: int) -> None:
+        """A held episode's segment scores are in: ask ``on_step`` whether it goes on."""
+        episode.held = None
+        if self.on_step(episode.sample, [column[segment] for column in episode.prm]):
+            self._step(episode, episode.traj)
+            return
+        self._counters['stopped'] += 1
+        self.rollout.stop(episode.traj, episode_id=episode.episode_id)
+        self._lose(episode)
 
-        The recipe calls this after training the batch ``__next__`` handed it. The count becomes the
-        bridge's consume return, which drives the publish cadence (twinkle publishes after consume returns,
-        so the trained weights -- not stale ones -- are what the next admission window samples from). Omitting
-        the count, or passing ``None``, means one step. An explicit ``0`` means this batch did not update the
-        optimizer and does not consume the ``max_steps`` budget. The same count also feeds that budget, so a
-        driver constructed with a numeric budget exits on its own.
-        """
-        # None means the caller omitted the count. An explicit 0 does not consume budget.
-        self._committed_steps = 1 if optimizer_steps is None else int(optimizer_steps)
-        self._iteration_committed = True
-        self._budget_steps += self._committed_steps
-        self._ack_event.set()
+    def _score_orm(self, episode: _Episode) -> None:
+        episode.orm = [_PENDING] * len(self.orms)
+        episode.orm_pending = len(self.orms)
+        for index, orm in enumerate(self.orms):
+            future = orm([episode.traj])
+            future.add_done_callback(
+                lambda f, episode=episode, index=index: self._events.put(('orm', episode, index, f)))
+        self._maybe_finish(episode)
 
-    # --- external publication signal (the driver owns the accounting, NOT the cadence or the push) --------
+    def _fail(self, episode: _Episode, exc: BaseException) -> None:
+        self._counters['episode_errors'] += 1
+        self._consecutive_failures += 1
+        self._failures.append(True)
+        logger.warning(f'episode {episode.episode_id} skipped: {exc}')
+        if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES or (
+                len(self._failures) == self.FAILURE_WINDOW
+                and sum(self._failures) > self.MAX_FAILURE_RATE * self.FAILURE_WINDOW):
+            raise RuntimeError(f'too many episodes fail ({self._consecutive_failures} in a row, '
+                               f'{sum(self._failures)} of the last {len(self._failures)}); last: {exc}') from exc
+        self._lose(episode)
 
-    @staticmethod
-    def no_push(window: Any) -> None:
-        """A publish request that pushes nothing: the caller ran the weight update itself.
+    def _lose(self, episode: _Episode) -> None:
+        """An episode that will produce no sample: its group is short one member (under the lock)."""
+        episode.lost = True
+        self._inflight -= 1
+        group = episode.group
+        if episode.role == _BASELINE:
+            self._drop_group(group)
+            return
+        group.missing += 1
+        self._live -= 1
+        self._settle(group)
 
-        The in-place strategy's visible half (abort in-flight + sync weights) runs in the recipe loop;
-        the driver's bracket then carries only the version accounting, hence this no-op.
-        """
+    def _maybe_finish(self, episode: _Episode) -> None:
+        if not episode.done or episode.finished or episode.lost or episode.orm_pending or episode.prm_pending:
+            return
+        # The trajectory itself stays exactly as it travels (a reference under ray, the rollout's
+        # stash channel): it is only ever passed on to remote calls (the forwards, the advantage,
+        # the filter) and handed out at delivery -- the driver never opens it. The scores and the
+        # identity the recipe reads live on the sample and the delivery facts instead.
+        sample = episode.sample
+        sample.prompt_id = episode.group.key
+        sample.group_key = episode.group.key
+        sample.episode_id = episode.episode_id
+        sample.role = episode.role
+        sample.policy_version = episode.version
+        sample.orm_reward = list(episode.orm)
+        if episode.prm is not None:
+            sample.prm_rewards = [list(column) for column in episode.prm]
+            sample.extra = dict(sample.extra or {}, **{PRM_SEGMENT_TURNS: list(episode.prm_turns)})
+        if episode.role != _BASELINE and self.on_sample is not None and self.on_sample(sample) is False:
+            self._counters['dropped_sample'] += 1
+            self._lose(episode)
+            return
+        episode.finished = True
+        self._inflight -= 1
+        self._settle(episode.group)
 
-    def request_publish(self, push: Optional[Callable[[Any], Optional[str]]] = None) -> None:
-        """Signal that the just-trained weights should be published at the next pass boundary.
+    # ------------------------------------------------------------------ groups
 
-        ``push(window) -> Optional[str]`` is the CALLER's weight sync: it pauses generation,
-        overwrites the sampler's weights and resumes only on success (in-place, returning ``None``), or saves a
-        new adapter snapshot (returning its path). Omitting ``push`` selects the default built from
-        ``snapshot_model`` (:meth:`_default_publish_push`); :attr:`no_push` is the explicit no-op for a
-        caller that already pushed the weights itself. The driver does NOT store it and does NOT decide
-        when to call it -- the external controller owns the cadence and the weight push; the driver only
-        brackets the push with its own version/window accounting (close the oldest window before, bump the
-        version + drop now-stale samples + prune after), executed on the run-loop thread at the top of the
-        next pass so the buffer/pins are only ever mutated on that one thread.
+    def _settle(self, group: _Group) -> None:
+        """Act on a group whose current attempt has no work left (under the lock)."""
+        if group.key not in self._groups:
+            return
+        if any(not (e.finished or e.lost) for e in group.members + group.baselines):
+            return
+        if group.missing:
+            if group.attempt >= self.max_group_regenerations:
+                self._drop_group(group)
+                return
+            group.attempt += 1
+            self._counters['regenerated'] += 1
+            # the lost members are redone from their trajectories; the scored ones stay
+            self._live += group.missing
+            self._counters['admitted'] += group.missing
+            group.missing = 0
+            for index, episode in enumerate(group.members):
+                if episode.lost:
+                    group.members[index] = self._submit(group, copy.deepcopy(group.source[index]), '')
+            return
+        if group.baselines:
+            rows = [list(e.sample.orm_reward) for e in group.baselines]
+            for episode in group.members:
+                episode.sample.baseline = rows[0] if len(rows) == 1 else rows
+            self._accept(group)
+            return
+        if self.on_group is not None:
+            # the verdict reads the samples (light, local: the scores are already stamped on
+            # them); the trajectories themselves are references under ray and never opened here.
+            trajectories = list(self.on_group(group.row, [e.sample for e in group.members], group.attempt) or [])
+            regenerate = [t for t in trajectories if _role_of(t) != _BASELINE]
+            if regenerate and len(regenerate) != self.num_generations:
+                raise ValueError(f'on_group returned {len(regenerate)} trajectories to replace a group of '
+                                 f'{self.num_generations}; a group is always num_generations rows.')
+            if regenerate and group.attempt < self.max_group_regenerations:
+                # baselines returned alongside wait: the replaced group is offered to on_group again
+                self._live -= len(group.members)
+                self._counters['regenerated'] += 1
+                group.attempt += 1
+                self._start_attempt(group, regenerate)
+                return
+            baselines = [t for t in trajectories if _role_of(t) == _BASELINE]
+            if baselines:
+                self._start_attempt(group, baselines)
+                return
+        self._accept(group)
 
-        Thread-safe: the request is set from the consumer thread (the recipe / UI) and taken on the run-loop
-        thread. A second request before the first is consumed raises (the run loop consumes one per pass, so
-        this only happens on a wiring bug). The infer regime never calls this, so its version stays 0.
-        """
-        if push is None:
-            if self._snapshot_model is None:
-                raise ValueError('request_publish() without a push needs snapshot_model on the driver -- pass '
-                                 'a push callable, use StreamingDriver.no_push when the weights are already '
-                                 'synced, or construct with snapshot_model for the default adapter save.')
-            push = self._default_publish_push
-        if not callable(push):
-            raise TypeError(f'request_publish needs a callable push, got {type(push).__name__}')
-        with self._publish_lock:
-            if self._pending_push is not None:
-                raise RuntimeError('a publish is already pending; the run loop consumes one request per pass, '
-                                   'so a second request before it is taken is a wiring bug.')
-            self._pending_push = push
+    def _accept(self, group: _Group) -> None:
+        del self._groups[group.key]
+        self._ready.append(list(group.members))
+        self._ready_rows += len(group.members)
 
-    def _take_pending_publish(self) -> Optional[Callable[[Any], Optional[str]]]:
-        """Take (and clear) the pending publication request; ``None`` when no publish is due this pass."""
-        with self._publish_lock:
-            push, self._pending_push = self._pending_push, None
-            return push
+    def _drop_group(self, group: _Group) -> None:
+        """Give the group up: its counted rows leave the bound, its unfinished episodes stop (under the lock)."""
+        if self._groups.pop(group.key, None) is None:
+            return
+        self._counters['dropped_group'] += 1
+        for episode in group.members + group.baselines:
+            if episode.lost:
+                continue
+            episode.lost = True
+            if episode.role != _BASELINE:
+                self._live -= 1
+            if not episode.finished:
+                self._inflight -= 1
+                if episode.held is not None:
+                    # waiting for its PRM scores, no step in flight; a stepping one is stopped when it returns
+                    self.rollout.stop(episode.traj, episode_id=episode.episode_id)
+
+
+#: Placeholder for a score whose Future has not completed yet.
+_PENDING = object()

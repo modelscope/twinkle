@@ -33,7 +33,6 @@ from twinkle.checkpoint_engine.weight_keys import (add_base_layer_suffix, is_lor
                                                    print_weight_example)
 from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
@@ -852,15 +851,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             inputs['completion_mask'] = completion_mask
 
     def _postprocess_forward_outputs(self, outputs, *, labels, task, temperature, sampling_masks, return_logits,
-                                     loss_instance, replay=None):
+                                     loss_instance, replay=None, output_fields=frozenset()):
         """Shared forward/forward_only tail: derive logps/entropy/values, then reclaim logits memory.
 
         ``replay`` is the ``(loss_mask, masked_labels, metadata)`` tuple from ``_prepare_sampling_replay``
-        when sampling replay is enabled.
+        when sampling replay is enabled. ``output_fields`` is the caller's explicit channel
+        request: it widens the derivation gates beyond the loss's own require_* flags.
         """
-        loss_require_logits = getattr(loss_instance, 'require_logits', False)
-        loss_require_entropy = getattr(loss_instance, 'require_entropy', False)
-        loss_require_logps = getattr(loss_instance, 'require_logps', True)
+        loss_require_logits = getattr(loss_instance, 'require_logits', False) or 'logits' in output_fields
+        loss_require_entropy = getattr(loss_instance, 'require_entropy', False) or 'entropies' in output_fields
+        loss_require_logps = getattr(loss_instance, 'require_logps', True) or 'logps' in output_fields
+        loss_require_values = getattr(loss_instance, 'require_values', False) or 'values' in output_fields
         if get_task_spec(task).requires_logps and labels is not None and loss_require_logps:
             if replay is not None:
                 loss_mask, masked_labels, replay_metadata = replay
@@ -891,8 +892,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             outputs['logits'] = None
 
     def _finalize_forward_outputs(self, inputs, outputs, *, processor, task, optimizer_config, is_training,
-                                  forward_kwargs, loss_instance, return_logits, recorded_routing):
-        """Shared forward/forward_only tail: SP postprocess, unpack, status recording, and the return copy."""
+                                  forward_kwargs, loss_instance, return_logits, recorded_routing,
+                                  output_frame='sequence', output_fields=None, response_rows=None):
+        """Shared forward/forward_only tail: SP postprocess, unpack, status recording, and the return copy.
+
+        ``output_frame='response'`` projects THE RETURN COPY ONLY onto per-sample response rows
+        (see :meth:`TrainableModel.project_response_frame`); the internal training chain reads the
+        untouched full-length tensors recorded in ``status.outputs``.
+        """
         inputs, outputs = processor.postprocess_outputs(
             inputs, outputs, task=task,
             gather_fn=self.sp_strategy.gather_loss_tensors if self.sp_strategy is not None else None,
@@ -906,10 +913,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             status.loss_reduction = getattr(loss_instance, 'reduction', 'mean')
         status.loss_value = outputs.get('aux_loss', 0)
         return_outputs = copy(outputs)
-        if not return_logits:
+        if not return_logits and 'logits' not in (output_fields or ()):
             return_outputs['logits'] = None
         if recorded_routing is not None:
             return_outputs['routed_experts'] = recorded_routing
+        if output_frame == 'response':
+            return_outputs = self.project_response_frame(
+                return_outputs,
+                labels=inputs.get('labels'),
+                completion_mask=inputs.get('completion_mask'),
+                rows=response_rows,
+                tokenizer=optimizer_config.template)
+        if output_fields:
+            for field in output_fields:
+                if return_outputs.get(field) is None:
+                    raise ValueError(f'output_fields requested {field!r} but this forward produced none')
         return return_outputs
 
     def _forward_with_task_readout(self, unwrapped_model, task, inputs, adapter_name=None):
@@ -966,7 +984,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         finally:
             handle.remove()
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict')
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function and record the inputs and outputs.
 
@@ -977,6 +995,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         Returns:
             The output of the model forward.
         """
+        inputs, kwargs = self._rollout_features(inputs, kwargs, lift=False)
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         temperature = float(kwargs.pop('temperature', 1.0))
         sampling_masks = kwargs.pop('sampling_masks', None)
@@ -1093,7 +1112,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     # lazy_collect follows the global default (True): a caller that reads the output itself calls
     # ``.result()`` first, while a ref-only pipeline hands the handle straight to a downstream remote
     # call, which resolves and collects it where the data is consumed (see ``LazyCollect``).
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict')
     @timed
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
@@ -1107,10 +1126,28 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 dynamic_batching: Pack samples under max_tokens_per_micro_batch.
                 max_tokens_per_micro_batch: Token budget required for dynamic batching.
                 packing_algorithm: Dynamic packing strategy, 'ffd' (default) or 'kk'.
+                output_frame: 'sequence' (default) keeps the full-length tensor channels;
+                    'response' projects the public return onto per-sample response rows
+                    (logps/values/entropies as Python numeric lists aligned with
+                    response_token_ids, frames declared in field_frames). The internal
+                    training chain is never reshaped.
+                output_fields: Explicitly request channels (logps/values/entropies/logits/
+                    embeddings/routed_experts); derivation follows the request instead of the
+                    loss's require_* flags. Requesting a field this forward cannot produce
+                    fails loudly.
         Returns:
             The output of the model forward.
         """
         config = MicroBatchConfig.from_kwargs(kwargs)
+        _, output_fields, _ = self.resolve_output_frame_request(kwargs)
+        if output_fields is not None:
+            # tuple rides dispatch untouched: a list would be sliced as a batch dimension.
+            kwargs['output_fields'] = tuple(output_fields)
+        response_rows = self._capture_response_rows(inputs)
+        inputs, kwargs = self._rollout_features(inputs, kwargs, lift=False)
+        if response_rows is not None:
+            # Row identity for the response projection, captured before the feature split.
+            kwargs['_response_rows'] = response_rows
         # Kept IN kwargs on purpose: the single-batch / micro-batch callees below pop it
         # themselves, and the per-adapter head resolution (head_for) needs the CALL's adapter,
         # not the default group.
@@ -1169,7 +1206,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             optimizer_config.dp_balance_forward_kwargs = dict(kwargs)
         batches = []
         for indices in plan:
-            micro_kwargs = {key: select_batch(value, indices, len(inputs)) for key, value in kwargs.items()}
+            # Control scalars/tuples never slice with the samples; a field tuple whose length
+            # happens to equal the batch size would otherwise be cut by select_batch.
+            micro_kwargs = {key: (value if key in ('output_frame', 'output_fields')
+                                  else select_batch(value, indices, len(inputs)))
+                            for key, value in kwargs.items()}
             outputs = self._forward_only_single(
                 inputs=[inputs[index] for index in indices],
                 optimizer_config=optimizer_config,
@@ -1192,6 +1233,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
         loss_key = kwargs.pop('loss_key', None)
+        output_frame = kwargs.pop('output_frame', 'sequence')
+        output_fields = frozenset(kwargs.pop('output_fields', None) or ())
+        response_rows = kwargs.pop('_response_rows', None)
         # Accepted for backend parity with Megatron's empty-loss probe entry (``compute_loss=False``). This
         # forward_only derives logps via selective_log_softmax and never calls the loss, so there is nothing
         # to skip here; popped so it does not linger in eval_status.forward_kwargs.
@@ -1276,6 +1320,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 return_logits=return_logits,
                 loss_instance=loss_instance,
                 replay=(replay_loss_mask, replay_masked_labels, replay_metadata) if enable_sampling_replay else None,
+                output_fields=output_fields,
             )
             return self._finalize_forward_outputs(
                 inputs,
@@ -1288,9 +1333,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 loss_instance=loss_instance,
                 return_logits=return_logits,
                 recorded_routing=recorded_routing,
+                output_frame=output_frame,
+                output_fields=output_fields,
+                response_rows=response_rows,
             )
 
-    @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False)
+    @remote_function(dispatch='slice_dp', collect='dp_flatten', lazy_collect=False)
     def generate(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -1314,7 +1362,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         ``AutoModelForCausalLM.generate`` reads directly -- so in-place generation is sound here.
 
         Distribution. ``dispatch='slice_dp'`` splits ``inputs`` across data ranks, so each worker only
-        generates for its own shard; ``collect=collect_dp_and_flatten`` then deduplicates the ranks that
+        generates for its own shard; ``collect='dp_flatten'`` then deduplicates the ranks that
         share one data shard (TP / PP / ulysses peers produce the same result) and flattens the per-worker
         lists back into one, in input order. A single-GPU or FSDP model is the degenerate case: one data
         rank, nothing to dedup. ``inputs`` must therefore be a *list* -- a bare ``Trajectory`` dict would
@@ -1729,7 +1777,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             **kwargs,
         )
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict', sync=True)
     @timed
     def forward_backward(
         self,
@@ -1741,6 +1789,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         **kwargs,
     ):
         """Run one homogeneous loss RPC and optionally finalize a two-RPC backward transaction."""
+        inputs, kwargs = self._rollout_features(inputs, kwargs, lift=True)
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
         balance = kwargs.pop('_dp_balance', None)

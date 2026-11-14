@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from twinkle import remote_function
-from twinkle.infra.collectors import collect_tensor_dict
+from twinkle.infra.collectors import tensor_dict
 from twinkle.model.base import TrainableModel
 from twinkle.model.dp_balance import _estimate_megatron_ranks, estimate_workload, plan_call
 from twinkle.processor import InputProcessor
@@ -116,7 +116,7 @@ class _RefWorker:
 
         infra._mode = "ray"
 
-    @remote_function(dispatch="slice_dp", collect=collect_tensor_dict)
+    @remote_function(dispatch="slice_dp", collect=tensor_dict)
     def forward_backward(self, *, inputs, advantages, _dp_balance=None):
         assert len(inputs) == 4  # driver already sliced; worker must not slice twice
         assert [row["sample_id"] for row in inputs] == advantages

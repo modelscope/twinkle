@@ -5,7 +5,7 @@ from twinkle import DeviceMesh
 from twinkle.utils import pad_and_stack_tensors
 
 
-def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) -> Dict[str, Any]:
+def tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) -> Dict[str, Any]:
     import torch
     if not outputs:
         return {}
@@ -49,26 +49,35 @@ def collect_tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) 
             result[key] = pad_and_stack_tensors(values)
 
         elif isinstance(first_value, dict):
-            result[key] = collect_tensor_dict(values, device_mesh)
+            result[key] = tensor_dict(values, device_mesh)
+
+        elif isinstance(first_value, str):
+            # Constant metadata (frame declarations, fingerprints): workers must agree, and the
+            # merged value is the constant itself -- never a per-worker list of copies.
+            if any(v != first_value for v in values):
+                raise ValueError(f'output key {key!r} disagrees across workers: {sorted(set(values))}')
+            result[key] = first_value
 
         elif isinstance(first_value, np.ndarray) and first_value.size > 1:
             raise NotImplementedError('Numpy array not supported for now.')
 
         else:
-            result[key] = values
+            # One surviving worker keeps the bare value -- the counterpart of stacking a single
+            # tensor, which adds no batch row either; several keep the per-worker list, the
+            # scalar counterpart of that batch dimension. No key is special-cased: which
+            # quantity a scalar reports, and how a caller folds it, is the caller's business.
+            result[key] = values[0] if len(values) == 1 else values
 
-    if 'loss' in result and len(result['loss']) > 1:
-        result['loss'] = np.mean(result['loss'])
     return result
 
 
-def collect_dp_and_flatten(outputs: List[List[Any]], device_mesh: DeviceMesh) -> List[Any]:
+def dp_flatten(outputs: List[List[Any]], device_mesh: DeviceMesh) -> List[Any]:
     """Collect a ``slice_dp`` call whose per-worker result is a list: dedup by data rank, then flatten.
 
     Each worker returns the list of results for the data shard it was handed. ``slice_dp`` splits by
     *data rank*, and within one data rank several workers (TP / PP / ulysses peers) hold the same shard
     and produce identical outputs, so ``get_collect_ranks()`` nominates a single representative per data
-    rank -- the same dedup ``collect_tensor_dict`` applies to tensors. Keeping only those and flattening
+    rank -- the same dedup ``tensor_dict`` applies to tensors. Keeping only those and flattening
     in worker order yields each input's result exactly once, in the order it was submitted. DP and FSDP
     need no dedup (each of their ranks is its own data rank holding a distinct shard), and this handles
     them unchanged because ``get_collect_ranks()`` then returns every rank.

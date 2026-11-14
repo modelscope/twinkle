@@ -19,8 +19,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, requires, template, torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.infra import collect_tensor_dict
-from twinkle.infra._torch_setup import seed_from_env
+from twinkle.utils import seed_from_env
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
@@ -246,7 +245,7 @@ class MultiLoraMegatronModel(MegatronModel):
         self.task_head_slots.release(adapter_name, self._task_head_host(),
                                      self.multi_adapter._write_param_tensor)
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict', sync=True)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Forward pass without gradient computation.
 
@@ -263,7 +262,7 @@ class MultiLoraMegatronModel(MegatronModel):
         with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora):
             return super().forward_only(inputs=inputs, **kwargs)
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict', sync=True)
     def forward_backward(self,
                          *,
                          inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],

@@ -1,32 +1,30 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""OpenEnv adapters (embedded + server mode) and distributed EnvPool.
+"""OpenEnv adapters: embedded and server mode.
 
 OpenEnv environments can be consumed in two ways:
 
-- **Embedded** (:class:`OpenEnv`): the environment object is instantiated
-  in-process, bypassing OpenEnv's FastAPI server. Zero network overhead, no
-  isolation. Shard it across Ray workers with :class:`EnvPool`.
-- **Server** (:class:`OpenEnvClient`): connect to a running OpenEnv server
-  over its WebSocket protocol. The environment runs in a separate process or
-  container, one server hosts many concurrent sessions. Do NOT wrap this in
-  ``EnvPool`` — a session lives on the server, so Ray sharding buys nothing.
+- **Embedded** (:class:`OpenEnv`): every session is an environment object
+  instantiated in-process, bypassing OpenEnv's FastAPI server. Zero network
+  overhead, no isolation. Give it a ``remote_group`` to spread sessions over
+  several replicas.
+- **Server** (:class:`OpenEnvClient`): every session is one WebSocket session on
+  a running OpenEnv server. The environment runs in a separate process or
+  container, one server hosts many concurrent sessions.
 
-- ``EnvPoolAdapter``: wraps a single pool slot as a standard ``Env``
+Neither runs scripts (:meth:`Env.run_script` raises): act through the tools.
 """
 import importlib
 import importlib.util
 import inspect
 import json
-import math
 import os
 import re
-import threading
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
-from twinkle import DeviceMesh, remote_class, remote_function
+from twinkle import remote_class, remote_function
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
-from .base import Env, StepResult
+from .base import ENV_MAX_CONCURRENCY, Env, StepResult
 
 logger = get_logger()
 
@@ -98,22 +96,6 @@ def _normalize_result(result) -> Dict[str, Any]:
         'reward': float(getattr(result, 'reward', 0.0) or 0.0),
         'done': bool(getattr(result, 'done', False)),
     }
-
-
-def _collect_single(results, device_mesh=None):
-    for r in results:
-        if r is not None:
-            return r
-    return None
-
-
-def _collect_batch(results, device_mesh=None):
-    merged = []
-    for worker_results in results:
-        if worker_results:
-            merged.extend(worker_results)
-    merged.sort(key=lambda x: x[0])
-    return [r[1] for r in merged]
 
 
 # ==========================================================================
@@ -218,17 +200,27 @@ def _discover_openenv_classes(env_name: str):
     return env_cls, action_cls
 
 
+@remote_class(max_concurrency=ENV_MAX_CONCURRENCY)
 class OpenEnv(Env):
-    """Embedded OpenEnv adapter — implements the standard Env interface.
+    """Embedded OpenEnv adapter: every session is one environment object, built in this process.
 
     Usage::
 
-        env = OpenEnv(env_name='openspiel_env', env_kwargs={'game_name': 'blackjack'})
-        result = env.reset()
-        result = env.step('play', {'action': 'hit'})
+        env = OpenEnv(env_name='openspiel_env', env_kwargs={'game_name': 'blackjack'}, remote_group='env')
+        result = env.reset(episode_id)
+        result = env.step(episode_id, 'play', {'action': 'hit'})
+        reward = env.close(episode_id)
     """
 
-    def __init__(self, env_name=None, env_cls=None, env_kwargs=None, action_cls=None, action_mapper=None, **kwargs):
+    def __init__(self,
+                 env_name=None,
+                 env_cls=None,
+                 env_kwargs=None,
+                 action_cls=None,
+                 action_mapper=None,
+                 max_sessions: int = 64,
+                 **kwargs):
+        super().__init__(max_sessions=max_sessions)
         if env_cls is None and env_name is None:
             raise ValueError("Either 'env_name' or 'env_cls' is required. "
                              "Example: OpenEnv(env_name='openspiel_env', env_kwargs={'game_name': 'blackjack'})")
@@ -239,56 +231,59 @@ class OpenEnv(Env):
         else:
             resolved_cls = _import_env_class(env_cls) if isinstance(env_cls, str) else env_cls
 
-        self._env = resolved_cls(**(env_kwargs or {}))
+        self._env_cls = resolved_cls
+        self._env_kwargs = dict(env_kwargs or {})
         self._action_cls = _import_env_class(action_cls) if isinstance(action_cls, str) else action_cls
         self._action_mapper = action_mapper
+        self._advertised: Optional[List[ToolInfo]] = None
 
+    @remote_function(execute='first', collect='first', lazy_collect=False)
     def tools(self) -> List[ToolInfo]:
         # Prefer the environment's own advertisement when it has one. OpenEnv's Environment
         # interface defines no tools() and no official environment implements it, so fall
         # back to deriving the schema from the Action class (_tool_from_action): its fields
         # are exactly the arguments step() accepts, which keeps the advertised schema and
         # the invocation contract from ever drifting apart.
-        inner = getattr(self._env, 'tools', None)
-        if callable(inner):
-            advertised = list(inner())
-            if advertised:
-                return advertised
-        if self._action_cls is not None:
-            return [_tool_from_action(self._action_cls)]
-        return []
+        if self._advertised is None:
+            advertised = []
+            if callable(getattr(self._env_cls, 'tools', None)):
+                probe = self._env_cls(**self._env_kwargs)
+                try:
+                    advertised = list(probe.tools())
+                finally:
+                    if hasattr(probe, 'close'):
+                        probe.close()
+            if not advertised and self._action_cls is not None:
+                advertised = [_tool_from_action(self._action_cls)]
+            self._advertised = advertised
+        return list(self._advertised)
 
-    def reset(self, trajectory=None) -> StepResult:
-        result = self._env.reset()
-        normalized = _normalize_result(result)
-        return StepResult(
-            observation=normalized['observation'],
-            reward=normalized['reward'],
-            done=normalized['done'],
-        )
+    def _open(self, trajectory) -> Tuple[Any, StepResult]:
+        env = self._env_cls(**self._env_kwargs)
+        try:
+            normalized = _normalize_result(env.reset())
+        except BaseException:
+            if hasattr(env, 'close'):
+                env.close()
+            raise
+        return env, StepResult(**normalized)
 
-    def step(self, tool_name: str, arguments: Dict[str, Any] = None) -> StepResult:
+    def _step(self, state, tool_name: str, arguments: Dict[str, Any]) -> StepResult:
         if self._action_mapper is not None:
-            action = self._action_mapper(tool_name, arguments or {})
+            action = self._action_mapper(tool_name, arguments)
         else:
-            action = arguments if arguments is not None else {}
+            action = arguments
         if self._action_cls is not None and isinstance(action, dict):
             action = self._action_cls(**action)
-        result = self._env.step(action)
-        normalized = _normalize_result(result)
-        return StepResult(
-            observation=normalized['observation'],
-            reward=normalized['reward'],
-            done=normalized['done'],
-        )
+        return StepResult(**_normalize_result(state.step(action)))
 
-    def close(self) -> None:
-        if hasattr(self._env, 'close'):
-            self._env.close()
+    def _close(self, state) -> None:
+        if hasattr(state, 'close'):
+            state.close()
 
 
 # ==========================================================================
-# OpenEnvClient: server mode (WebSocket session against a running server)
+# OpenEnvClient: server mode (WebSocket sessions against a running server)
 # ==========================================================================
 
 _DEFAULT_CODE_TOOL: ToolInfo = {
@@ -379,19 +374,35 @@ def _format_client_observation(obs) -> str:
     return '\n'.join(parts) if parts else '(no output)'
 
 
-class OpenEnvClient(Env):
-    """Env backed by one session on a running OpenEnv server.
+class ClientSession:
+    """One episode's session on the OpenEnv server: a synchronous client with its own WebSocket.
 
-    Deliberately NOT a ``@remote_class``: a session lives server-side, so
-    every instance is just a WebSocket client and can be created directly in
-    the driver (one per trajectory, typically reset in a thread pool).
+    What a registered tool handler receives (``handler(session, arguments)``).
+    """
+
+    def __init__(self, client, action_builder: Callable[[Dict[str, Any]], Any]):
+        self.client = client
+        self.last_result = None
+        self._action_builder = action_builder
+
+    def execute(self, action) -> Any:
+        """Send an action (an Action instance or a dict of its fields); returns the server's raw ``StepResult``."""
+        if isinstance(action, dict):
+            action = self._action_builder(action)
+        self.last_result = self.client.step(action)
+        return self.last_result
+
+
+@remote_class(max_concurrency=ENV_MAX_CONCURRENCY)
+class OpenEnvClient(Env):
+    """Env backed by a running OpenEnv server: every session is one WebSocket session on it.
 
     Usage::
 
         env = OpenEnvClient(env_name='coding_env', base_url='http://host:8000')
-        result = env.reset()
-        result = env.step('run_python', {'code': 'print(1 + 1)'})
-        env.close()
+        env.reset(episode_id)
+        result = env.step(episode_id, 'run_python', {'code': 'print(1 + 1)'})
+        reward = env.close(episode_id)
 
     The server must have capacity for every concurrent session
     (``MAX_CONCURRENT_ENVS``), and its environment class must declare
@@ -410,6 +421,7 @@ class OpenEnvClient(Env):
                  connect_timeout_s: float = 10.0,
                  message_timeout_s: float = 120.0,
                  client_kwargs: Optional[Dict[str, Any]] = None,
+                 max_sessions: int = 64,
                  **kwargs):
         """
         Args:
@@ -428,12 +440,13 @@ class OpenEnvClient(Env):
                 ``run_python(code)`` tool, matching OpenEnv's code environments.
             reset_kwargs: Extra kwargs forwarded to the server's ``reset()``
                 (e.g. ``task_prompt`` / ``expected_answer`` for ``repl_env``).
-                Also settable per episode via the ``reset_kwargs`` attribute.
             connect_timeout_s: WebSocket connect timeout.
             message_timeout_s: Per-message timeout; raise it when the
                 environment runs long-executing code.
             client_kwargs: Extra kwargs for the OpenEnv client constructor.
+            max_sessions: Sessions this component holds open at once.
         """
+        super().__init__(max_sessions=max_sessions)
         if env_cls is None and env_name is None:
             raise ValueError("Either 'env_name' or 'env_cls' is required. "
                              "Example: OpenEnvClient(env_name='coding_env', base_url='http://host:8000')")
@@ -449,48 +462,36 @@ class OpenEnvClient(Env):
             if action_cls is None:
                 action_cls = discovered_action_cls
 
+        self._client_cls = resolved_cls
         self._base_url = base_url
+        self._client_kwargs = dict(
+            connect_timeout_s=connect_timeout_s, message_timeout_s=message_timeout_s, **(client_kwargs or {}))
         self._action_cls = _import_env_class(action_cls) if isinstance(action_cls, str) else action_cls
         self._action_mapper = action_mapper
         self._tools = list(tools) if tools is not None else [_DEFAULT_CODE_TOOL]
         self._custom_tools: List[ToolInfo] = []
-        self._custom_handlers: Dict[str, Callable[['OpenEnvClient', Dict[str, Any]], str]] = {}
-        self.reset_kwargs: Dict[str, Any] = dict(reset_kwargs or {})
-        self._episode_reward = 0.0
-        self._last_result = None
-        self._operation_lock = threading.Lock()
-        self._inflight = False
-        self._uncertain_error: BaseException | None = None
-        self._closed = False
-
-        async_client = resolved_cls(
-            base_url=base_url,
-            connect_timeout_s=connect_timeout_s,
-            message_timeout_s=message_timeout_s,
-            **(client_kwargs or {}),
-        )
-        # .sync() gives each instance a dedicated background event loop, which
-        # keeps a thread pool of concurrent episodes safe.
-        self._client = async_client.sync()
+        self._custom_handlers: Dict[str, Callable[[ClientSession, Dict[str, Any]], str]] = {}
+        self._reset_kwargs: Dict[str, Any] = dict(reset_kwargs or {})
 
     # ------------------------------------------------------------------
     # Tool registration
     # ------------------------------------------------------------------
 
-    def register_tool(self, tool_info: ToolInfo, handler: Callable[['OpenEnvClient', Dict[str, Any]],
-                                                                   str]) -> 'OpenEnvClient':
-        """Register a tool handled locally instead of being sent to the server.
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    def register_tool(self, tool_info: ToolInfo, handler: Callable[[ClientSession, Dict[str, Any]], str]) -> None:
+        """Register a tool handled locally instead of being sent to the server, on every replica.
 
         Useful for bookkeeping tools such as ``submit_solution``, which record
-        the model's answer on the env for the training loop to score later.
+        the model's answer on the session for a check to read later.
 
         Args:
             tool_info: OpenAI-format tool schema exposed to the model.
-            handler: ``handler(env, arguments) -> str`` returning the
-                observation. Shadows a server-backed tool of the same name.
+            handler: ``handler(session, arguments) -> str`` returning the
+                observation, where ``session`` is the episode's :class:`ClientSession`.
+                Shadows a server-backed tool of the same name.
 
-        Returns:
-            self, to allow chained registration.
+        Replicas added later are built from the constructor arguments only, so a deployment that
+        grows its env replicas declares its tools in a subclass instead.
         """
         name = tool_info.get('function', {}).get('name')
         if not name:
@@ -498,116 +499,71 @@ class OpenEnvClient(Env):
         self._custom_tools = [t for t in self._custom_tools if t['function']['name'] != name]
         self._custom_tools.append(tool_info)
         self._custom_handlers[name] = handler
-        return self
 
     # ------------------------------------------------------------------
     # Env interface
     # ------------------------------------------------------------------
 
-    def reset(self, trajectory=None) -> StepResult:
-        self._episode_reward = 0.0
-        # The server rebuilds its environment instance on reset, so the
-        # session (and its WebSocket) is reused across episodes.
-        result = self._invoke(self._client.reset, **self.reset_kwargs)
-        self._last_result = result
-        return StepResult(
-            observation=_format_client_observation(getattr(result, 'observation', None)),
-            reward=float(getattr(result, 'reward', 0.0) or 0.0),
-            done=bool(getattr(result, 'done', False)),
-        )
-
-    def step(self, tool_name: str, arguments: Dict[str, Any] = None) -> StepResult:
-        arguments = arguments or {}
-        if tool_name in self._custom_handlers:
-            try:
-                observation = self._custom_handlers[tool_name](self, arguments)
-            except Exception as e:  # noqa
-                logger.warning(f'OpenEnvClient handler error (tool={tool_name}): {e}')
-                observation = f'Error: {e}'
-            return StepResult(
-                observation=observation, reward=0.0, done=False, info={'episode_reward': self._episode_reward})
-        try:
-            result = self.execute(self._build_action(tool_name, arguments))
-        except Exception as e:  # noqa
-            # Keep the episode alive on transient errors; max_turns bounds it.
-            logger.warning(f'OpenEnvClient step error (tool={tool_name}): {e}')
-            return StepResult(observation=f'Error: {e}', reward=0.0, done=False, info={'error': str(e)})
-        reward = float(getattr(result, 'reward', 0.0) or 0.0)
-        self._episode_reward += reward
-        return StepResult(
-            observation=_format_client_observation(getattr(result, 'observation', None)),
-            reward=reward,
-            done=bool(getattr(result, 'done', False)),
-            info={'episode_reward': self._episode_reward},
-        )
-
+    @remote_function(execute='first', collect='first', lazy_collect=False)
     def tools(self) -> List[ToolInfo]:
         custom_names = set(self._custom_handlers)
         tools = [t for t in self._tools if t['function']['name'] not in custom_names]
         tools.extend(self._custom_tools)
         return tools
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._invoke(self._client.close)
-        self._closed = True
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def execute(self, episode_id: str, action) -> Any:
+        """Send an action in the episode's session and return the server's raw ``StepResult``.
 
-    def ensure_idle(self) -> None:
-        """A successful synchronous reply confirms completion; a failed wait does not."""
-        with self._operation_lock:
-            if self._uncertain_error is not None:
-                raise RuntimeError('OpenEnv execution/close is unconfirmed') from self._uncertain_error
-            if self._inflight:
-                raise RuntimeError('OpenEnv operation is still in flight')
+        Public so a check can run scoring code in the same session (e.g. append
+        unit tests to a submitted solution) and inspect typed fields such as
+        ``exit_code`` instead of the rendered text.
+        """
+        return self._session(episode_id).state.execute(action)
 
-    def _invoke(self, operation, *args, **kwargs):
-        with self._operation_lock:
-            if self._uncertain_error is not None:
-                raise RuntimeError('OpenEnv execution/close is unconfirmed') from self._uncertain_error
-            if self._closed or self._inflight:
-                raise RuntimeError('OpenEnv session is closed or busy')
-            self._inflight = True
+    def _open(self, trajectory) -> Tuple[ClientSession, StepResult]:
+        # .sync() gives each session a dedicated background event loop, which
+        # keeps concurrent episodes safe.
+        client = self._client_cls(base_url=self._base_url, **self._client_kwargs).sync()
         try:
-            return operation(*args, **kwargs)
-        except BaseException as error:
-            with self._operation_lock:
-                self._uncertain_error = error
+            result = client.reset(**self._reset_kwargs)
+        except BaseException:
+            client.close()
             raise
-        finally:
-            with self._operation_lock:
-                self._inflight = False
+        session = ClientSession(client, self._build_action_from_fields)
+        session.last_result = result
+        return session, StepResult(
+            observation=_format_client_observation(getattr(result, 'observation', None)),
+            reward=float(getattr(result, 'reward', 0.0) or 0.0),
+            done=bool(getattr(result, 'done', False)),
+        )
+
+    def _step(self, state: ClientSession, tool_name: str, arguments: Dict[str, Any]) -> StepResult:
+        if tool_name in self._custom_handlers:
+            try:
+                observation = self._custom_handlers[tool_name](state, arguments)
+            except Exception as e:  # noqa
+                logger.warning(f'OpenEnvClient handler error (tool={tool_name}): {e}')
+                observation = f'Error: {e}'
+            return StepResult(observation=observation)
+        try:
+            result = state.execute(self._build_action(tool_name, arguments))
+        except Exception as e:  # noqa
+            # Keep the episode alive on transient errors; max_turns bounds it.
+            logger.warning(f'OpenEnvClient step error (tool={tool_name}): {e}')
+            return StepResult(observation=f'Error: {e}', info={'error': str(e)})
+        return StepResult(
+            observation=_format_client_observation(getattr(result, 'observation', None)),
+            reward=float(getattr(result, 'reward', 0.0) or 0.0),
+            done=bool(getattr(result, 'done', False)),
+        )
+
+    def _close(self, state: ClientSession) -> None:
+        state.client.close()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    @property
-    def client(self):
-        """The underlying (synchronous) OpenEnv client."""
-        return self._client
-
-    @property
-    def episode_reward(self) -> float:
-        return self._episode_reward
-
-    @property
-    def last_result(self):
-        """Raw ``StepResult`` from the last server call, for reward extraction."""
-        return self._last_result
-
-    def execute(self, action) -> Any:
-        """Send an action and return the server's raw ``StepResult``.
-
-        Public so a training loop can run scoring code in the same session
-        (e.g. append unit tests to a submitted solution) and inspect typed
-        fields such as ``exit_code`` instead of the rendered text.
-        """
-        if isinstance(action, dict):
-            action = self._build_action_from_fields(action)
-        result = self._invoke(self._client.step, action)
-        self._last_result = result
-        return result
 
     def _build_action(self, tool_name: str, arguments: Dict[str, Any]):
         if self._action_mapper is not None:
@@ -621,152 +577,3 @@ class OpenEnvClient(Env):
             raise ValueError('No action_cls available: pass action_cls, or an action_mapper '
                              'that returns a ready-made Action instance.')
         return self._action_cls(**fields)
-
-
-# ==========================================================================
-# EnvPool: distributed environment pool (OpenEnv-specific)
-# ==========================================================================
-
-
-@remote_class(execute='all')
-class EnvPool:
-    """Distributed pool of OpenEnv instances managed as a Twinkle remote_class.
-
-    Environments are sharded across workers. Each worker manages pool_size // num_workers slots.
-    """
-
-    def __init__(self,
-                 pool_size: int = 32,
-                 device_mesh: Optional[DeviceMesh] = None,
-                 env_kwargs: Optional[Dict[str, Any]] = None,
-                 **kwargs):
-        self._pool_size = pool_size
-        self._env_kwargs = env_kwargs or {}
-
-        rank = int(os.environ.get('RANK', 0))
-        world_size = int(os.environ.get('WORLD_SIZE', 1))
-        shard_size = math.ceil(pool_size / world_size)
-        self._start = min(rank * shard_size, pool_size)
-        self._end = min(self._start + shard_size, pool_size)
-        local_size = self._end - self._start
-
-        self._episode_rewards: List[float] = [0.0] * local_size
-        self._envs: List[OpenEnv] = [OpenEnv(**self._env_kwargs) for _ in range(local_size)]
-        logger.info(f'EnvPool initialized: pool_size={pool_size}, '
-                    f'shard=[{self._start}, {self._end}), rank={rank}/{world_size}')
-
-    def _owns(self, idx: int) -> bool:
-        return self._start <= idx < self._end
-
-    def _do_reset(self, idx: int) -> Dict[str, Any]:
-        local_idx = idx - self._start
-        env = self._envs[local_idx]
-        self._episode_rewards[local_idx] = 0.0
-        result = env.reset()
-        return {
-            'observation': result.observation,
-            'reward': result.reward,
-            'done': result.done,
-            'episode_reward': 0.0,
-        }
-
-    def _do_step(self, idx: int, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        local_idx = idx - self._start
-        env = self._envs[local_idx]
-        result = env.step(tool_name, arguments)
-        self._episode_rewards[local_idx] += result.reward
-        return {
-            'observation': result.observation,
-            'reward': result.reward,
-            'done': result.done,
-            'episode_reward': self._episode_rewards[local_idx],
-        }
-
-    @remote_function(dispatch='all', collect=_collect_single)
-    def reset(self, idx: int) -> Dict[str, Any]:
-        if not self._owns(idx):
-            return None
-        return self._do_reset(idx)
-
-    @remote_function(dispatch='all', collect=_collect_single)
-    def step(self, idx: int, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        if not self._owns(idx):
-            return None
-        return self._do_step(idx, tool_name, arguments)
-
-    @remote_function(dispatch='all', collect=_collect_batch)
-    def reset_batch(self, indices: List[int]) -> List:
-        results = []
-        for i in indices:
-            if self._owns(i):
-                results.append((i, self._do_reset(i)))
-        return results
-
-    @remote_function(dispatch='all', collect=_collect_batch)
-    def step_batch(self, indices: List[int], tool_names: List[str], arguments_list: List[Dict[str, Any]]) -> List:
-        results = []
-        for i, tn, args in zip(indices, tool_names, arguments_list):
-            if self._owns(i):
-                results.append((i, self._do_step(i, tn, args)))
-        return results
-
-    @remote_function(dispatch='all', collect='first')
-    def close(self) -> None:
-        for env in self._envs:
-            env.close()
-        self._envs.clear()
-        logger.info('EnvPool closed.')
-
-    @property
-    def pool_size(self) -> int:
-        return self._pool_size
-
-    def get_adapters(self, n: int) -> List['EnvPoolAdapter']:
-        """Create n EnvPoolAdapter instances wrapping pool slots [0, n).
-
-        Must be called from the driver side. Each adapter proxies
-        reset/step calls to the correct worker via remote_function dispatch.
-        """
-        if n > self._pool_size:
-            raise ValueError(f'Requested {n} adapters but pool only has {self._pool_size} slots.')
-        return [EnvPoolAdapter(pool=self, idx=i) for i in range(n)]
-
-
-# ==========================================================================
-# EnvPoolAdapter: wraps a single pool slot as standard Env
-# ==========================================================================
-
-
-class EnvPoolAdapter(Env):
-    """Wraps a single slot in an EnvPool as a standard Env."""
-
-    def __init__(self, pool: EnvPool, idx: int):
-        self._pool = pool
-        self._idx = idx
-        self._episode_reward: float = 0.0
-
-    def reset(self, trajectory=None) -> StepResult:
-        self._episode_reward = 0.0
-        result = self._pool.reset(self._idx)
-        return StepResult(observation=result.get('observation', ''), reward=0.0, done=False, info=result)
-
-    def step(self, tool_name: str, arguments: Dict[str, Any] = None) -> StepResult:
-        try:
-            result = self._pool.step(self._idx, tool_name, arguments or {})
-            self._episode_reward = float(result.get('episode_reward', 0.0))
-            return StepResult(
-                observation=result.get('observation', ''),
-                reward=float(result.get('reward', 0.0)),
-                done=bool(result.get('done', False)),
-                info={'episode_reward': self._episode_reward},
-            )
-        except Exception as e:
-            logger.warning(f'EnvPoolAdapter step error (idx={self._idx}): {e}')
-            return StepResult(observation=f'Error: {e}', reward=0.0, done=True, info={'error': str(e)})
-
-    @property
-    def episode_reward(self) -> float:
-        return self._episode_reward
-
-    def close(self) -> None:
-        pass

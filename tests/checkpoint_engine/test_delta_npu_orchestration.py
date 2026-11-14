@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Rollout-side NPU (HCCL) orchestration: manager rendezvous and DeltaSamplerMixin RPC sequence, all mocked."""
+"""Rollout-side NPU (HCCL) orchestration: manager rendezvous and VLLMDeltaSamplerMixin RPC sequence, all mocked."""
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -9,7 +9,7 @@ import pytest
 from twinkle import Platform
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.checkpoint_engine.delta import DeltaSyncConfig
-from twinkle.checkpoint_engine.delta.rollout.mixin import DeltaSamplerMixin
+from twinkle.checkpoint_engine.delta.rollout.mixin import VLLMDeltaSamplerMixin
 from twinkle.checkpoint_engine.hccl_checkpoint_engine import MasterMetadata
 
 MASTER = MasterMetadata(zmq_ip='10.0.0.1', zmq_port=6000, dist_ip='10.0.0.1', dist_port=5000)
@@ -195,7 +195,7 @@ def test_gpu_manager_still_uses_worker_metadata():
 
 
 # --------------------------------------------------------------------------- sampler
-class LocalSampler(DeltaSamplerMixin):
+class LocalSampler(VLLMDeltaSamplerMixin):
     def _run_in_loop(self, coroutine):
         return asyncio.run(coroutine)
 

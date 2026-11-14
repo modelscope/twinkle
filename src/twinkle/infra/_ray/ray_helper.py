@@ -1,13 +1,20 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import threading
+import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar, Union
 
-from twinkle import DeviceGroup, Platform, find_free_port, find_node_ip, requires
-from twinkle.utils.loader import run_worker_setup_hook
+from twinkle import Platform, find_free_port, find_node_ip, requires
 from .. import _torch_setup
 from .resource_manager import ResourceManager
 
 T = TypeVar('T')
+
+#: Registry key holding every device group's placements, published by the process that ran
+#: ``initialize`` so that any other process (a driver actor growing a sampler pool) can place workers.
+_GROUPS_KEY = '__twinkle_groups__'
+#: Registry key holding the placement of every allocated physical rank (lending trainer ranks).
+_RANKS_KEY = '__twinkle_rank_placements__'
 
 
 class LazyCollect:
@@ -21,8 +28,6 @@ class LazyCollect:
     success); the exception is raised at the real collect.
     """
 
-    _is_lazy_collect = True
-
     def __init__(self, futures, method, collect_func, device_mesh, timeout=None):
         self._futures = futures
         self._method = method
@@ -30,17 +35,30 @@ class LazyCollect:
         self.device_mesh = device_mesh
         self._result = None  # Cache collected results
         self._timeout = timeout
+        #: ObjectRef -> its Ray future, once ``add_done_callback`` asked for one; the collect then reads the
+        #: value that future already fetched instead of fetching it again.
+        self._ref_futures = {}
 
-    def _get_result(self):
-        """Internal method to lazily collect and cache results"""
+    def __getstate__(self):
+        # Ray futures are this process's waiters; a copy in another process fetches on its own.
+        state = self.__dict__.copy()
+        state['_ref_futures'] = {}
+        return state
+
+    def _get_result(self, fetched: Optional[Dict[Any, Any]] = None):
+        """Collect and cache the result; ``fetched`` holds ref values a caller already got in one batch."""
         import ray
         if self._result is None:
             result = []
             for future in self._futures:
-                if isinstance(future, ray.ObjectRef):
-                    result.append(ray.get(future, timeout=self._timeout))
-                else:
+                if not isinstance(future, ray.ObjectRef):
                     result.append(future)
+                elif fetched is not None and future in fetched:
+                    result.append(fetched[future])
+                elif future in self._ref_futures:
+                    result.append(self._ref_futures[future].result(timeout=self._timeout))
+                else:
+                    result.append(ray.get(future, timeout=self._timeout))
             self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
         return self._result
 
@@ -85,6 +103,34 @@ class LazyCollect:
         ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
         return len(ready) == len(refs)
 
+    def add_done_callback(self, fn: Callable[['LazyCollect'], Any]):
+        """Call ``fn(self)`` once every referenced task has finished, without polling.
+
+        Each ``ObjectRef.future()`` reports its own completion; the last one fires ``fn`` on Ray's
+        callback thread, so ``fn`` must not block (hand the handle to a queue and read it there).
+        A failed task also completes; the exception surfaces at :meth:`result`.
+        """
+        import ray
+        refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
+        if not refs:
+            fn(self)
+            return
+        remaining = [len(refs)]
+        lock = threading.Lock()
+
+        def _on_ref_done(_):
+            with lock:
+                remaining[0] -= 1
+                last = remaining[0] == 0
+            if last:
+                fn(self)
+
+        for ref in refs:
+            future = self._ref_futures.get(ref)
+            if future is None:
+                future = self._ref_futures[ref] = ref.future()
+            future.add_done_callback(_on_ref_done)
+
     def __iter__(self):
         """Support iteration: automatically collect results then iterate"""
         return iter(self._get_result())
@@ -119,8 +165,11 @@ class RayHelper:
 
     _remote_components: Dict[str, Any] = {}
 
+    #: Every actor this process created, so ``shutdown`` can terminate them.
+    _created_actors: List[Any] = []
+
     @staticmethod
-    def _get_ray_custom_resources(device_groups: List[DeviceGroup]) -> Dict[str, float]:
+    def _get_ray_custom_resources(device_groups) -> Dict[str, float]:
         """Return accelerator resources needed for local Ray startup.
 
         Ray discovers CUDA GPUs itself.  Other accelerators -- Ascend NPUs, and
@@ -145,10 +194,15 @@ class RayHelper:
 
         @ray.remote
         class WorkerRegistry:
-            """A config center to store global configs"""
+            """A config center for global configs and the membership table of every worker pool.
+
+            A pool entry is ``{worker_id: {'actor', 'state', 'group', 'slot', 'ranks'}}``; ``state`` is one of
+            WARMING / ACTIVE / DRAINING. Ray runs this actor's methods one at a time, so each call is atomic.
+            """
 
             def __init__(self):
                 self.config = {}
+                self.pools = {}
 
             def add_config(self, key: str, value: Any):
                 self.config[key] = value
@@ -163,8 +217,34 @@ class RayHelper:
             def get_config(self, key: str):
                 return self.config.get(key)
 
+            def pool_get(self, key: str) -> Dict[str, Dict[str, Any]]:
+                return dict(self.pools.get(key, {}))
+
+            def pool_put(self, key: str, members: Dict[str, Dict[str, Any]]):
+                self.pools.setdefault(key, {}).update(members)
+
+            def pool_set_state(self, key: str, worker_ids: List[str], state: str):
+                pool = self.pools.get(key, {})
+                for worker_id in worker_ids:
+                    if worker_id in pool:
+                        pool[worker_id]['state'] = state
+
+            def pool_remove(self, key: str, worker_ids: List[str]):
+                pool = self.pools.get(key, {})
+                for worker_id in worker_ids:
+                    pool.pop(worker_id, None)
+
+            def occupied(self) -> List[Tuple[str, Any, Tuple[int, ...]]]:
+                """``(group, slot, ranks)`` of every replica of every pool."""
+                return [(member['group'], member.get('slot'), tuple(member.get('ranks') or ()))
+                        for pool in self.pools.values() for member in pool.values()]
+
+            def all_actors(self) -> List[Any]:
+                return [member['actor'] for pool in self.pools.values() for member in pool.values()]
+
             def clear(self):
                 self.config.clear()
+                self.pools.clear()
 
         registry_name = os.environ.get('TWINKLE_RAY_REGISTRY_NAME', 'config_registry')
         registry_namespace = os.environ.get('TWINKLE_RAY_NAMESPACE')
@@ -183,16 +263,13 @@ class RayHelper:
         assert RayHelper._registry is not None
 
     @staticmethod
-    def initialize(nproc_per_node: int, ncpu_proc_per_node: int, device_groups: List[DeviceGroup]):
+    def initialize(nproc_per_node: int, ncpu_proc_per_node: int, device_groups):
         """Initialize RayHelper.
 
         Args:
             nproc_per_node: How many processes in one node.
             ncpu_proc_per_node: How many cpu processes in one node.
             device_groups: The device groups to initialize.
-
-        Returns:
-            None
         """
         requires('ray')
         import ray
@@ -214,22 +291,46 @@ class RayHelper:
             # Resource manager initializes only once in the pipeline process.
             RayHelper.resource_manager = ResourceManager(nproc_per_node, ncpu_proc_per_node, device_groups)
         RayHelper.init_registry()
+        manager = RayHelper.resource_manager
+        RayHelper.add_config(_GROUPS_KEY, {
+            config.name: {
+                'device_type': config.device_type,
+                'gpus_per_worker': getattr(config, 'gpus_per_worker', 1),
+                'placements': manager.get_group(config.name),
+            }
+            for config in manager.group_configs
+        })
+        RayHelper.add_config(_RANKS_KEY, getattr(manager, 'rank_placements', {}))
 
     @staticmethod
-    def teardown():
-        """Teardown RayHelper."""
+    def shutdown():
+        """Terminate every actor this run created, release the placement groups and stop Ray."""
+        import ray
+        if not RayHelper.ray_inited():
+            return
+        actors = list(RayHelper._created_actors)
+        if RayHelper._registry is not None:
+            try:
+                actors.extend(ray.get(RayHelper._registry.all_actors.remote()))
+            except Exception:  # noqa
+                pass
+        for actor in actors:
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:  # noqa
+                pass
+        RayHelper._created_actors.clear()
         if RayHelper.resource_manager is not None:
             RayHelper.resource_manager.destroy_placement_group()
             RayHelper.resource_manager = None
-
         if RayHelper._registry is not None:
-            import ray
             try:
                 ray.get(RayHelper._registry.clear.remote())
                 ray.kill(RayHelper._registry)
-            except:  # noqa
+            except Exception:  # noqa
                 pass
             RayHelper._registry = None
+        ray.shutdown()
 
     @staticmethod
     def ray_inited():
@@ -249,47 +350,98 @@ class RayHelper:
 
     @staticmethod
     def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], *,
-                         on_submit: Optional[Callable] = None, timeout=None):
-        """Execute method and return results.
-
-        ``timeout`` is passed to ``ray.get(list, timeout=)``, whose semantics are
-        the **total** wall-clock time to collect the whole list -- different from
-        ``LazyCollect``'s per-future timing (see ``do_get_and_collect_func``).
-        The two paths are each bounded on their own; the total-time semantics here
-        are strictly tighter.
-        """
+                         timeout=None):
+        """Execute method and return results; ``timeout`` bounds the whole ``ray.get``."""
         import ray
-        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args, on_submit=on_submit), timeout=timeout)
+        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args), timeout=timeout)
 
     @staticmethod
-    def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], *,
-                          on_submit: Optional[Callable] = None):
-        """Execute method and return futures."""
+    def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
+        """Execute method and return refs."""
         output = []
-        for worker_and_args in workers_and_args:
-            worker, args, kwargs = worker_and_args
-            remote_call = getattr(worker, method_name)
-            result = remote_call.remote(*args, **kwargs)
-            output.append(result)
-            # Register one by one so already-sent refs are never lost if a later RPC send fails.
-            if on_submit is not None:
-                on_submit(worker, result)
+        for worker, args, kwargs in workers_and_args:
+            output.append(getattr(worker, method_name).remote(*args, **kwargs))
         return output
 
     @staticmethod
-    def add_or_get_config(key: str, value: Any):
+    def _registry_call(name: str, *args):
         import ray
-        return ray.get(RayHelper._registry.add_or_get.remote(key, value))
+        RayHelper.init_registry()
+        return ray.get(getattr(RayHelper._registry, name).remote(*args))
+
+    @staticmethod
+    def add_or_get_config(key: str, value: Any):
+        return RayHelper._registry_call('add_or_get', key, value)
 
     @staticmethod
     def add_config(key: str, value: Any):
-        import ray
-        ray.get(RayHelper._registry.add_config.remote(key, value))
+        RayHelper._registry_call('add_config', key, value)
 
     @staticmethod
     def get_config(key: str):
-        import ray
-        return ray.get(RayHelper._registry.get_config.remote(key))
+        return RayHelper._registry_call('get_config', key)
+
+    @staticmethod
+    def pool_get(key: str) -> Dict[str, Dict[str, Any]]:
+        return RayHelper._registry_call('pool_get', key)
+
+    @staticmethod
+    def pool_put(key: str, members: Dict[str, Dict[str, Any]]):
+        RayHelper._registry_call('pool_put', key, members)
+
+    @staticmethod
+    def pool_set_state(key: str, worker_ids: List[str], state: str):
+        RayHelper._registry_call('pool_set_state', key, list(worker_ids), state)
+
+    @staticmethod
+    def pool_remove(key: str, worker_ids: List[str]):
+        RayHelper._registry_call('pool_remove', key, list(worker_ids))
+
+    @staticmethod
+    def pool_occupied() -> List[Tuple[str, Any, Tuple[int, ...]]]:
+        return RayHelper._registry_call('occupied')
+
+    @staticmethod
+    def group_info(group: str) -> Dict[str, Any]:
+        """Device type, worker width and placements of one device group, from any process."""
+        manager = RayHelper.resource_manager
+        if manager is not None:
+            config = manager.get_config(group)
+            return {
+                'device_type': config.device_type,
+                'gpus_per_worker': getattr(config, 'gpus_per_worker', 1),
+                'placements': manager.get_group(group),
+            }
+        groups = RayHelper.get_config(_GROUPS_KEY) or {}
+        if group not in groups:
+            raise ValueError(f'No device group {group!r}; known groups: {sorted(groups)}')
+        return groups[group]
+
+    @staticmethod
+    def rank_placements(ranks: List[int], width: int) -> List[Dict[str, Any]]:
+        """Placements for explicit physical ranks, ``width`` consecutive ranks per worker."""
+        manager = RayHelper.resource_manager
+        table = getattr(manager, 'rank_placements', None) if manager is not None else None
+        if table is None:
+            table = RayHelper.get_config(_RANKS_KEY) or {}
+        ranks = list(ranks)
+        if len(ranks) % width:
+            raise ValueError(f'{len(ranks)} ranks cannot be split into workers of {width} device(s).')
+        placements = []
+        for start in range(0, len(ranks), width):
+            chunk = ranks[start:start + width]
+            missing = [rank for rank in chunk if rank not in table]
+            if missing:
+                raise ValueError(f'Physical ranks {missing} are not allocated by any device group.')
+            groups = {id(table[rank]['placement_group']) for rank in chunk}
+            if len(groups) > 1:
+                raise ValueError(f'Ranks {chunk} span multiple nodes; one worker must stay on one node.')
+            placements.append({
+                'gpu_rank': [table[rank]['gpu_rank'] for rank in chunk],
+                'placement_group': table[chunk[0]]['placement_group'],
+                'ranks': chunk,
+            })
+        return placements
 
     @staticmethod
     def _get_remote_component(component):
@@ -320,53 +472,82 @@ class RayHelper:
         return LazyCollect(futures, method, collect_func, device_mesh, timeout=timeout)
 
     @staticmethod
-    def _resolve_arg_refs(value: Any) -> Any:
+    def _is_handle(value) -> bool:
+        import ray
+        return isinstance(value, ray.ObjectRef) or isinstance(value, LazyCollect)
+
+    @staticmethod
+    def _resolve_arg_refs(value: Any, resolved: Dict[Any, Any]) -> Any:
         """Materialise remote handles (ObjectRef / LazyCollect) anywhere inside an argument value.
 
         Ray dereferences only refs passed at the TOP level of an actor call; a handle nested in a
         list element, a dict value or a dataclass field rides through to the worker as a handle.
-        The stash protocol hands consumers exactly those shapes -- a ``[sample.encoded, ...]``
-        list, a ``RolloutSample`` whose ``encoded`` field is a ref, a ``scored`` dict of lazy
-        forward handles -- and the worker-side unpacking is where every one of them turns back
-        into a value. This is what lets a component method body read its arguments as plain
-        single-process data: remote-function's boundary absorbs the whole stash protocol, and no
-        component ever resolves a handle itself.
+        This is where every one of them turns back into a value, so a component method body reads
+        its arguments as plain single-process data. ``resolved`` maps each ObjectRef to its value,
+        fetched beforehand in one batch (:meth:`do_get_and_collect`).
         """
         import ray
         from dataclasses import fields, is_dataclass, replace
         if isinstance(value, ray.ObjectRef):
-            return ray.get(value)
-        if callable(value) and getattr(value, '_is_lazy_collect', False):
-            return value()
+            return resolved[value]
+        if isinstance(value, LazyCollect):
+            return value._get_result(resolved)
         if isinstance(value, list):
-            return [RayHelper._resolve_arg_refs(item) for item in value]
+            return [RayHelper._resolve_arg_refs(item, resolved) for item in value]
         if isinstance(value, tuple):
-            resolved = tuple(RayHelper._resolve_arg_refs(item) for item in value)
-            return type(value)(*resolved) if hasattr(type(value), '_fields') else resolved
+            items = tuple(RayHelper._resolve_arg_refs(item, resolved) for item in value)
+            return type(value)(*items) if hasattr(type(value), '_fields') else items
         if isinstance(value, dict):
-            return {key: RayHelper._resolve_arg_refs(item) for key, item in value.items()}
+            return {key: RayHelper._resolve_arg_refs(item, resolved) for key, item in value.items()}
         if is_dataclass(value) and not isinstance(value, type):
-            return replace(value, **{field.name: RayHelper._resolve_arg_refs(getattr(value, field.name))
-                                     for field in fields(value)})
+            return replace(value, **{field.name: RayHelper._resolve_arg_refs(getattr(value, field.name), resolved)
+                                     for field in fields(value) if field.init})
         return value
 
     @staticmethod
+    def _collect_arg_refs(value: Any, refs: List[Any]) -> None:
+        """Append every ObjectRef nested in ``value``; a LazyCollect contributes its own refs."""
+        import ray
+        from dataclasses import fields, is_dataclass
+        if isinstance(value, ray.ObjectRef):
+            refs.append(value)
+        elif isinstance(value, LazyCollect):
+            # Fetched with the rest; its collect then reads them from ``resolved``.
+            refs.extend(ref for ref in value._futures if isinstance(ref, ray.ObjectRef))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                RayHelper._collect_arg_refs(item, refs)
+        elif isinstance(value, dict):
+            for item in value.values():
+                RayHelper._collect_arg_refs(item, refs)
+        elif is_dataclass(value) and not isinstance(value, type):
+            for field in fields(value):
+                if field.init:
+                    RayHelper._collect_arg_refs(getattr(value, field.name), refs)
+
+    @staticmethod
     def do_get_and_collect(args, kwargs):
-        """Materialise every remote handle the arguments carry, wherever it is nested."""
-        new_args = [RayHelper._resolve_arg_refs(arg) for arg in args]
-        new_kwargs = {key: RayHelper._resolve_arg_refs(value) for key, value in kwargs.items()}
+        """Materialise every remote handle the arguments carry, wherever it is nested, in ONE ``ray.get``.
+
+        A list of N trajectory refs is then fetched concurrently instead of in N sequential round trips.
+        """
+        import ray
+        refs: List[Any] = []
+        for value in list(args) + list(kwargs.values()):
+            RayHelper._collect_arg_refs(value, refs)
+        refs = list(dict.fromkeys(refs))
+        resolved = dict(zip(refs, ray.get(refs))) if refs else {}
+        new_args = [RayHelper._resolve_arg_refs(arg, resolved) for arg in args]
+        new_kwargs = {key: RayHelper._resolve_arg_refs(value, resolved) for key, value in kwargs.items()}
         return new_args, new_kwargs
 
     @staticmethod
     def has_ref(args, kwargs) -> bool:
         """Whether any argument carries a remote handle, at any nesting depth."""
-        import ray
         from dataclasses import fields, is_dataclass
 
         def _carries_ref(value) -> bool:
-            if isinstance(value, ray.ObjectRef):
-                return True
-            if callable(value) and getattr(value, '_is_lazy_collect', False):
+            if RayHelper._is_handle(value):
                 return True
             if isinstance(value, (list, tuple)):
                 return any(_carries_ref(item) for item in value)
@@ -386,181 +567,84 @@ class RayHelper:
                        instance_id,
                        extra_torch_kwargs: Optional[Dict[str, Any]] = None,
                        max_concurrency: Optional[int] = None,
-                       worker_slots: Optional[List[int]] = None,
+                       placements: Optional[List[Dict[str, Any]]] = None,
                        **kwargs) -> List[T]:
-        # TODO when will remote create remote?
-        # Should it peer create peer? or peer create all?
-        # Whether the input data of each remote is independent, or they are a part of the whole device mesh?
+        """Create one actor per placement of ``group`` (or per explicit ``placements``)."""
         import ray
         from ray.runtime_env import RuntimeEnv
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-        workers = []
-        device_config = RayHelper.resource_manager.get_config(group)
-        placement_groups = RayHelper.resource_manager.get_group(group)
+        info = RayHelper.group_info(group)
+        # Workers added to a live pool get a unique name suffix: the initial ``key-<index>`` names are taken.
+        suffix = None if placements is None else uuid.uuid4().hex[:8]
+        if placements is None:
+            placements = list(info['placements'])
+        if not placements:
+            return []
         worker_cls = RayHelper._get_remote_component(worker_cls)
-        ranks = device_config.ranks
-        if isinstance(ranks, int):
-            ranks = list(range(ranks))
-        assert len(placement_groups) == len(ranks)
-        if worker_slots is not None:
-            slots = tuple(worker_slots)
-            if any(type(slot) is not int or not 0 <= slot < len(ranks) for slot in slots) or len(set(slots)) != len(slots):
-                raise ValueError(f'worker_slots must be unique indices in [0, {len(ranks)}), got {slots!r}.')
-            if not slots:
-                return []
-            placement_groups = [placement_groups[slot] for slot in slots]
-            ranks = [ranks[slot] for slot in slots]
         key = f'{group}-{worker_cls.__class__.__name__}-{instance_id}'
         if execute == 'peer':
-            # Create the peer worker
-            # 0 1 2 3
-            # | | | |
-            # 0 1 2 3
-            _slice = Platform.get_peer_index(len(ranks))
-            placement_groups = placement_groups[_slice]
-            ranks = ranks[_slice]
-            ip, port = RayHelper.get_master_id_port(placement_groups[0]['placement_group'])
+            placements = placements[Platform.get_peer_index(len(placements))]
+            ip, port = RayHelper.get_master_id_port(placements[0]['placement_group'])
             ip = RayHelper.add_or_get_config(key + '-ip', ip)
             port = RayHelper.add_or_get_config(key + '-port', port)
-        elif execute == 'first':
-            placement_groups = placement_groups[:1]
-            ranks = ranks[:1]
-            ip, port = RayHelper.get_master_id_port(placement_groups[0]['placement_group'])
         else:
-            ip, port = RayHelper.get_master_id_port(placement_groups[0]['placement_group'])
+            if execute == 'first':
+                placements = placements[:1]
+            ip, port = RayHelper.get_master_id_port(placements[0]['placement_group'])
 
-        device_type_upper = (device_config.device_type or '').upper()
-        if device_type_upper != 'CPU':
-            world_size = len(ranks)
-            device_type = Platform.get_platform(device_type_upper).__name__
-            for pg_idx, (deploy_pg, gpu) in enumerate(zip(placement_groups, ranks)):
-                deploy_pg: Dict
-                cluster_name = group
-                worker_name = key + '-' + str(pg_idx)
-                env_vars = os.environ.copy()
-                env_vars.update({
-                    'WORLD_SIZE':
-                    str(world_size),
-                    'RANK':
-                    str(pg_idx),
-                    'LOCAL_RANK':
-                    str(0),
-                    'CLUSTER_NAME':
-                    cluster_name,
-                    'WORKER_NAME':
-                    worker_name,
-                    Platform.get_platform(device_type_upper).visible_device_env():
-                    ','.join([str(r) for r in deploy_pg['gpu_rank']]),
-                    'TWINKLE_MODE':
-                    'ray',
-                    _torch_setup.EXTRA_TORCH_KWARGS_ENV:
-                    _torch_setup.to_env_value(extra_torch_kwargs),
-                })
-
+        device_type_upper = (info['device_type'] or '').upper()
+        world_size = len(placements)
+        workers = []
+        for index, placement in enumerate(placements):
+            worker_name = f'{key}-{index}' if suffix is None else f'{key}-{suffix}-{index}'
+            env_vars = os.environ.copy()
+            env_vars.update({
+                'WORLD_SIZE': str(world_size),
+                'RANK': str(index),
+                'LOCAL_RANK': str(0),
+                'CLUSTER_NAME': group,
+                'WORKER_NAME': worker_name,
+                'TWINKLE_MODE': 'ray',
+                _torch_setup.EXTRA_TORCH_KWARGS_ENV: _torch_setup.to_env_value(extra_torch_kwargs),
+            })
+            if device_type_upper != 'CPU':
+                env_vars[Platform.get_platform(device_type_upper).visible_device_env()] = ','.join(
+                    str(r) for r in placement['gpu_rank'])
                 env_vars['MASTER_ADDR'] = ip
                 env_vars['MASTER_PORT'] = str(port)
-
                 # Prevent Ray from overriding CUDA_VISIBLE_DEVICES set in runtime_env
                 # This is critical for multi-GPU workers (gpus_per_worker > 1)
                 env_vars.update(ResourceManager.noset_env())
+            if max_concurrency is not None:
+                # Read back in the worker to size the thread pool that runs
+                # blocking continuous-work methods off the actor's event loop.
+                env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-                if max_concurrency is not None:
-                    # Read back in the worker to size the thread pool that runs
-                    # blocking continuous-work methods off the actor's event loop.
-                    env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
-
-                # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
-                # ("Object of type function is not JSON serializable"). Pass the import path instead.
-                runtime_env = RuntimeEnv(
-                    env_vars=env_vars,
-                    worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
-
-                worker_options = {
-                    'scheduling_strategy':
-                    PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
-                    'name': worker_name,
-                    'namespace': os.environ.get('TWINKLE_RAY_NAMESPACE', 'default'),
-                    'runtime_env': runtime_env,
-                    'num_cpus': 0.01,
-                }
-
-                # The placement group already reserves a worker's full
-                # accelerator allocation and the visible-device env above pins
-                # that actor to the ranks selected by DeviceGroup.  Do not
-                # additionally request a fractional Ray accelerator resource
-                # (GPU, or the custom NPU resource).
-                #
-                # With a fractional request, Ray translates the placement-group
-                # device id through the already narrowed visible-device list.
-                # For a group that does not start at device 0 (e.g. NPUs 2,3
-                # next to a sampler on 0,1) that becomes index 2 into ``['2']``,
-                # killing the worker in ``set_visible_accelerator_ids`` before
-                # its constructor runs.  The CPU claim and placement-group
-                # strategy are sufficient to place the actor in the owning bundle.
-
-                if max_concurrency is not None:
-                    worker_options['max_concurrency'] = max_concurrency
-
-                if os.environ.get('TWINKLE_RAY_NAMESPACE'):
-                    worker_options.update(max_restarts=0, max_task_retries=0)
-                try:
-                    worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
-                except BaseException:
-                    for created in workers:
-                        ray.kill(created, no_restart=True)
-                    raise
-                workers.append(worker)
-        else:
-            world_size = len(ranks)
-            workers = []
-            # For CPU case, don't set visible device environment variables
-            _visible_device_env = {}
-            for rank, (deploy_pg, index) in enumerate(zip(placement_groups, list(range(world_size)))):
-                deploy_pg: Dict
-                cluster_name = group
-                worker_name = key + '-' + str(rank)
-                env_vars = os.environ.copy()
-                env_vars.update({
-                    'WORLD_SIZE': str(world_size),
-                    'RANK': str(rank),
-                    'LOCAL_RANK': str(0),
-                    'CLUSTER_NAME': cluster_name,
-                    'WORKER_NAME': worker_name,
-                    'TWINKLE_MODE': 'ray',
-                    _torch_setup.EXTRA_TORCH_KWARGS_ENV: _torch_setup.to_env_value(extra_torch_kwargs),
-                    **_visible_device_env
-                })
-                if max_concurrency is not None:
-                    # Read back in the worker to size the thread pool that runs
-                    # blocking continuous-work methods off the actor's event loop.
-                    env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
-
-                # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
-                # ("Object of type function is not JSON serializable"). Pass the import path instead.
-                runtime_env = RuntimeEnv(
-                    env_vars=env_vars,
-                    worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
-
-                worker_options = {
-                    'scheduling_strategy':
-                    PlacementGroupSchedulingStrategy(placement_group=deploy_pg['placement_group']),
-                    'name': worker_name,
-                    'namespace': os.environ.get('TWINKLE_RAY_NAMESPACE', 'default'),
-                    'runtime_env': runtime_env,
-                    'num_cpus': 0.01,
-                }
-
-                if max_concurrency is not None:
-                    worker_options['max_concurrency'] = max_concurrency
-
-                if os.environ.get('TWINKLE_RAY_NAMESPACE'):
-                    worker_options.update(max_restarts=0, max_task_retries=0)
-                try:
-                    worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
-                except BaseException:
-                    for created in workers:
-                        ray.kill(created, no_restart=True)
-                    raise
-                workers.append(worker)
+            # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
+            # ("Object of type function is not JSON serializable"). Pass the import path instead.
+            runtime_env = RuntimeEnv(
+                env_vars=env_vars, worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
+            # The placement group already reserves a worker's full accelerator allocation and the
+            # visible-device env pins the actor to its ranks, so no fractional accelerator is requested:
+            # Ray would translate the bundle's device id through the already narrowed visible list.
+            worker_options = {
+                'scheduling_strategy': PlacementGroupSchedulingStrategy(placement_group=placement['placement_group']),
+                'name': worker_name,
+                'namespace': os.environ.get('TWINKLE_RAY_NAMESPACE', 'default'),
+                'runtime_env': runtime_env,
+                'num_cpus': 0.01,
+            }
+            if max_concurrency is not None:
+                worker_options['max_concurrency'] = max_concurrency
+            if os.environ.get('TWINKLE_RAY_NAMESPACE'):
+                worker_options.update(max_restarts=0, max_task_retries=0)
+            try:
+                worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+            except BaseException:
+                for created in workers:
+                    ray.kill(created, no_restart=True)
+                raise
+            workers.append(worker)
+        RayHelper._created_actors.extend(workers)
         return workers

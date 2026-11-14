@@ -40,6 +40,8 @@ class SampleRequest(StrictRequest):
         None, description='Sampling parameters (max_tokens, temperature, num_samples, etc.)')
     adapter_name: str = Field('', description='Adapter name for LoRA inference')
     adapter_uri: str | None = Field(None, description='Adapter URI (twinkle:// path or local path) for LoRA inference')
+    token_only: bool = Field(
+        False, description='Return sampled tokens/logprobs only; encoded inputs are engine ids, media alongside')
 
 
 class SampledSequenceModel(ResponseModel):

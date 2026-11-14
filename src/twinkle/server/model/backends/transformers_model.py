@@ -16,7 +16,6 @@ from tinker import types
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
-from twinkle.infra import collect_tensor_dict
 from twinkle.model import MultiLoraTransformersModel, SpectralHybridTransformersModel
 from twinkle.model.transformers import TransformersModel
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
@@ -97,13 +96,13 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
     # Twinkle-native methods (InputFeature/Trajectory-based I/O)
     # ------------------------------------------------------------------
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict')
     def forward_only(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
         output = super().forward_only(inputs=inputs, **kwargs)
         return to_cpu_safe_output(output)
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict')
     def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         self._normalize_ref_outputs(kwargs)

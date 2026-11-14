@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import TYPE_CHECKING, List, Literal, Union
 
+from twinkle import remote_class, remote_function
+
 from .base import Advantage
 from ._utils import apply_kl_in_reward, reduce_rewards
 
@@ -8,6 +10,7 @@ if TYPE_CHECKING:
     import torch
 
 
+@remote_class(execute='first')
 class GPGAdvantage(Advantage):
     """GPG (Group Policy Gradient) advantage estimator.
 
@@ -21,11 +24,18 @@ class GPGAdvantage(Advantage):
     effectively upweighting informative samples when many are zero-reward.
     """
 
-    def __call__(self,
-                 rewards: Union['torch.Tensor', List[float]],
-                 num_generations: int = 1,
-                 scale: Literal['group', 'batch', 'none'] = 'none',
-                 **kwargs) -> 'torch.Tensor':
+    _reads_f_norm = True
+
+    @remote_function(execute='first', collect='first', stash=(0,))
+    def __call__(self, trajs, **kwargs):
+        """Trajectories and forward lanes in, training-target columns out -- see :class:`Advantage`."""
+        return self._call(trajs, **kwargs)
+
+    def _per_sequence(self,
+                      rewards: Union['torch.Tensor', List[float]],
+                      num_generations: int = 1,
+                      scale: Literal['group', 'batch', 'none'] = 'none',
+                      **kwargs) -> 'torch.Tensor':
         """Compute GPG advantages.
 
         Args:
@@ -47,6 +57,9 @@ class GPGAdvantage(Advantage):
         f_norm = float(kwargs.get('f_norm', 1.0))
 
         rewards = reduce_rewards(rewards, kwargs.get('reward_weights'))
+        # An unscored row (nan out of reduce_rewards) records 0 here, exactly as the legacy
+        # weighted-nansum fold did -- nan-aware group exclusion is grpo/rloo/passk's contract.
+        rewards = torch.nan_to_num(rewards, nan=0.0)
         rewards = apply_kl_in_reward(
             rewards,
             kl_in_reward=kwargs.get('kl_in_reward', False),

@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
 import threading
+import uuid
 from typing import List
 
 from twinkle import Platform, remote_function
@@ -37,16 +38,20 @@ class CheckpointEngineMixin:
         engines = getattr(self, '_checkpoint_engines', None)
         self._checkpoint_engine = engines.get(self._checkpoint_engine_key) if engines else None
 
-    @remote_function(dispatch='all', lazy_collect=False, exclusive=True)
-    def activate_checkpoint_engine(self, backend: str, channel: str = 'default', auth_key: str = ''):
+    @remote_function(dispatch='all', lazy_collect=False)
+    def activate_checkpoint_engine(self, backend: str, channel: str = 'default', auth_key: str = '') -> str:
         """Select one persistent transport channel without discarding the other channels.
 
         ``auth_key`` signs the engine's control frames (IPC) over the unauthenticated socket path;
         it travels through the Ray control path, which the deployment already trusts.
+
+        Returns an id of this object, fixed for its lifetime: the manager compares the ids it gets
+        back to tell whether the set of receivers changed since it built the channel.
         """
         self._select_checkpoint_engine(backend, channel, auth_key)
+        return self.__dict__.setdefault('_checkpoint_receiver_id', uuid.uuid4().hex)
 
-    @remote_function(dispatch='all', lazy_collect=False, exclusive=True)
+    @remote_function(dispatch='all', lazy_collect=False)
     def set_checkpoint_engine_backend(self, backend: str):
         """Choose the default transport channel for backward-compatible callers."""
         self._select_checkpoint_engine(backend, 'default')
@@ -95,13 +100,13 @@ class CheckpointEngineMixin:
         self._checkpoint_engine = engine
         return engine
 
-    @remote_function(collect='first', lazy_collect=False, exclusive=True)
+    @remote_function(collect='first', lazy_collect=False)
     def prepare_checkpoint_engine(self, is_master):
         engine = self._get_or_create_checkpoint_engine()
         engine.is_master = is_master
         return engine.prepare()
 
-    @remote_function(dispatch='slice', lazy_collect=True, exclusive=True)
+    @remote_function(dispatch='slice', lazy_collect=True)
     def init_checkpoint_process_group(self, rank: int, world_size: int, master_metadata):
         """Initialize process group for weight synchronization."""
         if isinstance(rank, list):
@@ -120,13 +125,13 @@ class CheckpointEngineMixin:
             master_metadata=master_metadata,
         )
 
-    @remote_function(dispatch='all', lazy_collect=False, exclusive=True)
+    @remote_function(dispatch='all', lazy_collect=False)
     def finalize_checkpoint_engine(self):
         """Finalize the active engine while retaining a reusable communication group."""
         engine = self._get_or_create_checkpoint_engine()
         engine.finalize()
 
-    @remote_function(dispatch='all', lazy_collect=False, exclusive=True)
+    @remote_function(dispatch='all', lazy_collect=False)
     def reset_checkpoint_engine(self, channel: str = 'default', backend: str = None):
         """Destroy selected persistent channels when their remote peer is retired."""
         engines = getattr(self, '_checkpoint_engines', None) or {}
@@ -170,7 +175,7 @@ class CheckpointEngineMixin:
             f'{type(self).__name__} does not hold local weight shards: implement _get_local_state_dict '
             'on the class that receives EMA updates (see TransformersModel / MegatronModel).')
 
-    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def direct_weight_sync_device(self):
         """Physical identity used to pair a colocated sender with a vLLM receiver."""
         import torch
@@ -179,14 +184,17 @@ class CheckpointEngineMixin:
             return None
         return Platform.get_vllm_device_uuid(torch.cuda.current_device())
 
-    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
+    @remote_function(dispatch='all', lazy_collect=True)
     @timed
     def send_weights_to_vllm(self, targets, *, channel='default', auth_key='',
-                             base_sync_done=False, model_keys=None):
-        """Stream full weights straight to vLLM, bypassing the sampler's data plane.
+                             base_sync_done=False, merge_and_sync=True,
+                             peft_config=None, model_keys=None):
+        """Stream weights straight to vLLM, bypassing the sampler's data plane.
 
-        Every rank must consume the export generator, even those without a local
-        receiver: FSDP/TP export can contain collectives across all training ranks.
+        Full transfers send merged weights; a LoRA-only sync (``base_sync_done`` with
+        ``peft_config``) sends just the adapter. Every rank must consume the export
+        generator, even those without a local receiver: FSDP/TP export can contain
+        collectives across all training ranks.
         """
         import torch
 
@@ -195,7 +203,7 @@ class CheckpointEngineMixin:
         device = self.direct_weight_sync_device()
         target = next((row for row in targets if row['device_uuid'] == device), None)
         weights = self._get_weight_generator(
-            base_sync_done=base_sync_done, merge_and_sync=True, model_keys=model_keys)
+            base_sync_done=base_sync_done, merge_and_sync=merge_and_sync, model_keys=model_keys)
         if target is None:
             for _name, _tensor in weights:
                 pass
@@ -213,7 +221,7 @@ class CheckpointEngineMixin:
         def send():
             try:
                 asyncio.run(sender.update_weights(
-                    weights, base_sync_done=base_sync_done,
+                    weights, peft_config=peft_config, base_sync_done=base_sync_done,
                     zmq_handle=target['endpoint'], auth_key=auth_key, device=transfer_device,
                     direct_large_tensors=True))
             except BaseException as error:
@@ -225,7 +233,7 @@ class CheckpointEngineMixin:
         if errors:
             raise errors[0]
 
-    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
+    @remote_function(dispatch='all', lazy_collect=True)
     def send_weights(
         self,
         adapter_name: str = None,
@@ -283,7 +291,7 @@ class CheckpointEngineMixin:
         if result_container['error'] is not None:
             raise result_container['error']
 
-    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def prepare_ema_sender(self):
         """Prepare this rank's engine as master for a paired 2-rank EMA group.
 
@@ -294,7 +302,7 @@ class CheckpointEngineMixin:
         engine.is_master = True
         return engine.prepare()
 
-    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
+    @remote_function(dispatch='all', lazy_collect=True)
     @timed
     def receive_weights_ema(self, alpha: float, **kwargs):
         """Receive policy weights via checkpoint-engine and apply EMA to local params.

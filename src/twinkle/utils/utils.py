@@ -152,3 +152,16 @@ def run_sync(async_fn: Callable[..., Any], *args, **kwargs):
         return _go()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(_go).result()
+
+
+#: Env var carrying the JSON-encoded torch-init knobs (seed / determinism / tf32) across the process
+#: boundary; ``twinkle.initialize`` publishes it and every Ray worker inherits it.
+EXTRA_TORCH_KWARGS_ENV = 'EXTRA_TORCH_KWARGS'
+
+
+def seed_from_env(default: int = 42) -> int:
+    """The configured RNG seed from ``EXTRA_TORCH_KWARGS``, or *default* when it is absent or None."""
+    import json
+    raw = os.environ.get(EXTRA_TORCH_KWARGS_ENV)
+    seed = json.loads(raw).get('seed') if raw else None
+    return default if seed is None else int(seed)

@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """The token account of one episode, separated from the policy that grows it.
 
-``MultiTurnRollout._run_one`` is two things braided together. One is policy --
+``MultiTurnRollout`` is two things braided together. One is policy --
 how many turns, what a malformed reply costs, when a follow-up stage is granted.
 The other is bookkeeping: which token ids the trajectory now consists of, which
 of them the policy produced, and the logprob for each of those. This file is the
@@ -20,91 +20,25 @@ different ids depending on what precedes it, so a trajectory rebuilt from its ow
 transcript can differ from what was sampled -- and every logprob then belongs to
 a position that has moved. The gradient is still computed, against the wrong
 tokens, and nothing raises. That is why :meth:`record` takes a ``SampledSequence``
-and reads ``new_input_feature`` off it rather than encoding anything, and why
-:meth:`graft` -- the entry point for an episode driven from outside -- compares
-prompt ids against what is already banked and refuses a prompt that does not
-extend it, rather than re-encoding to make it fit.
+and reads ``new_input_feature`` off it rather than encoding anything, and why an
+episode driven from outside appends only what extends the recorded conversation
+(:meth:`observe`) and starts a fresh account when it does not, rather than
+re-encoding to make it fit.
 """
 
 import inspect
-import threading
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from twinkle.data_format import Trajectory
 from twinkle.data_format import last_assistant_text as _traj_last_assistant_text
+from twinkle.data_format import turn_token_spans, validate_trajectory
+from twinkle.data_format.trajectory import _trainable_positions
 from twinkle.data_format.sampling import SampledSequence
 from twinkle.template.base import Template
 from twinkle.template.contract import RolloutState, coerce_tool_call_arguments
 from twinkle_agentic.utils.token_utils import _to_plain, append_ids
-
-
-def _input_order_labels(labels: list[int]) -> list[int]:
-    """Undo twinkle's output-order roll to get labels aligned with ``input_ids``.
-
-    ``append_ids`` stores labels shifted, so ``labels[i]`` is the target for position
-    ``i + 1``; shifting right by one recovers input order, where a trainable position
-    ``j`` holds ``in_labels[j] == input_ids[j]``.
-    """
-    return (labels[-1:] + labels[:-1]) if labels else []
-
-
-def _trainable_positions(input_ids: list[int], labels: list[int], completion_mask: Any) -> list[int]:
-    """Input-order positions of the policy-produced tokens, in order.
-
-    ``labels != -100`` intersected with ``completion_mask`` when one is present. Labels AND
-    the mask both arrive in output/shifted order, so both are unrolled before the
-    position-wise intersection.
-    """
-    in_labels = _input_order_labels(list(labels or []))
-    mask = (
-        _input_order_labels(list(completion_mask))
-        if completion_mask is not None and len(completion_mask) == len(in_labels)
-        else None
-    )
-    positions: list[int] = []
-    for j, lab in enumerate(in_labels):
-        if lab == -100:
-            continue
-        if mask is not None and not mask[j]:
-            continue
-        positions.append(j)
-    return positions
-
-
-def trainable_runs(encoded: dict[str, Any]) -> list[list[int]]:
-    """Contiguous runs of trainable input_ids positions, one run per assistant turn.
-
-    The ledger records a whole generation as trainable and every observation as
-    masked, so the runs alternate one-to-one with the assistant turns.
-    """
-    input_ids = list(encoded.get("input_ids") or [])
-    labels = list(encoded.get("labels") or [])
-    completion_mask = encoded.get("completion_mask")
-    positions = _trainable_positions(input_ids, labels, completion_mask)
-    runs: list[list[int]] = []
-    for j in positions:
-        if runs and j == runs[-1][-1] + 1:
-            runs[-1].append(j)
-        else:
-            runs.append([j])
-    return runs
-
-
-def turn_token_spans(encoded: dict[str, Any]) -> list[tuple[int, int]]:
-    """Per-assistant-turn ``[start, end)`` spans within the flat response tokens.
-
-    The k-th contiguous trainable run occupies a contiguous slice of the flat
-    response array, so this returns those slices as half-open spans -- the turn
-    boundaries multi-turn PRM step segmentation needs.
-    """
-    spans: list[tuple[int, int]] = []
-    cursor = 0
-    for run in trainable_runs(encoded):
-        spans.append((cursor, cursor + len(run)))
-        cursor += len(run)
-    return spans
 
 
 def sampled_token_logprobs(tokens: list[int], logprobs) -> list[float]:
@@ -137,8 +71,7 @@ class TurnLedger:
     """Token ids, labels and logprobs for one episode, and nothing else.
 
     Not thread-safe and not meant to be: one ledger belongs to one episode, and
-    an episode runs in one thread. See :class:`LedgerBook` for the many-episode
-    case, which is a lock around this and not a change to it.
+    an episode takes one step at a time.
 
     Usage is one :meth:`open`, then :meth:`record` after each generation and
     :meth:`observe` for each thing appended that the model did not write, then
@@ -171,7 +104,7 @@ class TurnLedger:
         self._pif: dict[str, Any] = {}
         self._state: RolloutState | None = None
         self._logprobs: list[Any] = []
-        self._sampling_mask: Any = None
+        self._sampling_masks: Any = None
         self._turns = 0
 
     # ---------------------------------------------------------------- reading
@@ -361,7 +294,7 @@ class TurnLedger:
         # and merge exposes it only for a single-generation episode whose one CSR covers
         # the whole response -- a multi-turn episode would need the per-turn blocks
         # concatenated, which no consumer asks for yet.
-        self._sampling_mask = getattr(seq, "sampling_mask", None)
+        self._sampling_masks = getattr(seq, "sampling_masks", None)
 
     def _extend_logprobs(self, seq: SampledSequence) -> None:
         """Append one generation's logprobs -- one per sampled token, or raise.
@@ -439,59 +372,6 @@ class TurnLedger:
         self._pif = _to_plain(dict(input_feature))
         self._state = None
 
-    def graft(
-        self, prompt_token_ids: Sequence[int], seq: SampledSequence, *, messages: Sequence[dict[str, Any]] | None = None
-    ) -> bool:
-        """Bank one round of an episode this loop did not drive.
-
-        An agent running as its own program resends the whole conversation on
-        every call, as text, and never sends token ids back. It does not have to:
-        the prompt it resends is encoded on the way in to be sampled at all, and
-        *those* ids are the real ones -- what the model ran on, not a
-        reconstruction. So the account is kept on this side, one call at a time,
-        and each call is checked against it: ``prompt_token_ids`` must begin with
-        every id already banked.
-
-        What the prompt adds beyond that is whatever happened out there between
-        the two calls -- a tool result, a file the agent read, a question it asked
-        itself -- and it is appended masked, because none of it is the policy's
-        writing. ``seq.tokens`` is, and is appended trainable.
-
-        False, and nothing changed, when the prompt does not extend what is
-        banked. The agent compacted or rewrote its history, which no append can
-        express. The only honest response is to keep the episode as it stands and
-        open a fresh ledger for what follows: splicing the new prompt onto the old
-        ids would produce a trajectory that never existed.
-
-        ``messages`` is recorded for whoever reads the episode afterwards -- a
-        trace, a reward function -- and has no bearing on the ids.
-        """
-        banked = list(self._pif.get("input_ids") or [])
-        prompt = list(prompt_token_ids)
-        if len(prompt) < len(banked) or prompt[: len(banked)] != banked:
-            return False
-        pif: dict[str, Any] | None = self._pif
-        observed = prompt[len(banked) :]
-        if observed:
-            pif = append_ids(pif, observed, self.template, trainable=False)
-            if pif is None:
-                return False
-        if not seq.tokens:
-            raise RuntimeError(
-                f"the endpoint returned an empty continuation for {self.label}; "
-                "there is nothing to train on and nothing to append."
-            )
-        pif = append_ids(pif, list(seq.tokens), self.template, trainable=True)
-        if pif is None:
-            return False
-        if messages is not None:
-            pif["messages"] = list(messages)
-        self._pif = pif
-        self._state = None
-        self._turns += 1
-        self._extend_logprobs(seq)
-        return True
-
     # ---------------------------------------------------------------- closing
 
     def merge(self, trajectory: Trajectory, **fields: Any) -> Trajectory:
@@ -500,9 +380,12 @@ class TurnLedger:
         Token fields land at top level, which is what tells a sampler downstream
         that this is already encoded and must not be encoded again. The TRAINING
         VIEW comes with it: ``response_token_ids`` (the policy-produced tokens,
-        input order), ``rollout_logprobs`` (one scalar per response token -- the
-        old_logps a consumer like GRPO needs), and ``replay_mask`` beside a routed
-        ``routed_experts`` -- so no caller has to re-derive them from the labels.
+        input order), ``response_positions`` (the prediction positions those
+        tokens are scored at -- ``labels[position]`` IS the token, the shifted-labels
+        contract ``validate_trajectory`` asserts), ``rollout_logps`` (one scalar per
+        response token -- the old_logps a consumer like GRPO needs), and
+        ``replay_mask`` beside a routed ``routed_experts`` -- so no caller has to
+        re-derive them from the labels.
         """
         self.audit()
         out = dict(trajectory)
@@ -514,17 +397,31 @@ class TurnLedger:
         input_ids = self._pif.get("input_ids") or []
         completion_mask = self._pif.get("completion_mask")
         positions = _trainable_positions(input_ids, labels, completion_mask)
+        if positions and positions[0] == 0:
+            # A trainable input-order position 0 means the very first token of the
+            # input is policy-produced: there is no prompt. Its label lives nowhere
+            # under the shifted convention (``labels[-1]`` is the last position's
+            # target), so refusing beats guessing an index that scores nothing.
+            raise RuntimeError(
+                f"the first input token of {self.label} is policy-produced; an episode with no "
+                "prompt has no response position to score."
+            )
         out["response_token_ids"] = [input_ids[j] for j in positions]
-        out["rollout_logprobs"] = (
+        out["response_positions"] = [j - 1 for j in positions]
+        out["rollout_logps"] = (
             sampled_token_logprobs(out["response_token_ids"], self._logprobs) if self._logprobs else []
         )
         if "routed_experts" in self._pif:
             out["replay_mask"] = (
                 list(completion_mask) if completion_mask is not None else [int(label != -100) for label in labels]
             )
-        if self._turns == 1 and self._sampling_mask is not None:
-            out["sampling_mask"] = self._sampling_mask
+        if self._turns == 1 and self._sampling_masks is not None:
+            out["sampling_masks"] = self._sampling_masks
         out.update(fields)
+        # The response contract is asserted HERE, at the trajectory's producer: the driver's
+        # hand-out merge stays row-level work, and a bad encoding fails this episode's step
+        # instead of a training batch far downstream.
+        validate_trajectory(out)
         return out
 
     def audit(self) -> None:
@@ -737,98 +634,4 @@ class MessageLedger:
         return
 
 
-class LedgerBook:
-    """Ledgers filed under a key, for episodes whose turns arrive unannounced.
-
-    A ledger belongs to an episode, but an externally driven episode has no loop
-    here to hold one: rounds arrive one HTTP request at a time, interleaved with
-    every other episode in the batch, and the only thing tying a request to an
-    episode is the key it came in under. This keeps the accounts and does the
-    filing.
-
-    A key can end up with more than one ledger, and that is the interesting part.
-    An agent is free to compact or rewrite its own history -- summarise the first
-    twenty turns into a paragraph, drop a file it no longer needs -- and when it
-    does, the next prompt is not an extension of what is banked. There is no
-    append that expresses it and no honest way to splice the two. So the ledger in
-    hand is left exactly as it is, complete up to the last round that did fit, and
-    a fresh one takes over from the rewritten history. One episode becomes two
-    trajectories, which is what actually happened.
-
-    Thread-safe, because the requests are: one lock per key so that concurrent
-    episodes do not wait on each other, and the key registry guarded separately
-    so two first-requests cannot each create an account.
-    """
-
-    def __init__(self, template: Template, *, max_tokens: Optional[int] = None) -> None:
-        """
-        Args:
-            template: one template for every account here, for the reason
-                :class:`TurnLedger` gives: two would disagree about special tokens.
-            max_tokens: passed to each ledger as its length limit.
-        """
-        self.template = template
-        self.max_tokens = max_tokens
-        self._filed: Dict[str, List[TurnLedger]] = {}
-        self._locks: Dict[str, threading.Lock] = {}
-        self._guard = threading.Lock()
-
-    def __contains__(self, key: str) -> bool:
-        with self._guard:
-            return key in self._filed
-
-    def bank(self,
-             key: str,
-             prompt_token_ids: Sequence[int],
-             seq: SampledSequence,
-             *,
-             messages: Optional[Sequence[Dict[str, Any]]] = None) -> Optional[TurnLedger]:
-        """Record one round against ``key``, opening or splitting as needed.
-
-        A key seen for the first time gets an empty account, and the whole prompt
-        the agent sent -- its system prompt, its tool descriptions, the task -- is
-        appended masked. That is correct rather than convenient: none of it is the
-        policy's writing, and we did not compose it.
-
-        Returns the ledger the round landed in, or None when it landed nowhere:
-        the sequence no longer fits the template's length limit. The caller should
-        let the agent carry on -- it has its own reasons to stop, and killing its
-        request over our bookkeeping teaches it nothing -- while knowing that what
-        follows is not being recorded.
-        """
-        ledgers, lock = self._file(key)
-        with lock:
-            current = ledgers[-1]
-            if current.graft(prompt_token_ids, seq, messages=messages):
-                return current
-            fresh = self._ledger(key, len(ledgers))
-            if not fresh.graft(prompt_token_ids, seq, messages=messages):
-                return None
-            ledgers.append(fresh)
-            return fresh
-
-    def close(self, key: str) -> List[TurnLedger]:
-        """Take the accounts for ``key`` away, in the order they were opened.
-
-        Removed, not just read: the key is done, and a request arriving under it
-        afterwards is a new episode that reused a name, not a continuation of one
-        already handed to the trainer. Empty list for a key that never banked
-        anything -- an agent that failed to make a single call.
-        """
-        with self._guard:
-            self._locks.pop(key, None)
-            return self._filed.pop(key, [])
-
-    def _file(self, key: str) -> tuple:
-        with self._guard:
-            if key not in self._filed:
-                self._filed[key] = [self._ledger(key, 0)]
-                self._locks[key] = threading.Lock()
-            return self._filed[key], self._locks[key]
-
-    def _ledger(self, key: str, part: int) -> TurnLedger:
-        label = key if part == 0 else f'{key}#{part}'
-        return TurnLedger(self.template, label=label, max_tokens=self.max_tokens)
-
-
-__all__ = ['LedgerBook', 'MessageLedger', 'TurnLedger', 'turn_token_spans']
+__all__ = ['MessageLedger', 'TurnLedger', 'turn_token_spans']

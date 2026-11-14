@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .groups import training_groups
-from .multi_turn import ClientMultiTurnRollout
+"""Client training runs the local MultiTurnRollout over an :class:`HTTPSampler` and a local
+StreamingDriver; :class:`ClientCheckpointManager` is its weight sync."""
+from ._http_sampler import ClientCheckpointManager, HTTPSampler
 
-__all__ = ['ClientMultiTurnRollout', 'training_groups']
+__all__ = ['ClientCheckpointManager', 'HTTPSampler']

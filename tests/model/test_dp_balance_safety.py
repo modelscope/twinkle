@@ -36,7 +36,7 @@ from twinkle.loss.base import dp_balance_group_size
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.transformers import TransformersModel
 from .test_dp_balance import _call_inputs, _FakeModel
-from .test_grpo_micro_batch import TrainingHarness
+from .test_grpo_micro_batch import TrainingHarness as _BaseTrainingHarness
 
 
 @pytest.mark.parametrize(
@@ -121,6 +121,10 @@ def test_rank_local_token_means_change_gradients_if_reordered(loss):
 )
 def test_audited_invariant_losses_keep_balancing_enabled(loss, size):
     assert dp_balance_group_size(loss) == size
+
+
+class TrainingHarness(_BaseTrainingHarness):
+    _rollout_features = staticmethod(TransformersModel._rollout_features)
 
 
 class _ScoreHarness(TrainingHarness):
@@ -246,6 +250,9 @@ def _cached_model():
         _get_default_group=lambda: "default",
         model=SimpleNamespace(training=False),
         device_mesh=None,
+        _rollout_features=TransformersModel._rollout_features,
+        _capture_response_rows=TransformersModel._capture_response_rows,
+        resolve_output_frame_request=TransformersModel.resolve_output_frame_request,
     )
     model._prepare_forward_only_inputs = lambda inputs, optimizer_config: inputs
 

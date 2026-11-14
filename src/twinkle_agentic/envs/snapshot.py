@@ -11,7 +11,7 @@ File bodies go out byte for byte and the trailing-newline count is stated: a
 listing that tidies up is not ground truth, and a check written against a tidied
 listing fails on the very state it was written from.
 """
-from typing import Any, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 # Written to stdout in one write: the caller reads the whole stream, and a partial
 # line would read as a truncated file body.
@@ -57,14 +57,16 @@ sys.stdout.write('\\n'.join(lines).strip())
 '''
 
 
-def list_workspace(env: Any, *, max_files: int, per_file: int, budget: int, skip: Sequence[str]) -> Tuple[str, str]:
-    """The environment's workspace as ``(listing, error)``; both empty when it has none.
+def list_workspace(root: Optional[str], run_python: Callable[[str], Tuple[int, str]], *, max_files: int,
+                   per_file: int, budget: int, skip: Sequence[str]) -> Tuple[str, str]:
+    """The workspace ``root`` as ``(listing, error)``; both empty when there is none.
 
-    Takes anything with a ``workspace`` and a ``run_script``, so it is as usable
+    Takes the directory and a way to run a python script where it lives, so it is as usable
     from an environment written outside this package as from one written in it.
 
     Args:
-        env: the environment to look inside.
+        root: the directory to look inside; falsy for an environment that keeps none.
+        run_python: ``source -> (exit_code, output)``, running the script next to ``root``.
         max_files: how many files to name, shortest path first.
         per_file: how many bytes of each file body to show.
         budget: total bytes of file bodies, across all of them.
@@ -75,10 +77,9 @@ def list_workspace(env: Any, *, max_files: int, per_file: int, budget: int, skip
         "empty" when it means "I could not look" produces tasks whose only true
         assertion is that nothing happened.
     """
-    root = getattr(env, 'workspace', None)
     if not root:
         return '', ''
-    exit_code, output = env.run_script(
+    exit_code, output = run_python(
         _SNAPSHOT_SCRIPT.format(root=root, max_files=max_files, per_file=per_file, budget=budget, skip=tuple(skip)))
     if exit_code != 0:
         # Reported, not raised: the caller rejects the episode on an error string,

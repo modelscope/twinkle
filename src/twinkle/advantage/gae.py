@@ -1,103 +1,122 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple
 
-from .base import Advantage
-
-if TYPE_CHECKING:
-    import torch
+from twinkle import remote_class, remote_function
+from .base import Advantage, _mean, weighted_score
 
 
+def _check_unit(name: str, value: float) -> float:
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f'{name} must be in [0, 1]')
+    return value
+
+
+@remote_class(execute='first')
 class GAEAdvantage(Advantage):
-    """Token-level generalized advantage estimation for terminal completions."""
+    """Token-level generalized advantage estimation over ragged per-sample response tokens.
 
-    def __init__(self, gamma: float = 1.0, gae_lambda: float = 0.95, normalize: bool = True):
-        if not 0.0 <= gamma <= 1.0:
-            raise ValueError('gamma must be in [0, 1]')
-        if not 0.0 <= gae_lambda <= 1.0:
-            raise ValueError('gae_lambda must be in [0, 1]')
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.normalize = normalize
+    The token-level member of the :class:`Advantage` family: trajectories and the critic /
+    reference forward lanes in, ``advantages`` / ``returns`` / ``old_logps`` / ``old_values``
+    written back onto the trajectories. The recursion itself (:meth:`token_advantages`) takes
+    per-token rows, so a caller holding only references builds this class with
+    ``remote_group`` and the rows are read where they live.
+    """
 
-    @staticmethod
-    def build_token_rewards(
-        rewards: Union['torch.Tensor', List[float]],
-        lengths: List[int],
-        *,
-        old_logps: Optional[List[List[float]]] = None,
-        ref_logps: Optional[List[List[float]]] = None,
-        kl_coef: float = 0.0,
-    ) -> List[List[float]]:
-        import torch
+    _token_level = True
 
-        rewards = torch.as_tensor(rewards, dtype=torch.float32).flatten().tolist()
-        if len(rewards) != len(lengths):
-            raise ValueError('rewards and lengths must have the same batch size')
-        if (old_logps is None) != (ref_logps is None):
-            raise ValueError('old_logps and ref_logps must be provided together')
+    @remote_function(execute='first', collect='first', stash=(0,))
+    def __call__(self, trajs, **kwargs):
+        """Trajectories and forward lanes in, training-target columns out -- see :class:`Advantage`."""
+        return self._call(trajs, **kwargs)
 
-        token_rewards = []
-        for i, (reward, length) in enumerate(zip(rewards, lengths)):
-            if length <= 0:
-                raise ValueError('completion lengths must be positive')
-            values = [0.0] * length
-            if old_logps is not None:
-                if len(old_logps[i]) != length or len(ref_logps[i]) != length:
-                    raise ValueError(f'log-prob length mismatch at sample {i}')
-                values = [-kl_coef * (float(old) - float(ref)) for old, ref in zip(old_logps[i], ref_logps[i])]
-            values[-1] += float(reward)
-            token_rewards.append(values)
-        return token_rewards
+    def _estimate(self, trajs, rollout_logps, scores, *, ref_out, teacher_out, old_out, value_out, global_step=0):
+        if teacher_out is not None or old_out is not None:
+            raise ValueError("GAEAdvantage reads ref_out and value_out only; teacher_out / old_out are "
+                             'the scalar-family lanes.')
+        if ref_out is None:
+            raise ValueError('GAEAdvantage requires ref_out: the reference forward lane for the token KL.')
+        if value_out is None:
+            raise ValueError("GAEAdvantage requires value_out: the pre-update critic forward (task='value').")
+        if not any(value is not None and value == value
+                   for score in scores for value in self._orm_row(score)):
+            raise ValueError('GAEAdvantage got no valid ORM score in the batch (every score row is None): '
+                             'the reward would degenerate into pure KL + value bootstrap. Wire a reward '
+                             'scorer, or pick a scalar-family estimator for a teacher-only run.')
+        # old_logps is fixed to the sampler's lane (no scalar-family pre-update policy forward);
+        # old_values is the pre-update critic snapshot the value loss replays against.
+        old_logps = rollout_logps
+        ref_logps = self._lane('ref_out', ref_out, 'logps', trajs)
+        old_values = self._lane('value_out', value_out, 'values', trajs)
+        kl_rows = self._kl(old_logps, ref_logps, kind=self.kl_kind, reduce='none')
+        rm_scores = [weighted_score(self._orm_row(score), self.reward_weights) for score in scores]
+        token_rewards = self._shape(rm_scores, kl_rows, beta=self.kl_coef, profile='token')
+        advantages, returns = self.token_advantages(token_rewards, old_values)
+        new_trajs = self._write_back(trajs, {'advantages': advantages, 'returns': returns,
+                                             'old_logps': old_logps, 'old_values': old_values})
+        return new_trajs, {'estimator': type(self).__name__, 'num_rows': len(trajs),
+                           'mean_advantage': _mean(advantages), 'mean_return': _mean(returns),
+                           'reward_totals': [float(sum(row)) for row in token_rewards]}
 
-    def __call__(
+    @remote_function(dispatch='all', collect='first', lazy_collect=True)
+    def token_advantages(
         self,
-        rewards: Union['torch.Tensor', List[List[float]]],
-        values: Union['torch.Tensor', List[List[float]]],
+        rewards: Sequence[Any],
+        values: Sequence[Sequence[float]],
         *,
-        masks: Optional[Union['torch.Tensor', List[List[bool]]]] = None,
+        gamma: Optional[float] = None,
+        gae_lambda: Optional[float] = None,
         normalize: Optional[bool] = None,
         **kwargs,
-    ) -> Tuple['torch.Tensor', 'torch.Tensor']:
+    ) -> Tuple[List[List[float]], List[List[float]]]:
+        """``(advantages, returns)``, one row per sample, each as long as its ``values`` row.
+
+        ``values[i]`` is sample i's per-token value estimates; ``rewards[i]`` is its per-token
+        rewards (the same length) or one scalar terminal reward, placed on its last token.
+        ``gamma`` / ``gae_lambda`` / ``normalize`` override the constructor's for this call;
+        ``normalize`` whitens the advantages over every response token of the batch.
+        """
         import torch
 
-        rewards = torch.as_tensor(rewards, dtype=torch.float32)
-        values = torch.as_tensor(values, dtype=torch.float32, device=rewards.device)
-        if rewards.dim() == 1:
-            rewards = rewards.unsqueeze(0)
-        if values.dim() == 1:
-            values = values.unsqueeze(0)
-        if rewards.shape != values.shape:
-            raise ValueError(f'rewards and values must have identical shapes, got {rewards.shape} and {values.shape}')
+        gamma = self.gamma if gamma is None else _check_unit('gamma', float(gamma))
+        gae_lambda = self.gae_lambda if gae_lambda is None else _check_unit('gae_lambda', float(gae_lambda))
+        should_normalize = self.normalize if normalize is None else normalize
+        if len(rewards) != len(values):
+            raise ValueError(f'{len(rewards)} reward rows for {len(values)} value rows.')
+        reward_rows: List[List[float]] = []
+        value_rows: List[List[float]] = []
+        for index, (reward, value) in enumerate(zip(rewards, values)):
+            value = [float(v) for v in value]
+            if isinstance(reward, (list, tuple)):
+                reward = [float(r) for r in reward]
+                if len(reward) != len(value):
+                    raise ValueError(f'row {index}: {len(reward)} token rewards vs {len(value)} values; '
+                                     'the value lane must cover exactly the response tokens.')
+            else:
+                if not value:
+                    raise ValueError(f'row {index} has no response token to carry its terminal reward.')
+                reward = [0.0] * (len(value) - 1) + [float(reward)]
+            reward_rows.append(reward)
+            value_rows.append(value)
+        lengths = [len(row) for row in value_rows]
+        max_len = max(lengths, default=0)
+        rewards_t = torch.tensor([row + [0.0] * (max_len - len(row)) for row in reward_rows], dtype=torch.float32)
+        values_t = torch.tensor([row + [0.0] * (max_len - len(row)) for row in value_rows], dtype=torch.float32)
+        masks = torch.tensor([[True] * length + [False] * (max_len - length) for length in lengths], dtype=torch.bool)
 
-        if masks is None:
-            masks = torch.ones_like(rewards, dtype=torch.bool)
-        else:
-            masks = torch.as_tensor(masks, dtype=torch.bool, device=rewards.device)
-            if masks.shape != rewards.shape:
-                raise ValueError('masks must have the same shape as rewards')
-
-        advantages = torch.zeros_like(rewards)
-        for batch_idx in range(rewards.shape[0]):
-            valid = masks[batch_idx].nonzero(as_tuple=True)[0]
-            last_gae = rewards.new_zeros(())
-            for j in range(len(valid) - 1, -1, -1):
-                pos = valid[j]
-                if j + 1 < len(valid):
-                    next_value = values[batch_idx, valid[j + 1]]
-                else:
-                    next_value = rewards.new_zeros(())
-                delta = rewards[batch_idx, pos] + self.gamma * next_value - values[batch_idx, pos]
-                last_gae = delta + self.gamma * self.gae_lambda * last_gae
+        advantages = torch.zeros_like(rewards_t)
+        for batch_idx, length in enumerate(lengths):
+            last_gae = rewards_t.new_zeros(())
+            for pos in range(length - 1, -1, -1):
+                next_value = values_t[batch_idx, pos + 1] if pos + 1 < length else rewards_t.new_zeros(())
+                delta = rewards_t[batch_idx, pos] + gamma * next_value - values_t[batch_idx, pos]
+                last_gae = delta + gamma * gae_lambda * last_gae
                 advantages[batch_idx, pos] = last_gae
 
-        returns = advantages + values
-        should_normalize = self.normalize if normalize is None else normalize
+        returns = advantages + values_t
         if should_normalize:
-            valid_advantages = advantages[masks]
-            if valid_advantages.numel() > 1:
-                mean = valid_advantages.mean()
-                std = valid_advantages.std(unbiased=False)
-                advantages = torch.where(masks, (advantages - mean) / (std + 1e-8), advantages)
-        advantages = advantages.masked_fill(~masks, 0.0)
-        returns = returns.masked_fill(~masks, 0.0)
-        return advantages, returns
+            valid = advantages[masks]
+            if valid.numel() > 1:
+                advantages = torch.where(masks, (advantages - valid.mean()) / (valid.std(unbiased=False) + 1e-8),
+                                         advantages)
+        return ([advantages[i, :length].tolist() for i, length in enumerate(lengths)],
+                [returns[i, :length].tolist() for i, length in enumerate(lengths)])

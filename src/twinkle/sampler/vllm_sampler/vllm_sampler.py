@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
-from twinkle.checkpoint_engine.delta.rollout.mixin import DeltaSamplerMixin
+from twinkle.checkpoint_engine.delta.rollout.mixin import VLLMDeltaSamplerMixin
 from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
                                  SamplingParams, Trajectory)
 from twinkle.exceptions import FullWeightLoadError
@@ -19,7 +19,6 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
-from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.template.contract import RolloutState, feature_has_media
 from twinkle.utils import Platform
 
@@ -88,7 +87,7 @@ SAMPLER_MAX_CONCURRENCY = max(1, int(_ENV_SAMPLER_CONCURRENCY)) if _ENV_SAMPLER_
 
 
 @remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
-class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamplerMixin):
+class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
     This sampler automatically configures vLLM based on available GPUs.
@@ -100,7 +99,13 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
     # feature without one), and _generate_inputs already reads state.feature / engine_input_ids / media.
     accepts_rollout_state = True
 
-    def __init__(self, model_id: str, engine_args: Dict[str, Any] = None, device_mesh: DeviceMesh = None, **kwargs):
+    def __init__(self,
+                 model_id: str,
+                 engine_args: Dict[str, Any] = None,
+                 device_mesh: DeviceMesh = None,
+                 template: Optional[Any] = None,
+                 template_kwargs: Optional[Dict[str, Any]] = None,
+                 **kwargs):
         """Initialize vLLMSampler.
 
         Args:
@@ -109,6 +114,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
                 is not specified, it will be automatically set based on the
                 number of visible GPUs (from CUDA_VISIBLE_DEVICES).
             device_mesh: Parallel configuration for data parallelism.
+            template: The chat template (instance, class or registered name) that encodes Trajectory
+                inputs; built on every replica at construction.
+            template_kwargs: Keyword arguments for building ``template``.
             **kwargs: Additional arguments.
         """
         os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
@@ -118,6 +126,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
 
         self.model_id = model_id
         self.device_mesh = device_mesh
+        self._init_template(template, template_kwargs)
 
         # Create a dedicated background event loop for vLLM async operations.
         # This is necessary because:
@@ -131,8 +140,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='vLLMSampler-EventLoop')
         self._async_thread.start()
 
-        # Engine request ids currently mid-generation (PartialRolloutMixin), so an in-place weight republish
-        # can abort them and let each resume on the fresh weights. Only touched from ``self._async_loop``.
+        # Engine request ids currently mid-generation, so shutdown / replica removal can abort them.
+        # Only touched from ``self._async_loop``.
         self._inflight_request_ids: set = set()
 
         from .vllm_engine import VLLMEngine
@@ -232,7 +241,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         """
         template = self.template
         if template is None:
-            raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
+            raise ValueError(f"Template not set for adapter '{adapter_name}'. Pass template= to the sampler.")
         encoded = template.encode(
             trajectory,
             add_generation_prompt=add_generation_prompt,
@@ -242,7 +251,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
                 encoded[key] = encoded[key].tolist()
         return encoded
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
@@ -314,12 +323,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         """Sample a single input asynchronously.
 
         ``request_id`` is this generation's engine handle: auto-generated when not given, and registered as
-        in-flight for the duration of the call so :meth:`abort_all_inflight` (PartialRolloutMixin) can
-        interrupt it and let a partial rollout resume from the tokens it produced before the abort.
+        in-flight for the duration of the call so :meth:`abort_all_inflight` can interrupt it.
         """
         if request_id is None:
             request_id = uuid.uuid4().hex
-        if state is None and feature_has_media(feat):
+        if state is None and not token_only and feature_has_media(feat):
+            # token-only takes the ids the engine runs on with their media and builds no feature
             raise NotImplementedError('multimodal sampling requires a Trajectory or RolloutState.')
         prompt_ids = list(state.engine_input_ids) if state is not None else feat['input_ids']
         response = await self._sample_engine_request(
@@ -364,7 +373,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
                     stop_reason=seq.stop_reason,
                     tokens=[] if logprobs_only else seq.tokens,
                     logprobs=None if logprobs_only else seq.logprobs,
-                    sampling_mask=seq.sampling_mask,
+                    sampling_masks=seq.sampling_masks,
                 )
             elif logprobs_only:
                 new_input_feature = _convert_ndarray_to_list(feat)
@@ -387,7 +396,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
                     decoded=self.template.decode(seq.tokens),
                     new_input_feature=new_input_feature,
                     new_state=completion.state,
-                    sampling_mask=seq.sampling_mask,
+                    sampling_masks=seq.sampling_masks,
                 )
             sequences.append(sampled_seq)
         return SampleResponse(
@@ -412,8 +421,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
                 batch.exception()
             raise
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False, enable_continous_work=True,
-                     worker_selector='_sampling_worker_ids')
+    @remote_function(enable_continous_work=True, sticky_key='session_id')
     @timed
     def sample(
         self,
@@ -425,8 +433,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         return_encoded: bool = False,
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
-        allow_partial_rollout: bool = False,
         token_only: bool = False,
+        session_id: Optional[str] = None,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -454,38 +462,31 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
             num_samples: Number of completions to generate per input prompt.
                 When > 1, returns num_samples sequences for each input.
 
-            _session_ids: Ray driver-only routing metadata accepted by the decorator:
-                one session string per input, or None for ordinary load balancing.
-                Repeated sessions reuse their worker; bindings expire after 30 minutes
-                idle or are replaced when their worker is no longer eligible. Session
-                IDs must be unique within this sampler handle (include tenant/adapter
-                identity when needed). Requires a materialized list batch.
+            session_id: Routing key: calls sharing it go to the same replica (a multi-turn episode
+                keeps its prefix cache there).
 
         Returns:
             SampleResponse containing sampled sequences.
             Total sequences = len(inputs) * num_samples.
 
         Note:
-            In Ray mode with multiple workers (DP > 1):
-            - Data is automatically sliced by DP rank (dispatch='slice_dp')
-            - Each worker receives already-sliced inputs (e.g., DP4 with 8 inputs -> 2 per worker)
-            - ``adapter_paths`` is a list too, so it is sliced in lockstep with ``inputs`` and stays
-              aligned with them on every rank.
+            In Ray mode with several replicas, a list of inputs is spread request by request over the
+            least loaded replicas; ``adapter_paths`` is a list too, so it stays aligned with ``inputs``.
         """
         # One sampling path: the blocking sample is the async core driven to completion on the loop. The
         # non-blocking ``submit`` schedules the SAME coroutine on this loop and hands back a Future, so
         # an overlapped RL rollout and a plain blocking call cannot drift.
-        return self._run_in_loop(
-            self._generate_inputs(
-                inputs,
-                sampling_params,
-                adapter_name,
-                adapter_path,
-                return_encoded=return_encoded,
-                use_base_model=use_base_model,
-                adapter_paths=adapter_paths,
-                allow_partial_rollout=allow_partial_rollout,
-                token_only=token_only))
+        with self._gate().read():
+            return self._run_in_loop(
+                self._generate_inputs(
+                    inputs,
+                    sampling_params,
+                    adapter_name,
+                    adapter_path,
+                    return_encoded=return_encoded,
+                    use_base_model=use_base_model,
+                    adapter_paths=adapter_paths,
+                    token_only=token_only))
 
     async def _generate_inputs(
         self,
@@ -497,7 +498,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         return_encoded: bool = False,
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
-        allow_partial_rollout: bool = False,
         token_only: bool = False,
     ) -> List[SampleResponse]:
         """The async generation core shared by the blocking :meth:`sample` and the non-blocking ``submit``.
@@ -507,11 +507,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         call cannot drift apart. LoRA is resolved with the
         async ``_aload_lora`` rather than the blocking ``_load_lora`` because this already runs inside
         the event loop -- ``_load_lora`` would call ``_run_in_loop`` and deadlock on itself.
-
-        With ``allow_partial_rollout`` each input is driven through
-        :meth:`~twinkle.sampler.partial_rollout.PartialRolloutMixin._run_partial_rollout`, so an abort from
-        a concurrent in-place weight republish resumes it from its own tokens on the fresh weights instead
-        of ending it truncated; otherwise each input is a single ``_sample_single`` attempt.
         """
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -530,8 +525,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
                                  '(one per input), not both.')
             if len(adapter_paths) != len(inputs_list):
                 raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
-                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
-                                 'slicing keeps them aligned.')
+                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that '
+                                 'routing keeps them aligned.')
 
         # Check if inputs are Trajectory (not encoded) - aligned with Model.forward logic
         is_trajectory = 'input_ids' not in inputs_list[0]
@@ -545,7 +540,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
 
         if is_trajectory:
             assert self.template is not None, \
-                'Use set_template to add a template when trying to input Trajectory'
+                'Pass template= to the sampler to input Trajectory'
             prompts = [
                 self.template.encode_prompt(traj, backend='vllm', add_generation_prompt=not logprobs_only)
                 for traj in inputs_list
@@ -566,57 +561,23 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         else:
             lora_requests = [await self._aload_lora(adapter_path)] * len(encoded_inputs)
 
-        # ``request_id`` is the caller-side handle for async control (submit/pause/stop): taken from
-        # the raw inputs before encoding (the encoder does not carry it) and handed to the engine as
-        # the request id, so an abort can address this exact generation.
+        # ``request_id`` addresses this exact generation for an abort: taken from the raw inputs before
+        # encoding (the encoder does not carry it) and handed to the engine as the request id.
         request_ids = [input.get('request_id') for input in inputs_list]
 
-        async def _generate_one(feat, state, multi_modal_data, lora_request, request_id):
-            if not allow_partial_rollout:
-                return await self._sample_single(
-                    feat,
-                    sampling_params,
-                    lora_request=lora_request,
-                    multi_modal_data=multi_modal_data,
-                    logprobs_only=logprobs_only,
-                    disable_lora=use_base_model,
-                    token_only=token_only,
-                    request_id=request_id,
-                    state=state,
-                )
-
-            # Partial rollout: one generation attempt is a plain _sample_single; the resume/merge loop
-            # re-runs it from the feature and RolloutState returned by the preceding segment.
-            async def run_attempt(current_input, current_state, attempt_params, attempt):
-                response = await self._sample_single(
-                    current_input,
-                    attempt_params,
-                    lora_request=lora_request,
-                    multi_modal_data=multi_modal_data,
-                    logprobs_only=logprobs_only,
-                    disable_lora=use_base_model,
-                    token_only=token_only,
-                    request_id=request_id,
-                    state=current_state,
-                )
-                return response, None
-
-            outcome = await self._run_partial_rollout(
+        return await self._gather_generation_tasks(
+            self._sample_single(
                 feat,
                 sampling_params,
-                run_attempt=run_attempt,
-                original_state=state,
-                allow_partial_rollout=True,
-                max_retries=self.rollout_max_retries,
-                retry_delay_s=self.rollout_retry_delay_s,
-            )
-            return outcome.response
-
-        return await self._gather_generation_tasks(
-            _generate_one(feat, state, multi_modal_data, lora_request, request_id)
-            for feat, state, multi_modal_data, lora_request, request_id in zip(encoded_inputs, states,
-                                                                               multi_modal_data_list, lora_requests,
-                                                                               request_ids))
+                lora_request=lora_request,
+                multi_modal_data=multi_modal_data,
+                logprobs_only=logprobs_only,
+                disable_lora=use_base_model,
+                token_only=token_only,
+                request_id=request_id,
+                state=state,
+            ) for feat, state, multi_modal_data, lora_request, request_id in zip(
+                encoded_inputs, states, multi_modal_data_list, lora_requests, request_ids))
 
     async def _encode_single(
         self,
@@ -638,8 +599,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
             mm_processor_kwargs=feat.get('mm_processor_kwargs'),
         )
 
-    @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False,
-                     worker_selector='_sampling_worker_ids')
+    @remote_function(enable_continous_work=True)
     @timed
     def encode(
         self,
@@ -652,7 +612,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
     ) -> List[PoolingResponse]:
         """Run a pooling forward (embedding / classify) for each input.
 
-        The pooling counterpart of :meth:`sample`, sharing its dispatch, trajectory encoding, LoRA
+        The pooling counterpart of :meth:`sample`, sharing its routing, trajectory encoding, LoRA
         resolution and multimodal extraction. It requires the engine to have been built as a pooling
         runner (``runner='pooling'`` in ``engine_args``); against a generation engine vLLM has no
         pooling head to run and raises.
@@ -664,7 +624,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
             pooling_params: Which head to run and how to post-process it. Defaults to a plain embedding.
             adapter_name: Optional LoRA adapter name.
             adapter_path: Optional LoRA adapter path, applied to every input in this call.
-            adapter_paths: Per-input LoRA paths, one entry per input, sliced in lockstep with ``inputs``.
+            adapter_paths: Per-input LoRA paths, one entry per input, routed in lockstep with ``inputs``.
 
         Returns:
             One PoolingResponse per input, in input order.
@@ -683,8 +643,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
                                  '(one per input), not both.')
             if len(adapter_paths) != len(inputs_list):
                 raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
-                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that DP '
-                                 'slicing keeps them aligned.')
+                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that '
+                                 'routing keeps them aligned.')
 
         if not inputs_list:
             return []
@@ -692,7 +652,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
 
         if is_trajectory:
             assert self.template is not None, \
-                'Use set_template to add a template when trying to input Trajectory'
+                'Pass template= to the sampler to input Trajectory'
             prompts = [
                 self.template.encode_prompt(traj, backend='vllm', add_generation_prompt=False) for traj in inputs_list
             ]
@@ -768,7 +728,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
             feat = state.feature
         elif 'input_ids' not in inputs:
             if self.template is None:
-                raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
+                raise ValueError(f"Template not set for adapter '{adapter_name}'. Pass template= to the sampler.")
             state = self.template.encode_prompt(inputs, backend='vllm').state
             feat = state.feature
         else:
@@ -811,13 +771,37 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
         """Resume engine state (weights / kv cache) BEFORE the caller proceeds.
 
         Eagerly collected by design: a lazy wake_up returns before the engine is
-        actually awake, and the next wave of ``sample`` calls then parks on the
-        continuous-work barrier waiting for that in-flight ref -- a wave whose
-        own execution the wake_up's completion can depend on, which is a closed
-        wait loop. Waiting here means the device is guaranteed awake (or the
-        failure is visible at this line) before generation starts.
+        actually awake and the next ``sample`` reaches a sleeping engine. Waiting
+        here means the device is guaranteed awake (or the failure is visible at
+        this line) before generation starts.
         """
         self._run_in_loop(self.engine.wake_up(tags=tags))
+
+    def _pause_engine(self) -> bool:
+        """vLLM's own pause: ``keep`` freezes running requests in place (their KV stays), older builds
+        wait for them to finish instead."""
+        import inspect
+        pause = getattr(self.engine.engine, 'pause_generation', None)
+        if pause is None:
+            return False
+        params = inspect.signature(pause).parameters
+        if 'mode' in params:
+            kwargs = {'mode': 'keep', 'clear_cache': False}
+        elif 'wait_for_inflight_requests' in params:
+            kwargs = {'wait_for_inflight_requests': True}
+        else:
+            return False
+        self._run_in_loop(pause(**kwargs))
+        return True
+
+    def _resume_engine(self) -> None:
+        self._run_in_loop(self.engine.engine.resume_generation())
+
+    def _pressure(self) -> float:
+        capacity = getattr(self.engine, 'max_num_seqs', None) or 0
+        if not capacity:
+            return 0.0
+        return len(self._inflight_request_ids) / capacity
 
     @remote_function(dispatch='all', collect='first')
     def reset_prefix_cache(self):
@@ -835,7 +819,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
     def get_state_keys(self):
         return self._run_in_loop(self.engine.get_state_keys())
 
-    @remote_function(dispatch='all', collect='none', lazy_collect=False, exclusive=True)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def direct_weight_sync_metadata(self):
         """Control-only metadata; model tensors never pass through this actor."""
         device = self.direct_weight_sync_device()
@@ -846,19 +830,20 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamp
                 self.engine.engine.collective_rpc('weight_sync_metadata'))
         return self._direct_weight_targets
 
-    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
+    @remote_function(dispatch='all', lazy_collect=True)
     @timed
-    def receive_weights_direct(self, targets, *, auth_key='', base_sync_done=False):
+    def receive_weights_direct(self, targets, *, auth_key='', base_sync_done=False, peft_config=None):
         async def receive():
             await self.engine.engine.collective_rpc(
                 'update_weights_direct',
-                kwargs={'targets': targets, 'auth_key': auth_key, 'base_sync_done': base_sync_done})
+                kwargs={'targets': targets, 'auth_key': auth_key, 'base_sync_done': base_sync_done,
+                        'peft_config': peft_config})
             if not base_sync_done:
                 self.engine.invalidate_synced_lora()
 
         self._run_in_loop(receive())
 
-    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
+    @remote_function(dispatch='all', lazy_collect=True)
     @timed
     def receive_weights(
         self,

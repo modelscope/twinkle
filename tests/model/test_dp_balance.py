@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from twinkle import remote_function
-from twinkle.infra.collectors import collect_tensor_dict
+from twinkle.infra.collectors import tensor_dict
 from twinkle.model.base import TrainableModel
 
 from twinkle.model.dp_balance import (
@@ -282,7 +282,7 @@ class _LocalModel:
     def _dp_balance_spec(self, adapter_name=None, loss_key=None):
         return {"enabled": True, "padding_free": True, "hidden_size": 1024, "group_size": 1}
 
-    @remote_function(dispatch="slice_dp", collect=collect_tensor_dict, dp_balance=True)
+    @remote_function(dispatch="slice_dp", collect=tensor_dict, dp_balance=True)
     def forward_backward(self, *, inputs, advantages, _dp_balance=None):
         lengths = [len(model_input["input_ids"]) for model_input in inputs]
         self.seen = (lengths, advantages.tolist(), _dp_balance)

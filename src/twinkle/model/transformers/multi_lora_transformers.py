@@ -13,7 +13,6 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, template, torch_util
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.infra import collect_tensor_dict
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
@@ -272,7 +271,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             # Leaving a disable_lora context re-enables adapter layers, which flips the flags again.
             self.multi_adapter.enable_slot_gradients()
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict')
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         optimizer_config = self.optimizer_group[kwargs.get('adapter_name')]
@@ -288,7 +287,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         with self._adapter_context(kwargs.get('adapter_name')):
             return super().forward(inputs=inputs, **kwargs)
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    @remote_function(dispatch='slice_dp', collect='tensor_dict')
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         adapter_name = kwargs.get('adapter_name')
         disable_lora = kwargs.get('disable_lora', False)

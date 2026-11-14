@@ -17,15 +17,14 @@ class RolloutResources:
     Sampling keeps the rollout's concurrent execution path. An interrupted or failed
     managed call stops subsequent managed calls; unscoped clients are unchanged.
 
-    Register a dedicated rollout with ``own_rollout`` and unstarted environments with
-    ``own_environment`` before resetting them. Existing ``rollout.streaming(driver)``
-    still owns the driver's lifetime. This scope also drains the rollout if setup
-    fails before that context is entered.
+    Register the rollout (or the driver running it) with ``own_rollout`` and the Env
+    components it uses with ``own_environment``. This scope closes them if setup fails too.
 
-    Exit waits for issued operations, drains the rollout, then closes environments
-    and the client. Unknown execution or failed closes retain their resource handles
-    on this scope and raise; they are never treated as successful release. Cleanup
-    runs off the caller thread so repeated interrupts cannot skip later resources.
+    Exit waits for issued operations, closes the rollout (its episodes and their env
+    sessions), then shuts the environments down and closes the client. Unknown execution
+    or failed closes retain their resource handles on this scope and raise; they are never
+    treated as successful release. Cleanup runs off the caller thread so repeated
+    interrupts cannot skip later resources.
     """
 
     def __init__(self, client_factory, **client_kwargs):
@@ -64,7 +63,7 @@ class RolloutResources:
         return self
 
     def own_rollout(self, rollout):
-        """Transfer one dedicated batch or streaming rollout to this scope; return it."""
+        """Transfer the rollout (anything with ``close()``) to this scope; return it."""
         with self._lock:
             if not self._accepting:
                 raise RuntimeError('resource scope is closing')
@@ -74,26 +73,12 @@ class RolloutResources:
         return rollout
 
     def own_environment(self, env):
-        """Register an unstarted environment before reset, including partial setup."""
+        """Register an Env component; exit shuts it down after the rollout is closed."""
         with self._lock:
             if not self._accepting:
                 raise RuntimeError('resource scope is closing')
             self._environments[id(env)] = env
         return env
-
-    def close_environment(self, env):
-        """Release a collected episode's environment, retaining it if release fails.
-
-        Call after ``rollout.collect`` has returned, when its resource borrow ended.
-        Exit retries any remaining environments after the whole rollout is drained.
-        """
-        with self._lock:
-            if self._environments.get(id(env)) is not env:
-                raise ValueError('environment is not owned by this resource scope')
-        env.ensure_idle()
-        env.close()
-        with self._lock:
-            self._environments.pop(id(env))
 
     def _finish(self, issues):
         def attempt(operation):
@@ -104,10 +89,7 @@ class RolloutResources:
 
         attempt(self.operations.close)
         if self._rollout is not None:
-            attempt(self._rollout.drain)
-            if not self._rollout.is_idle:
-                issues.append(RuntimeError('rollout execution is unconfirmed; environments and client retained'))
-                return
+            attempt(self._rollout.close)
         if self._operation_scope.uncertain_errors:
             issues.append(BaseExceptionGroup(
                 'remote operation settlement is unconfirmed; environments and client retained',
@@ -116,7 +98,12 @@ class RolloutResources:
         with self._lock:
             environments = list(self._environments.values())
         for env in environments:
-            attempt(lambda env=env: self.close_environment(env))
+            def shutdown(env=env):
+                env.shutdown()
+                with self._lock:
+                    self._environments.pop(id(env))
+
+            attempt(shutdown)
         if self.client is not None:
             def close_client():
                 self.client.close()

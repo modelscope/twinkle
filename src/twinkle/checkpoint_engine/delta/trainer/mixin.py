@@ -43,7 +43,11 @@ class DeltaTrainerMixin:
     def _initialize_delta_engine(self, config: DeltaSyncConfig) -> None:
         # Resolve first so an unsupported platform fails before any process group is created.
         platform_name = Platform.get_platform().__name__
-        engine_cls = resolve_delta_engine_cls(platform_name)
+        if config.transport == 'collect':
+            from ..transport.collect_engine import DeltaCollectEngine
+            engine_cls = DeltaCollectEngine
+        else:
+            engine_cls = resolve_delta_engine_cls(platform_name)
         if dist.is_initialized():
             self._delta_metadata_group = dist.new_group(
                 backend='gloo', timeout=timedelta(seconds=config.timeout_seconds))
@@ -81,7 +85,14 @@ class DeltaTrainerMixin:
     def send_delta_weights(self) -> dict[str, Any]:
         started = perf_counter()
         metrics = asyncio.run(self._delta_engine.send_weights(self))
-        return {'send_seconds': perf_counter() - started, 'checkpoint_engine': metrics}
+        result = {'send_seconds': perf_counter() - started, 'checkpoint_engine': metrics}
+        take_flushes = getattr(self._delta_engine, 'take_flushes', None)
+        if take_flushes is not None:
+            # Collect transport: hand the gathered flush stream back for the manager to forward
+            # to the sampler actor (only rank 0's engine collects; the other ranks' take is
+            # empty, and the manager reads rank 0's return).
+            result['flushes'] = take_flushes()
+        return result
 
     @remote_function(dispatch='all', lazy_collect=False)
     def close_delta_trainer(self) -> None:

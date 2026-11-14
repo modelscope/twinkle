@@ -1,20 +1,28 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import TYPE_CHECKING, List, Literal, Union
 
+from twinkle import remote_class, remote_function
+
 from .base import Advantage
-from ._utils import apply_kl_in_reward, compute_gdpo_advantages, reduce_rewards
+from ._utils import apply_kl_in_reward, compute_gdpo_advantages, nanstd, reduce_rewards
 
 if TYPE_CHECKING:
     import torch
 
 
+@remote_class(execute='first')
 class GRPOAdvantage(Advantage):
 
-    def __call__(self,
-                 rewards: Union['torch.Tensor', List[float]],
-                 num_generations: int = 1,
-                 scale: Literal['group', 'batch', 'none', 'gdpo'] = 'group',
-                 **kwargs) -> 'torch.Tensor':
+    @remote_function(execute='first', collect='first', stash=(0,))
+    def __call__(self, trajs, **kwargs):
+        """Trajectories and forward lanes in, training-target columns out -- see :class:`Advantage`."""
+        return self._call(trajs, **kwargs)
+
+    def _per_sequence(self,
+                      rewards: Union['torch.Tensor', List[float]],
+                      num_generations: int = 1,
+                      scale: Literal['group', 'batch', 'none', 'gdpo'] = 'group',
+                      **kwargs) -> 'torch.Tensor':
         """
             GRPO-style advantages: subtract group mean.
 
@@ -75,14 +83,17 @@ class GRPOAdvantage(Advantage):
             return torch.zeros_like(rewards)
 
         grouped = rewards.view(-1, num_generations)
-        group_mean = grouped.mean(dim=1, keepdim=True)
+        # An unscored row rides as NaN out of reduce_rewards: nanmean/nanstd keep it out of the
+        # group statistics and nan_to_num lands it at a zero advantage -- a judge failure is not a
+        # 0 score dragging the group mean, and not a penalty on the sample either.
+        group_mean = torch.nanmean(grouped, dim=1, keepdim=True)
         advantages = grouped - group_mean
 
         if scale == 'group':
-            group_std = grouped.std(dim=1, keepdim=True)
+            group_std = nanstd(grouped, dim=1, keepdim=True)
             advantages = advantages / (group_std + 1e-8)
         elif scale == 'batch':
-            batch_std = grouped.std()
+            batch_std = nanstd(grouped)
             advantages = advantages / (batch_std + 1e-8)
 
-        return advantages.view(-1)
+        return torch.nan_to_num(advantages, nan=0.0).view(-1)

@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import FSDPModule, fully_shard
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Set
 
 from twinkle.model.state_dict_utils import collect_local_state, is_lora_state_key, is_saveable_adapter_key
@@ -252,6 +252,12 @@ class NativeFSDPStrategy(TransformerStrategyBase):
 
             if ep_enabled:
                 _rebuild_ep_param_groups(model)
+
+            # Initialize dtype bookkeeping while trainable adapters are enabled.
+            # A first reference forward under PEFT disable_adapter() temporarily
+            # freezes them, otherwise caching no trainable parameter dtype.
+            if isinstance(model, FSDPModule):
+                model._get_fsdp_state()._lazy_init()
 
         return (model, *(_rebind_optimizer(optimizer, model) if optimizer is not None else None
                          for optimizer in optimizers))

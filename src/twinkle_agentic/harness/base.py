@@ -1,103 +1,74 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Agent harness: framework-owned message/tool lifecycle, minus generate/execute.
+"""How to run one agent program on one task.
 
-``MultiTurnRollout`` owns batched sampling and ``new_input_feature`` extension.
-``Env`` owns tool execution. A harness mutates the same :class:`Trajectory`
-the rest of the stack already uses (``messages`` / ``tools`` / ``user_data``).
-
-Only *append-only* mutations of ``messages`` are safe after the first encode:
-rewriting earlier turns would break the token-id chain MultiTurn keeps in
-``new_input_feature``. Implementations that compact/rewrite history must do
-it in :meth:`start` / the first :meth:`before_generate` (before encode), or
-opt in explicitly.
+An agent here is a command line, not a loop we call. What it takes to add support
+for one is a small, testable object: what to install, what to invoke, which
+protocol it speaks and which environment variable that particular program reads
+its endpoint out of. Nothing in this package imports a sampler, or knows a token
+from a tensor -- that is :class:`~twinkle_agentic.rollout.multi_turn.MultiTurnRollout`'s
+job, and keeping the two apart is what lets a new agent be added without reading
+any of it.
 """
-from abc import ABC
-from typing import Any, Dict, List, Optional
+from abc import ABC, abstractmethod
+from typing import Literal
 
 from twinkle.data_format import Trajectory
 
 
-class AgentHarness(ABC):
-    """Per-episode agent-framework hooks.
+def default_task_text(trajectory: Trajectory) -> str:
+    """The prompt, flattened into the single string a CLI agent accepts.
 
-    Default implementations are no-ops so MultiTurn can take ``harness=None``
-    or a subclass that only overrides some phases. Subclasses that wrap a
-    specific framework (ms-agent, …) live next to this file, not in
-    ``rollout/`` or ``rsi/``. Harness-private runtime (LLMAgent, session)
-    lives on the harness instance, not on the trajectory.
+    Everything the caller wrote -- system framing and question both -- in order,
+    because an agent program brings its own system prompt and would drop ours if
+    only the last user message were passed.
+    """
+    parts = [
+        str(message['content']) for message in (trajectory.get('messages') or [])
+        if message.get('role') in ('system', 'user') and message.get('content')
+    ]
+    if not parts:
+        raise ValueError('cannot build a task for an external agent: the trajectory has no '
+                         'system or user message to send. Override CliAgent.task for a prompt '
+                         'that lives somewhere else.')
+    return '\n\n'.join(parts)
+
+
+class CliAgent(ABC):
+    """How to run one agent program on one task. Nothing about training.
+
+    The rollout runs :meth:`command` in the episode's env session
+    (``env.run_script(episode_id, command, 'shell', timeout)``) and answers the
+    requests the program makes on the way, one rollout step per request.
+
+    Attributes:
+        protocol: which OpenAI protocol the program speaks -- ``'chat'``
+            (``/v1/chat/completions``) or ``'responses'`` (``/v1/responses``).
+        timeout: seconds before the program is killed. There is no other bound
+            on an episode: the agent decides when it is done.
     """
 
-    def tool_schemas(self) -> List[Dict[str, Any]]:
-        """OpenAI-shaped tool list this harness puts in the prompt.
+    protocol: Literal['chat', 'responses'] = 'chat'
+    timeout: float = 1800.0
 
-        The harness owns the tool *names and schemas* so training and serving
-        advertise the identical set; the Env owns the *implementation*. Build
-        the executing side from the same list::
+    def task(self, trajectory: Trajectory) -> str:
+        """The text handed to the agent; defaults to :func:`default_task_text`."""
+        return default_task_text(trajectory)
 
-            tm = ToolManager(EnvTool.from_schemas(env, harness.tool_schemas()))
+    @abstractmethod
+    def command(self, *, task: str, base_url: str, api_key: str, workspace: str) -> str:
+        """The shell command that runs the agent to completion on ``task``.
 
-        Skipping that step lets the prompt advertise tools the Env cannot run,
-        and every call comes back as an unknown-tool error.
+        Args:
+            task: the task, as text. The agent's only input.
+            base_url: an OpenAI-compatible endpoint serving the training policy.
+                Must be what the agent actually calls -- anything else trains on
+                a model that is not the one being updated.
+            api_key: passed through as the API key, and doubling as the identity
+                of this episode. Whatever the agent does with the conversation,
+                it must keep sending this key, or its requests land in no episode.
+            workspace: the directory to work in, or ``''`` when the env keeps none.
+
+        Returns:
+            One shell command, run with the shell. It must exit when the agent is
+            done: this is what tells the rollout the episode is over.
         """
-        return []
-
-    def start(self, query: str, **kwargs) -> Trajectory:
-        """Open an episode: system + user (+ tool schema).
-
-        Called by the training driver *before* MultiTurn encodes. Not invoked
-        by MultiTurn itself. Extra kwargs are merged onto the trajectory
-        (``user_data``, ``tools``, …).
-        """
-        traj: Trajectory = {'messages': [{'role': 'user', 'content': query}]}
-        traj.update(kwargs)
-        return traj
-
-    def before_generate(self, trajectory: Trajectory) -> Trajectory:
-        """Mutate ``trajectory`` immediately before a generate turn.
-
-        First call happens before the initial ``template.encode``. Later calls
-        must be append-only relative to ``messages`` already in the pif,
-        or MultiTurn will ignore the rewrite to protect token alignment.
-        """
-        return trajectory
-
-    def after_generate(
-        self,
-        trajectory: Trajectory,
-        decoded: str,
-        tool_calls: Optional[List[Dict[str, Any]]] = None,
-    ) -> Trajectory:
-        """Normalize the assistant turn (content / tool_calls / reasoning).
-
-        ``decoded`` and ``tool_calls`` come from the sampler; the pif already
-        contains the generated tokens. This hook only updates message metadata
-        so the next encode-bridge and the serving agent see the same shape.
-        """
-        return trajectory
-
-    def after_tools(
-        self,
-        trajectory: Trajectory,
-        observations: List[str],
-        tool_calls: Optional[List[Dict[str, Any]]] = None,
-    ) -> Trajectory:
-        """Turn raw Env observations into ``role=tool`` messages (append).
-
-        Default: one tool message per observation, copying ``id`` / ``name``
-        from the corresponding tool call when present.
-        """
-        msgs = trajectory.setdefault('messages', [])
-        calls = list(tool_calls or [])
-        for i, obs in enumerate(observations):
-            msg: Dict[str, Any] = {'role': 'tool', 'content': obs if obs is not None else ''}
-            if i < len(calls):
-                tc = calls[i] if isinstance(calls[i], dict) else {}
-                fn = tc.get('function') if isinstance(tc.get('function'), dict) else {}
-                tid = tc.get('id') or tc.get('tool_call_id')
-                name = fn.get('name') or tc.get('name') or tc.get('tool_name')
-                if tid:
-                    msg['tool_call_id'] = tid
-                if name:
-                    msg['name'] = name
-            msgs.append(msg)
-        return trajectory

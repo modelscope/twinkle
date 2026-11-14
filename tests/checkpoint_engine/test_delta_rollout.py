@@ -9,12 +9,12 @@ import pytest
 import torch
 
 from twinkle.checkpoint_engine.delta.rollout.cuda_receiver import CudaDeltaReceiver
-from twinkle.checkpoint_engine.delta.rollout.mixin import DeltaSamplerMixin
+from twinkle.checkpoint_engine.delta.rollout.mixin import VLLMDeltaSamplerMixin
 from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
 from twinkle.sampler.vllm_sampler.vllm_worker_extension import _cuda_visible_device
 
 
-class LocalCudaSampler(DeltaSamplerMixin):
+class LocalCudaSampler(VLLMDeltaSamplerMixin):
     def _run_in_loop(self, coroutine):
         return asyncio.run(coroutine)
 

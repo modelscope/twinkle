@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
 
 from twinkle import get_logger
-from twinkle.utils.network import find_free_port
+from twinkle.utils.network import find_free_port, find_node_ip
 from .base import CheckpointEngine, TensorMeta
 from .zmq_auth import generate_auth_key, recv_auth_pyobj, send_auth_pyobj
 from .zmq_pubsub import connect_subscriber, start_publisher
@@ -152,8 +152,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
     def _start_zmq_server(self):
         """Start ZMQ PUB server for metadata broadcast (master only)."""
-        from twinkle.infra import node_ip
-        self.ip = node_ip()
+        self.ip = find_node_ip()
         self.listen_port = find_free_port()
         self.auth_key = generate_auth_key()  # 256-bit shared secret
 
