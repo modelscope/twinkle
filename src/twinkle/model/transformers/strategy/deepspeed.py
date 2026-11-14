@@ -460,7 +460,12 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         """
         import torch
 
-        out: Dict[str, Any] = {'sources': []}
+        # The default stride samples 2.6% of a multi-billion element partition. That is enough to say a
+        # difference exists and roughly where, but not enough to say it is confined there: a post-update
+        # parameter digest can show changes in parameters whose gradient chunk was never sampled. The
+        # count is tunable so a single investigation can pay for a denser read without every run doing so.
+        chunks = int(os.environ.get('TWINKLE_STEP_DELTA_PROBE_CHUNKS', 64))
+        out: Dict[str, Any] = {'sources': [], 'chunks': chunks}
         attr, partitions = self._fp32_partitions(model)
         if partitions:
             for index, group in enumerate(partitions):
@@ -468,7 +473,10 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 if torch.is_tensor(grad):
                     name = f'{attr}[{index}].grad'
                     flat = grad.detach().flatten()
-                    out[name] = {'agg': self._sample_digest(flat), 'chunks': self._chunk_sums(flat)}
+                    out[name] = {
+                        'agg': self._sample_digest(flat, chunks=chunks),
+                        'chunks': self._chunk_sums(flat, chunks=chunks),
+                    }
                     out['sources'].append(name)
         averaged = getattr(getattr(_resolve_engine(model), 'optimizer', None), 'averaged_gradients', None)
         if isinstance(averaged, dict):
