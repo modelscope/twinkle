@@ -536,6 +536,87 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         save_dir = os.path.dirname(output_path)
         engine.save_checkpoint(save_dir)
 
+    def _probe_fp32_master(self, engine, load_dir: str) -> None:
+        """Compare the live fp32 master weights against the ones in the checkpoint.
+
+        Gated by ``TWINKLE_OPT_MASTER_PROBE`` (a path prefix). With ZeRO offload the model's
+        parameters are bfloat16 and the precision the optimizer actually updates lives in a flat
+        float32 partition held by the CPU optimizer, so a checkpoint restore that brings back the
+        moments but not that partition leaves the run updating a master rebuilt from bf16 weights.
+        Restoring the moments alone looks like success: the first resumed step reproduces the source
+        run's loss, grad_norm and gradients exactly, because the forward only ever sees the bf16
+        weights, and the drift appears one step later.
+
+        Only a window of each partition is compared. These files are tens of gigabytes, so the read
+        goes through mmap and the comparison is bounded rather than materialising the artifact.
+        """
+        prefix = os.environ.get('TWINKLE_OPT_MASTER_PROBE')
+        if not prefix:
+            return
+        import glob
+        import json
+
+        rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+        optimizer = getattr(engine, 'optimizer', None)
+        live = None
+        live_attr = None
+        for attr in ('single_partition_of_fp32_groups', 'fp32_partitioned_groups_flat', 'fp32_flat_groups'):
+            candidate = getattr(optimizer, attr, None)
+            if candidate:
+                live, live_attr = candidate, attr
+                break
+        paths = (sorted(glob.glob(os.path.join(load_dir, 'global_step*', f'*rank_{rank}_*optim_states.pt')))
+                 or sorted(glob.glob(os.path.join(load_dir, f'*rank_{rank}_*optim_states.pt'))))
+        record = {
+            'rank': rank,
+            'live_attr': live_attr,
+            'live_groups': len(live) if live is not None else 0,
+            'artifact': os.path.basename(paths[0]) if paths else None,
+        }
+        if live is None or not paths:
+            record['error'] = 'no live master or no optim-states artifact found'
+            with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
+                handle.write(json.dumps(record) + '\n')
+            return
+        try:
+            saved_obj = torch.load(paths[0], map_location='cpu', mmap=True, weights_only=True)
+        except Exception:
+            # DeepSpeed's optim-states artifact can carry non-tensor members (a loss-scaler object,
+            # the ds_config dict) that weights-only loading refuses. This file was written by this
+            # process's own save into this run's own output directory, so it is not untrusted input.
+            saved_obj = torch.load(paths[0], map_location='cpu', mmap=True, weights_only=False)
+        saved_osd = saved_obj.get('optimizer_state_dict', saved_obj)
+        saved = None
+        for key in ('single_partition_of_fp32_groups', 'fp32_flat_groups'):
+            if saved_osd.get(key):
+                saved = saved_osd[key]
+                record['saved_key'] = key
+                break
+        detail = []
+        for index, live_group in enumerate(live):
+            if live_group is None or saved is None or index >= len(saved) or saved[index] is None:
+                detail.append({'group': index, 'skipped': True})
+                continue
+            saved_group = saved[index]
+            window = min(live_group.numel(), saved_group.numel(), 1 << 20)
+            live_values = live_group.detach().flatten()[:window].to(torch.float32)
+            saved_values = saved_group.detach().flatten()[:window].to(torch.float32)
+            rounded = saved_values.to(torch.bfloat16).to(torch.float32)
+            detail.append({
+                'group': index,
+                'numel': int(live_group.numel()),
+                'compared': window,
+                'exact': bool((live_values == saved_values).all()),
+                'worst_abs_diff': float((live_values - saved_values).abs().max()),
+                # True means the master holds bf16-rounded values, whether because the partition was
+                # never restored and was rebuilt from the bf16 parameters, or because it was restored
+                # through a narrowing copy. Either way the fp32 precision is gone.
+                'live_is_bf16_of_saved': bool((live_values == rounded).all()),
+            })
+        record['detail'] = detail
+        with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
+            handle.write(json.dumps(record) + '\n')
+
     def load_optimizer_checkpoint(
         self,
         model,
@@ -556,6 +637,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             engine.load_checkpoint(load_dir)
         except (KeyError, FileNotFoundError, RuntimeError) as e:
             logger.warning(f'Failed to load deepspeed checkpoint: {e}')
+        self._probe_fp32_master(engine, load_dir)
 
     def get_full_state_dict(self, model) -> dict:
         """Collect full state dict (with persistent buffers), gathering ZeRO-3 partitioned params."""
