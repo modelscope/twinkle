@@ -1946,6 +1946,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             'master_pre': engine_step.get('master_pre', master_pre or {}),
             'master_post': engine_step.get('master_post', master_post),
             'grad_partition_pre': engine_step.get('grad_partition_pre', {}),
+            # The Adam moments the update is about to consume, read before it overwrites them in place.
+            # The last input to the update that was never measured: with the master, the gradient it
+            # consumes, lr, betas, eps, weight decay and the Adam step all equal across a resume, the
+            # post-update master still differed, so the moments are what separates "restore lost them"
+            # from "the update itself is not reproducible".
+            'optim_moment_pre': engine_step.get('optim_moment_pre', {}),
             # ZeRO-2 hands the CPU optimizer this step's reduced gradient inside ``step``, so the
             # partition read before it is the PREVIOUS step's gradient; the one read after is the
             # gradient this update actually consumed.

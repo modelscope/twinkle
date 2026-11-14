@@ -452,6 +452,48 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             out[str(index)] = self._aggregate(self._chunk_stats(group.detach().flatten()))
         return out
 
+    def engine_optim_moment_digest(self, model) -> Dict[str, Any]:
+        """Per-group ``[sum, absmax, norm]`` of the Adam moments the next update will read.
+
+        The last unmeasured input to the update. On a ZeRO-2 offload resume, the fp32 master, the
+        gradient the update consumes, the lr, betas, eps, weight decay and the Adam step counter all
+        read identically to the fresh run at the first resumed step, and the post-update master still
+        differs -- so either the moments differ or the update itself does, and nothing else is left to
+        distinguish those. They live in the *inner* optimizer's state, keyed by the fp32 partition
+        tensor the ZeRO optimizer updates rather than by any model parameter, which on this tier the
+        inner optimizer never sees.
+        """
+        import torch
+
+        chunks = int(os.environ.get('TWINKLE_STEP_DELTA_PROBE_CHUNKS', 64))
+        _, partitions = self._fp32_partitions(model)
+        if not partitions:
+            return {}
+        inner = getattr(_resolve_engine(model).optimizer, 'optimizer', None)
+        state = getattr(inner, 'state', None) or {}
+        out: Dict[str, Any] = {'sources': [], 'chunks': chunks}
+        for index, partition in enumerate(partitions):
+            if partition is None:
+                continue
+            # Tensors hash by identity, and the partition tensor is itself the inner optimizer's
+            # "parameter", so this is the same lookup the update performs.
+            entry = state.get(partition)
+            if not isinstance(entry, dict):
+                continue
+            step = entry.get('step')
+            out[f'adam_step[{index}]'] = int(step.item()) if hasattr(step, 'item') else (
+                int(step) if step is not None else None)
+            for moment in ('exp_avg', 'exp_avg_sq'):
+                value = entry.get(moment)
+                if torch.is_tensor(value):
+                    name = f'{moment}[{index}]'
+                    stats = self._chunk_stats(value.detach().flatten(), chunks=chunks)
+                    out[name] = {'agg': self._aggregate(stats), 'chunks': [s[0] for s in stats]}
+                    out['sources'].append(name)
+        if not out['sources']:
+            out['unreadable'] = ['<inner optimizer>.state[fp32_partition]']
+        return out
+
     def engine_grad_partition_digest(self, model) -> Dict[str, Any]:
         """``[sum, absmax, norm]`` of the float32 gradients the offload optimizer updates from.
 
@@ -545,6 +587,9 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                     'grad_partition_pre': self.engine_grad_partition_digest(model),
                     'layout': self.engine_grad_partition_layout(model),
                     'master_pre': self.engine_master_digest(model),
+                    # Read before the update, since the update overwrites the moments in place: this is
+                    # the value the update is about to consume, which is the one that has to match.
+                    'optim_moment_pre': self.engine_optim_moment_digest(model),
                 }
             engine.step()
             if probe:
