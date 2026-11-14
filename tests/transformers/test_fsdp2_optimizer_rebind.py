@@ -176,3 +176,41 @@ def test_a_plain_parameter_the_wrap_already_rebound_is_not_a_replacement_candida
     rebind(model, optimizer)
 
     assert _params_of(optimizer) == [rebound, visual_new]
+
+
+def test_a_repair_after_training_carries_the_adam_moments_onto_the_new_object():
+    """The save-time repair: the optimizer already holds state, keyed by the stale object.
+
+    FSDP2's mixed precision can replace a parameter object AFTER prepare, so the wrap-time repair
+    finds nothing to do and the divergence is only observable at save time -- by which point Adam has
+    moments. An offender is a parameter FSDP2 left unsharded, so it is full-shaped on both sides and
+    the moments transfer by identity; leaving them keyed to the stale object would orphan them and
+    the resumed run would restart its second-moment estimate from zero.
+    """
+    current = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.bfloat16))
+    stale = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.float32))
+    model = _Model([('model.visual.proj.weight', current)])
+    optimizer = _optimizer(stale)
+    optimizer.state[stale] = {'step': 7, 'exp_avg': torch.ones(4, 3), 'exp_avg_sq': torch.full((4, 3), 2.0)}
+
+    rebind(model, optimizer)
+
+    assert _params_of(optimizer) == [current]
+    assert all(key is not stale for key in optimizer.state)
+    assert optimizer.state[current]['step'] == 7
+    assert torch.equal(optimizer.state[current]['exp_avg'], torch.ones(4, 3))
+    assert torch.equal(optimizer.state[current]['exp_avg_sq'], torch.full((4, 3), 2.0))
+
+
+def test_an_unprovable_repair_leaves_the_state_keyed_as_it_was():
+    """Control: when no bucket matches, neither the groups nor the state may be touched."""
+    current = torch.nn.Parameter(torch.zeros(4, 3))
+    stale = torch.nn.Parameter(torch.zeros(9, 9, dtype=torch.float32))
+    model = _Model([('weight', current)])
+    optimizer = _optimizer(stale)
+    optimizer.state[stale] = {'step': 3}
+
+    rebind(model, optimizer)
+
+    assert _params_of(optimizer) == [stale]
+    assert optimizer.state[stale] == {'step': 3}

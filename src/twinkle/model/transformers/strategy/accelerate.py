@@ -302,6 +302,14 @@ class AccelerateStrategy(TransformerStrategyBase):
             return
         for group in param_groups:
             group['params'] = [replacement.get(id(param), param) for param in group['params']]
+        # Adam's moments are keyed by parameter OBJECT, so repointing the groups alone would orphan
+        # them. Every offender is a parameter FSDP2 left unsharded, hence full-shaped on both sides
+        # and differing only in dtype -- and the moments are fp32 whatever the parameter dtype is --
+        # so the state carries over by identity. Empty at wrap time, which makes this a no-op there.
+        state = getattr(inner, 'state', None)
+        if state:
+            for old in [key for key in list(state) if id(key) in replacement]:
+                state[replacement[id(old)]] = state.pop(old)
 
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model, keep_torch_compile=False)
@@ -394,6 +402,11 @@ class AccelerateStrategy(TransformerStrategyBase):
             # PyTorch initializes Adam state through the native optimizer step.
             # AcceleratedOptimizer may skip that step when gradients are not synchronized.
             inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
+            # The wrap-time repair can come too early: FSDP2's mixed precision replaces a parameter
+            # object when it casts it, and that cast does not necessarily happen inside prepare. So
+            # repair again here, where the divergence is observable, before torch maps state by
+            # identity. Nothing to do when the wrap already covered it.
+            self._rebind_unsharded_optimizer_params(model, inner_optimizer)
             self._check_optimizer_params_reachable(model, inner_optimizer)
             optim_state = get_optimizer_state_dict(
                 model,
