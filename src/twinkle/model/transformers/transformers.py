@@ -117,6 +117,18 @@ def _validate_fused_rl_task(task, labels, loss_instance, return_logits, enable_s
                          'return_logits, value outputs and sequence/context parallelism are not supported')
 
 
+def _check_fused_rl_task(self, task, labels, loss_instance, return_logits, enable_sampling_replay):
+    _validate_fused_rl_task(
+        task,
+        labels,
+        loss_instance,
+        return_logits,
+        enable_sampling_replay,
+        parallel_enabled=(getattr(self, '_enable_sp', False)
+                          or (self.device_mesh is not None and self.device_mesh.cp_world_size > 1)),
+    )
+
+
 def _fused_rl_logps(outputs, labels, temperature, return_entropy):
     from twinkle.kernel.ops.fused_linear_selective_log_softmax import fused_linear_selective_log_softmax
 
@@ -634,9 +646,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         labels: torch.Tensor = inputs.pop('labels', None)
         # Not a model argument; the loss reads it back off `inputs` further down.
         completion_mask = inputs.pop('completion_mask', None)
-        parallel_enabled = (
-            getattr(self, '_enable_sp', False) or (self.device_mesh is not None and self.device_mesh.cp_world_size > 1))
-        _validate_fused_rl_task(task, labels, loss_instance, return_logits, enable_sampling_replay, parallel_enabled)
+        _check_fused_rl_task(self, task, labels, loss_instance, return_logits, enable_sampling_replay)
         replay_metadata = replay_loss_mask = replay_masked_labels = None
         if enable_sampling_replay:
             replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
@@ -764,11 +774,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             labels = inputs.pop('labels', None)
             # Not a model argument; the loss reads it back off `inputs` further down.
             completion_mask = inputs.pop('completion_mask', None)
-            parallel_enabled = (
-                getattr(self, '_enable_sp', False)
-                or (self.device_mesh is not None and self.device_mesh.cp_world_size > 1))
-            _validate_fused_rl_task(task, labels, loss_instance, return_logits, enable_sampling_replay,
-                                    parallel_enabled)
+            _check_fused_rl_task(self, task, labels, loss_instance, return_logits, enable_sampling_replay)
             replay_metadata = replay_loss_mask = replay_masked_labels = None
             if enable_sampling_replay:
                 packed_position_ids = processor._is_packed_position_ids(inputs.get('position_ids'))

@@ -4,11 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .kernels import backward_launch, stats_launch
-
-# Entropy's E_p[z] reduction runs in FP32 over row chunks; chunking is over rows,
-# so per-row math is chunk-size independent.
-_ENTROPY_CHUNK_BYTES = 128 << 20
+from .kernels import backward_launch, expected_launch, stats_launch
 
 
 class _FusedLinearSelectiveLogSoftmax(torch.autograd.Function):
@@ -23,12 +19,7 @@ class _FusedLinearSelectiveLogSoftmax(torch.autograd.Function):
         expected = torch.empty_like(logps) if return_entropy else lse
         stats_launch(logits, targets, lse, logps)
         if return_entropy:
-            chunk_rows = max(1, _ENTROPY_CHUNK_BYTES // (logits.shape[-1] * 4))
-            for start in range(0, rows, chunk_rows):
-                stop = min(start + chunk_rows, rows)
-                wide = logits[start:stop].float()
-                probabilities = torch.softmax(wide, dim=-1)
-                expected[start:stop] = (probabilities * wide).sum(dim=-1)
+            expected_launch(logits, lse, expected)
             entropies = lse - expected
         else:
             entropies = None
@@ -70,5 +61,5 @@ def npu_fused_linear_selective_log_softmax(x, weight, targets, temperature=1.0, 
     # indices instead of silently producing wrong probabilities in the Triton kernels.
     if not torch.logical_and(targets >= 0, targets < weight.shape[0]).all():
         raise IndexError(f'targets must be within the vocabulary range [0, {weight.shape[0]})')
-    return _FusedLinearSelectiveLogSoftmax.apply(x.contiguous(), weight.contiguous(),
-                                                 targets.contiguous(), temperature, return_entropy)
+    return _FusedLinearSelectiveLogSoftmax.apply(x.contiguous(), weight.contiguous(), targets.contiguous(), temperature,
+                                                 return_entropy)

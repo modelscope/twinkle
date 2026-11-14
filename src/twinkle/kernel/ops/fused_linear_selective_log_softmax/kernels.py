@@ -58,6 +58,27 @@ def backward_row_kernel(LOGITS, TARGETS, LSE, EXPECTED, GRAD_LOGPS, GRAD_ENTROPI
         tl.store(LOGITS + base + offsets, grad.to(LOGITS.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def expected_row_kernel(LOGITS, LSE, EXPECTED, V, BLOCK_SIZE: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    base = row * V
+    lse = tl.load(LSE + row)
+    running = 0.0
+    for i in range(0, tl.cdiv(V, BLOCK_SIZE)):
+        offsets = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        valid = offsets < V
+        logits = tl.load(LOGITS + base + offsets, mask=valid, other=0.0).to(tl.float32)
+        # Masked lanes contribute 0 to both factors, avoiding exp(-inf) * (-inf) = NaN.
+        probabilities = tl.where(valid, tl.exp(logits - lse), 0.0)
+        running += tl.sum(probabilities * tl.where(valid, logits, 0.0), 0)
+    tl.store(EXPECTED + row, running)
+
+
+def expected_launch(logits, lse, expected):
+    rows, vocab = logits.shape
+    expected_row_kernel[(rows, )](logits, lse, expected, vocab, BLOCK, num_warps=NUM_WARPS)
+
+
 def stats_launch(logits, targets, lse, logps):
     rows, vocab = logits.shape
     stats_row_kernel[(rows, )](logits, targets, lse, logps, vocab, BLOCK, num_warps=NUM_WARPS)
