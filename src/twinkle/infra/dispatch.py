@@ -738,9 +738,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                 # A worker method may hand back a plain Future (an engine-side async submission);
                 # waiting here makes the caller's reference come ready only when the work finishes.
                 result = result.result()
-            if stash is not None and stash is not False:
+            if stash is not None and stash is not False and func.__name__ != '__iter__':
                 # Partial collect: lift the declared heavy channels to refs here, at the value's
                 # birthplace, so the caller's collect materialises only the light half.
+                # ``__iter__`` is exempt: it hands back the generator, not a batch, and the stash
+                # declared on it is applied per yielded value by the ``__next__`` wrapper.
                 result = _stash_channels(result, stash)
             return result
 
