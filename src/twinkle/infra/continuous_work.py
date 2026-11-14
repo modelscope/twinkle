@@ -126,6 +126,16 @@ def _make_worker_async_companion(func, wrapper):
         inspect.Parameter('args', inspect.Parameter.VAR_POSITIONAL),
         inspect.Parameter('kwargs', inspect.Parameter.VAR_KEYWORD),
     ])
+    # The pin alone is not enough on THIS object. Ray resolves an actor method's signature by
+    # walking __wrapped__ back to the undecorated function and injecting its own _ray_trace_ctx
+    # there, so a companion that keeps the chain hands Ray the original method's named parameters
+    # and the _dispatch_context that _submit adds is refused as an unexpected keyword -- measured:
+    # inspect.signature(companion) reports (self, *args, **kwargs) while Ray's ActorMethod captured
+    # (items, tag, _ray_trace_ctx). Dropping the chain here is safe because the companion is only
+    # ever reached through the actor handle; the caller-side wrapper keeps its own __wrapped__,
+    # which is how the test suite reaches the undecorated body.
+    if hasattr(companion, '__wrapped__'):
+        del companion.__wrapped__
     companion.__name__ = _WORKER_ASYNC_PREFIX + func.__name__
     return companion
 
