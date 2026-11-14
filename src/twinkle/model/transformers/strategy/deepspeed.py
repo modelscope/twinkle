@@ -399,13 +399,17 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         the training itself. ``chunks`` samples of ``width`` elements are taken at even strides instead:
         cheap, and -- unlike a prefix window -- able to see a difference anywhere in the partition.
 
-        Reductions are per chunk and in float64, and callers combine them in a fixed order. Aggregating
-        with ``torch.sum`` over the concatenation instead is NOT reproducible: past a few million
-        elements torch reduces in parallel, so the addition order follows thread scheduling and the same
-        data yields a different last digit between two runs. A digest whose aggregate drifts on identical
-        input reports differences that are not there, which is worse than no digest at all.
+        Every reduction here is exact and therefore independent of the schedule it runs under. That is a
+        hard requirement, not a preference: ``torch.sum`` reduces in parallel past a few thousand
+        elements, so the addition order follows thread scheduling and identical data yields a different
+        last digit between two runs. A digest that drifts on identical input reports differences that are
+        not there, which is worse than no digest at all -- measured on a ZeRO-2 resume that restores
+        exactly, a per-chunk ``torch.sum`` differed by two float64 ULP on a 5e3-magnitude group whose
+        elements cancel, while its absmax and norm matched. ``math.fsum`` is correctly rounded and
+        ``max`` is exact, so neither depends on order; converting with ``tolist`` first is what makes
+        that available, and float32/bf16 to float64 is lossless so nothing is given up by doing it.
         """
-        import torch
+        import math
 
         numel = flat.numel()
         if numel == 0:
@@ -419,8 +423,8 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             starts.append(numel - width)
         out = []
         for start in starts:
-            piece = flat[start:start + width].to(torch.float64)
-            out.append([float(piece.sum()), float(piece.abs().max()), float((piece * piece).sum())])
+            values = flat[start:start + width].tolist()
+            out.append([math.fsum(values), max(abs(v) for v in values), math.fsum(v * v for v in values)])
         return out
 
     @staticmethod
@@ -481,6 +485,13 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                         name = f'averaged_gradients[{index}][{slot}]'
                         out[name] = self._aggregate(self._chunk_stats(grad.detach().flatten(), chunks=chunks))
                         out['sources'].append(name)
+        if not out['sources']:
+            # Name the failure instead of returning a bare empty digest. Two empty digests compare equal,
+            # so a tier whose gradient is not readable from here would otherwise sign off as "gradients
+            # matched". ZeRO-2 without offload reaches this after ``step`` by design: it assigns the flat
+            # gradient to the fp32 partition inside ``step`` and clears both it and ``averaged_gradients``
+            # before returning, so the gradient that update consumed is only readable beforehand.
+            out['unreadable'] = list(self._FP32_PARTITION_ATTRS) + ['averaged_gradients']
         return out
 
     def engine_grad_partition_layout(self, model) -> Dict[str, Any]:
