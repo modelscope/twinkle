@@ -1851,7 +1851,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         grad = self._digest_parameters('grad') if probe else None
         self.step(**kwargs)
         if probe:
-            self._write_step_probe(probe, pre, grad)
+            self._write_step_probe(probe, pre, grad, **kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
@@ -1876,7 +1876,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             out[name] = [float(tensor.sum()), float(tensor.abs().max()), float(tensor.norm())]
         return out
 
-    def _write_step_probe(self, prefix, pre, grad):
+    def _write_step_probe(self, prefix, pre, grad, **kwargs):
         # Answers one question a resumed run cannot answer from its loss curve alone: which
         # parameters received a different update. The loss and the global grad_norm are aggregates
         # -- they can match to four decimals while a subset of parameters is updated wrongly, which
@@ -1885,10 +1885,15 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
         step_no = self.__dict__.setdefault('_probe_step_no', 0) + 1
         self.__dict__['_probe_step_no'] = step_no
+        # The optimizer is not an attribute of the model: it lives on the OptimizerGroup selected by
+        # adapter name, resolved here the same way ``step`` resolves it so the probe reads the very
+        # object that was just stepped.
+        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+        optimizer = self.optimizer_group[adapter_name].optimizer
         optimizer_step = None
-        for group in self.optimizer.param_groups:
+        for group in optimizer.param_groups:
             for param in group['params']:
-                state = self.optimizer.state.get(param)
+                state = optimizer.state.get(param)
                 if state is not None and 'step' in state:
                     counter = state['step']
                     optimizer_step = int(counter.item()) if hasattr(counter, 'item') else int(counter)
@@ -1899,9 +1904,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             'rank': rank,
             'step_no': step_no,
             'optimizer_step': optimizer_step,
-            'lrs': [float(g.get('lr', 0.0)) for g in self.optimizer.param_groups],
-            'weight_decays': [float(g.get('weight_decay', 0.0)) for g in self.optimizer.param_groups],
-            'group_sizes': [len(g['params']) for g in self.optimizer.param_groups],
+            'lrs': [float(g.get('lr', 0.0)) for g in optimizer.param_groups],
+            'weight_decays': [float(g.get('weight_decay', 0.0)) for g in optimizer.param_groups],
+            'group_sizes': [len(g['params']) for g in optimizer.param_groups],
             'pre': pre,
             'grad': grad,
             'post': post,
