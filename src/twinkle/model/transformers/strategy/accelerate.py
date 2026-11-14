@@ -688,6 +688,34 @@ class AccelerateStrategy(TransformerStrategyBase):
         state = collect_local_state(unwrapped, include_buffers=True)
         return {name: torch_util.to_local_tensor(tensor).cpu() for name, tensor in state.items()}
 
+    def _match_master_weight_precision(self, model) -> None:
+        """Put trainable parameters in the dtype the FSDP2 wrap will train them at, before a load.
+
+        ``accelerate.utils.fsdp_utils`` upcasts every trainable parameter to a float32 master when
+        mixed precision is on -- ``MixedPrecisionPolicy.param_dtype`` then supplies the
+        low-precision compute copy -- and it does that inside ``prepare``, which runs AFTER this
+        load. Loading a float32 checkpoint into parameters that are still bfloat16 therefore rounds
+        away every bit the source run had trained past bf16 precision, and the run continues from a
+        master that never held them.
+
+        The forward cannot see this: it casts to bf16 either way, so the first resumed step matches
+        the source run's loss and grad_norm exactly, and so do its clipped gradients. The next
+        optimizer update lands on the rounded master, whose bf16 compute cast can now cross a
+        rounding boundary, so the trajectory diverges from the following step onward -- a resume
+        that looks correct for one step and then drifts. Upcasting first makes the copy lossless
+        and turns the wrap's own upcast into a no-op.
+
+        The quantized guard mirrors accelerate's: it skips its upcast entirely when the model
+        carries 4-bit parameters, so this must not upcast them either.
+        """
+        if self.accelerator.mixed_precision == 'no':
+            return
+        if any(hasattr(param, 'quant_state') for param in model.parameters()):
+            return
+        for param in model.parameters():
+            if param.requires_grad and param.is_floating_point() and param.dtype != torch.float32:
+                param.data = param.data.to(torch.float32)
+
     def load_full_state_dict(self, model, state_dict) -> None:
         """Load a full (non-sharded) state dict into the model in-place.
 
@@ -699,6 +727,7 @@ class AccelerateStrategy(TransformerStrategyBase):
             from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
             from twinkle.model.state_dict_utils import with_tied_weight_aliases
+            self._match_master_weight_precision(model)
             self._probe_load_precision(model, state_dict, after=False)
             set_model_state_dict(
                 model,
