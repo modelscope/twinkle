@@ -699,14 +699,18 @@ class AccelerateStrategy(TransformerStrategyBase):
             from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
             from twinkle.model.state_dict_utils import with_tied_weight_aliases
+            self._probe_load_precision(model, state_dict, after=False)
             set_model_state_dict(
                 model,
                 with_tied_weight_aliases(self.unwrap_model(model), state_dict),
                 options=self._prepare_full_optimizer_state_dict_options(for_load=True),
             )
+            self._probe_load_precision(model, state_dict, after=True)
             return
+        self._probe_load_precision(model, state_dict, after=False)
         unwrapped = self.unwrap_model(model)
         unwrapped.load_state_dict(state_dict, strict=False)
+        self._probe_load_precision(model, state_dict, after=True)
 
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
         """Collect LoRA parameters, trained modules_to_save copies, and their buffers."""

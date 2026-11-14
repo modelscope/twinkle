@@ -90,6 +90,51 @@ class TransformerStrategyBase(ABC):
         """Load a full (non-sharded) state dict into the model in-place."""
         ...
 
+    def _probe_load_precision(self, model, state_dict, *, after):
+        """Report whether a full-state-dict load preserves the checkpoint's precision.
+
+        Gated by ``TWINKLE_LOAD_PRECISION_PROBE`` (a path prefix). A checkpoint saved from a
+        float32 master holds values that are almost never representable in bf16, so the fraction
+        of loaded elements that ARE bf16-representable is a direct read-out of a downcast: near
+        zero means full precision survived, near one means the master was rounded to bf16. The
+        destination dtype is reported alongside because a bf16 destination at load time followed
+        by a later promotion to float32 leaves exactly that signature -- float32 parameters
+        carrying bf16-rounded values -- which no post-hoc inspection of the parameters can
+        distinguish from a faithful load of genuinely bf16 weights.
+        """
+        prefix = os.environ.get('TWINKLE_LOAD_PRECISION_PROBE')
+        if not prefix:
+            return
+        import json
+
+        # torch is not a module-level dependency of this abstract base; os already is, and
+        # re-importing it here would make it function-local and shadow the module binding that
+        # the guard above just used.
+        import torch
+        sampled = 0
+        representable = 0
+        total = 0
+        for _, param in model.named_parameters():
+            if sampled >= 8:
+                break
+            local = param.to_local() if hasattr(param, 'to_local') else param
+            if local.numel() == 0 or not local.is_floating_point():
+                continue
+            sampled += 1
+            flat = local.detach().float().flatten()
+            total += flat.numel()
+            representable += int((flat.to(torch.bfloat16).to(torch.float32) == flat).sum().item())
+        record = {
+            'rank': int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0),
+            'phase': 'after' if after else 'before',
+            'dest_dtypes': sorted({str(p.dtype) for p in model.parameters()}),
+            'src_dtypes': sorted({str(v.dtype) for v in state_dict.values() if torch.is_tensor(v)}),
+            'params_sampled': sampled,
+            'bf16_representable_ratio': (representable / total) if total else None,
+        }
+        with open(f'{prefix}.rank{record["rank"]}.jsonl', 'a') as handle:
+            handle.write(json.dumps(record) + '\n')
+
     @abstractmethod
     def get_adapter_state_dict(self, model, adapter_name: str) -> Dict[str, Any]:
         """Collect LoRA parameters, trained modules_to_save copies and their buffers."""
