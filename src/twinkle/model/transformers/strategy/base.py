@@ -253,3 +253,14 @@ class TransformerStrategyBase(ABC):
         still looks right while the update it produced is not.
         """
         return {}
+
+    def engine_master_digest(self, model) -> Dict[str, Any]:
+        """Digest of the float32 master partitions this strategy's optimizer actually updates.
+
+        Offload tiers keep the trained precision in a flat CPU partition that the model's parameters
+        are only a bfloat16 view of, so digesting the parameters cannot show whether an update landed:
+        they read the same values before and after the step. Sampling is spread across the whole
+        partition rather than taken from its head, because a prefix sample is exactly what let a
+        partition that differed past its first elements report as identical.
+        """
+        return {}

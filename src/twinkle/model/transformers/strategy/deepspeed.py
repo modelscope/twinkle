@@ -377,6 +377,51 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         engine = _resolve_engine(model)
         return {name: int(getattr(engine, name)) for name in ('global_steps', 'micro_steps')}
 
+    def engine_master_digest(self, model) -> Dict[str, Any]:
+        """Per-group ``[sum, absmax, norm]`` over samples spread across the whole fp32 partition.
+
+        The partitions are billions of elements, so digesting them whole each step would cost more than
+        the training itself. ``chunks`` samples of ``width`` elements are taken at even strides instead:
+        deterministic between two runs, cheap, and -- unlike a prefix window -- able to see a difference
+        anywhere in the partition. Accumulation is in float64 on CPU, where the order is fixed, so the
+        digest itself is not a source of run-to-run noise.
+        """
+        import torch
+
+        optimizer = getattr(_resolve_engine(model), 'optimizer', None)
+        live = None
+        for attr in ('single_partition_of_fp32_groups', 'fp32_partitioned_groups_flat', 'fp32_flat_groups'):
+            candidate = getattr(optimizer, attr, None)
+            if candidate:
+                live = candidate
+                break
+        if not live:
+            return {}
+        chunks, width = 64, 4096
+        out = {}
+        for index, group in enumerate(live):
+            if group is None:
+                continue
+            flat = group.detach().flatten()
+            numel = flat.numel()
+            if numel == 0:
+                out[str(index)] = [0.0, 0.0, 0.0]
+                continue
+            stride = max(numel // chunks, width)
+            pieces = []
+            for start in range(0, numel - width + 1, stride):
+                pieces.append(flat[start:start + width])
+            if not pieces:
+                pieces = [flat[:min(width, numel)]]
+            # The strided walk stops at the last start that still fits a whole chunk, so an even stride
+            # leaves the partition's tail unsampled -- anchored here, because a restore that is wrong
+            # only past the sampled region is the exact failure this digest exists to catch.
+            if numel >= width and (numel - width) % stride:
+                pieces.append(flat[numel - width:])
+            sample = torch.cat(pieces).to(torch.float64)
+            out[str(index)] = [float(sample.sum()), float(sample.abs().max()), float(sample.norm())]
+        return out
+
     def engine_backward(self, model, loss, *, sync_gradients: bool) -> None:
         """Drive the engine for one micro-batch: backward always, the update at the boundary.
 

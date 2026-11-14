@@ -1847,11 +1847,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         probe = os.environ.get('TWINKLE_STEP_DELTA_PROBE')
         pre = self._digest_parameters('param') if probe else None
+        master_pre = self.strategy.engine_master_digest(self.model) if probe else None
         self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         grad = self._digest_parameters('grad') if probe else None
         self.step(**kwargs)
         if probe:
-            self._write_step_probe(probe, pre, grad, **kwargs)
+            self._write_step_probe(probe, pre, grad, master_pre=master_pre, **kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
 
@@ -1884,12 +1885,15 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             out[name] = [float(tensor.sum()), float(tensor.abs().max()), float(tensor.norm())]
         return out
 
-    def _write_step_probe(self, prefix, pre, grad, **kwargs):
+    def _write_step_probe(self, prefix, pre, grad, *, master_pre=None, **kwargs):
         # Answers one question a resumed run cannot answer from its loss curve alone: which
         # parameters received a different update. The loss and the global grad_norm are aggregates
         # -- they can match to four decimals while a subset of parameters is updated wrongly, which
         # is exactly the signature of a resume that reproduces its first step and then drifts.
         post = self._digest_parameters('param')
+        # On an offload tier the parameters are only a bfloat16 view of the float32 master, so they read
+        # identically before and after the step; the master digest is what shows the update landed.
+        master_post = self.strategy.engine_master_digest(self.model)
         rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
         step_no = self.__dict__.setdefault('_probe_step_no', 0) + 1
         self.__dict__['_probe_step_no'] = step_no
@@ -1935,6 +1939,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             'pre': pre,
             'grad': grad,
             'post': post,
+            'master_pre': master_pre or {},
+            'master_post': master_post,
         }
         with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
             handle.write(json.dumps(record) + '\n')
