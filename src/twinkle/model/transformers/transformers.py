@@ -2459,6 +2459,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         optimizer_config = self.optimizer_group[adapter_name]
 
+        # RNG state is per rank, so it is written here rather than below the master-only return:
+        # each rank's generator has advanced by its own dropout draws, and one master-written file
+        # would replay rank 0's stream on every rank. Wherever the forward is stochastic
+        # (``lora_dropout``, attention dropout) that changes the first resumed step's loss, so a
+        # resume diverges from its source run immediately instead of continuing it. The barrier keeps
+        # ``trainer_state.json`` -- the resume completion marker written just below -- from ever
+        # marking a checkpoint complete while another rank's RNG file is still unwritten.
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        torch.save(self._get_training_rng_state(), os.path.join(output_dir, f'rng_state_rank_{rank}.pt'))
+        if dist.is_initialized():
+            dist.barrier()
+
         if not Platform.is_master():
             return
 
@@ -2489,8 +2501,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 },
                 os.path.join(output_dir, 'scaler.pt'),
             )
-
-        torch.save(self._get_training_rng_state(), os.path.join(output_dir, 'rng_state.pt'))
 
     def _save_tokenizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -2695,7 +2705,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         scaler_path = os.path.join(checkpoint_dir, 'scaler.pt')
         if os.path.exists(scaler_path) and optimizer_config.scaler is not None:
             self._load_scaler_state(scaler_path, adapter_name=adapter_name)
-        rng_path = os.path.join(checkpoint_dir, 'rng_state.pt')
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        rng_path = os.path.join(checkpoint_dir, f'rng_state_rank_{rank}.pt')
+        if not os.path.exists(rng_path):
+            # A checkpoint written before RNG state became per rank carries one master-written file.
+            # Restoring it puts rank 0's stream on every rank, which is closer than no replay but not
+            # exact, so name the consequence instead of letting the resume look faithful.
+            legacy_path = os.path.join(checkpoint_dir, 'rng_state.pt')
+            if os.path.exists(legacy_path):
+                logger.warning(f'{legacy_path} is a single master-written RNG state; rank {rank} replays '
+                               'it instead of its own stream. A stochastic forward (lora_dropout, '
+                               'attention dropout) will not reproduce the source run bit for bit.')
+                rng_path = legacy_path
         if os.path.exists(rng_path):
             self._load_rng_state(rng_path)
         optimizer_config.cur_step = trainer_state['cur_step']
