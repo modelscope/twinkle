@@ -263,6 +263,39 @@ class AccelerateStrategy(TransformerStrategyBase):
         fsdp_plugin = self._get_fsdp_plugin()
         return fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2
 
+    @staticmethod
+    def _check_optimizer_params_reachable(model, optimizer) -> None:
+        """Raise before torch does, naming the parameters its FSDP2 optimizer save cannot map.
+
+        ``get_optimizer_state_dict`` maps optimizer state onto parameter FQNs by object IDENTITY:
+        torch's ``_get_optim_state_dict`` zips the live ``param_groups`` into a pid table, looks every
+        ``model.named_parameters()`` entry up in it, and then indexes that table with each pid of the
+        optimizer's own state. A parameter the wrapped model does not expose is skipped by the lookup
+        but still present in the state, so the save dies as a bare ``KeyError: <pid>`` naming neither
+        the parameter nor the cause.
+
+        FSDP2 makes that reachable: accelerate carves the embedding/tail into their own units and
+        switches the optimizer onto the sharded parameters, so a parameter the model still holds
+        unsharded has an optimizer entry pointing at a different object. Only a final checkpoint asks
+        for optimizer state, which is why such a run trains to completion and fails at the very end.
+        """
+        from torch.distributed.tensor import DTensor
+
+        params = [param for group in optimizer.param_groups for param in group['params']]
+        model_params = list(model.named_parameters())
+        model_ids = {id(param) for _, param in model_params}
+        unreachable = [index for index, param in enumerate(params) if id(param) not in model_ids]
+        if not unreachable:
+            return
+        unsharded = [fqn for fqn, param in model_params if not isinstance(param, DTensor)]
+        raise RuntimeError(
+            f'{len(unreachable)} optimizer parameter(s) (pids {unreachable[:8]}) are not reachable from '
+            f'the wrapped model {type(model).__name__}, so its FSDP2 optimizer state cannot be mapped to '
+            f'parameter names and no resumable checkpoint can be written. The model still holds '
+            f'{len(unsharded)} unsharded parameter(s): {unsharded[:12]}. This is the full-parameter FSDP2 '
+            'path; an adapter run (--tuner lora) keeps every optimizer parameter inside a wrapped unit '
+            'and saves normally.')
+
     def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         import torch
 
@@ -274,6 +307,7 @@ class AccelerateStrategy(TransformerStrategyBase):
             # PyTorch initializes Adam state through the native optimizer step.
             # AcceleratedOptimizer may skip that step when gradients are not synchronized.
             inner_optimizer = getattr(optimizer, 'optimizer', optimizer)
+            self._check_optimizer_params_reachable(model, inner_optimizer)
             optim_state = get_optimizer_state_dict(
                 model,
                 inner_optimizer,
