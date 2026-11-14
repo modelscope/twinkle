@@ -1926,6 +1926,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             'betas': [tuple(g.get('betas', ())) for g in optimizer.param_groups],
             'eps': [float(g.get('eps', 0.0)) for g in optimizer.param_groups],
             'engine_counters': self.strategy.engine_counters(self.model),
+            # The console line rounds grad_norm to four decimals, which hides exactly the low-bit
+            # difference that would separate "the update is wrong" from "the gradient is wrong".
+            # Where the engine owns the update, param.grad is already consumed by the time the probe
+            # runs, so the engine's own full-precision norm is the only readable form of it.
+            'engine_grad_norm': (self.strategy.engine_grad_norm(self.model)
+                                 if self.strategy.owns_update_step() else None),
             'pre': pre,
             'grad': grad,
             'post': post,
