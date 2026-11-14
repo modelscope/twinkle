@@ -4,6 +4,7 @@ import re
 import shutil
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
+from itertools import chain
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Type, Union
 
 from twinkle import Platform, remote_function
@@ -389,14 +390,15 @@ class TrainableModel(ABC):
         return heads.get(adapter_name)
 
     def _task_head_state(self, adapter_name: Optional[str]) -> Dict[str, Any]:
-        """The adapter's head weights under slot-independent 'task_head.' keys.
+        """The head's parameters and calibration buffers under slot-independent keys.
 
         Default (single-model) form reads the head hanging on the host; MultiLora
         hosts override this with their slot-pool export."""
         head = self._attached_head(adapter_name)
         if head is None:
             return {}
-        return {f'task_head.{name}': p.detach().clone().cpu() for name, p in head.named_parameters()}
+        return {f'task_head.{name}': tensor.detach().clone().cpu()
+                for name, tensor in chain(head.named_parameters(), head.named_buffers())}
 
     def _task_head_carries_on_this_rank(self) -> bool:
         """Whether THIS rank is expected to hold the head at all. True by default;
@@ -418,20 +420,27 @@ class TrainableModel(ABC):
                     'carries no head to restore them into.')
             return
         params = dict(head.named_parameters())
-        expected = {f'task_head.{name}' for name in params}
-        if set(state) != expected:
+        tensors = {**params, **dict(head.named_buffers())}
+        expected = {f'task_head.{name}' for name in tensors}
+        legacy = {f'task_head.{name}' for name in params}
+        if set(state) not in (expected, legacy):
             raise ValueError(
                 f'task_head checkpoint keys {sorted(state)} do not match the head it '
                 f'restores: expected {sorted(expected)}.')
+        for key, value in state.items():
+            tensor = tensors[key[len('task_head.'):]]
+            if value.shape != tensor.shape:
+                raise ValueError(f'task-head shape mismatch for {key}: {value.shape} != {tensor.shape}')
         with torch.no_grad():
-            for name, param in params.items():
-                value = state[f'task_head.{name}'].to(device=param.device, dtype=param.dtype)
+            for key, value in state.items():
+                param = tensors[key[len('task_head.'):]]
+                value = value.to(device=param.device, dtype=param.dtype)
                 param.data.copy_(value)
 
     def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
         """Write the adapter's attached head to its own task_head.safetensors.
 
-        Keyed 'task_head.<param>' -- slot-independent, so a re-added adapter may land
+        Keyed 'task_head.<name>' -- slot-independent, so a re-added adapter may land
         on a different slot and still restore. Runs on the master rank only; the head
         file is tiny, so it writes synchronously alongside the (async) weights."""
         state = self._task_head_state(adapter_name)

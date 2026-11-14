@@ -3,6 +3,7 @@ import torch
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
+from itertools import chain
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Embedding, Linear, LoraLayer
 from torch.distributed.tensor import distribute_tensor
@@ -56,7 +57,8 @@ class MultiLoraTaskHeadSlots:
             head = build_head()
             setattr(host, f'task_head_slot_{slot}', head)
             self._initial_weights[slot] = {
-                name: parameter.detach().clone().cpu() for name, parameter in head.named_parameters()}
+                name: tensor.detach().clone().cpu()
+                for name, tensor in chain(head.named_parameters(), head.named_buffers())}
         host.task_heads = {}
 
     def bind(self, adapter_name: str, host: torch.nn.Module) -> None:
@@ -93,7 +95,9 @@ class MultiLoraTaskHeadSlots:
         if head is None:
             return
         with torch.no_grad():
-            for name, parameter in head.named_parameters():
+            # Calibration buffers can be nonpersistent in the family head. They still
+            # belong to this tenant and must not leak when the physical slot is reused.
+            for name, parameter in chain(head.named_parameters(), head.named_buffers()):
                 saved = self._initial_weights.get(slot, {}).get(name)
                 if saved is not None:
                     write_param(parameter, saved)
@@ -118,7 +122,7 @@ class MultiLoraTaskHeadSlots:
             return {}
         return {
             f'task_head.{name}': read_param(parameter).detach().clone().cpu()
-            for name, parameter in head.named_parameters()
+            for name, parameter in chain(head.named_parameters(), head.named_buffers())
         }
 
     def import_state(self, adapter_name: str, host: torch.nn.Module, state: Dict[str, torch.Tensor],
@@ -142,16 +146,25 @@ class MultiLoraTaskHeadSlots:
             # lives on the last stage; every rank binds the same slot index.
             return
         parameters = dict(head.named_parameters())
+        tensors = {**parameters, **dict(head.named_buffers())}
         covered = {key[len(prefix):] for key in head_keys}
-        if covered != set(parameters):
+        # Parameter-only checkpoints predate calibration snapshots; keep them loadable.
+        if covered not in (set(parameters), set(tensors)):
             raise ValueError(
                 f'checkpoint task-head keys {sorted(covered)} do not match the bound head\'s '
-                f'parameters {sorted(parameters)}: the head architecture changed since the '
+                f'tensors {sorted(tensors)}: the head architecture changed since the '
                 'checkpoint was written.')
+        for key in head_keys:
+            tensor = tensors[key[len(prefix):]]
+            shapes = {tensor.shape}
+            if hasattr(tensor, 'to_local'):
+                shapes.add(tensor.to_local().shape)
+            if state[key].shape not in shapes:
+                raise ValueError(f'task-head shape mismatch for {key}: {state[key].shape} != {tensor.shape}')
         with torch.no_grad():
             for key in head_keys:
                 name = key[len(prefix):]
-                parameter = parameters[name]
+                parameter = tensors[name]
                 write_param(parameter, state[key])
 
 

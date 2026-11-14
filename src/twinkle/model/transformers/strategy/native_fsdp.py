@@ -24,6 +24,35 @@ PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
 
+def _shard_builtin_task_heads(model, *, mesh, reshard_after_forward, mp_policy):
+    # The head wrapper owns unsharding for the readout backward instead of the root wrapper.
+    heads = [getattr(model, name, None) for name in ('score', 'classifier')]
+    heads.extend((getattr(model, 'task_heads', None) or {}).values())
+    seen = set()
+    for head in heads:
+        if (head is None or id(head) in seen or getattr(head, 'keep_fp32', False)
+                or next(head.parameters(), None) is None):
+            continue
+        seen.add(id(head))
+        fully_shard(head, mesh=mesh, reshard_after_forward=reshard_after_forward, mp_policy=mp_policy)
+        head._twinkle_independent_fsdp = True
+
+
+def _shard_fp32_task_heads(model, *, mesh, reshard_after_forward):
+    # Independent FSDP wrappers unshard these externally-called heads and keep per-group dtypes uniform.
+    for module in model.modules():
+        if (getattr(module, '_twinkle_independent_fsdp', False)
+                or not getattr(module, 'keep_fp32', False) or next(module.parameters(), None) is None):
+            continue
+        fully_shard(
+            module,
+            mesh=mesh,
+            reshard_after_forward=reshard_after_forward,
+            mp_policy=_build_mp_policy('no'),
+        )
+        module._twinkle_independent_fsdp = True
+
+
 class NativeFSDPStrategy(TransformerStrategyBase):
 
     def __init__(self,
@@ -193,6 +222,11 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             world_size = self.device_mesh.world_size
             ep_fsdp_mesh_1d = self.ep_fsdp_device_mesh['ep_fsdp'] if ep_enabled else None
 
+            _shard_builtin_task_heads(
+                model, mesh=fsdp_mesh, reshard_after_forward=reshard_after_forward, mp_policy=mp_policy)
+            _shard_fp32_task_heads(
+                model, mesh=fsdp_mesh, reshard_after_forward=reshard_after_forward)
+
             for layer_mod, experts_mod in layer_pairs:
                 layer_mod._fsdp_modules = []
 
@@ -269,7 +303,48 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             full_state_dict=True,
             cpu_offload=not for_load,
             broadcast_from_rank0=for_load,
+            # Adam initializes state lazily, so unused trainable parameters have no entry to restore.
+            strict=not for_load,
         )
+
+    def get_independent_task_head_state(self, head):
+        if not getattr(head, '_twinkle_independent_fsdp', False):
+            return None
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+        state = get_model_state_dict(head, options=self._prepare_optimizer_state_dict_options(for_load=False))
+        for name, buffer in head.named_buffers():
+            state.setdefault(name, buffer)
+        return {f'task_head.{name}': tensor.detach().clone().cpu() for name, tensor in state.items()}
+
+    def restore_independent_task_head_state(self, head, state) -> bool:
+        if not getattr(head, '_twinkle_independent_fsdp', False):
+            return False
+        from torch.distributed.checkpoint.state_dict import set_model_state_dict
+
+        tensors = {**dict(head.named_parameters()), **dict(head.named_buffers())}
+        expected = {f'task_head.{name}' for name in tensors}
+        legacy = {f'task_head.{name}' for name in head.named_parameters()}
+        if set(state) not in (expected, legacy):
+            raise ValueError(
+                f'task_head checkpoint keys {sorted(state)} do not match the head it restores: '
+                f'expected {sorted(expected)}.')
+        for key, value in state.items():
+            tensor = tensors[key[len('task_head.'):]]
+            if value.shape != tensor.shape:
+                raise ValueError(f'task-head shape mismatch for {key}: {value.shape} != {tensor.shape}')
+        persistent = set(head.state_dict())
+        model_state = {key[len('task_head.'):]: value for key, value in state.items()
+                       if key[len('task_head.'):] in persistent}
+        set_model_state_dict(
+            head, model_state, options=self._prepare_optimizer_state_dict_options(for_load=True))
+        with torch.no_grad():
+            for key, value in state.items():
+                name = key[len('task_head.'):]
+                if name not in persistent:
+                    tensor = tensors[name]
+                    tensor.copy_(value.to(device=tensor.device, dtype=tensor.dtype))
+        return True
 
     def needs_wrapped_optimizer_state(self) -> bool:
         return self.device_mesh is not None

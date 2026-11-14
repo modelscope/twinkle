@@ -104,12 +104,13 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         else:
             from transformers import AutoConfig
             self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        if model_cls is None and hasattr(self.hf_config, 'architectures'):
-            model_cls = self.hf_config.architectures[0]
-        if model_cls is None:
-            model_cls = AutoModelForCausalLM
-        if isinstance(model_cls, str):
-            model_cls = getattr(transformers, model_cls)
+        if model_loader is None or model_id is None:
+            if model_cls is None and getattr(self.hf_config, 'architectures', None):
+                model_cls = self.hf_config.architectures[0]
+            if model_cls is None:
+                model_cls = AutoModelForCausalLM
+            if isinstance(model_cls, str):
+                model_cls = getattr(transformers, model_cls)
         if model_loader is not None and model_id is not None:
             processor = model_loader.process_tokenizer(model_loader.build_processor(model_id, self.hf_config))
             self._default_tokenizer = processor

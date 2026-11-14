@@ -124,6 +124,37 @@ def _force_fla_off(model: torch.nn.Module) -> None:
             delattr(la, '_twinkle_npu_patched')
 
 
+def test_full_determinism_selects_torch_gdn_kernels(monkeypatch):
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+    from twinkle.model.transformers.transformers import TransformersModel
+
+    gdn_type = type('Qwen3_5GatedDeltaNet', (torch.nn.Module,), {})
+    gdn = gdn_type()
+    gdn.chunk_gated_delta_rule = lambda *args: None
+    gdn.causal_conv1d_fn = lambda *args: None
+    wrapper = TransformersModel.__new__(TransformersModel)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.model = torch.nn.Module()
+    wrapper.model.gdn = gdn
+    monkeypatch.setattr(torch, 'are_deterministic_algorithms_enabled', lambda: True)
+    wrapper._apply_deterministic_model_kernels()
+    assert gdn.chunk_gated_delta_rule is torch_chunk_gated_delta_rule
+    assert gdn.causal_conv1d_fn is None
+
+
+def test_full_determinism_disables_nondeterministic_sdp(monkeypatch):
+    from twinkle.utils.platforms.gpu import GPU
+
+    calls = []
+    monkeypatch.setattr(torch.backends.cuda, 'enable_mem_efficient_sdp', calls.append)
+    monkeypatch.setattr(torch.backends.cudnn, 'deterministic', False)
+    monkeypatch.setattr(torch.backends.cudnn, 'benchmark', True)
+    GPU.apply_determinism()
+    assert calls == [False]
+    assert torch.backends.cudnn.deterministic
+    assert not torch.backends.cudnn.benchmark
+
+
 def _force_fla_on(model: torch.nn.Module) -> int:
     import importlib
     import twinkle.kernel.ops.fla.npu as fla_mod

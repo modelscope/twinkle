@@ -337,12 +337,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             logger.warning_once('loading %s with trust_remote_code=True: the checkpoint\'s own Python code '
                                 'will execute inside this process. Only use checkpoints you trust.', model_id)
             self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        if model_cls is None and hasattr(self.hf_config, 'architectures'):
-            model_cls = self.hf_config.architectures[0]
-        if model_cls is None:
-            model_cls = AutoModelForCausalLM
-        if isinstance(model_cls, str):
-            model_cls = getattr(transformers, model_cls)
+        if model_loader is None or model_id is None:
+            if model_cls is None and getattr(self.hf_config, 'architectures', None):
+                model_cls = self.hf_config.architectures[0]
+            if model_cls is None:
+                model_cls = AutoModelForCausalLM
+            if isinstance(model_cls, str):
+                model_cls = getattr(transformers, model_cls)
         if model_loader is not None and model_id is not None:
             # Full takeover: the loader builds the processor, then the pretrained model (its own
             # model_cls, trust_remote_code and dynamic-module handling), then post-processes it
@@ -371,6 +372,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # applying runtime overrides such as ``attn_implementation``.  Keep Twinkle's
         # config reference aligned with the config that the model actually uses.
         self.hf_config = self.model.config
+        self._apply_deterministic_model_kernels()
         logger.info_once(
             f'[TransformersModel] attn_implementation: requested={kwargs.get("attn_implementation")!r}, '
             f'resolved={getattr(self.model.config, "_attn_implementation", None)!r}')
@@ -666,6 +668,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             if ga:
                 break
         fill(int(micro_batch_size), int(ga or 1))
+
+    def _apply_deterministic_model_kernels(self):
+        if not torch.are_deterministic_algorithms_enabled():
+            return
+        from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+
+        for module in self.model.modules():
+            if type(module).__name__ == 'Qwen3_5GatedDeltaNet':
+                module.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+                module.causal_conv1d_fn = None
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
@@ -2468,7 +2480,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             interval: Save each interval steps.
             **kwargs:
                 adapter_name: Lora adapter name.
-                save_optimizer: Whether to save optimizer state.
+                save_optimizer: Whether to save optimizer state. Requires a complete gradient
+                    accumulation window; pending gradients are not included in checkpoints.
                 safe_serialization: Save weights with safetensors instead of torch serialization.
                 max_shard_size: Maximum size of each full-model weight shard.
                 save_total_limit: Maximum number of completed checkpoint directories to retain.
@@ -2594,14 +2607,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _save_training_state(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
         defer_trainer_state = kwargs.pop('defer_trainer_state', False)
+        optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config.require_finalized('save training state')
+        optimizer = optimizer_config.optimizer
+        pending_gradients = optimizer is not None and any(
+            parameter.grad is not None for group in optimizer.param_groups for parameter in group['params'])
+        if optimizer_config.cur_step % optimizer_config.gradient_accumulation_steps or pending_gradients:
+            raise ValueError(
+                'save_optimizer=True requires a complete gradient accumulation window; '
+                'finish the pending backward/optimizer steps and zero_grad before saving, or save weights only.')
         # The optimizer/scheduler files are written before _write_weights() gets a chance to
         # create the checkpoint dir via save_pretrained; torch.save then raises
         # "Parent directory ... does not exist". This lives HERE (not at the top of save()) so it
         # also covers the hybrid model's save path, which calls _save_training_state directly.
         os.makedirs(output_dir, exist_ok=True)
         self._save_optimizer(output_dir, adapter_name=adapter_name)
-
-        optimizer_config = self.optimizer_group[adapter_name]
 
         # RNG state is per rank, so it is written here rather than below the master-only return:
         # each rank's generator has advanced by its own dropout draws, and one master-written file
@@ -2838,6 +2858,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
+        if trainer_state['cur_step'] % trainer_state['gradient_accumulation_steps']:
+            raise ValueError(
+                'Checkpoint was saved during gradient accumulation without pending gradients; '
+                'use resume_only_model=True to start fresh, or resume a complete accumulation window.')
 
         adapter_name = adapter_name or self._get_default_group()
         optimizer_config = self.optimizer_group[adapter_name]
@@ -3016,6 +3040,22 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
     def _task_head_is_master(self) -> bool:
         return Platform.is_master()
+
+    def _task_head_state(self, adapter_name):
+        head = self._attached_head(adapter_name)
+        getter = getattr(self.strategy, 'get_independent_task_head_state', None)
+        if head is not None and getter is not None:
+            state = getter(head)
+            if state is not None:
+                return state
+        return super()._task_head_state(adapter_name)
+
+    def _restore_task_head_state(self, adapter_name, state) -> None:
+        head = self._attached_head(adapter_name)
+        restorer = getattr(self.strategy, 'restore_independent_task_head_state', None)
+        if head is not None and restorer is not None and restorer(head, state):
+            return
+        super()._restore_task_head_state(adapter_name, state)
 
     def _add_task_head(self, adapter_name: str, task, task_head_loader=None, num_labels=None) -> None:
         """Build one task head worker-side and register it per adapter.

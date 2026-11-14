@@ -21,7 +21,7 @@ def test_full_resume_restores_weights_and_optional_training_state(tmp_path, weig
     torch.save(saved_optimizer.state_dict(), tmp_path / 'optimizer.pt')
     save_file({'weight': torch.full((1, 1), 2.)}, str(tmp_path / 'model.safetensors'))
     (tmp_path / 'trainer_state.json').write_text(json.dumps({
-        'cur_step': 3, 'consumed_train_samples': 12, 'gradient_accumulation_steps': 2,
+        'cur_step': 4, 'consumed_train_samples': 12, 'gradient_accumulation_steps': 2,
     }))
     wrapper = object.__new__(TransformersModel)
     wrapper.__dict__['model'] = model
@@ -31,14 +31,14 @@ def test_full_resume_restores_weights_and_optional_training_state(tmp_path, weig
     result = wrapper.resume_from_checkpoint(str(tmp_path), resume_only_model=weights_only)
     assert model(torch.ones(1, 1)).item() == 2
     # dev's weights-only contract starts fresh progress as well as fresh optimizer state.
-    assert result['cur_step'] == (0 if weights_only else 3)
+    assert result['cur_step'] == (0 if weights_only else 4)
     assert result['consumed_train_samples'] == (0 if weights_only else 12)
     if weights_only:
         assert not optimizer.state
         assert wrapper.optimizer_group[''].cur_step == 0
     else:
         torch.testing.assert_close(optimizer.state[model.weight]['exp_avg'], torch.full((1, 1), 0.5))
-        assert wrapper.optimizer_group[''].cur_step == 3
+        assert wrapper.optimizer_group[''].cur_step == 4
         assert wrapper.optimizer_group[''].gradient_accumulation_steps == 2
 
 
@@ -166,3 +166,12 @@ def test_rebind_is_a_noop_when_the_optimizer_is_already_bound():
     group = SimpleNamespace(lr_scheduler=scheduler, _scheduler_spec=None)
     TransformersModel._rebind_lr_scheduler(group, built_on)  # same optimizer object
     assert scheduler.base_lrs == [0.05]
+
+
+def test_optimizer_resume_rejects_legacy_partial_accumulation_checkpoint(tmp_path):
+    wrapper = object.__new__(TransformersModel)
+    (tmp_path / 'trainer_state.json').write_text(json.dumps({
+        'cur_step': 3, 'gradient_accumulation_steps': 2,
+    }))
+    with pytest.raises(ValueError, match='saved during gradient accumulation'):
+        wrapper._restore_training_state(str(tmp_path))

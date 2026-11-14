@@ -56,5 +56,6 @@ class GPU(Platform):
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
         os.environ['FLASH_ATTENTION_DETERMINISTIC'] = '1'
         import torch
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False

@@ -23,6 +23,7 @@ class CheckpointWriterRankTest(unittest.TestCase):
                     wrapper.optimizer_group = {'': SimpleNamespace(cur_step=3)}
                     wrapper._save_training_state = Mock()
                     wrapper._save_tokenizer = Mock()
+                    wrapper._save_task_head_checkpoint = Mock()
                     wrapper.submit_async_write = Mock()
                     with patch(f'{module}.Platform.is_master', return_value=rank == 0), \
                             patch(f'{module}.copy_checkpoint_args'), patch(f'{module}.rotate_checkpoints'):

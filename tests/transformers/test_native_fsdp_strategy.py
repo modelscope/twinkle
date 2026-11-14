@@ -91,6 +91,7 @@ def test_lazy_wrapping_rebinds_each_tenants_optimizer_without_other_parameters(t
     mesh.mesh_dim_names = None
     strategy = NativeFSDPStrategy(device_mesh=mesh, enable_ep=False)
     wrapper = SimpleNamespace(model=original, optimizer_group=groups, strategy=strategy,
+                              model_arch={'language_model': [], 'vision_tower': [], 'aligner': []},
                               _model_wrapped=False, _enable_expert_parallel=False, sp_strategy=None,
                               _maybe_apply_expert_parallel=lambda: None, _ensure_sp_strategy=lambda: None,
                               _ensure_gdn_padding_free_patch=lambda: None,
@@ -109,3 +110,108 @@ def test_lazy_wrapping_rebinds_each_tenants_optimizer_without_other_parameters(t
     torch.testing.assert_close(replacement['base'], torch.ones(2))
     if tenant_count == 1:
         torch.testing.assert_close(replacement['b'], torch.ones(2))
+
+
+def test_builtin_score_head_is_sharded_before_the_root_model():
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
+    model.score = torch.nn.Linear(4, 2).to(torch.bfloat16)
+    strategy = NativeFSDPStrategy(device_mesh=MagicMock(), mixed_precision='bf16', enable_ep=False)
+
+    with patch('twinkle.model.transformers.strategy.native_fsdp._build_fsdp_mesh',
+               return_value=MagicMock()), \
+         patch('twinkle.model.transformers.strategy.native_fsdp.fully_shard') as fully_shard:
+        strategy.wrap_model(model)
+
+    assert fully_shard.call_count == 2
+    head_call, model_call = fully_shard.call_args_list
+    assert head_call.args[0] is model.score
+    assert head_call.kwargs['mp_policy'].param_dtype is torch.bfloat16
+    assert model_call.args[0] is model
+
+
+def test_attached_standard_head_is_sharded_independently():
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
+    model.task_heads = {'': torch.nn.Linear(4, 1).to(torch.bfloat16)}
+    strategy = NativeFSDPStrategy(device_mesh=MagicMock(), mixed_precision='bf16', enable_ep=False)
+
+    with patch('twinkle.model.transformers.strategy.native_fsdp._build_fsdp_mesh',
+               return_value=MagicMock()), \
+         patch('twinkle.model.transformers.strategy.native_fsdp.fully_shard') as fully_shard:
+        strategy.wrap_model(model)
+
+    assert fully_shard.call_count == 2
+    assert fully_shard.call_args_list[0].args[0] is model.task_heads['']
+    assert model.task_heads['']._twinkle_independent_fsdp
+
+
+def test_optimizer_restore_accepts_lazy_state_for_unused_parameters():
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict, set_optimizer_state_dict
+
+    strategy = NativeFSDPStrategy(device_mesh=MagicMock(), enable_ep=False)
+    model = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 1))
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model[0](torch.ones(2, 3)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    state = get_optimizer_state_dict(
+        model, optimizer, options=strategy._prepare_optimizer_state_dict_options(for_load=False))
+    load_options = strategy._prepare_optimizer_state_dict_options(for_load=True)
+    load_options.broadcast_from_rank0 = False
+    set_optimizer_state_dict(model, optimizer, state, options=load_options)
+    assert optimizer.state[model[0].weight]['step'].item() == 1
+    assert len(optimizer.state[model[1].weight]) == 0
+
+
+def test_fp32_task_head_is_sharded_as_separate_precision_group():
+
+    class Head(torch.nn.Module):
+        keep_fp32 = True
+
+        def __init__(self):
+            super().__init__()
+            self.bias = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+    class Model(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
+            self.task_head = Head()
+            self.scoring_head = self.task_head
+
+    strategy = NativeFSDPStrategy(device_mesh=MagicMock(), mixed_precision='bf16', enable_ep=False)
+    model = Model()
+    with patch('twinkle.model.transformers.strategy.native_fsdp._build_fsdp_mesh',
+               return_value=MagicMock()), \
+         patch('twinkle.model.transformers.strategy.native_fsdp.fully_shard') as fully_shard:
+        strategy.wrap_model(model)
+
+    assert fully_shard.call_count == 2
+    head_call, model_call = fully_shard.call_args_list
+    assert head_call.args[0] is model.task_head
+    assert head_call.kwargs['mp_policy'].param_dtype is None
+    assert head_call.kwargs['mp_policy'].reduce_dtype is None
+    assert model_call.args[0] is model
+    assert model_call.kwargs['mp_policy'].param_dtype is torch.bfloat16
+    assert model.task_head.bias.dtype is torch.float32
+    assert model.task_head._twinkle_independent_fsdp
+
+
+def test_independent_task_head_checkpoint_includes_nonpersistent_buffers():
+    head = torch.nn.Linear(2, 1)
+    head.register_buffer('calibration', torch.tensor([1.0]), persistent=False)
+    head._twinkle_independent_fsdp = True
+    strategy = NativeFSDPStrategy(enable_ep=False)
+    with patch('torch.distributed.checkpoint.state_dict.get_model_state_dict',
+               return_value={'weight': head.weight.detach(), 'bias': head.bias.detach()}):
+        state = strategy.get_independent_task_head_state(head)
+    assert set(state) == {'task_head.weight', 'task_head.bias', 'task_head.calibration'}
+
+    restored = {key: torch.full_like(value, 3.0) for key, value in state.items()}
+    with patch('torch.distributed.checkpoint.state_dict.set_model_state_dict') as set_state:
+        assert strategy.restore_independent_task_head_state(head, restored)
+    set_state.assert_called_once()
+    assert set_state.call_args.args[1].keys() == {'weight', 'bias'}
+    torch.testing.assert_close(head.calibration, torch.tensor([3.0]))

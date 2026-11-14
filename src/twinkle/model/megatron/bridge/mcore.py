@@ -25,7 +25,15 @@ class MCoreBridgeBackend:
         # from a compatibility default. mcore's ModelConfig consumes the actual values, not this marker.
         kwargs.pop('_strict_model_kwargs', None)
         config_kwargs = hf_to_mcore_config(hf_config)
+        # Preserve a checkpoint's classification head instead of constructing a
+        # vocabulary-sized language-model output layer and skipping score weights.
+        is_seq_cls = any(name.endswith('ForSequenceClassification')
+                         for name in (getattr(hf_config, 'architectures', None) or []))
+        if is_seq_cls:
+            config_kwargs.update(task_type='seq_cls', num_labels=hf_config.num_labels)
         config_kwargs.update(kwargs)
+        if is_seq_cls:
+            config_kwargs['untie_embeddings_and_output_weights'] = True
         # per-token-mean grad normalization (mcore default is False; twinkle forces True).
         if 'calculate_per_token_loss' not in config_kwargs:
             config_kwargs['calculate_per_token_loss'] = True

@@ -59,6 +59,26 @@ def _first_optimizer_lr(optimizer) -> float:
     return chained[0].config.lr
 
 
+def _align_distributed_optimizer_param_order(optimizer) -> None:
+    """Match checkpoint indices to MCore's FP32-first main-parameter order.
+
+    Some MCore versions index mixed groups in gradient-buffer order, then put
+    FP32 parameters before low-precision master parameters in the inner optimizer.
+    A decision head kept in FP32 exposes this mismatch during checkpoint save/load.
+    """
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    for part in getattr(optimizer, 'chained_optimizers', None) or [optimizer]:
+        if not isinstance(part, DistributedOptimizer):
+            continue
+        fp32_groups = getattr(part, 'model_fp32_groups', ())
+        low_groups = getattr(part, 'model_float16_groups', ())
+        for group_index, (fp32, low) in enumerate(zip(fp32_groups, low_groups, strict=True)):
+            if fp32 and low:
+                for param_index, param in enumerate([*fp32, *low]):
+                    part.model_param_group_index_map[param] = (group_index, param_index)
+
+
 def _gather_vocab_parallel(tensor):
     """Differentiable vocab all-gather: ``[n, V/TP]`` -> ``[n, V]`` (identity when TP=1).
 
@@ -71,6 +91,13 @@ def _gather_vocab_parallel(tensor):
         return tensor
     from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
     return gather_from_tensor_model_parallel_region(tensor)
+
+
+def _generative_reranker_score(logits, template):
+    from twinkle.model.tasks import _resolve_generative_reranker_token_ids
+
+    positive, negative = _resolve_generative_reranker_token_ids(template)
+    return logits[..., positive:positive + 1] - logits[..., negative:negative + 1]
 
 
 def _last_valid_positions(processor, batch, output_tensor):
@@ -230,6 +257,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # ``_attach_task_head``.
         task_head_loader = kwargs.pop('task_head_loader', None)
         task = kwargs.pop('task', None)
+        self._head_task = task or ('decision' if task_head_loader is not None else None)
         num_labels = kwargs.pop('num_labels', None)
         if config is not None:
             self.hf_config = config
@@ -428,8 +456,20 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             _device_mesh=self.device_mesh,
         )
 
+    def _apply_deterministic_model_kernels(self):
+        if not torch.are_deterministic_algorithms_enabled():
+            return
+        from transformers.models.qwen3_next.modeling_qwen3_next import torch_chunk_gated_delta_rule
+
+        for model in self.model:
+            for module in model.modules():
+                if type(module).__name__ == 'Qwen3NextGatedDeltaNet':
+                    module.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
+                    module.causal_conv1d_fn = None
+
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
+            self._apply_deterministic_model_kernels()
             self.model = self.strategy.wrap_model(self.model)
             self._model_wrapped = True
 
@@ -987,6 +1027,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         else:
                             # Packed: one row [1, total, C]; each segment ends at its last token.
                             unpacked_logits = output_tensor[0, _last_idx]
+                        if task == 'generative_reranker':
+                            unpacked_logits = _gather_vocab_parallel(unpacked_logits)
+                            unpacked_logits = _generative_reranker_score(
+                                unpacked_logits, self.optimizer_group[adapter_name].template)
                 elif task == 'value':
                     # Legacy path -- PPO critic over the bridge-built head: keep its per-token
                     # V(s_t) riding the logits channel ([b, s]); PPOValueLoss masks to response
@@ -1528,6 +1572,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             model_chunks=model_chunks,
             config_overrides=config_overrides,
         )
+        _align_distributed_optimizer_param_order(optimizer)
         return optimizer
 
     def _create_megatron_scheduler(self, optimizer, lr_decay_steps, max_lr=1e-4, **kwargs):
@@ -1927,8 +1972,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         synchronous path."""
         from megatron.core import dist_checkpointing
         from megatron.core import parallel_state as mpu
-        from megatron.core.dist_checkpointing.serialization import TorchDistSaveShardedStrategy
         from megatron.core.dist_checkpointing.strategies.fully_parallel import FullyParallelSaveStrategyWrapper
+        from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 
         iteration = optimizer_config.cur_step
         iter_dir = os.path.join(checkpoint_dir, f'iter_{iteration:07d}')
@@ -1937,6 +1982,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # The sharding type must match the data-parallel wrapper the strategy chose at wrap time
         # (Megatron-FSDP stores optimizer state as DTensors, plain DDP does not).
         sharded_sd_metadata = self.strategy.get_sharded_sd_metadata()
+        if (self._head_task == 'decision'
+                and sharded_sd_metadata.get('distrib_optim_sharding_type') == 'dp_reshardable'):
+            # A tiny FP32 calibration head can leave an empty local DP bucket.
+            # MCore's canonical model-space format supports that layout; gather
+            # on CPU so saving does not duplicate full optimizer state on device.
+            sharded_sd_metadata.update(distrib_optim_sharding_type='fully_reshardable',
+                                       distrib_optim_fully_reshardable_mem_efficient=True)
 
         no_save_rng = kwargs.pop('no_save_rng', False)
         rng_state = None if no_save_rng else self._get_rng_state()
@@ -1958,7 +2010,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # megatron-core < 0.19 exposed get_default_save_sharded_strategy(); 0.19 made
         # save(sharded_strategy=None) default to TorchDistSaveShardedStrategy itself -- build that
         # explicitly, the thread_count tweak and the wrapper below need a concrete instance.
-        save_strategy = TorchDistSaveShardedStrategy()
+        save_strategy = TorchDistSaveShardedStrategy(backend='torch_dist', version=1)
         if hasattr(save_strategy, 'thread_count'):
             save_strategy.thread_count = thread_count
         if mpu.get_data_parallel_world_size(with_context_parallel=True) > 1:
@@ -1970,15 +2022,16 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # Async staging is only sound under an initialized process group (the metadata finalize
         # holds a barrier); a single-process run has no skew to hide anyway.
         async_save = kwargs.pop('async_save', False) and dist.is_initialized()
+        # Older supported MCore versions use the built-in queue without this option.
+        save_options = {'async_strategy': 'mcore'} if 'async_strategy' in inspect.signature(
+            dist_checkpointing.save).parameters else {}
         async_request = dist_checkpointing.save(
             state_dict,
             iter_dir,
             save_strategy,
             async_sharded_save=async_save,
-            # mcore's default 'nvrx' strategy needs the nvidia-resiliency-ext package, which is
-            # not a twinkle dependency; the built-in 'mcore' strategy drives the SAME
-            # AsyncCallsQueue the consumption path below schedules into.
-            async_strategy='mcore',
+            # Avoid the optional nvidia-resiliency-ext queue on newer MCore.
+            **save_options,
             validate_access_integrity=True,
             content_metadata=sharded_sd_metadata,
         )
