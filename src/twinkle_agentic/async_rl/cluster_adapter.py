@@ -345,6 +345,18 @@ class RLResourceEstimator:
         flex_gpus = int(overrides.get('flex_gpus', getattr(rollout_config, 'resource_flex_gpus', 0)))
         if flex_gpus < 0:
             raise ValueError('flex_gpus must be non-negative.')
+        total_cap = getattr(rollout_config, 'resource_total_gpus', None)
+        auto_filled = False
+        if total_cap is not None and 'sampler_replicas' not in overrides:
+            # An explicit cap asks the plan to USE the GPUs: beyond the fixed roles (trainer,
+            # auxiliaries, the flex reservation) and the default one sampler replica, every whole
+            # replica the remaining cards can hold becomes a real sampler replica instead of idling.
+            # An explicit sampler_replicas override wins over the fill; leftover cards below one
+            # replica's width stay unused and the cap check below still rejects a too-small cap.
+            fixed = trainer_gpus + flex_gpus + sum(int(width) for _, width in auxiliary_widths.items())
+            extra = max(0, total_cap - fixed - sampler_width) // sampler_width
+            sampler_replicas += extra
+            auto_filled = extra > 0
         next_rank = trainer_gpus
         trainer = RolePlacement('trainer', trainer_width, trainer_gpus // trainer_width,
                                 tuple(range(trainer_gpus)), trainer_width)
@@ -364,7 +376,6 @@ class RLResourceEstimator:
                 and flex_gpus < sampler_width:
             raise ValueError(f'resource_flex_gpus={flex_gpus} cannot hold one complete sampler replica of '
                              f'width {sampler_width}. Increase the flex reservation or set it to zero.')
-        total_cap = getattr(rollout_config, 'resource_total_gpus', None)
         if total_cap is not None and next_rank > total_cap:
             raise ValueError(f'resource plan needs {next_rank} GPUs but resource_total_gpus={total_cap}.')
         enable_shared = bool(overrides.get('shared_sampler',
@@ -386,6 +397,8 @@ class RLResourceEstimator:
             explanation=(
                 f'prompt p50/p95/p99/max={lengths["p50"]}/{lengths["p95"]}/{lengths["p99"]}/{lengths["max"]}',
                 f'sampler KV budget={kv_budget / _GIB:.2f} GiB per card',
+                *(() if not auto_filled else
+                  (f'sampler replicas auto-filled to {sampler_replicas} from resource_total_gpus={total_cap}',)),
             ))
 
 
