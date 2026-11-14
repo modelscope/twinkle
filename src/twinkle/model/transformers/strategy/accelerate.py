@@ -312,6 +312,16 @@ class AccelerateStrategy(TransformerStrategyBase):
                 group = groups[0]
             if group is not None:
                 group['params'].append(fresh)
+                # ``param_names`` is the parallel list of FQNs that the checkpoint's state-dict
+                # mapping is built from. Appending the parameter without its name leaves the two
+                # lists different lengths inside the saved artifact -- measured on a 4B run: group 0
+                # held 398 params against 397 names -- and anything that pairs them by position then
+                # associates the wrong name with the wrong tensor. That is how the untied head ends
+                # up under a different weight_decay group on resume than it had in the run that
+                # produced the checkpoint, which changes the update without changing the forward.
+                names = group.get('param_names')
+                if isinstance(names, list):
+                    names.append(fqn)
         config = getattr(model, 'config', None)
         for holder in (config, getattr(config, 'text_config', None)):
             if holder is not None and getattr(holder, 'tie_word_embeddings', False):
