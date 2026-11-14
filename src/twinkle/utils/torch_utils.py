@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Union
 
 from .framework import Torch
-from .network import is_valid_ipv6_address
+from .network import find_free_port, is_valid_ipv6_address
 from .utils import has_signature_parameter
 
 if TYPE_CHECKING:
@@ -524,6 +524,15 @@ def ensure_default_process_group(force: bool = False, should_bind_device_id=None
 
     if dist.is_initialized() or not (force or Platform.get_world_size() > 1):
         return False
+    if 'RANK' not in os.environ and Platform.get_world_size() == 1:
+        # A launcher-less single-process run (debugpy / notebook) has no RANK/WORLD_SIZE/
+        # MASTER_ADDR/MASTER_PORT to inherit, and torch's env:// rendezvous reads those from
+        # the environment -- it IGNORES the rank/world_size passed to init_process_group --
+        # so stand up a 1-rank job here instead of failing deep inside the rendezvous.
+        os.environ['RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+        os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+        os.environ.setdefault('MASTER_PORT', str(find_free_port()))
     Torch.set_device()
     backend = Platform.device_backend()
     if Platform.get_platform().ensures_socket_env():
