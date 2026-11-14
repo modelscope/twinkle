@@ -372,6 +372,11 @@ class DeepSpeedStrategy(TransformerStrategyBase):
     def owns_update_step(self) -> bool:
         return True
 
+    def engine_counters(self, model) -> Dict[str, int]:
+        """The engine's own update and micro-batch counters, which decide the accumulation boundary."""
+        engine = _resolve_engine(model)
+        return {name: int(getattr(engine, name)) for name in ('global_steps', 'micro_steps')}
+
     def engine_backward(self, model, loss, *, sync_gradients: bool) -> None:
         """Drive the engine for one micro-batch: backward always, the update at the boundary.
 

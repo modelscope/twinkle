@@ -242,3 +242,14 @@ class TransformerStrategyBase(ABC):
     def engine_grad_norm(self, model):
         """The gradient norm the engine computed while stepping, in place of clipping a second time."""
         raise NotImplementedError(f'{type(self).__name__} does not own the update step.')
+
+    def engine_counters(self, model) -> Dict[str, int]:
+        """The owning engine's own step counters, or an empty dict when no engine owns the update.
+
+        An engine that owns the update decides at which micro-batch it applies one, so its counters --
+        not the training loop's -- determine whether the first update after a resume aggregates the same
+        micro-batches the source run aggregated. A resume that restores the weights and the optimizer
+        state but not these counters shifts the accumulation boundary: the reported loss of that step
+        still looks right while the update it produced is not.
+        """
+        return {}

@@ -1925,32 +1925,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # learning rate can still step with different bias correction or a different denominator.
             'betas': [tuple(g.get('betas', ())) for g in optimizer.param_groups],
             'eps': [float(g.get('eps', 0.0)) for g in optimizer.param_groups],
-            'engine_counters': self._engine_counters(optimizer),
+            'engine_counters': self.strategy.engine_counters(self.model),
             'pre': pre,
             'grad': grad,
             'post': post,
         }
         with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
             handle.write(json.dumps(record) + '\n')
-
-    @staticmethod
-    def _engine_counters(optimizer) -> Dict[str, Any]:
-        """The owning engine's own step counters, for strategies that drive the update themselves.
-
-        An engine that owns the update (``owns_update_step``) decides at which micro-batch it applies
-        one, so its counters -- not the loop's -- determine whether the first update after a resume
-        aggregates the same micro-batches the source run aggregated. A resume that restores the
-        weights and the optimizer state but not these counters shifts the accumulation boundary and
-        changes that update while leaving the reported loss of the step looking right.
-        """
-        engine = getattr(optimizer, 'engine', None)
-        if engine is None:
-            return {}
-        return {
-            name: int(getattr(engine, name))
-            for name in ('global_steps', 'micro_steps')
-            if isinstance(getattr(engine, name, None), int)
-        }
 
     def _create_param_group(self,
                             adapter_name: str,
