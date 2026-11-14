@@ -405,3 +405,57 @@ def test_optimizer_checkpoint_exists_follows_the_strategies_own_layout(tmp_path)
     blank.mkdir()
     (blank / 'latest').write_text('   \n')
     assert deepspeed.optimizer_checkpoint_exists(str(blank)) is False
+
+
+def test_the_name_repair_carries_the_moments_so_state_dict_does_not_die():
+    """A repointed group with an un-migrated moment kills ``Optimizer.state_dict()``.
+
+    torch remaps every state key through the parameter groups, so a moment left under the stale
+    object raises a bare ``KeyError: <id>`` -- which is what a full-parameter FSDP2 run hit at its
+    final save once the name rule settled the tie but the migration lived only in the shape rule.
+    """
+    current = torch.nn.Parameter(torch.zeros(6, 2))
+    head = torch.nn.Parameter(torch.zeros(6, 2))
+    stale = torch.nn.Parameter(torch.zeros(6, 2))
+    model = _Model([('embed', current), ('lm_head', head)])
+    optimizer = _optimizer(stale)
+    optimizer.state[stale] = {'step': 3, 'exp_avg': torch.ones(6, 2), 'exp_avg_sq': torch.ones(6, 2)}
+
+    rebind(model, optimizer, {id(stale): 'embed'})
+
+    assert _same(_params_of(optimizer), [current])
+    assert all(key is current for key in optimizer.state), 'the moment must follow the parameter'
+    assert optimizer.state_dict()['state'][0]['step'] == 3, 'and survive the remap through the groups'
+
+
+def test_the_shape_repair_and_the_name_repair_share_one_migration():
+    """Both rules must feed the same state migration, not just whichever one settles last."""
+    named_new = torch.nn.Parameter(torch.zeros(6, 2))
+    tied = torch.nn.Parameter(torch.zeros(6, 2))
+    shaped_new = torch.nn.Parameter(torch.zeros(3, 4))
+    stale_named = torch.nn.Parameter(torch.zeros(6, 2))
+    stale_shaped = torch.nn.Parameter(torch.zeros(3, 4))
+    model = _Model([('embed', named_new), ('lm_head', tied), ('vision', shaped_new)])
+    optimizer = _optimizer(stale_named, stale_shaped)
+    for stale in (stale_named, stale_shaped):
+        optimizer.state[stale] = {'step': 7}
+
+    rebind(model, optimizer, {id(stale_named): 'embed'})
+
+    assert _same(_params_of(optimizer), [named_new, shaped_new])
+    assert all(key is not stale_named and key is not stale_shaped for key in optimizer.state)
+    assert optimizer.state_dict()['state'] == {0: {'step': 7}, 1: {'step': 7}}
+
+
+def test_the_guard_refuses_a_moment_whose_parameter_left_every_group():
+    """The same unmappable state, reached from the other side: no offender, only an orphan."""
+    import pytest
+
+    current = torch.nn.Parameter(torch.zeros(6, 2))
+    orphan = torch.nn.Parameter(torch.zeros(6, 2))
+    model = _Model([('w', current)])
+    optimizer = _optimizer(current)
+    optimizer.state[orphan] = {'step': 1}
+
+    with pytest.raises(RuntimeError, match='no group holds'):
+        AccelerateStrategy._check_optimizer_params_reachable(model, optimizer)

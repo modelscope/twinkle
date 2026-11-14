@@ -339,9 +339,8 @@ class AccelerateStrategy(TransformerStrategyBase):
         if not stale:
             return
         named = dict(model_params)
-        optimizer_ids = {id(param) for group in param_groups for param in group['params']}
-        by_name = {}
-        for param in list(stale):
+        replacement = {}
+        for param in stale:
             fqn = (param_names or {}).get(id(param))
             current = named.get(fqn)
             # The name is exact where the shape is not: a tied weight's two names share one shape, so
@@ -349,41 +348,43 @@ class AccelerateStrategy(TransformerStrategyBase):
             # still be a weight the optimizer does not already hold, or the repair would duplicate.
             if (current is not None and current.requires_grad and not isinstance(current, DTensor)
                     and id(current) not in optimizer_ids):
-                by_name[id(param)] = current
-        if by_name:
-            for group in param_groups:
-                group['params'] = [by_name.get(id(param), param) for param in group['params']]
-            stale = [param for param in stale if id(param) not in by_name]
-            if not stale:
-                return
-        candidates = [
-            param for _, param in model_params
-            if param.requires_grad and not isinstance(param, DTensor) and id(param) not in optimizer_ids
-        ]
+                replacement[id(param)] = current
 
-        def buckets(params):
-            grouped = {}
-            for param in params:
-                grouped.setdefault(tuple(param.shape), []).append(param)
-            return grouped
+        # Whatever the names did not settle falls back to the shape rule, over the offenders still
+        # unmatched and the candidates the names did not consume.
+        remaining = [param for param in stale if id(param) not in replacement]
+        taken = {id(param) for param in replacement.values()}
+        if remaining:
+            candidates = [
+                param for _, param in model_params
+                if param.requires_grad and not isinstance(param, DTensor)
+                and id(param) not in optimizer_ids and id(param) not in taken
+            ]
 
-        stale_buckets, candidate_buckets = buckets(stale), buckets(candidates)
-        replacement = {}
-        for shape, group in stale_buckets.items():
-            peers = candidate_buckets.get(shape)
-            # Only a bucket that matches one-for-one is provable; a partial match would leave some
-            # offender pointing at a weight that belongs to another offender.
-            if peers is None or len(peers) != len(group):
-                continue
-            replacement.update(zip((id(param) for param in group), peers))
+            def buckets(params):
+                grouped = {}
+                for param in params:
+                    grouped.setdefault(tuple(param.shape), []).append(param)
+                return grouped
+
+            stale_buckets, candidate_buckets = buckets(remaining), buckets(candidates)
+            for shape, group in stale_buckets.items():
+                peers = candidate_buckets.get(shape)
+                # Only a bucket that matches one-for-one is provable; a partial match would leave some
+                # offender pointing at a weight that belongs to another offender.
+                if peers is None or len(peers) != len(group):
+                    continue
+                replacement.update(zip((id(param) for param in group), peers))
         if not replacement:
             return
         for group in param_groups:
             group['params'] = [replacement.get(id(param), param) for param in group['params']]
-        # Adam's moments are keyed by parameter OBJECT, so repointing the groups alone would orphan
-        # them. Every offender is a parameter FSDP2 left unsharded, hence full-shaped on both sides
-        # and differing only in dtype -- and the moments are fp32 whatever the parameter dtype is --
-        # so the state carries over by identity. Empty at wrap time, which makes this a no-op there.
+        # Adam's moments are keyed by parameter OBJECT, so repointing the groups alone orphans them,
+        # and torch's Optimizer.state_dict() then remaps every state key through the groups and dies
+        # with a bare KeyError on the orphan's id. Both rules feed the same migration. Every offender
+        # is a parameter FSDP2 left unsharded, hence full-shaped on both sides and differing only in
+        # dtype -- and the moments are fp32 whatever the parameter dtype is -- so the state carries
+        # over by identity. Empty at wrap time, which makes this a no-op there.
         state = getattr(inner, 'state', None)
         if state:
             for old in [key for key in list(state) if id(key) in replacement]:
@@ -437,7 +438,12 @@ class AccelerateStrategy(TransformerStrategyBase):
         model_params = list(model.named_parameters())
         model_ids = {id(param) for _, param in model_params}
         unreachable = [(index, param) for index, param in enumerate(params) if id(param) not in model_ids]
-        if not unreachable:
+        # The other direction: a moment whose parameter no longer sits in any group. torch's
+        # Optimizer.state_dict() remaps every state key through the groups, so an orphan dies there
+        # with a bare KeyError on its id -- the same unmappable state, reached from the other side.
+        group_ids = {id(param) for param in params}
+        orphans = [key for key in getattr(optimizer, 'state', {}) if id(key) not in group_ids]
+        if not unreachable and not orphans:
             return
         unsharded = [fqn for fqn, param in model_params if not isinstance(param, DTensor)]
         # The other half of the divergence: a parameter the model trains but the optimizer never
@@ -476,7 +482,9 @@ class AccelerateStrategy(TransformerStrategyBase):
                 f'; same-shape model params {same_shape or ["<none>"]} '
                 f'({named} of them already named by the optimizer)')
         raise RuntimeError(
-            f'{len(unreachable)} of {len(params)} optimizer parameter(s) are not reachable from the wrapped '
+            f'{len(orphans)} optimizer state entr(y/ies) belong to a parameter no group holds any '
+            f'more, and {len(unreachable)} of {len(params)} optimizer parameter(s) are not reachable '
+            f'from the wrapped '
             f'model {type(model).__name__} (which exposes {len(trainable)} trainable parameter(s)), so its '
             f'FSDP2 optimizer state cannot be mapped to parameter names and no resumable checkpoint can be '
             f'written. Offenders: {offenders}. The model trains {len(missing)} parameter(s) the '
