@@ -237,16 +237,11 @@ class AccelerateStrategy(TransformerStrategyBase):
     def wrap_model(self, model, *args):
         import torch
 
-        probe = os.environ.get('TWINKLE_FSDP2_PROBE')
-        if probe:
-            self._dump_probe(probe, 'before', model, args)
         result = self.accelerator.prepare(model, *args)
         # ``Accelerator.prepare`` ends with ``return result if len(result) > 1 else result[0]``, and
         # ``result`` is a list, so the container's type says nothing about what was prepared and a
         # lone argument comes back bare. Testing for a tuple here silently skipped the repair.
         prepared = result if isinstance(result, (tuple, list)) else (result,)
-        if probe:
-            self._dump_probe(probe, 'after', prepared[0], prepared[1:])
         for optimizer in prepared[1:]:
             if isinstance(optimizer, torch.optim.Optimizer):
                 # Repair first, then record: the map has to describe an optimizer whose entries are
@@ -254,52 +249,7 @@ class AccelerateStrategy(TransformerStrategyBase):
                 self._rebind_unsharded_optimizer_params(
                     prepared[0], optimizer, self.__dict__.get('_optimizer_param_names'))
                 self._remember_optimizer_params(prepared[0], optimizer)
-        if probe:
-            self._dump_probe(probe, 'rebound', prepared[0], prepared[1:])
         return result
-
-    def _remember_optimizer_params(self, model, optimizer):
-        """Record the name each optimizer parameter had while the model and the optimizer agreed.
-
-        Right after ``prepare`` every optimizer parameter IS one of the model's own objects, so
-        ``named_parameters`` gives each entry an exact name. A later mixed-precision cast can replace
-        a parameter object again, and for a tied weight it replaces the single object the tie covered
-        with one fresh object per name -- the embedding and the tied head then both sit outside the
-        optimizer with the SAME shape, so shape alone cannot say which of them the stale entry meant.
-        The name recorded here can, which is why the save-time repair is handed this map.
-        """
-        ids = {id(param) for group in optimizer.param_groups for param in group['params']}
-        names = {id(param): fqn for fqn, param in model.named_parameters() if id(param) in ids}
-        self.__dict__['_optimizer_param_names'] = names
-        return names
-
-    def _dump_probe(self, path, stage, model, optimizers) -> None:
-        import json
-
-        import torch
-        from torch.distributed.tensor import DTensor
-
-        def describe(param):
-            return {
-                'id': id(param),
-                'ptr': param.data_ptr(),
-                'shape': list(param.shape),
-                'dtype': str(param.dtype),
-                'grad': bool(param.requires_grad),
-                'dtensor': isinstance(param, DTensor),
-            }
-
-        payload = {
-            'stage': stage,
-            'rank': self.accelerator.process_index,
-            'model': {name: describe(param) for name, param in model.named_parameters()},
-            'model_dup': {name: describe(param) for name, param in model.named_parameters(remove_duplicate=False)},
-            'optimizers': [[describe(p) for g in o.param_groups for p in g['params']]
-                           for o in optimizers if isinstance(o, torch.optim.Optimizer)],
-        }
-        suffix = f'.rank{self.accelerator.process_index}.{stage}.json'
-        with open(path + suffix, 'w') as handle:
-            json.dump(payload, handle)
 
     @staticmethod
     def _rebind_unsharded_optimizer_params(model, optimizer, param_names=None) -> None:
