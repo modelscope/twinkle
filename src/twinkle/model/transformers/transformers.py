@@ -1894,6 +1894,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # On an offload tier the parameters are only a bfloat16 view of the float32 master, so they read
         # identically before and after the step; the master digest is what shows the update landed.
         master_post = self.strategy.engine_master_digest(self.model)
+        engine_step = self.strategy.take_engine_step_probe()
         rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
         step_no = self.__dict__.setdefault('_probe_step_no', 0) + 1
         self.__dict__['_probe_step_no'] = step_no
@@ -1939,8 +1940,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             'pre': pre,
             'grad': grad,
             'post': post,
-            'master_pre': master_pre or {},
-            'master_post': master_post,
+            # Where the strategy owns the update, it brackets ``engine.step`` itself and its record is
+            # the only one that can show a change: the pair computed here is taken after that step has
+            # already run, so on such a tier it reads as an unchanged master over a step that moved it.
+            'master_pre': engine_step.get('master_pre', master_pre or {}),
+            'master_post': engine_step.get('master_post', master_post),
+            'grad_partition_pre': engine_step.get('grad_partition_pre', {}),
         }
         with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
             handle.write(json.dumps(record) + '\n')

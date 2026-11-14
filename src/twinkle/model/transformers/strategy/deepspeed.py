@@ -377,8 +377,23 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         engine = _resolve_engine(model)
         return {name: int(getattr(engine, name)) for name in ('global_steps', 'micro_steps')}
 
-    def engine_master_digest(self, model) -> Dict[str, Any]:
-        """Per-group ``[sum, absmax, norm]`` over samples spread across the whole fp32 partition.
+    #: Where each offload tier keeps the float32 master it actually updates: ZeRO-2 one flat partition
+    #: per group, ZeRO-3 the live partitioned copies, and the saved-state form read when restoring.
+    _FP32_PARTITION_ATTRS = ('single_partition_of_fp32_groups', 'fp32_partitioned_groups_flat', 'fp32_flat_groups')
+
+    @classmethod
+    def _fp32_partitions(cls, model):
+        """The attribute name and the list of float32 master partitions this tier updates."""
+        optimizer = getattr(_resolve_engine(model), 'optimizer', None)
+        for attr in cls._FP32_PARTITION_ATTRS:
+            candidate = getattr(optimizer, attr, None)
+            if candidate:
+                return attr, candidate
+        return None, None
+
+    @staticmethod
+    def _sample_digest(flat, chunks: int = 64, width: int = 4096) -> list:
+        """``[sum, absmax, norm]`` over samples spread across a flat partition.
 
         The partitions are billions of elements, so digesting them whole each step would cost more than
         the training itself. ``chunks`` samples of ``width`` elements are taken at even strides instead:
@@ -388,39 +403,65 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         """
         import torch
 
-        optimizer = getattr(_resolve_engine(model), 'optimizer', None)
-        live = None
-        for attr in ('single_partition_of_fp32_groups', 'fp32_partitioned_groups_flat', 'fp32_flat_groups'):
-            candidate = getattr(optimizer, attr, None)
-            if candidate:
-                live = candidate
-                break
-        if not live:
+        numel = flat.numel()
+        if numel == 0:
+            return [0.0, 0.0, 0.0]
+        stride = max(numel // chunks, width)
+        pieces = [flat[start:start + width] for start in range(0, numel - width + 1, stride)]
+        if not pieces:
+            pieces = [flat[:min(width, numel)]]
+        # The strided walk stops at the last start that still fits a whole chunk, so an even stride
+        # leaves the partition's tail unsampled -- anchored here, because a restore that is wrong
+        # only past the sampled region is the exact failure this digest exists to catch.
+        if numel >= width and (numel - width) % stride:
+            pieces.append(flat[numel - width:])
+        sample = torch.cat(pieces).to(torch.float64)
+        return [float(sample.sum()), float(sample.abs().max()), float(sample.norm())]
+
+    def engine_master_digest(self, model) -> Dict[str, Any]:
+        """Per-group ``[sum, absmax, norm]`` over samples spread across the whole fp32 partition."""
+        _, partitions = self._fp32_partitions(model)
+        if not partitions:
             return {}
-        chunks, width = 64, 4096
         out = {}
-        for index, group in enumerate(live):
+        for index, group in enumerate(partitions):
             if group is None:
                 continue
-            flat = group.detach().flatten()
-            numel = flat.numel()
-            if numel == 0:
-                out[str(index)] = [0.0, 0.0, 0.0]
-                continue
-            stride = max(numel // chunks, width)
-            pieces = []
-            for start in range(0, numel - width + 1, stride):
-                pieces.append(flat[start:start + width])
-            if not pieces:
-                pieces = [flat[:min(width, numel)]]
-            # The strided walk stops at the last start that still fits a whole chunk, so an even stride
-            # leaves the partition's tail unsampled -- anchored here, because a restore that is wrong
-            # only past the sampled region is the exact failure this digest exists to catch.
-            if numel >= width and (numel - width) % stride:
-                pieces.append(flat[numel - width:])
-            sample = torch.cat(pieces).to(torch.float64)
-            out[str(index)] = [float(sample.sum()), float(sample.abs().max()), float(sample.norm())]
+            out[str(index)] = self._sample_digest(group.detach().flatten())
         return out
+
+    def engine_grad_partition_digest(self, model) -> Dict[str, Any]:
+        """``[sum, absmax, norm]`` of the float32 gradients the offload optimizer updates from.
+
+        ZeRO-2 keeps the reduced gradients in ``averaged_gradients`` and hands the CPU optimizer the
+        ``.grad`` of its own float32 partition; ZeRO-3 exposes neither under those names. Each tier is
+        read through whatever it has, and the names actually found are reported in ``sources``, so a
+        tier carrying no readable gradient shows up as such instead of reading as "gradients matched".
+        """
+        import torch
+
+        out: Dict[str, Any] = {'sources': []}
+        attr, partitions = self._fp32_partitions(model)
+        if partitions:
+            for index, group in enumerate(partitions):
+                grad = getattr(group, 'grad', None) if group is not None else None
+                if torch.is_tensor(grad):
+                    name = f'{attr}[{index}].grad'
+                    out[name] = self._sample_digest(grad.detach().flatten())
+                    out['sources'].append(name)
+        averaged = getattr(getattr(_resolve_engine(model), 'optimizer', None), 'averaged_gradients', None)
+        if isinstance(averaged, dict):
+            for index in sorted(averaged):
+                for slot, grad in enumerate(averaged[index] or []):
+                    if torch.is_tensor(grad):
+                        name = f'averaged_gradients[{index}][{slot}]'
+                        out[name] = self._sample_digest(grad.detach().flatten())
+                        out['sources'].append(name)
+        return out
+
+    def take_engine_step_probe(self) -> Dict[str, Any]:
+        """The digests ``engine_backward`` recorded around ``engine.step``, consumed once."""
+        return self.__dict__.pop('_engine_step_probe', {})
 
     def engine_backward(self, model, loss, *, sync_gradients: bool) -> None:
         """Drive the engine for one micro-batch: backward always, the update at the boundary.
@@ -437,7 +478,18 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         engine.set_gradient_accumulation_boundary(is_boundary=sync_gradients)
         engine.backward(loss)
         if sync_gradients:
+            # The step probe brackets the update where it actually happens. The loop's
+            # ``clip_grad_and_step`` runs after this, so a digest taken there sees an already-updated
+            # master on both sides and would report "no change" over a step that did change it.
+            probe = os.environ.get('TWINKLE_STEP_DELTA_PROBE')
+            if probe:
+                self.__dict__['_engine_step_probe'] = {
+                    'grad_partition_pre': self.engine_grad_partition_digest(model),
+                    'master_pre': self.engine_master_digest(model),
+                }
             engine.step()
+            if probe:
+                self.__dict__['_engine_step_probe']['master_post'] = self.engine_master_digest(model)
 
     def engine_grad_norm(self, model):
         engine = _resolve_engine(model)

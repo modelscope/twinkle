@@ -264,3 +264,24 @@ class TransformerStrategyBase(ABC):
         partition that differed past its first elements report as identical.
         """
         return {}
+
+    def engine_grad_partition_digest(self, model) -> Dict[str, Any]:
+        """Digest of the float32 gradient partitions the optimizer consumes, or an empty dict.
+
+        Distinct from the master: on an offload tier the CPU optimizer reads a gradient held alongside
+        its own float32 partition, not the ``param.grad`` the model exposes -- which is already consumed
+        by the time a post-step probe runs, and reads as absent. The engine's global grad norm is a
+        single aggregate over the reduction, so two runs can report the same norm while the partitions
+        the update is actually computed from differ.
+        """
+        return {}
+
+    def take_engine_step_probe(self) -> Dict[str, Any]:
+        """The digests bracketing the update this strategy last performed, consumed once.
+
+        A strategy that owns the update step runs it inside its own backward, before the loop reaches
+        ``clip_grad_and_step``; a digest taken from the loop would then see an already-updated master on
+        both sides and report no change over a step that did change it. Those strategies record around
+        the update and hand the record over here.
+        """
+        return {}
