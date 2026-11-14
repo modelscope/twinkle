@@ -781,6 +781,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             # This is a result future, call it to get the actual result
             result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result, _mesh, timeout=_rgt)
             if func.__name__ == '__iter__':
+                # The replica's __iter__ stores the iterator on itself and __next__ reads it back
+                # there, so the two calls are ordered by state rather than by argument. Waiting here
+                # is what makes that order hold: without it the first __next__ can reach the replica
+                # before the iterator exists.
+                import ray
+                for _res in result:
+                    ray.get(_res, timeout=_rgt)
                 return self
 
             if func.__name__ == '__len__':
