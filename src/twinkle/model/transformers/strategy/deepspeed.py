@@ -636,6 +636,8 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         then by position within the group; the live ones hang off the inner CPU optimizer, keyed by
         the fp32 partition tensor itself.
         """
+        import torch
+
         out = {}
         live_entry = None
         try:
