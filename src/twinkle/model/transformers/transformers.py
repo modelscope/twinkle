@@ -1873,6 +1873,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             if tensor is None:
                 continue
             tensor = self._shard(tensor).double()
+            if tensor.numel() == 0:
+                # ZeRO-3 partitions parameters across ranks, so a rank can legitimately hold an
+                # empty local shard. ``max()`` and ``norm()`` raise on a zero-element tensor
+                # instead of returning an identity, and an empty shard contributes nothing to any
+                # aggregate, so it digests as zeros -- the key stays present, which keeps two runs
+                # comparable parameter by parameter.
+                out[name] = [0.0, 0.0, 0.0]
+                continue
             out[name] = [float(tensor.sum()), float(tensor.abs().max()), float(tensor.norm())]
         return out
 
@@ -1903,6 +1911,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         record = {
             'rank': rank,
             'step_no': step_no,
+            # The storage dtype settles where a precision loss originates: bf16 parameters mean the
+            # checkpoint was downcast by copying into a narrower destination, while float32
+            # parameters holding bf16-representable values mean the cast happened inside the
+            # distributed load itself.
+            'param_dtypes': sorted({str(t.dtype) for t in self.model.parameters()}),
             'optimizer_step': optimizer_step,
             'lrs': [float(g.get('lr', 0.0)) for g in optimizer.param_groups],
             'weight_decays': [float(g.get('weight_decay', 0.0)) for g in optimizer.param_groups],
