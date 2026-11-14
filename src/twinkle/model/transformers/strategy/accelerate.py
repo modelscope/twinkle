@@ -708,6 +708,8 @@ class AccelerateStrategy(TransformerStrategyBase):
         The quantized guard mirrors accelerate's: it skips its upcast entirely when the model
         carries 4-bit parameters, so this must not upcast them either.
         """
+        import torch
+
         if self.accelerator.mixed_precision == 'no':
             return
         if any(hasattr(param, 'quant_state') for param in model.parameters()):
