@@ -284,14 +284,26 @@ class AccelerateStrategy(TransformerStrategyBase):
         params = [param for group in optimizer.param_groups for param in group['params']]
         model_params = list(model.named_parameters())
         model_ids = {id(param) for _, param in model_params}
-        unreachable = [index for index, param in enumerate(params) if id(param) not in model_ids]
+        unreachable = [param for param in params if id(param) not in model_ids]
         if not unreachable:
             return
         unsharded = [fqn for fqn, param in model_params if not isinstance(param, DTensor)]
+        # An object id says nothing to whoever has to act on this, so name each offender by the model
+        # parameter(s) sharing its shape: the optimizer holds an object the wrapped model no longer
+        # exposes, and shape is the only identity left that ties it back to a recognizable weight.
+        by_shape: dict = {}
+        for fqn, param in model_params:
+            by_shape.setdefault(tuple(param.shape), []).append(fqn)
+        offenders = [
+            f'{tuple(param.shape)} {param.dtype} -> '
+            f'{by_shape.get(tuple(param.shape)) or ["<no model parameter of this shape>"]}'
+            for param in unreachable[:8]
+        ]
         raise RuntimeError(
-            f'{len(unreachable)} optimizer parameter(s) (pids {unreachable[:8]}) are not reachable from '
-            f'the wrapped model {type(model).__name__}, so its FSDP2 optimizer state cannot be mapped to '
-            f'parameter names and no resumable checkpoint can be written. The model still holds '
+            f'{len(unreachable)} of {len(params)} optimizer parameter(s) are not reachable from the wrapped '
+            f'model {type(model).__name__}, so its FSDP2 optimizer state cannot be mapped to parameter '
+            f'names and no resumable checkpoint can be written. Offenders as (shape, dtype) -> the model '
+            f'parameter(s) of that shape: {offenders}. The model still holds '
             f'{len(unsharded)} unsharded parameter(s): {unsharded[:12]}. This is the full-parameter FSDP2 '
             'path; an adapter run (--tuner lora) keeps every optimizer parameter inside a wrapped unit '
             'and saves normally.')
