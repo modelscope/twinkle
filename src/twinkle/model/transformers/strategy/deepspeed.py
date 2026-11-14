@@ -556,6 +556,8 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         import glob
         import json
 
+        import torch
+
         rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
         optimizer = getattr(engine, 'optimizer', None)
         live = None
