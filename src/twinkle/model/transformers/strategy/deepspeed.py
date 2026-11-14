@@ -597,8 +597,18 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         detail = []
         base = getattr(optimizer, 'optimizer', None)
         live_state = getattr(base, 'state', None) or {}
-        saved_base = saved_osd.get('base_optimizer_state')
-        record['saved_moment_container'] = type(saved_base).__name__ if saved_base is not None else None
+        # ZeRO-2 offload nests the moments under ``base_optimizer_state``, ZeRO-3 under
+        # ``optimizer_state_dict``; both then hold a torch-style ``{'state': {group: {...}},
+        # 'param_groups': ...}`` whose per-group leaf carries step / exp_avg / exp_avg_sq.
+        saved_container = None
+        saved_container_key = None
+        for key in ('base_optimizer_state', 'optimizer_state_dict'):
+            if isinstance(saved_osd.get(key), dict):
+                saved_container, saved_container_key = saved_osd[key], key
+                break
+        saved_state = saved_container.get('state') if saved_container is not None else None
+        record['saved_moment_container'] = saved_container_key
+        record['saved_moment_groups'] = len(saved_state) if isinstance(saved_state, dict) else None
         for index, live_group in enumerate(live):
             if live_group is None or saved is None or index >= len(saved) or saved[index] is None:
                 detail.append({'group': index, 'skipped': True})
@@ -619,14 +629,14 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 # through a narrowing copy. Either way the fp32 precision is gone.
                 'live_is_bf16_of_saved': bool((live_values == rounded).all()),
             }
-            entry.update(self._compare_moments(live_state, live_group, saved_base, index, window))
+            entry.update(self._compare_moments(live_state, live_group, saved_state, index, window))
             detail.append(entry)
         record['detail'] = detail
         with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
             handle.write(json.dumps(record) + '\n')
 
     @staticmethod
-    def _compare_moments(live_state, live_group, saved_base, index, window) -> dict:
+    def _compare_moments(live_state, live_group, saved_state, index, window) -> dict:
         """Compare the restored Adam moments against the checkpoint's, over the same window.
 
         A faithful master with unfaithful moments is indistinguishable from a faithful everything on
@@ -644,13 +654,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             live_entry = live_state.get(live_group) if hasattr(live_state, 'get') else None
         except TypeError:
             live_entry = None
-        saved_entry = None
-        if isinstance(saved_base, dict):
-            candidate = saved_base.get(index, saved_base.get(str(index)))
-            if isinstance(candidate, dict) and not any(
-                    k in candidate for k in ('exp_avg', 'exp_avg_sq', 'step')):
-                candidate = candidate.get(0, candidate.get('0', next(iter(candidate.values()), None)))
-            saved_entry = candidate
+        saved_entry = saved_state.get(index) if isinstance(saved_state, dict) else None
         for key in ('exp_avg', 'exp_avg_sq'):
             live_tensor = live_entry.get(key) if isinstance(live_entry, dict) else None
             saved_tensor = saved_entry.get(key) if isinstance(saved_entry, dict) else None
