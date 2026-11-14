@@ -377,11 +377,19 @@ class AccelerateStrategy(TransformerStrategyBase):
         for index, param in unreachable[:8]:
             positional = trainable[index] if index < len(trainable) else '<position past the trainable list>'
             model_param = dict(model_params).get(positional)
+            # What the rebind rule saw for this shape: how many model parameters share it, and how
+            # many of those the optimizer already names. A bucket is repaired only when the offenders
+            # and the not-yet-named parameters of that shape are equal in number, so these two counts
+            # are what decide whether a remaining offender was unprovable or merely unmatched.
+            same_shape = [fqn for fqn, other in model_params if tuple(other.shape) == tuple(param.shape)]
+            named = sum(1 for fqn, other in model_params
+                        if tuple(other.shape) == tuple(param.shape) and id(other) in model_ids)
             offenders.append(
                 f'#{index} {positional}: optimizer holds {tuple(param.shape)} {param.dtype}; '
                 f'model exposes '
                 f'{"nothing under that name" if model_param is None else f"{tuple(model_param.shape)} {model_param.dtype}" + (" (DTensor)" if isinstance(model_param, DTensor) else " (plain)")}'
-                f'; same-shape model params {by_shape.get(tuple(param.shape)) or ["<none>"]}')
+                f'; same-shape model params {same_shape or ["<none>"]} '
+                f'({named} of them already named by the optimizer)')
         raise RuntimeError(
             f'{len(unreachable)} of {len(params)} optimizer parameter(s) are not reachable from the wrapped '
             f'model {type(model).__name__} (which exposes {len(trainable)} trainable parameter(s)), so its '
