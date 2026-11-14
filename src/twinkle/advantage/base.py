@@ -128,9 +128,12 @@ class Advantage:
                       ('rollout_importance_sampling_mode', rollout_importance_sampling_mode),
                       ('log_rollout_offpolicy_metrics', log_rollout_offpolicy_metrics)]
             if kl_coef == 0.0:
-                # kl_kind reaches the token-reward fold through kl_coef, and 'k1' is the value PPO
-                # passes explicitly, so it is what "not set" means for this family.
-                unused.append(('kl_kind', kl_kind != 'k1'))
+                # kl_kind reaches the token-reward fold only through kl_coef, so with kl_coef at 0
+                # nothing reads it. Two values are still legitimate: 'k3' is this constructor's own
+                # default, i.e. the caller never set it, and 'k1' is what the PPO assembly always
+                # passes alongside kl_coef=beta -- a beta=0 run leaves it unread by choice, not by a
+                # wiring mistake. Any other kind was set on purpose and will be silently ignored.
+                unused.append(('kl_kind', kl_kind not in ('k1', 'k3')))
         else:
             unused = [('gamma', gamma != 1.0), ('gae_lambda', gae_lambda != 0.95),
                       ('normalize', not normalize), ('kl_coef', kl_coef != 0.0)]
