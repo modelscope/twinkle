@@ -317,7 +317,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
         # Fast path: group already initialized, skip all setup
         if self._group_initialized and not self.rebuild_group:
             # _nccl_store_port is set only in prepare() by the master (rank 0); every rank
-            # receives it through master_metadata instead, so log it from there.
+            # receives it through master_metadata instead, so log it from there -- a non-master
+            # rank never touches the master-only attribute, keeping the diagnostic line from
+            # being able to fail the very call it reports.
             logger.info(f'init_process_group: rank={rank} reusing the existing group '
                         f'(world_size={self.world_size}, store_port={master_metadata.nccl_store_port})')
             return
