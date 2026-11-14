@@ -532,15 +532,24 @@ class SGLangEngine(BaseSamplerEngine):
             logger.info('delta round carried no flushes: the rollout weights are unchanged')
 
     async def _flush_bucket(self, bucket: List[Tuple[str, torch.Tensor]], flush_cache: bool,
-                           load_format: Optional[str] = None) -> None:
+                            load_format: Optional[str] = None) -> None:
         """Hand one bucket to sglang, which forwards it to the TP workers as CUDA IPC handles.
 
         ``monkey_patch_torch_reductions`` swaps the device index inside each handle for the physical
         device UUID (the flow sglang's own weight sync and verl's integration use): a TP worker whose
         CUDA enumeration differs from this process's then maps the handle onto its own card instead
         of whatever carries the same index here. Idempotent, so calling it per flush is free.
+
+        The load runs inside a begin/end weight-update session, which sglang requires and which
+        brackets exactly one bucket: the session restores the in-place-packed weights before the
+        load and finalizes them after, so leaving one open across buckets would keep the runners in
+        the restored state while a later bucket lands.
         """
-        from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+        from sglang.srt.managers.io_struct import (
+            BeginWeightUpdateReqInput,
+            EndWeightUpdateReqInput,
+            UpdateWeightsFromTensorReqInput,
+        )
         from sglang.srt.utils import MultiprocessingSerializer
         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -558,9 +567,20 @@ class SGLangEngine(BaseSamplerEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        success, message = await self._manager.update_weights_from_tensor(request, None)
+        # sglang requires the load to run inside a weight-update session: begin restores the
+        # in-place-packed weights so new ones can land, end finalizes the runners it opened. The
+        # selector defaults to 'all', which covers the draft runner too when one is attached.
+        opened, begin_message = await self._manager.begin_weight_update(BeginWeightUpdateReqInput(), None)
+        if not opened:
+            raise RuntimeError(f'sglang refused to open a weight-update session: {begin_message}')
+        try:
+            success, message = await self._manager.update_weights_from_tensor(request, None)
+        finally:
+            closed, end_message = await self._manager.end_weight_update(EndWeightUpdateReqInput(), None)
         if not success:
             raise RuntimeError(f'sglang rejected a weight update bucket of {len(bucket)} tensors: {message}')
+        if not closed:
+            raise RuntimeError(f'sglang refused to close a weight-update session: {end_message}')
 
     @staticmethod
     async def _as_async_iter(weights):
