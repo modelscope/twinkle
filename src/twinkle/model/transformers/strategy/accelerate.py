@@ -234,9 +234,25 @@ class AccelerateStrategy(TransformerStrategyBase):
             move_optimizer_state(optimizer, device)
         clear_offload_record(self)
 
+    @staticmethod
+    def _duplicate_names(model):
+        """Map each name that shares its parameter object with an earlier name to that earlier name.
+
+        ``named_parameters(remove_duplicate=False)`` lists a tied weight under every name that
+        references it, so the duplicates are exactly the names a tie is hiding.
+        """
+        seen, duplicate = {}, {}
+        for fqn, param in model.named_parameters(remove_duplicate=False):
+            if id(param) in seen:
+                duplicate[fqn] = seen[id(param)]
+            else:
+                seen[id(param)] = fqn
+        return duplicate
+
     def wrap_model(self, model, *args):
         import torch
 
+        duplicates = self._duplicate_names(model)
         result = self.accelerator.prepare(model, *args)
         # ``Accelerator.prepare`` ends with ``return result if len(result) > 1 else result[0]``, and
         # ``result`` is a list, so the container's type says nothing about what was prepared and a
@@ -248,8 +264,40 @@ class AccelerateStrategy(TransformerStrategyBase):
                 # the model's own objects, and an argument would be evaluated before the call.
                 self._rebind_unsharded_optimizer_params(
                     prepared[0], optimizer, self.__dict__.get('_optimizer_param_names'))
+                self._adopt_untied_duplicates(prepared[0], optimizer, duplicates)
                 self._remember_optimizer_params(prepared[0], optimizer)
         return result
+
+    @staticmethod
+    def _adopt_untied_duplicates(model, optimizer, duplicates):
+        """Give the optimizer the weight that sharding untied from its partner.
+
+        ``fully_shard`` converts each module's parameters separately, so a weight two modules share
+        comes out of ``prepare`` as two objects and the tie is gone. The optimizer was built over the
+        tied view and holds only the partner's name, which leaves the duplicate frozen at its
+        pretrained value even though the model computes its logits with it -- a tied embedding/head
+        pair trained this way drifts apart, and the checkpoint carries a stale head beside a trained
+        embedding. A strict optimizer-state load then refuses the resume outright, for want of an
+        entry under the duplicate's name.
+
+        The duplicate joins the group that holds its partner, so it inherits the partner's learning
+        rate and weight decay -- which is what the tie would have implied.
+        """
+        inner = getattr(optimizer, 'optimizer', optimizer)
+        groups = getattr(inner, 'param_groups', None)
+        if not groups or not duplicates:
+            return
+        held = {id(param) for group in groups for param in group['params']}
+        by_name = dict(model.named_parameters())
+        for fqn, partner in duplicates.items():
+            param = by_name.get(fqn)
+            if param is None or not param.requires_grad or id(param) in held:
+                continue
+            partner_param = by_name.get(partner)
+            group = next((group for group in groups if partner_param is not None
+                          and any(item is partner_param for item in group['params'])), None)
+            (group if group is not None else groups[0])['params'].append(param)
+            held.add(id(param))
 
     def _remember_optimizer_params(self, model, optimizer):
         """Record the name each optimizer parameter had while the model and the optimizer agreed.

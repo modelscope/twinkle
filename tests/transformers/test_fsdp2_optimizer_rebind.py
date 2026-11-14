@@ -459,3 +459,90 @@ def test_the_guard_refuses_a_moment_whose_parameter_left_every_group():
 
     with pytest.raises(RuntimeError, match='no group holds'):
         AccelerateStrategy._check_optimizer_params_reachable(model, optimizer)
+
+
+# ---------------------------------------------------------------------------------------------
+# Sharding unties a shared weight; the duplicate must still be trained.
+# ---------------------------------------------------------------------------------------------
+
+
+def _duplicates(named):
+    class _Dup(torch.nn.Module):
+        def named_parameters(self, *args, **kwargs):
+            return list(named)
+
+    return AccelerateStrategy._duplicate_names(_Dup())
+
+
+def test_duplicate_names_finds_the_name_a_tie_is_hiding():
+    shared = torch.nn.Parameter(torch.zeros(6, 2))
+    other = torch.nn.Parameter(torch.zeros(3))
+    named = [('embed', shared), ('blocks.0.w', other), ('lm_head', shared)]
+
+    assert _duplicates(named) == {'lm_head': 'embed'}
+
+
+def test_an_untied_duplicate_joins_the_group_that_holds_its_partner():
+    """The defect: the head the forward pass uses stays at its pretrained value."""
+    embed = torch.nn.Parameter(torch.zeros(6, 2))
+    head = torch.nn.Parameter(torch.zeros(6, 2))
+    vision = torch.nn.Parameter(torch.zeros(3))
+    model = _Model([('embed', embed), ('lm_head', head), ('vision', vision)])
+    decay, no_decay = {'params': [embed], 'weight_decay': 0.1}, {'params': [vision], 'weight_decay': 0.0}
+    optimizer = torch.optim.AdamW([decay, no_decay], lr=1e-5)
+
+    AccelerateStrategy._adopt_untied_duplicates(model, optimizer, {'lm_head': 'embed'})
+
+    assert decay['params'] == [embed, head], 'the head must train beside its partner'
+    assert no_decay['params'] == [vision]
+    assert optimizer.param_groups[0]['weight_decay'] == 0.1, 'and inherit the partner\'s weight decay'
+
+
+def test_a_frozen_or_already_held_duplicate_is_not_adopted():
+    embed = torch.nn.Parameter(torch.zeros(6, 2))
+    frozen_head = torch.nn.Parameter(torch.zeros(6, 2), requires_grad=False)
+    model = _Model([('embed', embed), ('lm_head', frozen_head)])
+    optimizer = _optimizer(embed)
+
+    AccelerateStrategy._adopt_untied_duplicates(model, optimizer, {'lm_head': 'embed'})
+
+    assert _same(_params_of(optimizer), [embed])
+
+
+def test_an_untied_model_leaves_the_optimizer_alone():
+    embed = torch.nn.Parameter(torch.zeros(6, 2))
+    model = _Model([('embed', embed)])
+    optimizer = _optimizer(embed)
+
+    AccelerateStrategy._adopt_untied_duplicates(model, optimizer, {})
+
+    assert _same(_params_of(optimizer), [embed])
+
+
+def test_wrap_model_adopts_the_duplicate_prepare_untied():
+    """End to end through the seam: the model goes in tied and comes out untied.
+
+    The optimizer was built over the tied view, so it holds one entry for the pair; prepare then
+    exposes two objects. Without the adoption the second one never trains, and the recorded name map
+    -- which the save-time repair depends on -- would not cover it either.
+    """
+    shared = torch.nn.Parameter(torch.zeros(6, 2))
+    tied = _Model([('embed', shared), ('lm_head', shared)])
+    embed = torch.nn.Parameter(torch.zeros(6, 2))
+    head = torch.nn.Parameter(torch.zeros(6, 2))
+    untied = _Model([('embed', embed), ('lm_head', head)])
+    optimizer = _optimizer(embed)
+
+    strategy = object.__new__(AccelerateStrategy)
+
+    class _Untier:
+        process_index = 0
+
+        def prepare(self, model, *args):
+            return [untied, optimizer]
+
+    strategy.accelerator = _Untier()
+    strategy.wrap_model(tied, optimizer)
+
+    assert _same(_params_of(optimizer), [embed, head])
+    assert strategy.__dict__['_optimizer_param_names'] == {id(embed): 'embed', id(head): 'lm_head'}
