@@ -1532,7 +1532,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         loss_value = optimizer_config.train_status.loss_value
         assert loss_value is not None, 'Do forwarding and calculating loss before backward'
         scaler = optimizer_config.scaler
-        if scaler is None and self.mixed_precision == 'fp16':
+        # A strategy that owns the update does its own loss scaling: DeepSpeed scales the loss inside
+        # engine.backward by both the accumulation window and its own fp16 loss-scale factor. A
+        # GradScaler beside it would scale twice, and its update() would then read gradients that
+        # were never unscaled by it.
+        if scaler is None and self.mixed_precision == 'fp16' and not self.strategy.owns_update_step():
             self.set_grad_scaler(adapter_name=adapter_name)
             scaler = optimizer_config.scaler
 
@@ -1930,12 +1934,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     group['betas'] = optim_params['betas']
 
         with context():
-            if scaler is not None:
+            if scaler is not None and not self.strategy.owns_update_step():
                 scaler.step(optimizer, **kwargs)
                 scaler.update()
                 optimizer_config.scaler_has_nan = sum(v.item()
                                                       for v in scaler._found_inf_per_device(optimizer).values()) > 0
             else:
+                # Under such a strategy the engine already applied the update inside backward, and
+                # accelerate's DeepSpeedOptimizerWrapper.step is a documented no-op.
                 optimizer.step(**kwargs)
 
     @remote_function()
