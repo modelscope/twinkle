@@ -37,7 +37,13 @@ from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.state_dict_utils import normalize_adapter_keys
-from twinkle.model.micro_batch import MicroBatchConfig, merge_micro_batch_outputs, plan_micro_batches, select_batch
+from twinkle.model.micro_batch import (
+    MicroBatchConfig,
+    agree_micro_batch_count,
+    merge_micro_batch_outputs,
+    plan_micro_batches,
+    select_batch,
+)
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.tasks import get_task_spec_obj
 from twinkle.model.transformers.moe import apply_expert_parallel
@@ -1555,56 +1561,20 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """Plan the local micro-batches; under data parallelism every rank agrees on the count.
 
         Fixed plans are checked once, without splitting their batches further. Dynamic plans
-        can differ across ranks because of sequence lengths; the all-gather loop raises their
-        minimum count until every rank agrees, and fails when no common count exists.
+        can differ across ranks because of sequence lengths; the shared all-gather loop
+        (:func:`agree_micro_batch_count`) raises their minimum count until every rank agrees,
+        and fails when no common count exists.
         """
         processor = optimizer_config.processor
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
         optimizer_config._ensure_dp_group()
         dp_group = optimizer_config._dp_group
-        min_micro_batches = 1
-        while True:
-            try:
-                plan = plan_micro_batches(
-                    inputs,
-                    config,
-                    padding_free=processor.padding_free,
-                    min_micro_batches=min_micro_batches,
-                )
-                planning_error = None
-            except Exception as exc:
-                if dp_group is None:
-                    raise
-                plan = None
-                planning_error = f'{type(exc).__name__}: {exc}'
-
-            if dp_group is None:
-                return plan
-
-            local_state = {
-                'micro_batch_count': len(plan) if plan is not None else None,
-                'input_count': len(inputs),
-                'error': planning_error,
-            }
-            states = [None] * dist.get_world_size(dp_group)
-            dist.all_gather_object(states, local_state, group=dp_group)
-            errors = [
-                f'rank {rank}: {state["error"]}' for rank, state in enumerate(states) if state['error'] is not None
-            ]
-            if errors:
-                raise RuntimeError('micro-batch planning failed on one or more model DP ranks: ' + '; '.join(errors))
-
-            counts = [state['micro_batch_count'] for state in states]
-            if all(count == len(plan) for count in counts):
-                return plan
-            if not config.dynamic_batching:
-                raise ValueError(
-                    f'fixed micro-batch counts differ across model DP ranks ({counts}); distribute inputs so '
-                    'all ranks execute the same number of non-empty micro-batches.')
-            min_micro_batches = max(counts)
-            if any(min_micro_batches > state['input_count'] for state in states):
-                raise ValueError('model DP ranks cannot execute the same number of non-empty micro-batches; '
-                                 'make the input batch divisible by the model data-parallel size')
+        if dp_group is None:
+            return plan_micro_batches(inputs, config, padding_free=processor.padding_free)
+        return agree_micro_batch_count(
+            lambda min_micro_batches: plan_micro_batches(
+                inputs, config, padding_free=processor.padding_free, min_micro_batches=min_micro_batches),
+            config=config, dp_group=dp_group, input_count=len(inputs))
 
     def _global_loss_normalizer(self, inputs, loss_instance, optimizer_config):
         local_normalizer = loss_instance.batch_normalizer(inputs)

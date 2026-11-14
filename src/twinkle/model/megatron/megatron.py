@@ -33,6 +33,8 @@ from twinkle.utils import seed_from_env
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.micro_batch import (MicroBatchConfig, agree_micro_batch_count,
+                                       plan_micro_batches_contiguous, sequence_length)
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.tasks import get_task_spec_obj
 from twinkle.patch import Patch, apply_context, apply_patch
@@ -532,6 +534,37 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             rows=response_rows,
             tokenizer=optimizer_config.template)
 
+    def _build_micro_batch_plan(self, inputs, config, processor, mpu):
+        """Plan token-budget micro-batches, agreeing on the count across model DP ranks.
+
+        mcore's schedule iterations and the grad all-reduce run per rank, so every
+        data-parallel rank must execute the same number of micro-batches; the shared
+        all-gather loop (:func:`agree_micro_batch_count`) lifts all ranks to the largest
+        count, which the order-preserving packer can always reach exactly by splitting
+        groups.
+        """
+        lengths = [sequence_length(model_input) for model_input in inputs]
+        uniform_rows = self.variable_seq_lengths or len(set(lengths)) == 1
+        padding_free = processor.padding_free or processor._any_packing(inputs)
+
+        def plan_fn(min_micro_batches):
+            if not uniform_rows:
+                # The plan branch pads each micro-batch to its own max length; the uniform-output
+                # contract of variable_seq_lengths=False only holds when every row is one length.
+                # Raised inside the planner so the all-gather still runs: a rank-local raise
+                # before the collective would hang the others.
+                raise ValueError(
+                    'dynamic_batching pads each micro-batch to its own max length, so differing row '
+                    f'lengths {sorted(set(lengths))} require variable_seq_lengths=True on MegatronModel.')
+            return plan_micro_batches_contiguous(
+                lengths, config, padding_free=padding_free, min_micro_batches=min_micro_batches)
+
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        if dist.get_world_size(dp_group) == 1:
+            return plan_fn(1)
+        return agree_micro_batch_count(
+            plan_fn, config=config, dp_group=dp_group, input_count=len(inputs))
+
     def generate(self, *args, **kwargs):
         """Refuse in-place generation rather than approximate it.
 
@@ -660,11 +693,32 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         attention_mask_type = getattr(unwrapped_model.config, 'attention_mask_type', None)
         if attention_mask_type is None and task == 'causal_lm':
             attention_mask_type = 'causal'
+        # Token-budget micro-batching: the recipe passes the same batching keys the transformers
+        # backend reads; pop them here so they never ride **kwargs into the strategy contexts below.
+        mb_options = {
+            key: kwargs.pop(key)
+            for key in ('dynamic_batching', 'max_tokens_per_micro_batch', 'packing_algorithm')
+            if key in kwargs
+        }
+        micro_batch_plan = None
+        if mb_options.get('dynamic_batching'):
+            if 'packing_algorithm' in mb_options:
+                logger.warning(
+                    'packing_algorithm is ignored by the megatron backend: micro-batches keep the input row '
+                    'order (per-micro-batch loss kwargs, output assembly and the response projection all '
+                    'consume sample order), so the packer runs contiguous, not ffd/kk.')
+            micro_batch_config = MicroBatchConfig(
+                micro_batch_size=micro_batch_size,
+                dynamic_batching=True,
+                max_tokens_per_micro_batch=mb_options.get('max_tokens_per_micro_batch'),
+            )
+            micro_batch_plan = self._build_micro_batch_plan(inputs, micro_batch_config, processor, mpu)
         inputs = processor(
             inputs,
             micro_batch_size=micro_batch_size,
             variable_seq_lengths=self.variable_seq_lengths,
             attention_mask_type=attention_mask_type,
+            micro_batch_plan=micro_batch_plan,
         )
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
@@ -706,7 +760,15 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             if dist.get_world_size(dp_cp_group) > 1:
                 dist.all_reduce(global_normalizer, op=dist.ReduceOp.SUM, group=dp_cp_group)
         loss_extra_kwargs_per_mb = []
-        if num_microbatches <= 1:
+        if micro_batch_plan is not None:
+            # Token-budget plans carry per-micro-batch row counts; slice the parallel loss
+            # kwargs by each plan group (contiguous, input-ordered), mirroring the fixed
+            # stride split below.
+            loss_extra_kwargs_per_mb = [
+                loss_instance.micro_batch_kwargs(kwargs, indices, local_batch_size)
+                for indices in micro_batch_plan
+            ]
+        elif num_microbatches <= 1:
             loss_extra_kwargs_per_mb = [kwargs]
         else:
             # Only support extra kwargs length==total_batch_size
@@ -1037,15 +1099,20 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 global_normalizer=global_normalizer,
                 **kwargs):
             with get_task_spec_obj(task).megatron_context(self.strategy.unwrap_model(self.model)):
-                losses = forward_backward_func(
-                    forward_step_func=forward_step_func,
-                    data_iterator=data_iter,
-                    model=self.model,
-                    num_microbatches=len(inputs),
-                    seq_length=seq_length,
-                    micro_batch_size=micro_batch_size,
-                    forward_only=forward_only,
-                )
+                # Eval builds no graph: mcore wraps its own eval schedule in no_grad (training.py)
+                # and the transformers backend's forward_only does the same. Without it every
+                # logps/reference/teacher forward retains the whole logits chain (the logits, the
+                # bridge's transposed copy, the CE intermediates) for a backward that never comes.
+                with (torch.no_grad() if forward_only else contextlib.nullcontext()):
+                    losses = forward_backward_func(
+                        forward_step_func=forward_step_func,
+                        data_iterator=data_iter,
+                        model=self.model,
+                        num_microbatches=len(inputs),
+                        seq_length=seq_length,
+                        micro_batch_size=micro_batch_size,
+                        forward_only=forward_only,
+                    )
 
         # Extract loss from results (only last PP stage returns non-empty)
         loss = torch.tensor(0.0).to(Platform.get_local_device())
