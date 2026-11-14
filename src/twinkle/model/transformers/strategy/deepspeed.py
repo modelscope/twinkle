@@ -595,6 +595,10 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 record['saved_key'] = key
                 break
         detail = []
+        base = getattr(optimizer, 'optimizer', None)
+        live_state = getattr(base, 'state', None) or {}
+        saved_base = saved_osd.get('base_optimizer_state')
+        record['saved_moment_container'] = type(saved_base).__name__ if saved_base is not None else None
         for index, live_group in enumerate(live):
             if live_group is None or saved is None or index >= len(saved) or saved[index] is None:
                 detail.append({'group': index, 'skipped': True})
@@ -604,7 +608,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             live_values = live_group.detach().flatten()[:window].to(torch.float32)
             saved_values = saved_group.detach().flatten()[:window].to(torch.float32)
             rounded = saved_values.to(torch.bfloat16).to(torch.float32)
-            detail.append({
+            entry = {
                 'group': index,
                 'numel': int(live_group.numel()),
                 'compared': window,
@@ -614,10 +618,61 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 # never restored and was rebuilt from the bf16 parameters, or because it was restored
                 # through a narrowing copy. Either way the fp32 precision is gone.
                 'live_is_bf16_of_saved': bool((live_values == rounded).all()),
-            })
+            }
+            entry.update(self._compare_moments(live_state, live_group, saved_base, index, window))
+            detail.append(entry)
         record['detail'] = detail
         with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
             handle.write(json.dumps(record) + '\n')
+
+    @staticmethod
+    def _compare_moments(live_state, live_group, saved_base, index, window) -> dict:
+        """Compare the restored Adam moments against the checkpoint's, over the same window.
+
+        A faithful master with unfaithful moments is indistinguishable from a faithful everything on
+        the first resumed step: that step's loss, grad_norm and clipped gradients all reproduce the
+        source run exactly, because they depend only on the weights, and the wrong moments change the
+        update that follows. ZeRO-2 offload stores them under ``base_optimizer_state`` keyed by group
+        then by position within the group; the live ones hang off the inner CPU optimizer, keyed by
+        the fp32 partition tensor itself.
+        """
+        out = {}
+        live_entry = None
+        try:
+            live_entry = live_state.get(live_group) if hasattr(live_state, 'get') else None
+        except TypeError:
+            live_entry = None
+        saved_entry = None
+        if isinstance(saved_base, dict):
+            candidate = saved_base.get(index, saved_base.get(str(index)))
+            if isinstance(candidate, dict) and not any(
+                    k in candidate for k in ('exp_avg', 'exp_avg_sq', 'step')):
+                candidate = candidate.get(0, candidate.get('0', next(iter(candidate.values()), None)))
+            saved_entry = candidate
+        for key in ('exp_avg', 'exp_avg_sq'):
+            live_tensor = live_entry.get(key) if isinstance(live_entry, dict) else None
+            saved_tensor = saved_entry.get(key) if isinstance(saved_entry, dict) else None
+            if not torch.is_tensor(live_tensor) or not torch.is_tensor(saved_tensor):
+                out[key] = {
+                    'present': (torch.is_tensor(live_tensor), torch.is_tensor(saved_tensor)),
+                }
+                continue
+            n = min(live_tensor.numel(), saved_tensor.numel(), window)
+            live_values = live_tensor.detach().flatten()[:n].to(torch.float32)
+            saved_values = saved_tensor.detach().flatten()[:n].to(torch.float32)
+            out[key] = {
+                'numel': int(live_tensor.numel()),
+                'compared': n,
+                'exact': bool((live_values == saved_values).all()),
+                'worst_abs_diff': float((live_values - saved_values).abs().max()),
+            }
+        live_step = live_entry.get('step') if isinstance(live_entry, dict) else None
+        saved_step = saved_entry.get('step') if isinstance(saved_entry, dict) else None
+        out['step'] = {
+            'live': int(live_step.item()) if torch.is_tensor(live_step) else live_step,
+            'saved': int(saved_step.item()) if torch.is_tensor(saved_step) else saved_step,
+        }
+        return out
 
     def load_optimizer_checkpoint(
         self,
