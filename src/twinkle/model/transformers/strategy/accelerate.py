@@ -443,7 +443,26 @@ class AccelerateStrategy(TransformerStrategyBase):
         # path, reaching the adapter through a different entry point. Upcast first so the copy is
         # lossless and the wrap's later upcast becomes a no-op.
         self._match_master_weight_precision(model)
-        set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
+        self._probe_load_precision(model, adapter_weights, after=False)
+        load_result = set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
+        self._probe_load_precision(model, adapter_weights, after=True)
+        # A key the checkpoint holds but the model does not (or the reverse) is dropped silently by
+        # peft, leaving the resumed adapter short of the source run's -- so report rather than discard.
+        # ``missing_keys`` is peft's "every model key the state dict did not supply", which for an
+        # adapter load is the entire frozen base; only the adapter's own keys being absent is a defect.
+        unexpected = list(getattr(load_result, 'unexpected_keys', []) or [])
+        absent = [
+            key for key in (getattr(load_result, 'missing_keys', []) or [])
+            if 'lora_' in key or key in adapter_weights
+        ]
+        logger.info(f'Loaded adapter "{adapter_name}": {len(adapter_weights)} tensors, '
+                    f'{len(absent)} adapter keys absent, {len(unexpected)} unexpected.')
+        if absent:
+            logger.warning(f'Adapter "{adapter_name}" is missing {len(absent)} of its own keys, '
+                           f'first few: {absent[:5]}. The resumed adapter will not match its source run.')
+        if unexpected:
+            logger.warning(f'Adapter "{adapter_name}" checkpoint carries {len(unexpected)} keys the model '
+                           f'does not have, first few: {unexpected[:5]}. They were dropped.')
 
     def _get_fsdp_plugin(self):
         state = self.accelerator.state

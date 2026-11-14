@@ -111,10 +111,21 @@ class TransformerStrategyBase(ABC):
         # re-importing it here would make it function-local and shadow the module binding that
         # the guard above just used.
         import torch
+
+        # Sample the parameters the load actually writes, not the first ones the model happens to
+        # expose. An adapter checkpoint carries only the LoRA keys, so sampling in
+        # ``named_parameters()`` order measures the frozen base -- bfloat16 by construction, hence
+        # trivially 100% bfloat16-representable -- and reports a clean load over a truncated one.
+        targets = set(state_dict.keys())
+        candidates = [(name, param) for name, param in model.named_parameters() if name in targets]
+        if not candidates:
+            candidates = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+        if not candidates:
+            candidates = list(model.named_parameters())
         sampled = 0
         representable = 0
         total = 0
-        for _, param in model.named_parameters():
+        for _, param in candidates:
             if sampled >= 8:
                 break
             local = param.to_local() if hasattr(param, 'to_local') else param
@@ -127,8 +138,11 @@ class TransformerStrategyBase(ABC):
         record = {
             'rank': int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0),
             'phase': 'after' if after else 'before',
-            'dest_dtypes': sorted({str(p.dtype) for p in model.parameters()}),
+            # The destination dtypes that matter are those of the parameters being written; over the
+            # whole model they mix the frozen base in and hide which side the load landed on.
+            'dest_dtypes': sorted({str(p.dtype) for _, p in candidates}),
             'src_dtypes': sorted({str(v.dtype) for v in state_dict.values() if torch.is_tensor(v)}),
+            'targeted': len(candidates),
             'params_sampled': sampled,
             'bf16_representable_ratio': (representable / total) if total else None,
         }
