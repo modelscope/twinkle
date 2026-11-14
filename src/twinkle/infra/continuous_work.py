@@ -116,7 +116,13 @@ def _make_worker_async_companion(func, wrapper):
     # **kwargs) and reject the _dispatch_context that _submit adds when the arguments carry refs.
     # A pinned __signature__ outranks __wrapped__ in inspect.signature, so Ray still sees the
     # var-args form while __wrapped__ stays available for reaching the undecorated body.
+    #
+    # The pin must declare ``self``. Ray extracts an actor method's signature with
+    # ``extract_signature(func, ignore_first=True)``, which drops the first parameter unconditionally
+    # on the assumption that it is ``self``. A pin of just (*args, **kwargs) therefore loses ``args``
+    # and every positional argument is then refused with "too many positional arguments".
     companion.__signature__ = inspect.Signature(parameters=[
+        inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
         inspect.Parameter('args', inspect.Parameter.VAR_POSITIONAL),
         inspect.Parameter('kwargs', inspect.Parameter.VAR_KEYWORD),
     ])

@@ -759,7 +759,20 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                        _resolve_sticky_key(sticky_key, func, args, kwargs),
                                        RayHelper.has_ref(args, kwargs))
                 future = call.start()
-                return future if lazy_collect is True else future.result(timeout=_rgt)
+                if lazy_collect is True:
+                    return future
+                try:
+                    return future.result(timeout=_rgt)
+                except TimeoutError as exc:
+                    # Every other path here waits through ``ray.get``, whose timeout is a
+                    # ``ray.exceptions.GetTimeoutError``. A continuous-work call instead waits on a
+                    # ``concurrent.futures.Future``, whose native timeout is a plain ``TimeoutError``,
+                    # so a caller catching the infra's one timeout type would silently miss these.
+                    # ``GetTimeoutError`` subclasses ``TimeoutError``, so narrowing the type here
+                    # unifies the two paths without breaking anyone catching the builtin.
+                    import ray
+                    raise ray.exceptions.GetTimeoutError(
+                        f'{func.__name__}: no result within {_rgt}s') from exc
 
             execute_method = RayHelper.execute_all_async if not sync else functools.partial(
                 RayHelper.execute_all_sync, timeout=_rgt)
@@ -862,7 +875,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         # precedence over __wrapped__ in inspect.signature, which keeps Ray on the var-args form this
         # wrapper actually accepts while leaving __wrapped__ in place: reaching the undecorated body
         # through it is how the test suite drives these methods at all.
+        #
+        # The pin must declare ``self``: Ray extracts an actor method's signature with
+        # ``extract_signature(func, ignore_first=True)``, which drops the first parameter on the
+        # assumption that it is ``self``. Without it the pin loses ``args`` and every positional
+        # argument is refused with "too many positional arguments".
         wrapper.__signature__ = inspect.Signature(parameters=[
+            inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
             inspect.Parameter('args', inspect.Parameter.VAR_POSITIONAL),
             inspect.Parameter('kwargs', inspect.Parameter.VAR_KEYWORD),
         ])

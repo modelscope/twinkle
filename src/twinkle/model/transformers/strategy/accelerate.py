@@ -581,6 +581,9 @@ class AccelerateStrategy(TransformerStrategyBase):
                 optim_state,
                 options=self._prepare_full_optimizer_state_dict_options(for_load=True),
             )
+            probe = os.environ.get('TWINKLE_OPT_LOAD_PROBE')
+            if probe:
+                self._probe_loaded_optimizer_state(model, inner_optimizer, input_path, probe)
             return
 
         # weights_only=True: optimizer state is tensors + plain containers (verified), so a
@@ -588,6 +591,85 @@ class AccelerateStrategy(TransformerStrategyBase):
         optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
         remap_optimizer_state_names(optim_state, param_name_mapping or {})
         optimizer.load_state_dict(optim_state)
+
+    def _probe_loaded_optimizer_state(self, model, optimizer, checkpoint_path, path) -> None:
+        """Compare the moments in the live optimizer against the ones the checkpoint holds.
+
+        Both sides must be reduced to the same granularity before any number means anything: the
+        checkpoint is a FULL state dict, while an FSDP2 parameter -- and therefore its Adam moments
+        -- is a DTensor whose ``_local_tensor`` is only this rank's shard. Comparing a shard's L1
+        norm against the full tensor's says nothing, so each saved tensor is redistributed into the
+        live DTensor's own placement and the two shards are compared element by element.
+        """
+        import json
+
+        import torch
+        from torch.distributed.tensor import DTensor, distribute_tensor
+
+        saved = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        saved_state = saved.get('state') or {}
+        state = getattr(optimizer, 'state', {})
+        rank = self.accelerator.process_index
+        detail = {}
+        worst = {'name': None, 'key': None, 'diff': 0.0}
+        checked = 0
+        watched = ('model.language_model.embed_tokens.weight', 'lm_head.weight',
+                   'model.language_model.norm.weight', 'model.visual.patch_embed.proj.weight')
+        for name, param in model.named_parameters():
+            live, saved = state.get(param), saved_state.get(name)
+            if live is None or saved is None:
+                continue
+            for key in ('step', 'exp_avg', 'exp_avg_sq'):
+                live_value, saved_value = live.get(key), saved.get(key)
+                if live_value is None or saved_value is None:
+                    continue
+                if isinstance(live_value, DTensor):
+                    # Every rank runs this loop over the same names, so the collectives inside
+                    # redistribute match up; a rank that skipped one would deadlock the others.
+                    target = distribute_tensor(saved_value.to(dtype=live_value.dtype,
+                                                              device=live_value.device),
+                                               live_value.device_mesh, live_value.placements)
+                    diff = float((target.to_local() - live_value.to_local()).abs().max())
+                else:
+                    diff = float((saved_value.to(dtype=live_value.dtype, device=live_value.device)
+                                  - live_value).abs().max())
+                checked += 1
+                if diff > worst['diff']:
+                    worst = {'name': name, 'key': key, 'diff': diff}
+                if name in watched:
+                    detail[name] = detail.get(name, {})
+                    detail[name][key] = {
+                        'diff': diff,
+                        'live_l1': float(live_value.to_local().abs().sum()) if isinstance(live_value, DTensor)
+                        else float(live_value.abs().sum()),
+                        'saved_l1': float(saved_value.abs().sum()),
+                        'is_dtensor': isinstance(live_value, DTensor),
+                    }
+        payload = {
+            'rank': rank,
+            'group_params': sum(len(group['params']) for group in optimizer.param_groups),
+            'state_entries': len(state),
+            'group_params_without_state': sum(
+                1 for group in optimizer.param_groups for param in group['params'] if param not in state),
+            'saved_state_entries': len(saved_state),
+            'tensors_compared': checked,
+            'worst': worst,
+            # The moments are only half of what an Adam step consumes: the update is also a function
+            # of the group's hyperparameters, and those are rebuilt from the config on resume rather
+            # than read back from the checkpoint. ``lr`` is visible in the per-step log; weight_decay,
+            # betas and eps are not, so a group rebuilt with different values would leave the loss and
+            # grad_norm of the first resumed step matching while every later weight diverges.
+            'groups': [{k: v for k, v in group.items() if k != 'params'}
+                       for group in optimizer.param_groups],
+            'group_sizes': [len(group['params']) for group in optimizer.param_groups],
+            'saved_groups': [{k: v for k, v in group.items() if k != 'params'}
+                             for group in (saved.get('param_groups') or [])],
+            'saved_group_sizes': [len(group.get('params') or [])
+                                  for group in (saved.get('param_groups') or [])],
+            'detail': detail,
+        }
+        with open(f'{path}.rank{rank}.json', 'w') as handle:
+            json.dump(payload, handle, indent=1)
 
     def get_full_state_dict(self, model) -> dict:
         """Collect full state dict, including persistent buffers."""
