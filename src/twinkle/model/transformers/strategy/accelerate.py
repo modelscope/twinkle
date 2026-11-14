@@ -437,6 +437,12 @@ class AccelerateStrategy(TransformerStrategyBase):
     def load_peft_weights(self, model, adapter_weights: Mapping[str, Any], adapter_name: str) -> None:
         from peft.utils import set_peft_model_state_dict
 
+        # ``set_peft_model_state_dict`` copies into the parameters' EXISTING dtype, so a float32
+        # adapter checkpoint loaded while the LoRA modules are still bfloat16 is rounded on the way in
+        # -- the same truncation ``_match_master_weight_precision`` documents for the full-parameter
+        # path, reaching the adapter through a different entry point. Upcast first so the copy is
+        # lossless and the wrap's later upcast becomes a no-op.
+        self._match_master_weight_precision(model)
         set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
 
     def _get_fsdp_plugin(self):
