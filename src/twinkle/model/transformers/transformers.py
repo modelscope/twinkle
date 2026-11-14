@@ -331,12 +331,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             logger.warning_once('loading %s with trust_remote_code=True: the checkpoint\'s own Python code '
                                 'will execute inside this process. Only use checkpoints you trust.', model_id)
             self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        if model_cls is None and hasattr(self.hf_config, 'architectures'):
-            model_cls = self.hf_config.architectures[0]
-        if model_cls is None:
-            model_cls = AutoModelForCausalLM
-        if isinstance(model_cls, str):
-            model_cls = getattr(transformers, model_cls)
+        # A pretrained loader owns model construction, including external architecture classes.
+        if model_loader is None or model_id is None:
+            if model_cls is None and hasattr(self.hf_config, 'architectures'):
+                model_cls = self.hf_config.architectures[0]
+            if model_cls is None:
+                model_cls = AutoModelForCausalLM
+            if isinstance(model_cls, str):
+                model_cls = getattr(transformers, model_cls)
         if model_loader is not None and model_id is not None:
             # Full takeover: the loader builds the processor, then the pretrained model (its own
             # model_cls, trust_remote_code and dynamic-module handling), then post-processes it
