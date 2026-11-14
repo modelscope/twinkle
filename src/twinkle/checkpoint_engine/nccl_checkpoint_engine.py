@@ -316,13 +316,12 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         # Fast path: group already initialized, skip all setup
         if self._group_initialized and not self.rebuild_group:
-            # The store address is a master-only attribute -- rank 0 allocates the port in
-            # ``prepare`` -- while this fast path runs on every participating rank. Reading it
-            # through ``getattr`` keeps a diagnostic line from being able to fail the very call
-            # it reports: a non-master rank has no ``_nccl_store_port`` of its own.
+            # _nccl_store_port is set only in prepare() by the master (rank 0); every rank
+            # receives it through master_metadata instead, so log it from there -- a non-master
+            # rank never touches the master-only attribute, keeping the diagnostic line from
+            # being able to fail the very call it reports.
             logger.info(f'init_process_group: rank={rank} reusing the existing group '
-                        f'(world_size={self.world_size}, store_port='
-                        f'{getattr(self, "_nccl_store_port", None) or master_metadata.nccl_store_port})')
+                        f'(world_size={self.world_size}, store_port={master_metadata.nccl_store_port})')
             return
 
         if self._pg is None:
