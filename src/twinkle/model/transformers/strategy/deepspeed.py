@@ -440,16 +440,43 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             math.sqrt(math.fsum(s[2] for s in stats)),
         ]
 
+    @staticmethod
+    def _full_coverage_chunks(numel: int, width: int = 4096) -> int:
+        """The chunk count that makes a strided sample cover every element of a ``numel``-long partition.
+
+        ``stride = max(numel // chunks, width)``, so coverage is complete once the stride falls to
+        ``width`` -- i.e. once ``chunks >= numel / width``. Sampling is what makes the digest cheap, and
+        cheap is what lets it run every step; but a strided sample can only prove a difference exists,
+        never that one is absent. Measured on a ZeRO-2 offload resume: a 503,552-element group is
+        covered exhaustively by the default count and read identical, while a 4,538,761,984-element
+        group is 0.37% sampled -- and the post-update difference appeared only in the sparsely sampled
+        one, where "identical" was never actually established. Full coverage costs minutes on a
+        partition that size, so it is gated to the single step under investigation rather than run
+        every step.
+        """
+        return max(1, -(-numel // width))
+
     def engine_master_digest(self, model) -> Dict[str, Any]:
-        """Per-group ``[sum, absmax, norm]`` over samples spread across the whole fp32 partition."""
+        """Per-group ``[sum, absmax, norm]`` over samples spread across the whole fp32 partition.
+
+        ``TWINKLE_STEP_DELTA_PROBE_FULL_STEP`` names one global step at which to read every element
+        instead of a sample, which is what turns "no difference found" into "no difference present".
+        """
         _, partitions = self._fp32_partitions(model)
         if not partitions:
             return {}
+        full_step = os.environ.get('TWINKLE_STEP_DELTA_PROBE_FULL_STEP')
+        # Before ``engine.step`` the engine's counter still holds the number of completed updates, so the
+        # update about to run is ``global_steps + 1``.
+        at_full_step = bool(full_step) and _resolve_engine(model).global_steps + 1 == int(full_step)
         out = {}
         for index, group in enumerate(partitions):
             if group is None:
                 continue
-            out[str(index)] = self._aggregate(self._chunk_stats(group.detach().flatten()))
+            flat = group.detach().flatten()
+            chunks = self._full_coverage_chunks(flat.numel()) if at_full_step else 64
+            entry = self._aggregate(self._chunk_stats(flat, chunks=chunks))
+            out[str(index)] = {'agg': entry, 'chunks': chunks, 'covered': at_full_step} if at_full_step else entry
         return out
 
     def engine_optim_moment_digest(self, model) -> Dict[str, Any]:
