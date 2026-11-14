@@ -19,7 +19,6 @@ _ALLOWED_OVERRIDE_KEYS = frozenset({
     'sampler_replicas',
     'shared_sampler',
     'flex_gpus',
-    'max_num_batched_tokens',
     'max_num_seqs',
 })
 
@@ -57,7 +56,6 @@ class RLResourcePlan:
     auxiliaries: Tuple[RolePlacement, ...] = ()
     shared_sampler: Optional[RolePlacement] = None
     flex_ranks: Tuple[int, ...] = ()
-    max_num_batched_tokens: Optional[int] = None
     max_num_seqs: Optional[int] = None
     explanation: Tuple[str, ...] = ()
 
@@ -304,20 +302,13 @@ class RLResourceEstimator:
         kv_budget = budget - memory.weight_bytes - memory.runtime_reserve_bytes - memory.graph_reserve_bytes
         if kv_budget <= 0:
             raise ValueError('sampler KV budget is non-positive after weights and runtime reserves.')
-        # Tokens the KV cache can hold. The scheduler chunk is separate: one forward
-        # should cover a full max_model_len prefill, not the entire cache. Writing the
-        # cache size into max_num_batched_tokens also becomes vLLM's vision-encoder
-        # budget and profiles dozens of max-size images.
+        # Tokens the KV cache can hold -- the cap on live sequences. The per-step scheduler
+        # budget (max_num_batched_tokens) is NOT derived here: it is a throughput knob with no
+        # memory-physics behind it (chunked prefill splits long prompts on its own), so the
+        # engine default stands unless the user sets it in the engine kwargs.
         kv_tokens = max(1, math.floor(0.95 * kv_budget / max(1, memory.kv_bytes_per_token)))
-        context_limit = int(engine_context or 0)
-        if context_limit <= 0:
-            context_limit = int(getattr(hf_config, 'max_position_embeddings', 0) or 0)
         configured_seqs = getattr(rollout_config, 'vllm_max_num_seqs', None) if backend == 'vllm' else None
-        if 'max_num_batched_tokens' in overrides:
-            seq_budget = int(overrides['max_num_batched_tokens'])
-        else:
-            seq_budget = kv_tokens
-        max_seqs = max(1, seq_budget // max(1, total_p95))
+        max_seqs = max(1, kv_tokens // max(1, total_p95))
         if configured_seqs is not None:
             max_seqs = min(max_seqs, configured_seqs)
         max_seqs = int(overrides.get('max_num_seqs', max_seqs))
@@ -326,18 +317,6 @@ class RLResourceEstimator:
         if configured_seqs is not None and max_seqs > configured_seqs:
             raise ValueError(f'max_num_seqs override {max_seqs} exceeds the configured engine limit '
                              f'{configured_seqs}.')
-        if 'max_num_batched_tokens' in overrides:
-            max_batched = int(overrides['max_num_batched_tokens'])
-        else:
-            # One prefill step may be as long as the context window. Also keep room for
-            # one decode token from every live sequence, which vLLM requires.
-            chunk = kv_tokens if context_limit <= 0 else min(kv_tokens, context_limit)
-            max_batched = min(kv_tokens, max(chunk, max_seqs))
-        if max_batched < 1:
-            raise ValueError('max_num_batched_tokens must be positive.')
-        if max_batched < max_seqs:
-            raise ValueError(f'max_num_batched_tokens={max_batched} is smaller than max_num_seqs={max_seqs}; '
-                             'one scheduler step must hold a decode token from every live sequence.')
 
         sampler_replicas = int(overrides.get('sampler_replicas', 1))
         if sampler_replicas < 1:
@@ -392,7 +371,6 @@ class RLResourceEstimator:
             auxiliaries=tuple(auxiliaries),
             shared_sampler=shared,
             flex_ranks=flex_ranks,
-            max_num_batched_tokens=max_batched,
             max_num_seqs=max_seqs,
             explanation=(
                 f'prompt p50/p95/p99/max={lengths["p50"]}/{lengths["p95"]}/{lengths["p99"]}/{lengths["max"]}',
@@ -485,9 +463,8 @@ def apply_plan(plan: RLResourcePlan, *, distributed_config: Any, rollout_config:
         rollout_config.vllm_pipeline_parallel_size = 1
         rollout_config.vllm_data_parallel_size = sampler.replica_count
         rollout_config.vllm_max_num_seqs = plan.max_num_seqs
-        engine_kwargs = dict(rollout_config.vllm_engine_kwargs or {})
-        engine_kwargs['max_num_batched_tokens'] = plan.max_num_batched_tokens
-        rollout_config.vllm_engine_kwargs = engine_kwargs
+        # max_num_batched_tokens is deliberately NOT written: it is a throughput knob the
+        # engine defaults (or the user's engine kwargs) own, not a memory-planning output.
     else:
         rollout_config.sglang_tp_size = sampler.model_parallel_width
         rollout_config.sglang_pp_size = 1
