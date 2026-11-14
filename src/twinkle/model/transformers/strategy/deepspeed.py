@@ -392,40 +392,18 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         return None, None
 
     @staticmethod
-    def _sample_digest(flat, chunks: int = 64, width: int = 4096) -> list:
-        """``[sum, absmax, norm]`` over samples spread across a flat partition.
+    def _chunk_stats(flat, chunks: int = 64, width: int = 4096) -> list:
+        """Per-chunk ``[sum, absmax, sum_of_squares]`` over a strided sample of a flat partition.
 
         The partitions are billions of elements, so digesting them whole each step would cost more than
         the training itself. ``chunks`` samples of ``width`` elements are taken at even strides instead:
-        deterministic between two runs, cheap, and -- unlike a prefix window -- able to see a difference
-        anywhere in the partition. Accumulation is in float64 on CPU, where the order is fixed, so the
-        digest itself is not a source of run-to-run noise.
-        """
-        import torch
+        cheap, and -- unlike a prefix window -- able to see a difference anywhere in the partition.
 
-        numel = flat.numel()
-        if numel == 0:
-            return [0.0, 0.0, 0.0]
-        stride = max(numel // chunks, width)
-        pieces = [flat[start:start + width] for start in range(0, numel - width + 1, stride)]
-        if not pieces:
-            pieces = [flat[:min(width, numel)]]
-        # The strided walk stops at the last start that still fits a whole chunk, so an even stride
-        # leaves the partition's tail unsampled -- anchored here, because a restore that is wrong
-        # only past the sampled region is the exact failure this digest exists to catch.
-        if numel >= width and (numel - width) % stride:
-            pieces.append(flat[numel - width:])
-        sample = torch.cat(pieces).to(torch.float64)
-        return [float(sample.sum()), float(sample.abs().max()), float(sample.norm())]
-
-    @staticmethod
-    def _chunk_sums(flat, chunks: int = 64, width: int = 4096) -> list:
-        """Per-chunk sums over the same strided sample ``_sample_digest`` takes.
-
-        The aggregate alone cannot say where inside a partition a difference lives: a stale region left
-        by a restore shows up in one chunk, while an accumulation-order difference shows up in all of
-        them, and the two call for opposite fixes. Reporting the chunks separately keeps that
-        distinction readable without digesting billions of elements.
+        Reductions are per chunk and in float64, and callers combine them in a fixed order. Aggregating
+        with ``torch.sum`` over the concatenation instead is NOT reproducible: past a few million
+        elements torch reduces in parallel, so the addition order follows thread scheduling and the same
+        data yields a different last digit between two runs. A digest whose aggregate drifts on identical
+        input reports differences that are not there, which is worse than no digest at all.
         """
         import torch
 
@@ -434,9 +412,29 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             return []
         stride = max(numel // chunks, width)
         starts = list(range(0, numel - width + 1, stride)) or [0]
+        # The strided walk stops at the last start that still fits a whole chunk, so an even stride leaves
+        # the partition's tail unsampled -- anchored here, because a difference only past the sampled
+        # region is exactly what this digest exists to catch.
         if numel >= width and (numel - width) % stride and starts[-1] != numel - width:
             starts.append(numel - width)
-        return [float(flat[s:s + width].to(torch.float64).sum()) for s in starts]
+        out = []
+        for start in starts:
+            piece = flat[start:start + width].to(torch.float64)
+            out.append([float(piece.sum()), float(piece.abs().max()), float((piece * piece).sum())])
+        return out
+
+    @staticmethod
+    def _aggregate(stats: list) -> list:
+        """``[sum, absmax, norm]`` combined from per-chunk stats in a fixed order."""
+        import math
+
+        if not stats:
+            return [0.0, 0.0, 0.0]
+        return [
+            math.fsum(s[0] for s in stats),
+            max(s[1] for s in stats),
+            math.sqrt(math.fsum(s[2] for s in stats)),
+        ]
 
     def engine_master_digest(self, model) -> Dict[str, Any]:
         """Per-group ``[sum, absmax, norm]`` over samples spread across the whole fp32 partition."""
@@ -447,7 +445,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         for index, group in enumerate(partitions):
             if group is None:
                 continue
-            out[str(index)] = self._sample_digest(group.detach().flatten())
+            out[str(index)] = self._aggregate(self._chunk_stats(group.detach().flatten()))
         return out
 
     def engine_grad_partition_digest(self, model) -> Dict[str, Any]:
@@ -472,11 +470,8 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 grad = getattr(group, 'grad', None) if group is not None else None
                 if torch.is_tensor(grad):
                     name = f'{attr}[{index}].grad'
-                    flat = grad.detach().flatten()
-                    out[name] = {
-                        'agg': self._sample_digest(flat, chunks=chunks),
-                        'chunks': self._chunk_sums(flat, chunks=chunks),
-                    }
+                    stats = self._chunk_stats(grad.detach().flatten(), chunks=chunks)
+                    out[name] = {'agg': self._aggregate(stats), 'chunks': [s[0] for s in stats]}
                     out['sources'].append(name)
         averaged = getattr(getattr(_resolve_engine(model), 'optimizer', None), 'averaged_gradients', None)
         if isinstance(averaged, dict):
@@ -484,7 +479,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 for slot, grad in enumerate(averaged[index] or []):
                     if torch.is_tensor(grad):
                         name = f'averaged_gradients[{index}][{slot}]'
-                        out[name] = self._sample_digest(grad.detach().flatten())
+                        out[name] = self._aggregate(self._chunk_stats(grad.detach().flatten(), chunks=chunks))
                         out['sources'].append(name)
         return out
 
