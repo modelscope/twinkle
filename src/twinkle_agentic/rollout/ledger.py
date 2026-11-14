@@ -408,9 +408,12 @@ class TurnLedger:
             )
         out["response_token_ids"] = [input_ids[j] for j in positions]
         out["response_positions"] = [j - 1 for j in positions]
-        out["rollout_logps"] = (
-            sampled_token_logprobs(out["response_token_ids"], self._logprobs) if self._logprobs else []
-        )
+        if self._logprobs:
+            # An engine that returns no logprobs leaves the field ABSENT, not empty: ``rollout_logps``
+            # is response-framed, so an empty list reads as "this response has zero tokens" and
+            # ``validate_trajectory`` rejects it, while an absent field is the documented signal that
+            # this trajectory simply carries no sampling logps.
+            out["rollout_logps"] = sampled_token_logprobs(out["response_token_ids"], self._logprobs)
         if "routed_experts" in self._pif:
             out["replay_mask"] = (
                 list(completion_mask) if completion_mask is not None else [int(label != -100) for label in labels]
