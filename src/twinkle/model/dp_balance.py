@@ -20,6 +20,8 @@ it starts the micro-batch loop.
 """
 
 from __future__ import annotations
+import copy
+import functools
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -123,6 +125,321 @@ def _imbalance(values: Sequence[int]) -> float:
     return max(values) / mean if mean else 1.0
 
 
+def _reorder(value: Any, order: list[int], batch_size: int) -> Any:
+    # Mirrors what slice_dp slices: lists and tensors along dim 0, and dicts of them, key by key.
+    import torch
+
+    if isinstance(value, dict):
+        return {key: _reorder(item, order, batch_size) for key, item in value.items()}
+    if isinstance(value, list) and len(value) == batch_size:
+        return [value[index] for index in order]
+    if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == batch_size:
+        return value[order]
+    return value
+
+
+def _sliced_with_other_size(value: Any, batch_size: int) -> bool:
+    import torch
+
+    if isinstance(value, dict):
+        return any(_sliced_with_other_size(item, batch_size) for item in value.values())
+    if isinstance(value, list):
+        return len(value) != batch_size
+    if isinstance(value, torch.Tensor) and value.dim() > 0:
+        return value.shape[0] != batch_size
+    return False
+
+
+def batch_aligned(args: tuple, kwargs: dict[str, Any], batch_size: int) -> bool:
+    """Whether every argument ``slice_dp`` slices has one entry per sample, so a reorder keeps them aligned."""
+    return not any(_sliced_with_other_size(value, batch_size) for value in (*args, *kwargs.values()))
+
+
+def has_per_sample_values(value: Any) -> bool:
+    """Conservatively detect fresh batch data on a loss call whose inputs were reordered earlier."""
+    import numpy as np
+    import torch
+
+    if isinstance(value, dict):
+        return any(has_per_sample_values(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return True
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return value.ndim > 0
+    return False
+
+
+def call_lengths(args: tuple, kwargs: dict[str, Any]) -> list[int] | None:
+    """Sequence lengths of a ``slice_dp`` call's ``inputs``, or None when the call cannot be reordered."""
+    inputs = kwargs.get("inputs")
+    if kwargs.get("return_logits"):
+        # Raw logits of packed inputs are laid out per rank, so they cannot be put back in order.
+        return None
+    if not isinstance(inputs, list) or not inputs:
+        return None
+    if not batch_aligned(args, kwargs, len(inputs)):
+        return None
+    # Lists of per-sample ObjectRefs can be permuted without fetching their payloads. A whole
+    # tensor hidden behind one ref cannot: its shape/alignment are unknown, so skip that call.
+    import sys
+    ray = sys.modules.get('ray')
+
+    def opaque(value):
+        if ray is not None and isinstance(value, ray.ObjectRef):
+            return True
+        if isinstance(value, dict):
+            return any(opaque(item) for item in value.values())
+        if isinstance(value, list):
+            return False  # the list itself is the batch axis; its elements travel together
+        return callable(value) and getattr(value, '_is_lazy_collect', False)
+
+    if any(opaque(value) for value in (*args, *kwargs.values())):
+        return None
+    supplied = kwargs.get('input_lengths')
+    if supplied is not None:
+        if not isinstance(supplied, list) or len(supplied) != len(inputs):
+            raise ValueError('input_lengths must contain one sequence length per input')
+        lengths = [int(length) for length in supplied]
+        if any(length <= 0 for length in lengths):
+            raise ValueError('input_lengths must be positive')
+        return lengths
+    if not all(isinstance(item, dict) and 'input_ids' in item for item in inputs):
+        return None
+    return [sequence_length(model_input) for model_input in inputs]
+
+
+def _estimate_megatron_ranks(rank_lengths, *, micro_batch_size, padding_free, variable_seq_lengths,
+                            sequence_multiple, workload_fn):
+    """Mirror InputProcessor.collate_fn's fixed consecutive Megatron micro-batches and CP/SP padding."""
+    workloads, tokens, computed_tokens = [], [], []
+    for lengths in rank_lengths:
+        rounded = [((length + sequence_multiple - 1) // sequence_multiple) * sequence_multiple for length in lengths]
+        workload = computed = 0
+        for start in range(0, len(lengths), micro_batch_size):
+            batch = rounded[start:start + micro_batch_size]
+            if padding_free:
+                workload += sum(workload_fn(length) for length in batch)
+                computed += sum(batch)
+            else:
+                width = max(batch) if variable_seq_lengths else max(rounded)
+                workload += len(batch) * workload_fn(width)
+                computed += len(batch) * width
+        workloads.append(workload)
+        tokens.append(sum(lengths))
+        computed_tokens.append(computed)
+    return _RankEstimate(workloads, tokens, computed_tokens, len(rank_lengths[0]) // micro_batch_size)
+
+
+def plan_call(lengths: list[int], dp_size: int, spec: dict[str, Any], kwargs: dict[str, Any]) -> DPBalancePlan | None:
+    """Plan a call from the model's ``_dp_balance_spec``, or None when the call keeps its order untouched."""
+    if spec.get('backend', 'transformers') not in ('transformers', 'megatron'):
+        return None
+    workload_fn = estimate_workload
+    if spec["hidden_size"] is not None:
+        workload_fn = functools.partial(estimate_workload, hidden_size=spec["hidden_size"])
+    try:
+        config = MicroBatchConfig.from_kwargs(dict(kwargs))
+        rank_estimator = None
+        if spec.get('backend') == 'megatron':
+            # Keep every DP replica's schedule identical. Short tails have different sample weights
+            # in mcore's per-micro-batch mean path; dynamic batching is not this backend's contract.
+            if len(lengths) % dp_size or (config is not None and config.dynamic_batching):
+                return None
+            rank_size = len(lengths) // dp_size
+            size = config.micro_batch_size if config is not None else min(2, rank_size)
+            if not size or rank_size % size or size % spec['group_size']:
+                return None
+            rank_estimator = functools.partial(
+                _estimate_megatron_ranks, micro_batch_size=size, padding_free=spec['padding_free'],
+                variable_seq_lengths=spec.get('variable_seq_lengths', True),
+                sequence_multiple=spec.get('sequence_multiple', 1), workload_fn=workload_fn)
+        elif spec['group_size'] > 1 and config is not None:
+            if config.dynamic_batching or config.micro_batch_size % spec['group_size']:
+                return None
+        plan = plan_dp_balance_for_lengths(
+            lengths, dp_size, padding_free=spec['padding_free'], micro_batch_config=config,
+            group_size=spec['group_size'], workload_fn=workload_fn, rank_estimator=rank_estimator)
+    except ValueError:
+        # Options or batch shapes the model itself rejects; let it report them.
+        return None
+    return plan if plan.metrics else None
+
+
+# Local mode: every rank holds only its own slice of the batch, so the ranks swap samples instead of a
+# driver reordering the whole batch. A "leaf" is one value slice_dp would slice (a list, or a tensor along
+# dim 0), addressed by its path through the call's args and kwargs.
+
+
+def _leaves(value: Any, path: tuple) -> dict[tuple, Any]:
+    import torch
+
+    if isinstance(value, dict):
+        leaves = {}
+        for key, item in value.items():
+            leaves.update(_leaves(item, (*path, key)))
+        return leaves
+    if isinstance(value, list) or (isinstance(value, torch.Tensor) and value.dim() > 0):
+        return {path: value}
+    return {}
+
+
+def call_leaves(args: tuple, kwargs: dict[str, Any]) -> dict[tuple, Any]:
+    """The values of a call that ``slice_dp`` would slice, keyed by their path."""
+    leaves = {}
+    for index, arg in enumerate(args):
+        leaves.update(_leaves(arg, ("args", index)))
+    for key, value in kwargs.items():
+        leaves.update(_leaves(value, ("kwargs", key)))
+    return leaves
+
+
+def leaf_layout(leaves: dict[tuple, Any]) -> dict[tuple, Any]:
+    """What the ranks must agree on before their leaves can be joined into one batch."""
+    return {path: "list" if isinstance(value, list) else (value.dim(), str(value.dtype)) for path, value in leaves.items()}
+
+
+def to_cpu(value: Any) -> Any:
+    """``value`` with every tensor detached onto the CPU, for ``all_gather_object``."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        moved = copy.copy(value)
+        for key, item in value.items():
+            moved[key] = to_cpu(item)
+        return moved
+    if isinstance(value, (list, tuple)):
+        return type(value)(to_cpu(item) for item in value)
+    return value
+
+
+def _device(value: Any):
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.device if value.device.type != "cpu" else None
+    items = value.values() if isinstance(value, dict) else value if isinstance(value, (list, tuple)) else ()
+    for item in items:
+        device = _device(item)
+        if device is not None:
+            return device
+    return None
+
+
+def _to(value: Any, device) -> Any:
+    import torch
+
+    if device is None:
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: _to(item, device) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_to(item, device) for item in value)
+    return value
+
+
+def _take(value: Any, indices: list[int]) -> Any:
+    if isinstance(value, list):
+        return [value[index] for index in indices]
+    return value[indices]
+
+
+def _with_leaves(value: Any, path: tuple, leaves: dict[tuple, Any]) -> Any:
+    if path in leaves:
+        return leaves[path]
+    if isinstance(value, dict):
+        return {key: _with_leaves(item, (*path, key), leaves) for key, item in value.items()}
+    return value
+
+
+def exchange_call(
+    plan: DPBalancePlan, rank_leaves: list[dict[tuple, Any]], data_rank: int, args: tuple, kwargs: dict[str, Any]
+) -> tuple[tuple, dict[str, Any]]:
+    """This rank's share of the reordered batch, built from every data rank's leaves (in data-rank order).
+
+    Tensors are joined the way ``tensor_dict`` joins them for the Ray driver, padding the
+    trailing dims to the longest rank, and land on the device the local value was on.
+    """
+    from twinkle.utils import pad_and_stack_tensors
+
+    size = len(plan.order) // len(rank_leaves)
+    mine = plan.order[data_rank * size : (data_rank + 1) * size]
+    swapped = {}
+    for path, local in call_leaves(args, kwargs).items():
+        parts = [leaves[path] for leaves in rank_leaves]
+        joined = [item for part in parts for item in part] if isinstance(local, list) else pad_and_stack_tensors(parts)
+        swapped[path] = _to(_take(joined, mine), _device(local))
+    return (
+        tuple(_with_leaves(arg, ("args", index), swapped) for index, arg in enumerate(args)),
+        {key: _with_leaves(value, ("kwargs", key), swapped) for key, value in kwargs.items()},
+    )
+
+
+def _rows(value: Any) -> int | None:
+    import torch
+
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, torch.Tensor) and value.dim() > 0:
+        return value.shape[0]
+    return None
+
+
+def _restore_rank(value: Any, rank_values: list[Any], sources: list[tuple[int, int]]) -> Any:
+    from twinkle.utils import pad_and_stack_tensors
+
+    if isinstance(value, dict):
+        restored = copy.copy(value)
+        for key, item in value.items():
+            restored[key] = _restore_rank(
+                item, [other.get(key) if isinstance(other, dict) else None for other in rank_values], sources
+            )
+        return restored
+    size = len(sources)
+    if _rows(value) != size or any(_rows(other) != size or type(other) is not type(value) for other in rank_values):
+        # Not one entry per sample (a loss, a count): it stays this rank's own value.
+        return value
+    if isinstance(value, list):
+        return _to([rank_values[rank][row] for rank, row in sources], _device(value))
+    return pad_and_stack_tensors([rank_values[rank][row : row + 1] for rank, row in sources]).to(value.device)
+
+
+def normalize_rank_output(output: Any, size: int) -> Any:
+    """Merge Megatron's micro-batch logps before local per-sample output restoration.
+
+    Ray's collector already performs this merge. Keep the worker's metric cache untouched by
+    returning a shallow copy, and only merge tensors whose rows cover this complete rank shard.
+    """
+    import torch
+
+    from twinkle.utils import pad_and_stack_tensors
+
+    if isinstance(output, dict):
+        logps = output.get('logps')
+        if (isinstance(logps, list) and logps and all(isinstance(item, torch.Tensor) and item.ndim >= 2
+                                                    for item in logps)
+                and sum(item.shape[0] for item in logps) == size):
+            output = copy.copy(output)
+            output['logps'] = pad_and_stack_tensors(logps)
+    return output
+
+
+def restore_rank_outputs(output: Any, rank_outputs: list[Any], plan: DPBalancePlan, data_rank: int) -> Any:
+    """Put this rank's own samples' per-sample outputs back, fetched from the ranks that computed them.
+
+    ``rank_outputs`` holds every data rank's output, in data-rank order. Values that are not per-sample
+    keep this rank's own value.
+    """
+    size = len(plan.order) // len(rank_outputs)
+    position = [0] * len(plan.order)
+    for index, sample in enumerate(plan.order):
+        position[sample] = index
+    sources = [divmod(position[sample], size) for sample in range(data_rank * size, (data_rank + 1) * size)]
+    return _restore_rank(output, rank_outputs, sources)
+
 @dataclass(frozen=True)
 class DPBalancePlan:
     """A batch permutation for ``slice_dp`` dispatch plus before/after balance metrics."""
@@ -143,6 +460,25 @@ class DPBalancePlan:
             return values[self.order]
         raise TypeError(f"cannot reorder a field of type {type(values).__name__}")
 
+    @property
+    def reorders(self) -> bool:
+        return self.order != list(range(len(self.order)))
+
+    def reorder_call(self, args: tuple, kwargs: dict[str, Any]) -> tuple[tuple, dict[str, Any]]:
+        """Reorder every batch-aligned argument of a ``slice_dp`` call, the way ``slice_dp`` would slice it."""
+        size = len(self.order)
+        return (
+            tuple(_reorder(arg, self.order, size) for arg in args),
+            {key: _reorder(value, self.order, size) for key, value in kwargs.items()},
+        )
+
+    def restore_outputs(self, outputs: Any) -> Any:
+        """Put the batch-aligned fields of a collected result back in the caller's order."""
+        inverse = [0] * len(self.order)
+        for position, index in enumerate(self.order):
+            inverse[index] = position
+        return _reorder(outputs, inverse, len(self.order))
+
 
 def plan_dp_balance_for_lengths(
     lengths: Sequence[int],
@@ -152,6 +488,7 @@ def plan_dp_balance_for_lengths(
     micro_batch_config: MicroBatchConfig | None = None,
     group_size: int = 1,
     workload_fn: WorkloadFn = estimate_workload,
+    rank_estimator: Callable | None = None,
 ) -> DPBalancePlan:
     """Same as :func:`plan_dp_balance`, for samples given by their sequence lengths."""
     lengths = [int(length) for length in lengths]
@@ -195,7 +532,8 @@ def plan_dp_balance_for_lengths(
             [lengths[index] for index in order[rank * rank_size : (rank + 1) * rank_size]] for rank in range(dp_size)
         ]
         try:
-            estimates[name] = order, _estimate_ranks(rank_lengths, micro_batch_config, padding_free, workload_fn)
+            estimates[name] = order, (rank_estimator(rank_lengths) if rank_estimator is not None else
+                                      _estimate_ranks(rank_lengths, micro_batch_config, padding_free, workload_fn))
         except ValueError:
             # The model rejects this layout too (for example a sequence over max_tokens_per_micro_batch).
             continue

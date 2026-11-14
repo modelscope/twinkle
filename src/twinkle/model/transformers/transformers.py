@@ -259,6 +259,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     If model_id is passed in, `from_pretrained` will be used, else `__init__` will be used.
     """
 
+    _dp_balance_backend = 'transformers'
+
     @overload
     def __init__(self, *, model_cls: Type[PreTrainedModel], config: PretrainedConfig, remote_group, **kwargs) -> None:
         ...
@@ -292,6 +294,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             init_strategy: Optional[str] = None,
             use_liger_kernel: bool = False,
             liger_kernel_config: Optional[Dict[str, Any]] = None,
+            dp_balance: bool = True,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         # Opt-out of the cuDNN SDPA backend (falls back to flash/mem-efficient, numerically
@@ -304,6 +307,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # The Default tokenizer will be used to save with a model if no template was set.
         self._default_tokenizer = None
         self.device_mesh = device_mesh
+        # Read through _dp_balance_spec: reorder slice_dp batches to even out DP workloads.
+        self._init_dp_balance(dp_balance)
         self.mixed_precision = mixed_precision
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
@@ -1005,6 +1010,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
         self._fill_deepspeed_auto(kwargs)
+        optimizer_config.dp_balance_reordered = False
+        optimizer_config.dp_balance_forward_kwargs = None
         self._lazy_wrap_model()
         if not inputs:
             raise ValueError('inputs empty, check your DataLoader outputs')
@@ -1151,6 +1158,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # themselves, and the per-adapter head resolution (head_for) needs the CALL's adapter,
         # not the default group.
         optimizer_config = self.optimizer_group[kwargs.get('adapter_name', self._get_default_group())]
+        balance = kwargs.pop('_dp_balance', None)
+        optimizer_config.dp_balance_reordered = bool(balance and balance['reordered'])
+        optimizer_config.dp_balance_forward_kwargs = (
+            dict(kwargs) if optimizer_config.dp_balance_reordered and config is None else None)
         inputs = self._prepare_forward_only_inputs(inputs, optimizer_config)
         if config is None:
             return self._forward_only_single(inputs=inputs, optimizer_config=optimizer_config, **kwargs)
@@ -1196,6 +1207,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     'logits. Run the whole batch in one forward (the default), or use the megatron backend, '
                     'whose collate splits at record level.')
         plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        if optimizer_config.dp_balance_reordered and len(plan) == 1 and list(plan[0]) == list(range(len(inputs))):
+            # One in-order micro-batch leaves the whole rank batch cached, as the unbatched path does.
+            optimizer_config.dp_balance_forward_kwargs = dict(kwargs)
         batches = []
         for indices in plan:
             # Control scalars/tuples never slice with the samples; a field tuple whose length
@@ -1482,6 +1496,20 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """Calculate one selected loss, optionally pre-normalized for a multi-RPC transaction."""
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        if optimizer_config.dp_balance_reordered:
+            from twinkle.model.dp_balance import has_per_sample_values
+            if has_per_sample_values(kwargs):
+                raise ValueError(
+                    'forward_only reordered this batch across DP ranks, so fresh per-sample arguments '
+                    'to calculate_loss would not line up. Pass them to forward_only instead, or set dp_balance=False.')
+            saved_kwargs = optimizer_config.dp_balance_forward_kwargs
+            if saved_kwargs is None:
+                raise ValueError(
+                    'calculate_loss after a reordered micro-batch forward_only cannot use the cached last '
+                    'micro-batch as the whole batch. Use forward_backward, or set dp_balance=False.')
+            if saved_kwargs.get('loss_key') != loss_key:
+                raise ValueError('calculate_loss must use the same loss_key as the reordered forward_only.')
+            kwargs = {**{key: value for key, value in saved_kwargs.items() if key != 'loss_key'}, **kwargs}
         loss_instance: Loss = optimizer_config.get_loss(loss_key)
         assert isinstance(loss_instance, Loss), 'Set a loss_instance before calculating loss'
         is_training = optimizer_config.last_forward_training
@@ -1734,6 +1762,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         inputs, kwargs = self._rollout_features(inputs, kwargs, lift=True)
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        balance = kwargs.pop('_dp_balance', None)
+        optimizer_config.dp_balance_reordered = False
+        optimizer_config.dp_balance_forward_kwargs = None
+        if balance is not None:
+            optimizer_config.record_dp_balance(balance['metrics'])
         completing_pending = optimizer_config.prepare_backward_transaction(finalize_gradients, loss_weight)
         transactional = not finalize_gradients or completing_pending
         requested_sync = kwargs.pop('sync_gradients', None)

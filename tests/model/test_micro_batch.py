@@ -442,7 +442,7 @@ def test_forward_only_micro_batches_restore_order_and_slice_masks(algorithm, mic
 
 def test_forward_only_without_micro_batches_prepares_inputs_once():
     class ModelHarness:
-        optimizer_group = {'adapter': object()}
+        optimizer_group = {'adapter': SimpleNamespace()}
 
         def _get_default_group(self):
             return 'adapter'

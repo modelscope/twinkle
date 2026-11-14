@@ -28,3 +28,5 @@ The reason for the existence of max_loras and max_r parameters is that Twinkle's
 Because of this, the user's r must be less than or equal to the max_r configuration. During actual training, only part of the lora's rank will be used in the calculation.
 
 MultiLoraMegatronModel supports the `@remote_class` annotation and supports device_mesh, which means it can run in Ray workers.
+
+DP workload balancing is enabled by default through TrainableModel (`dp_balance=True`); see [the shared design and supported configurations](DPBalance.md).

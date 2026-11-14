@@ -56,6 +56,12 @@ class BaseOptimizerGroup:
     pending_backward: bool = False
     pending_failed: bool = False
     pending_loss: float = 0.0
+    # Set by forward_only when the driver reordered its batch for DP balance.
+    dp_balance_reordered: bool = False
+    # Full rank-local kwargs captured before forward_only splits micro-batches. None means the
+    # cached status is only the last micro-batch and cannot serve a subsequent balanced loss call.
+    dp_balance_forward_kwargs: dict[str, Any] | None = None
+    dp_balance_metrics: Dict[str, List[float]] = field(default_factory=dict)
 
     def set_loss(self, loss: Loss, loss_key: Optional[str] = None) -> None:
         if loss_key is None:
@@ -165,6 +171,10 @@ class BaseOptimizerGroup:
                 continue
             metric.accumulate(status.inputs, status.outputs, **metric_kwargs)
 
+    def record_dp_balance(self, metrics: Dict[str, float]) -> None:
+        for key, value in metrics.items():
+            self.dp_balance_metrics.setdefault(key, []).append(float(value))
+
     def calculate_metrics(self, is_training):
         """Calculate and return metrics."""
         self.accumulate_metrics(is_training)
@@ -187,6 +197,9 @@ class BaseOptimizerGroup:
         results = {}
         for metric in status.metrics:
             results.update(metric.calculate())
+        if is_training and self.dp_balance_metrics:
+            results.update({key: sum(values) / len(values) for key, values in self.dp_balance_metrics.items()})
+            self.dp_balance_metrics.clear()
         status.inputs = None
         status.outputs = None
         return results

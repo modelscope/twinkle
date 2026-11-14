@@ -55,7 +55,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
             acc_strategy: str = 'token',
             model_arch: Optional[Dict[str, Any]] = None,
+            dp_balance: bool = True,
             **kwargs):
+        self._init_dp_balance(dp_balance)
         new_special_tokens = kwargs.pop('new_special_tokens', None)
         if new_special_tokens:
             # Tenants share one frozen base tokenizer/embedding, so the vocab cannot be grown here;

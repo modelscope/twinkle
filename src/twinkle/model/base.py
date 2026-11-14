@@ -487,6 +487,123 @@ class TrainableModel(ABC):
             k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
             for k in inputs)
 
+    # Shared by backend subclasses, including those with independent constructors.
+    _dp_balance_backend = None
+    _dp_balance_enabled = True
+
+    def _init_dp_balance(self, enabled: bool = True) -> None:
+        self._dp_balance_enabled = bool(enabled)
+        self._dp_balance_off = not enabled
+
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def _dp_balance_spec(self, adapter_name: str | None = None, loss_key: str | None = None) -> dict[str, Any]:
+        """What the driver needs to plan a DP-balanced order for ``forward_backward`` / ``forward_only``."""
+        from twinkle.loss.base import dp_balance_group_size
+        optimizer_config = self.optimizer_group[adapter_name or self._get_default_group()]
+        try:
+            group_size = dp_balance_group_size(optimizer_config.get_loss(loss_key))
+        except ValueError:
+            # The call itself will fail on this loss_key; nothing tells which samples belong together.
+            group_size = None
+        text_config = self.hf_config.get_text_config() if hasattr(self.hf_config, 'get_text_config') else self.hf_config
+        return {
+            'enabled': getattr(self, '_dp_balance_enabled', True),
+            'padding_free': bool(getattr(optimizer_config.processor, 'padding_free', False)),
+            'hidden_size': getattr(text_config, 'hidden_size', None),
+            'group_size': group_size,
+            'backend': self._dp_balance_backend,
+            'variable_seq_lengths': getattr(self, 'variable_seq_lengths', True),
+            'sequence_multiple': (2 * (self.device_mesh.cp_world_size or 1)
+                                  if (self.device_mesh.cp_world_size or 1) > 1 else
+                                  (self.device_mesh.tp_world_size or 1)
+                                  if self.device_mesh.sequence_parallel else 1),
+        }
+
+    def _dp_balance_call(self, method: str, args: tuple, kwargs: Dict[str, Any]):
+        """Driver side of ``remote_function(dp_balance=True)``.
+
+        Returns ``(plan, args, kwargs)`` with the batch-aligned arguments reordered and a ``_dp_balance``
+        keyword for the workers, or ``None`` to dispatch the call unchanged. ``plan`` is ``None`` when the
+        batch keeps its order, so the result needs no restoring.
+        """
+        from .dp_balance import call_lengths, plan_call
+        if getattr(self, '_dp_balance_off', False):
+            return None
+        mesh = getattr(self, 'device_mesh', None)
+        if mesh is None or mesh.data_world_size <= 1:
+            return None
+        spec = self._dp_balance_spec(adapter_name=kwargs.get('adapter_name'), loss_key=kwargs.get('loss_key'))
+        if not spec['enabled']:
+            # Fixed at construction, so later calls skip the blocking spec round trip.
+            self._dp_balance_off = True
+            return None
+        if spec['group_size'] is None:
+            return None
+        lengths = call_lengths(args, kwargs)
+        if lengths is None:
+            return None
+        plan = plan_call(lengths, mesh.data_world_size, spec, kwargs)
+        if plan is None:
+            return None
+        if plan.reorders:
+            args, kwargs = plan.reorder_call(args, kwargs)
+        kwargs = dict(kwargs, _dp_balance={'reordered': plan.reorders, 'metrics': plan.metrics})
+        return (plan if plan.reorders else None), args, kwargs
+
+    def _dp_balance_local(self, run: Callable, args: tuple, kwargs: Dict[str, Any]):
+        """Local-mode side of ``remote_function(dp_balance=True)``, where each rank holds only its own slice.
+
+        The ranks gather their sequence lengths and plan the joined batch exactly as the Ray driver would.
+        When the plan reorders, they swap samples so each rank runs its share of the reordered batch, then
+        send every per-sample output back to the rank that holds its input. Each decision below is made
+        alike on all ranks, from configuration or gathered data, so the collectives never diverge.
+        """
+        original_run = run
+
+        def run(*call_args, **call_kwargs):
+            call_kwargs.pop('input_lengths', None)
+            return original_run(*call_args, **call_kwargs)
+
+        import torch.distributed as dist
+        from .dp_balance import call_leaves, call_lengths, exchange_call, leaf_layout, plan_call, restore_rank_outputs
+        from .dp_balance import normalize_rank_output, to_cpu
+        mesh = getattr(self, 'device_mesh', None)
+        if (getattr(self, '_dp_balance_off', False) or mesh is None or mesh.data_world_size <= 1
+                or not dist.is_initialized()
+                or sorted(mesh.mesh.flatten().tolist()) != list(range(dist.get_world_size()))):
+            return run(*args, **kwargs)
+        spec = self._dp_balance_spec(adapter_name=kwargs.get('adapter_name'), loss_key=kwargs.get('loss_key'))
+        if not spec['enabled']:
+            self._dp_balance_off = True
+            return run(*args, **kwargs)
+        if spec['group_size'] is None:
+            return run(*args, **kwargs)
+
+        def all_gather(value):
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, value)
+            # One rank per data rank, in data-rank order; TP / SP peers hold the same slice.
+            return [gathered[rank] for rank in mesh.get_collect_ranks()]
+
+        lengths = call_lengths(args, kwargs)
+        summaries = all_gather(None if lengths is None else (lengths, leaf_layout(call_leaves(args, kwargs))))
+        if (any(summary is None for summary in summaries) or len({len(summary[0]) for summary in summaries}) != 1
+                or any(summary[1] != summaries[0][1] for summary in summaries)):
+            # Joining the slices back into the batch get_slice cut needs equal slices with the same fields.
+            return run(*args, **kwargs)
+        plan = plan_call([length for summary in summaries for length in summary[0]], len(summaries), spec, kwargs)
+        if plan is None:
+            return run(*args, **kwargs)
+        balance = {'reordered': plan.reorders, 'metrics': plan.metrics}
+        if not plan.reorders:
+            return run(*args, **dict(kwargs, _dp_balance=balance))
+        rank_leaves = all_gather(to_cpu(call_leaves(args, kwargs)))
+        args, kwargs = exchange_call(plan, rank_leaves, mesh.data_rank, args, kwargs)
+        output = run(*args, **dict(kwargs, _dp_balance=balance))
+        if spec.get('backend') == 'megatron':
+            output = normalize_rank_output(output, len(lengths))
+        return restore_rank_outputs(output, all_gather(to_cpu(output)), plan, mesh.data_rank)
+
     @staticmethod
     def _rollout_features(inputs, kwargs: Dict[str, Any], *, lift: bool) -> tuple:
         """Split trajectories handed over by a rollout into model features and the loss's columns.
