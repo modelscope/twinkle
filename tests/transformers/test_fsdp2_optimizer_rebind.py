@@ -1,0 +1,178 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""FSDP2 leaves the parameters outside every ``fully_shard`` unit stale in the optimizer.
+
+Casting a parameter to the mixed-precision compute dtype replaces the ``Parameter`` object, and
+``accelerator.prepare`` rebuilds the optimizer over the sharded parameters -- but a vision tower and
+the embedding/tail that accelerate carves into their own units keep their PRE-WRAP objects in the
+optimizer's ``param_groups``. Training steps the model's objects, so nothing looks wrong until a
+checkpoint asks torch to map optimizer state onto parameter FQNs by object identity and the save
+dies after the whole run has trained. ``_rebind_unsharded_optimizer_params`` closes that gap at
+wrap time, where no optimizer state exists yet.
+
+These cases attack the pairing rule rather than confirming it: the replacement set must be the
+model's plain trainable parameters, a shape occurring twice must pair by traversal order, and a
+shape multiset that does not match must leave the optimizer untouched so the loud save-time refusal
+still fires instead of a silent guess.
+"""
+import torch
+
+from twinkle.model.transformers.strategy.accelerate import AccelerateStrategy
+
+rebind = AccelerateStrategy._rebind_unsharded_optimizer_params
+
+
+def _optimizer(*params):
+    return torch.optim.AdamW(list(params), lr=1e-5)
+
+
+def _params_of(optimizer):
+    return [param for group in optimizer.param_groups for param in group['params']]
+
+
+class _Model(torch.nn.Module):
+    """A stand-in for the wrapped model: named parameters in a declared order."""
+
+    def __init__(self, named):
+        super().__init__()
+        for index, (_, param) in enumerate(named):
+            self.register_parameter(f'p{index}', param)
+        self._names = [name for name, _ in named]
+
+    def named_parameters(self, *args, **kwargs):
+        return list(zip(self._names, [getattr(self, f'p{i}') for i in range(len(self._names))]))
+
+
+def test_a_stale_unsharded_parameter_is_repointed_onto_the_models_object():
+    """The defect itself: the optimizer names an object the wrapped model no longer exposes."""
+    current = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.bfloat16))
+    stale = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.float32))
+    model = _Model([('model.visual.patch_embed.proj.weight', current)])
+    optimizer = _optimizer(stale)
+
+    rebind(model, optimizer)
+
+    assert _params_of(optimizer) == [current], 'the optimizer must step the model\'s own parameter'
+    assert all(param is not stale for param in _params_of(optimizer))
+
+
+def test_a_shape_occurring_twice_pairs_by_traversal_order():
+    """An untied embedding and lm_head share a shape, so order is the only unambiguous pairing."""
+    embed_new = torch.nn.Parameter(torch.zeros(6, 2))
+    head_new = torch.nn.Parameter(torch.ones(6, 2))
+    embed_old = torch.nn.Parameter(torch.zeros(6, 2, dtype=torch.float32))
+    head_old = torch.nn.Parameter(torch.ones(6, 2, dtype=torch.float32))
+    model = _Model([('model.embed_tokens.weight', embed_new), ('lm_head.weight', head_new)])
+    optimizer = _optimizer(embed_old, head_old)
+
+    rebind(model, optimizer)
+
+    assert _params_of(optimizer) == [embed_new, head_new], 'same-shape offenders must pair in order'
+
+
+def test_a_mismatched_shape_multiset_leaves_the_optimizer_untouched():
+    """No provable pairing -> no rebind, so the save-time guard still refuses loudly."""
+    current = torch.nn.Parameter(torch.zeros(4, 3))
+    stale = torch.nn.Parameter(torch.zeros(9, 9, dtype=torch.float32))
+    model = _Model([('weight', current)])
+    optimizer = _optimizer(stale)
+
+    rebind(model, optimizer)
+
+    assert _params_of(optimizer) == [stale], 'an unprovable pairing must not be guessed'
+
+
+def test_a_count_mismatch_leaves_the_optimizer_untouched():
+    """Two stale objects against one plain model parameter of that shape: ambiguous, so no rebind."""
+    current = torch.nn.Parameter(torch.zeros(4, 3))
+    stale_a = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.float32))
+    stale_b = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.float32))
+    model = _Model([('weight', current)])
+    optimizer = _optimizer(stale_a, stale_b)
+
+    rebind(model, optimizer)
+
+    assert _params_of(optimizer) == [stale_a, stale_b]
+
+
+def test_a_frozen_model_parameter_is_not_offered_as_a_replacement():
+    """``plain`` is filtered on requires_grad: a frozen weight cannot own an optimizer moment."""
+    trainable = torch.nn.Parameter(torch.zeros(4, 3))
+    frozen = torch.nn.Parameter(torch.zeros(4, 3))
+    frozen.requires_grad_(False)
+    stale = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.float32))
+    # The frozen one is declared FIRST, so an unfiltered pairing would hand the stale object to it.
+    model = _Model([('frozen.weight', frozen), ('trainable.weight', trainable)])
+    optimizer = _optimizer(stale)
+
+    rebind(model, optimizer)
+
+    assert _params_of(optimizer) == [trainable], 'the replacement must be the trainable parameter'
+
+
+def test_an_already_reachable_optimizer_is_left_alone():
+    """Control for the above: nothing to do when the optimizer already names the model's objects."""
+    current = torch.nn.Parameter(torch.zeros(4, 3))
+    model = _Model([('weight', current)])
+    optimizer = _optimizer(current)
+
+    rebind(model, optimizer)
+
+    assert _params_of(optimizer) == [current]
+
+
+def test_rebinding_preserves_every_other_group_and_hyperparameter():
+    """The repair touches only the parameter objects, not the groups they sit in."""
+    current = torch.nn.Parameter(torch.zeros(4, 3))
+    stale = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.float32))
+    other = torch.nn.Parameter(torch.zeros(2, 2))
+    model = _Model([('weight', current), ('other', other)])
+    optimizer = torch.optim.AdamW([{
+        'params': [stale],
+        'lr': 3e-5,
+        'weight_decay': 0.1
+    }, {
+        'params': [other],
+        'lr': 1e-5
+    }])
+
+    rebind(model, optimizer)
+
+    assert optimizer.param_groups[0]['lr'] == 3e-5
+    assert optimizer.param_groups[0]['weight_decay'] == 0.1
+    assert optimizer.param_groups[0]['params'] == [current]
+    assert optimizer.param_groups[1]['params'] == [other]
+
+
+def test_an_optimizer_without_param_groups_does_not_crash():
+    """A forward-only build carries no optimizer parameters; the repair must be a silent no-op.
+
+    torch's own optimizers refuse an empty parameter list, so the stand-in is the shape the strategy
+    actually guards against: an object whose ``param_groups`` is empty.
+    """
+    class _NoGroups:
+        param_groups = []
+
+    model = _Model([('weight', torch.nn.Parameter(torch.zeros(2)))])
+
+    rebind(model, _NoGroups())
+
+    assert _NoGroups.param_groups == []
+
+
+def test_a_plain_parameter_the_wrap_already_rebound_is_not_a_replacement_candidate():
+    """The real failure shape: 12 unsharded model parameters against 11 stale optimizer objects.
+
+    One unsharded parameter was already repointed by the wrap, so it sits in the optimizer and is
+    reachable. Offering it as a replacement for a different offender would hand one weight two
+    optimizer entries and leave the real offender stale, so the candidate set excludes everything
+    the optimizer already names -- which is what makes the per-shape counts come out one-for-one.
+    """
+    rebound = torch.nn.Parameter(torch.zeros(8))          # plain, already in the optimizer
+    visual_new = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.bfloat16))
+    visual_old = torch.nn.Parameter(torch.zeros(4, 3, dtype=torch.float32))
+    model = _Model([('model.norm.weight', rebound), ('model.visual.proj.weight', visual_new)])
+    optimizer = _optimizer(rebound, visual_old)
+
+    rebind(model, optimizer)
+
+    assert _params_of(optimizer) == [rebound, visual_new]

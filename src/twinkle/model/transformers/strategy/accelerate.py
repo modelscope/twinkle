@@ -235,7 +235,73 @@ class AccelerateStrategy(TransformerStrategyBase):
         clear_offload_record(self)
 
     def wrap_model(self, model, *args):
-        return self.accelerator.prepare(model, *args)
+        result = self.accelerator.prepare(model, *args)
+        if isinstance(result, tuple):
+            for optimizer in result[1:]:
+                self._rebind_unsharded_optimizer_params(result[0], optimizer)
+        return result
+
+    @staticmethod
+    def _rebind_unsharded_optimizer_params(model, optimizer) -> None:
+        """Point the optimizer at the model's own objects for the parameters FSDP2 left unsharded.
+
+        Casting a parameter to the mixed-precision compute dtype replaces the ``Parameter`` object,
+        and ``accelerator.prepare`` rebuilds the optimizer over the sharded (DTensor) parameters --
+        but the parameters that sit OUTSIDE every ``fully_shard`` unit (a vision tower, and the
+        embedding/tail that accelerate carves into their own units) keep their pre-wrap objects in
+        the optimizer's ``param_groups``. Training then steps the model's objects while the optimizer
+        still names stale ones, which is invisible until a checkpoint asks torch to map optimizer
+        state onto parameter FQNs BY IDENTITY and the save dies -- after the whole run has trained.
+
+        This runs before the first optimizer step, so no state exists yet and re-pointing an object
+        loses nothing; doing it any later would have to migrate Adam moments across dtypes.
+
+        The pairing is taken only when it is provable, shape bucket by shape bucket. The offenders are
+        the optimizer parameters the wrapped model does not expose; the candidate replacements are the
+        model's plain (non-DTensor) trainable parameters that are NOT already in the optimizer -- the
+        set FSDP2 left alone, which is exactly the set that went stale, minus the members the wrap did
+        rebind. Within one shape bucket the pairing is by traversal order, so a shape occurring once is
+        matched exactly and a shape occurring twice (an untied embedding and lm_head) is matched by
+        order. A bucket whose two sides differ in count is left alone, and so is every other bucket:
+        the save-time guard then still refuses loudly rather than guessing which weight an optimizer
+        moment belongs to.
+        """
+        from torch.distributed.tensor import DTensor
+
+        inner = getattr(optimizer, 'optimizer', optimizer)
+        param_groups = getattr(inner, 'param_groups', None)
+        if not param_groups:
+            return
+        model_params = list(model.named_parameters())
+        optimizer_ids = {id(param) for group in param_groups for param in group['params']}
+        stale = [param for group in param_groups for param in group['params'] if id(param) not in
+                 {id(owned) for _, owned in model_params}]
+        if not stale:
+            return
+        candidates = [
+            param for _, param in model_params
+            if param.requires_grad and not isinstance(param, DTensor) and id(param) not in optimizer_ids
+        ]
+
+        def buckets(params):
+            grouped = {}
+            for param in params:
+                grouped.setdefault(tuple(param.shape), []).append(param)
+            return grouped
+
+        stale_buckets, candidate_buckets = buckets(stale), buckets(candidates)
+        replacement = {}
+        for shape, group in stale_buckets.items():
+            peers = candidate_buckets.get(shape)
+            # Only a bucket that matches one-for-one is provable; a partial match would leave some
+            # offender pointing at a weight that belongs to another offender.
+            if peers is None or len(peers) != len(group):
+                continue
+            replacement.update(zip((id(param) for param in group), peers))
+        if not replacement:
+            return
+        for group in param_groups:
+            group['params'] = [replacement.get(id(param), param) for param in group['params']]
 
     def unwrap_model(self, model):
         return self.accelerator.unwrap_model(model, keep_torch_compile=False)
@@ -284,26 +350,35 @@ class AccelerateStrategy(TransformerStrategyBase):
         params = [param for group in optimizer.param_groups for param in group['params']]
         model_params = list(model.named_parameters())
         model_ids = {id(param) for _, param in model_params}
-        unreachable = [param for param in params if id(param) not in model_ids]
+        unreachable = [(index, param) for index, param in enumerate(params) if id(param) not in model_ids]
         if not unreachable:
             return
         unsharded = [fqn for fqn, param in model_params if not isinstance(param, DTensor)]
-        # An object id says nothing to whoever has to act on this, so name each offender by the model
-        # parameter(s) sharing its shape: the optimizer holds an object the wrapped model no longer
-        # exposes, and shape is the only identity left that ties it back to a recognizable weight.
+        # Name each offender two ways, because either alone can mislead:
+        #   - BY POSITION: an optimizer is built over the model's trainable parameters in order, so the
+        #     i-th optimizer parameter and the i-th trainable FQN are the same weight even when the
+        #     wrap replaced the object. This identifies the weight exactly.
+        #   - BY SHAPE: the fallback when the counts have diverged (a group was dropped or rebuilt),
+        #     plus the dtype and DTensor-ness pair that says whether the optimizer holds a pre-wrap
+        #     copy (plain fp32) of what the model now exposes as a shard (bf16 DTensor).
+        trainable = [fqn for fqn, param in model_params if param.requires_grad]
         by_shape: dict = {}
         for fqn, param in model_params:
             by_shape.setdefault(tuple(param.shape), []).append(fqn)
-        offenders = [
-            f'{tuple(param.shape)} {param.dtype} -> '
-            f'{by_shape.get(tuple(param.shape)) or ["<no model parameter of this shape>"]}'
-            for param in unreachable[:8]
-        ]
+        offenders = []
+        for index, param in unreachable[:8]:
+            positional = trainable[index] if index < len(trainable) else '<position past the trainable list>'
+            model_param = dict(model_params).get(positional)
+            offenders.append(
+                f'#{index} {positional}: optimizer holds {tuple(param.shape)} {param.dtype}; '
+                f'model exposes '
+                f'{"nothing under that name" if model_param is None else f"{tuple(model_param.shape)} {model_param.dtype}" + (" (DTensor)" if isinstance(model_param, DTensor) else " (plain)")}'
+                f'; same-shape model params {by_shape.get(tuple(param.shape)) or ["<none>"]}')
         raise RuntimeError(
             f'{len(unreachable)} of {len(params)} optimizer parameter(s) are not reachable from the wrapped '
-            f'model {type(model).__name__}, so its FSDP2 optimizer state cannot be mapped to parameter '
-            f'names and no resumable checkpoint can be written. Offenders as (shape, dtype) -> the model '
-            f'parameter(s) of that shape: {offenders}. The model still holds '
+            f'model {type(model).__name__} (which exposes {len(trainable)} trainable parameter(s)), so its '
+            f'FSDP2 optimizer state cannot be mapped to parameter names and no resumable checkpoint can be '
+            f'written. Offenders: {offenders}. The model still holds '
             f'{len(unsharded)} unsharded parameter(s): {unsharded[:12]}. This is the full-parameter FSDP2 '
             'path; an adapter run (--tuner lora) keeps every optimizer parameter inside a wrapped unit '
             'and saves normally.')
