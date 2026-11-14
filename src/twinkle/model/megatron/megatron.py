@@ -149,6 +149,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
 
     _mcore_async_queue = None
 
+    def __repr__(self) -> str:
+        # nn.Module.__repr__ dumps the full tree, and raises on the driver-side handle
+        # (its __init__ never ran, so _modules is missing); ray interpolates argument
+        # reprs into actor-creation errors, so the dump or the crash swallows the real
+        # traceback. Keep it short and shell-safe, like TransformersModel.
+        return f'{type(self).__name__}(model_id={getattr(self, "model_id", None)!r})'
+
     def __init__(
         self,
         model_id: str,
