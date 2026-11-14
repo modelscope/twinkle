@@ -1119,6 +1119,13 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
             torch.save(state, output_path)
 
         @staticmethod
+        def optimizer_checkpoint_exists(output_dir):
+            # Mirrors TransformerStrategyBase: this stub torch.saves to the optimizer.pt path.
+            import os
+
+            return os.path.exists(os.path.join(output_dir, 'optimizer.pt'))
+
+        @staticmethod
         def load_optimizer_checkpoint(_model, optimizer, input_path, *, param_name_mapping=None):
             from twinkle.model.state_dict_utils import remap_optimizer_state_names
             state = torch.load(input_path, map_location='cpu', weights_only=False)
@@ -1239,6 +1246,13 @@ def test_hybrid_optimizer_resume_matches_uninterrupted_training(tmp_path):
             state = optimizer.state_dict()
             remap_optimizer_state_names(state, param_name_mapping or {})
             torch.save(state, output_path)
+
+        @staticmethod
+        def optimizer_checkpoint_exists(output_dir):
+            # Mirrors TransformerStrategyBase: this stub torch.saves to the optimizer.pt path.
+            import os
+
+            return os.path.exists(os.path.join(output_dir, 'optimizer.pt'))
 
         @staticmethod
         def load_optimizer_checkpoint(_model, optimizer, input_path, *, param_name_mapping=None):
