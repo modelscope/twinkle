@@ -122,16 +122,32 @@ class TransformerStrategyBase(ABC):
             candidates = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
         if not candidates:
             candidates = list(model.named_parameters())
+        limit = int(os.environ.get('TWINKLE_LOAD_PRECISION_PROBE_PARAMS', 8))
+        # Spread the sample evenly over the candidate list, both ends included, rather than taking it
+        # from the head. Sampling the first few is what let a load that only wrote part of the targeted
+        # parameters read as clean: the head is exactly where a truncated write still succeeds. A fixed
+        # stride does not fix that either -- unless it divides the list it stops short of the last
+        # parameter, and the limit is reached before the appended tail is ever visited.
+        count = len(candidates)
+        if count <= max(limit, 1):
+            order = list(range(count))
+        elif limit <= 1:
+            order = [0]
+        else:
+            order = [round(i * (count - 1) / (limit - 1)) for i in range(limit)]
         sampled = 0
         representable = 0
         total = 0
-        for _, param in candidates:
-            if sampled >= 8:
+        sampled_names = []
+        for index in order:
+            if sampled >= limit:
                 break
+            name, param = candidates[index]
             local = param.to_local() if hasattr(param, 'to_local') else param
             if local.numel() == 0 or not local.is_floating_point():
                 continue
             sampled += 1
+            sampled_names.append(name)
             flat = local.detach().float().flatten()
             total += flat.numel()
             representable += int((flat.to(torch.bfloat16).to(torch.float32) == flat).sum().item())
@@ -144,6 +160,11 @@ class TransformerStrategyBase(ABC):
             'src_dtypes': sorted({str(v.dtype) for v in state_dict.values() if torch.is_tensor(v)}),
             'targeted': len(candidates),
             'params_sampled': sampled,
+            # A ratio without the names it was taken over cannot be compared between two runs: the
+            # same number from two different parameter subsets says nothing. The stride makes the
+            # subset reproducible, and naming it makes that checkable rather than assumed.
+            'sampled_params': sampled_names,
+            'elements': total,
             'bf16_representable_ratio': (representable / total) if total else None,
         }
         with open(f'{prefix}.rank{record["rank"]}.jsonl', 'a') as handle:
