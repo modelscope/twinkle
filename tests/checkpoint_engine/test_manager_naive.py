@@ -44,12 +44,23 @@ class _Sampler:
         self.loaded = []
         self.fail = fail
         self._checkpoint_engine = None
+        # One timeline for the gate and the transfer, so "weights are swapped while generation is held"
+        # is assertable as an ordering rather than implied by two separate lists happening to be
+        # non-empty. The manager's contract is pause -> transfer -> resume.
+        self.gate = []
 
     def get_state_keys(self):
         return ['q_proj.weight']
 
+    def pause_generation(self) -> None:
+        self.gate.append('pause')
+
+    def resume_generation(self) -> None:
+        self.gate.append('resume')
+
     def receive_weights(self, **kwargs):
         self.calls.append(kwargs)
+        self.gate.append('receive')
         if self.fail is not None:
             raise self.fail
         self.loaded.append(list(kwargs['weights']))
@@ -68,6 +79,9 @@ def test_local_sync_streams_generator_without_checkpoint_engine(requested_mode):
     assert manager.backend_cls is None
     assert manager.base_sync_done is True
     assert sampler.loaded == [[('q_proj.weight', 'base')]]
+    # Generation is held across the transfer and released after, so requests in flight continue on the
+    # fresh weights rather than being torn down by the swap.
+    assert sampler.gate == ['pause', 'receive', 'resume']
     assert model._checkpoint_engine is None
     assert sampler._checkpoint_engine is None
     assert model.generator_calls == [{
