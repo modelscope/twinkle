@@ -4,7 +4,6 @@ import hashlib
 import os
 import tempfile
 from concurrent.futures import Future
-from contextlib import contextmanager
 from pathlib import Path
 from requests.exceptions import HTTPError
 from typing import Dict, List, Literal, Optional, Union
@@ -13,7 +12,9 @@ from twinkle.utils import requires
 from twinkle.utils.parallel import processing_lock
 from .model_alias import resolve_model_id_alias
 
-_executor = concurrent.futures.ProcessPoolExecutor(max_workers=8)
+# A thread pool suffices: the pushed payload is network I/O, and a process pool would fork after
+# CUDA is up in the importing process.
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 _futures = {}
 
 large_file_pattern = [
@@ -32,20 +33,10 @@ large_file_pattern = [
 
 class HubOperation:
 
-    @classmethod
-    @contextmanager
-    def patch_hub(cls):
-        yield
-
     @staticmethod
     def source_type(resource_name: str):
         resource_name = resource_name or ''
-        if resource_name.startswith('hf://'):
-            source_type = 'hf'
-        elif resource_name.startswith('ms://'):
-            source_type = 'ms'
-        else:
-            source_type = 'ms'
+        source_type = 'hf' if resource_name.startswith('hf://') else 'ms'
         if source_type == 'hf' and os.environ.get('TWINKLE_FORBID_HF', '0') != '0':
             # Preventing from hang
             raise ValueError('Using hf as hub backend is not supported.')
@@ -72,25 +63,7 @@ class HubOperation:
             The Hub class (HFHub or MSHub)
         """
         source = cls.source_type(resource_name)
-        if source == 'hf':
-            return HFHub
-        elif source == 'ms':
-            return MSHub
-        else:
-            raise NotImplementedError(f'Unknown source type: {source}')
-
-    @classmethod
-    def try_login(cls, token: Optional[str] = None) -> bool:
-        """Try to log in to the hub
-
-        Args:
-            token: The hub token to use
-
-        Returns:
-            bool: Whether login is successful
-        """
-        hub = cls._get_hub_class(token)
-        return hub.try_login(cls.remove_source_type(token))
+        return HFHub if source == 'hf' else MSHub
 
     @classmethod
     def create_model_repo(cls, repo_id: str, token: Optional[str] = None, private: bool = False):
@@ -148,18 +121,25 @@ class HubOperation:
                           **kwargs):
         future: Future = _executor.submit(HubOperation.push_to_hub, repo_id, folder_path, path_in_repo, commit_message,
                                           commit_description, token, private, revision, ignore_patterns, **kwargs)
+        replaced = _futures.pop(repo_id, None)
+        if replaced is not None and not replaced.done():
+            import logging
+            logging.getLogger(__name__).warning(
+                'A previous push of %r is still in flight and is now dropped by a newer one.', repo_id)
         _futures[repo_id] = future
 
     @classmethod
     def wait_for(cls, repo_ids: Optional[List[str]] = None) -> Dict[str, str]:
+        """Wait for the pushed repos; each waited-on push is popped (it is done from here on)."""
         results = {}
-        for repo_id, future in _futures.items():
-            future: Future
-            if not repo_ids or repo_id in repo_ids:
-                try:
-                    results[repo_id] = future.result()
-                except Exception as e:
-                    results[repo_id] = str(e)
+        for repo_id in list(_futures):
+            if repo_ids and repo_id not in repo_ids:
+                continue
+            future = _futures.pop(repo_id)
+            try:
+                results[repo_id] = future.result()
+            except Exception as e:
+                results[repo_id] = str(e)
         return results
 
     @classmethod
@@ -190,7 +170,7 @@ class HubOperation:
                        model_id_or_path: Optional[str] = None,
                        revision: Optional[str] = None,
                        download_model: bool = True,
-                       ignore_patterns: Optional[List[str]] = [],
+                       ignore_patterns: Optional[List[str]] = None,
                        token: Optional[str] = None,
                        **kwargs) -> str:
         """Download model from the hub
@@ -208,6 +188,9 @@ class HubOperation:
             The local dir
         """
         model_id_or_path = resolve_model_id_alias(model_id_or_path)
+        if not model_id_or_path:
+            # ``os.path.exists`` on None would raise a TypeError far from the real cause.
+            raise ValueError('download_model needs a model id or local path.')
         if kwargs.pop('ignore_model', False):
             ignore_patterns = set(ignore_patterns or []) | set(large_file_pattern)
         if os.path.exists(model_id_or_path):
@@ -234,117 +217,11 @@ class HubOperation:
                 token=token,
                 **kwargs)
 
-    @classmethod
-    def download_dataset(cls,
-                         dataset_id: str,
-                         revision: Optional[str] = None,
-                         allow_patterns: Optional[Union[List[str], str]] = None,
-                         ignore_patterns: Optional[Union[List[str], str]] = None,
-                         token: Optional[str] = None,
-                         **kwargs) -> str:
-        """Download a dataset repo from the hub, without loading it
-
-        Use this to place the files; use `load_dataset` to get an actual dataset object.
-
-        Args:
-            dataset_id: The dataset id, or a local path, which is returned untouched
-            revision: The dataset revision
-            allow_patterns: Only fetch files matching these patterns
-            ignore_patterns: Skip files matching these patterns
-            token: The hub token
-        Returns:
-            The local dir
-        """
-        if os.path.exists(dataset_id):
-            return dataset_id
-        hub = cls._get_hub_class(dataset_id)
-        with processing_lock(f'download_dataset:{dataset_id}', sticky=True):
-            return hub.download_dataset(
-                dataset_id=cls.remove_source_type(dataset_id),
-                revision=revision,
-                allow_patterns=allow_patterns,
-                ignore_patterns=ignore_patterns,
-                token=token,
-                **kwargs)
-
-    @classmethod
-    def download_file(cls,
-                      repo_id: str,
-                      repo_type: Literal['model', 'tokenizer', 'dataset'] = 'model',
-                      allow_patterns: Optional[Union[List[str], str]] = None,
-                      token: Optional[str] = None,
-                      **kwargs) -> str:
-        """Download a repo, or part of one, letting repo_type pick the right hub API
-
-        Callers holding nothing but a type string can use this instead of choosing between
-        `download_model` and `download_dataset` themselves.
-
-        Args:
-            repo_id: The repository id, or a local path, which is returned untouched
-            repo_type: 'model' for a full model repo, 'tokenizer' for the same repo without its
-                weights, 'dataset' for a dataset repo
-            allow_patterns: Only fetch files matching these patterns
-            token: The hub token
-            **kwargs: Additional arguments passed to the download function
-
-        Returns:
-            The local directory path containing downloaded files
-        """
-        if repo_type == 'dataset':
-            return cls.download_dataset(repo_id, allow_patterns=allow_patterns, token=token, **kwargs)
-        return cls.download_model(
-            repo_id, ignore_model=(repo_type == 'tokenizer'), allow_patterns=allow_patterns, token=token, **kwargs)
 
 
 class MSHub(HubOperation):
     ms_token = None
 
-    @staticmethod
-    def create_repo(repo_id: str,
-                    *,
-                    token: Optional[Union[str, bool]] = None,
-                    private: bool = False,
-                    **kwargs) -> 'modelscope.utils.repo_utils.RepoUrl':
-        """
-        Create a new repository on the hub.
-
-        Args:
-            repo_id: The ID of the repository to create.
-            token: The authentication token to use.
-            private: Whether the repository should be private.
-            **kwargs: Additional arguments.
-
-        Returns:
-            RepoUrl: The URL of the created repository.
-        """
-        requires('modelscope')
-        hub_model_id = MSHub.create_model_repo(repo_id, token, private)
-        from modelscope.utils.repo_utils import RepoUrl
-        return RepoUrl(url=hub_model_id, )
-
-    @staticmethod
-    def upload_folder(
-        *,
-        repo_id: str,
-        folder_path: Union[str, Path],
-        path_in_repo: Optional[str] = None,
-        commit_message: Optional[str] = None,
-        commit_description: Optional[str] = None,
-        token: Optional[Union[str, bool]] = None,
-        revision: Optional[str] = 'master',
-        ignore_patterns: Optional[Union[List[str], str]] = None,
-        **kwargs,
-    ):
-        requires('modelscope')
-        from modelscope.utils.repo_utils import CommitInfo
-        MSHub.push_to_hub(repo_id, folder_path, path_in_repo, commit_message, commit_description, token, True, revision,
-                          ignore_patterns)
-        return CommitInfo(
-            commit_url=f'https://www.modelscope.cn/models/{repo_id}/files',
-            commit_message=commit_message,
-            commit_description=commit_description,
-            oid='',
-        )
 
     @classmethod
     def try_login(cls, token: Optional[str] = None) -> bool:
@@ -502,27 +379,6 @@ class MSHub(HubOperation):
 
         return snapshot_download(**download_kwargs)
 
-    @classmethod
-    def download_dataset(cls,
-                         dataset_id: str,
-                         revision: Optional[str] = None,
-                         allow_patterns: Optional[Union[List[str], str]] = None,
-                         ignore_patterns: Optional[Union[List[str], str]] = None,
-                         token: Optional[str] = None,
-                         **kwargs) -> str:
-        requires('modelscope')
-        cls.try_login(token)
-        if revision is None or revision == 'main':
-            revision = 'master'
-        from modelscope import dataset_snapshot_download
-        return dataset_snapshot_download(
-            dataset_id=dataset_id,
-            revision=revision,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            token=token,
-            **kwargs)
-
     @staticmethod
     def add_patterns_to_file(repo,
                              file_name: str,
@@ -583,14 +439,12 @@ class MSHub(HubOperation):
 class HFHub(HubOperation):
 
     @classmethod
-    def try_login(cls, token: Optional[str] = None) -> bool:
-        pass
-
-    @classmethod
     def create_model_repo(cls, repo_id: str, token: Optional[str] = None, private: bool = False) -> str:
         requires('huggingface_hub')
         from huggingface_hub.hf_api import api
-        return api.create_repo(repo_id, token=token, private=private)
+        # exist_ok: a re-run export pushes onto a repo it created the first time; the MS path
+        # tolerates the same through its HTTPError branch below.
+        return api.create_repo(repo_id, token=token, private=private, exist_ok=True)
 
     @classmethod
     def push_to_hub(cls,
@@ -660,27 +514,6 @@ class HFHub(HubOperation):
             repo_id=model_id_or_path,
             repo_type='model',
             revision=revision,
-            ignore_patterns=ignore_patterns,
-            token=token,
-            **kwargs)
-
-    @classmethod
-    def download_dataset(cls,
-                         dataset_id: str,
-                         revision: Optional[str] = None,
-                         allow_patterns: Optional[Union[List[str], str]] = None,
-                         ignore_patterns: Optional[Union[List[str], str]] = None,
-                         token: Optional[str] = None,
-                         **kwargs) -> str:
-        requires('huggingface_hub')
-        if revision is None or revision == 'master':
-            revision = 'main'
-        from huggingface_hub import snapshot_download
-        return snapshot_download(
-            repo_id=dataset_id,
-            repo_type='dataset',
-            revision=revision,
-            allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
             token=token,
             **kwargs)

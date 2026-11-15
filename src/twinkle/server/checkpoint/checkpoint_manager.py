@@ -554,8 +554,8 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         """
         try:
             # Download only the checkpoint_metadata.json file from hub
-            local_dir = HubOperation.download_file(
-                repo_id=hub_model_id, allow_patterns=[CHECKPOINT_INFO_FILENAME], token=self.token)
+            local_dir = HubOperation.download_model(
+                hub_model_id, allow_patterns=[CHECKPOINT_INFO_FILENAME], token=self.token)
 
             # Read and parse the metadata
             metadata_path = os.path.join(local_dir, CHECKPOINT_INFO_FILENAME)
