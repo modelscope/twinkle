@@ -1850,7 +1850,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # for this step by the time the loop reaches here, so the engine's counter reads the step being
         # digested rather than the one before it.
         pre = self._digest_parameters('param') if probe else None
-        master_pre = self.strategy.engine_master_digest(self.model, stepped=True) if probe else None
+        # A strategy whose update happens here in the loop has no engine counter to read, so it is told
+        # which step is being digested. ``_probe_step_no`` counts the probes already written, which is
+        # one behind the step in flight at both of these sites.
+        probe_step = self.__dict__.get('_probe_step_no', 0) + 1
+        master_pre = self.strategy.engine_master_digest(self.model, stepped=True,
+                                                        step=probe_step) if probe else None
         self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         grad = self._digest_parameters('grad') if probe else None
         self.step(**kwargs)
@@ -1924,7 +1929,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         post = self._digest_parameters('param')
         # On an offload tier the parameters are only a bfloat16 view of the float32 master, so they read
         # identically before and after the step; the master digest is what shows the update landed.
-        master_post = self.strategy.engine_master_digest(self.model, stepped=True)
+        master_post = self.strategy.engine_master_digest(
+            self.model, stepped=True, step=self.__dict__.get('_probe_step_no', 0) + 1)
         engine_step = self.strategy.take_engine_step_probe()
         rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
         step_no = self.__dict__.setdefault('_probe_step_no', 0) + 1

@@ -713,6 +713,51 @@ class AccelerateStrategy(TransformerStrategyBase):
         state = collect_local_state(unwrapped, include_buffers=True)
         return {name: torch_util.to_local_tensor(tensor).cpu() for name, tensor in state.items()}
 
+    def engine_master_digest(self, model, *, stepped: bool = False, step: Optional[int] = None) -> Dict[str, Any]:
+        """Per-parameter ``bits`` fingerprint of this rank's FSDP2 shard, plus float statistics.
+
+        Under FSDP2 there is no separate flat float32 partition to read: ``prepare`` upcasts the
+        trainable parameters themselves to the float32 master and ``MixedPrecisionPolicy.param_dtype``
+        supplies a bfloat16 compute copy for the forward, so the master is the parameter's own local
+        shard. Digesting it here rather than leaving the base's empty default is what gives this tier an
+        identity-capable field at all -- without one, the only per-parameter evidence available is the
+        loop's plain digest, which reads whichever buffer the wrapper is exposing at that moment. That
+        buffer depends on how the model was constructed (``prepare`` on a fresh run, ``prepare`` followed
+        by ``load_full_state_dict`` on a resume), so two arms can disagree on it while computing the same
+        thing, and a difference measured that way locates nothing.
+
+        The dtype is recorded alongside because "the master was rounded to bfloat16" and "this read the
+        bfloat16 compute copy" are different claims with different remedies, and the values alone cannot
+        separate them.
+        """
+        full_step = os.environ.get('TWINKLE_STEP_DELTA_PROBE_FULL_STEP')
+        # No engine owns the update on this tier -- the loop applies it -- so there is no counter to
+        # read and the caller supplies the step being digested.
+        at_full_step = bool(full_step) and step is not None and int(step) == int(full_step)
+        out: Dict[str, Any] = {}
+        for name, param in self.unwrap_model(model).named_parameters():
+            if not param.requires_grad:
+                continue
+            # This rank's shard, not the gathered parameter: ``twinkle.utils.torch_util``'s
+            # ``to_local_tensor`` prefers ``full_tensor()``, which all-gathers. That is right for
+            # collecting a state dict to save and wrong here -- it is a collective every rank would
+            # have to enter in the same order, and it materializes the whole unsharded parameter on
+            # each rank, which is exactly what the sharding exists to avoid.
+            local = param.to_local() if hasattr(param, 'to_local') else param
+            if local.numel() == 0 or not local.is_floating_point():
+                continue
+            flat = local.detach().flatten()
+            chunks = self._full_coverage_chunks(flat.numel()) if at_full_step else 64
+            out[name] = {
+                'agg': self._aggregate(self._chunk_stats(flat, chunks=chunks)),
+                'chunks': chunks,
+                'covered': at_full_step,
+                'bits': self._bits_fingerprint(flat),
+                'dtype': str(local.dtype),
+                'numel': int(flat.numel()),
+            }
+        return out
+
     def _match_master_weight_precision(self, model) -> None:
         """Put trainable parameters in the dtype the FSDP2 wrap will train them at, before a load.
 

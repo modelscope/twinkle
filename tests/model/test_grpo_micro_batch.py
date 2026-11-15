@@ -18,6 +18,11 @@ class TrainingHarness:
     _forward_backward_micro_batches = TransformersModel._forward_backward_micro_batches
     _build_micro_batch_plan = TransformersModel._build_micro_batch_plan
     _global_loss_normalizer = TransformersModel._global_loss_normalizer
+    # ``forward_backward`` splits a rollout's trajectory into model features and the loss's columns
+    # before it reaches the micro-batch plan, so a harness that borrows the method has to borrow that
+    # collaborator too. It is a ``staticmethod`` on ``TrainableModel``, and a bare assignment would
+    # rebind it as an instance method and hand ``self`` to the ``inputs`` parameter.
+    _rollout_features = staticmethod(TransformersModel._rollout_features)
     _not_encoded = staticmethod(lambda _: False)
 
     def __init__(self, loss):

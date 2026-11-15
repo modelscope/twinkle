@@ -254,8 +254,93 @@ class TransformerStrategyBase(ABC):
         """
         return {}
 
-    def engine_master_digest(self, model, *, stepped: bool = False) -> Dict[str, Any]:
-        """Digest of the float32 master partitions this strategy's optimizer actually updates.
+    @staticmethod
+    def _chunk_stats(flat, chunks: int = 64, width: int = 4096) -> list:
+        """Per-chunk ``[sum, absmax, sum_of_squares]`` over a strided sample of a flat partition.
+
+        The partitions are billions of elements, so digesting them whole each step would cost more than
+        the training itself. ``chunks`` samples of ``width`` elements are taken at even strides instead:
+        cheap, and -- unlike a prefix window -- able to see a difference anywhere in the partition.
+
+        Every reduction here is exact and therefore independent of the schedule it runs under. That is a
+        hard requirement, not a preference: ``torch.sum`` reduces in parallel past a few thousand
+        elements, so the addition order follows thread scheduling and identical data yields a different
+        last digit between two runs. A digest that drifts on identical input reports differences that are
+        not there, which is worse than no digest at all -- measured on a ZeRO-2 resume that restores
+        exactly, a per-chunk ``torch.sum`` differed by two float64 ULP on a 5e3-magnitude group whose
+        elements cancel, while its absmax and norm matched. ``math.fsum`` is correctly rounded and
+        ``max`` is exact, so neither depends on order; converting with ``tolist`` first is what makes
+        that available, and float32/bf16 to float64 is lossless so nothing is given up by doing it.
+        """
+        import math
+
+        numel = flat.numel()
+        if numel == 0:
+            return []
+        stride = max(numel // chunks, width)
+        if stride == width:
+            # Every element is reachable, so tile exactly. Anchoring a final window at ``numel - width``
+            # here would overlap the last strided chunk and count that overlap twice, which corrupts the
+            # sum and the norm -- the two quantities a ``covered=True`` digest exists to report exactly,
+            # since that mode is what sizes and locates a difference rather than merely detecting one.
+            starts = list(range(0, numel, width))
+        else:
+            starts = list(range(0, numel - width + 1, stride)) or [0]
+            # The strided walk stops at the last start that still fits a whole chunk, so an even stride
+            # leaves the partition's tail unsampled -- anchored here, because a difference only past the
+            # sampled region is exactly what this digest exists to catch. The overlap this introduces is
+            # acceptable in a sample, which ``covered=False`` already declares non-authoritative.
+            if numel >= width and (numel - width) % stride and starts[-1] != numel - width:
+                starts.append(numel - width)
+        out = []
+        for start in starts:
+            values = flat[start:start + width].tolist()
+            out.append([math.fsum(values), max(abs(v) for v in values), math.fsum(v * v for v in values)])
+        return out
+
+    @staticmethod
+    def _aggregate(stats: list) -> list:
+        """``[sum, absmax, norm]`` combined from per-chunk stats in a fixed order."""
+        import math
+
+        if not stats:
+            return [0.0, 0.0, 0.0]
+        return [
+            math.fsum(s[0] for s in stats),
+            max(s[1] for s in stats),
+            math.sqrt(math.fsum(s[2] for s in stats)),
+        ]
+
+    @staticmethod
+    def _bits_fingerprint(flat, block: int = 1 << 24) -> list:
+        """Two order-independent exact integers that change if any element's bits change.
+
+        Delegates to :func:`twinkle.utils.torch_utils.bits_fingerprint`, which the weight-sync
+        engines use for the same purpose: an exact per-element comparison that does not depend on
+        the reduction schedule. See there for why integer accumulation is used instead of the exact
+        float reductions, which cost minutes on a billion-element partition.
+        """
+        from twinkle.utils.torch_utils import bits_fingerprint
+        return bits_fingerprint(flat, block=block)
+
+    @staticmethod
+    def _full_coverage_chunks(numel: int, width: int = 4096) -> int:
+        """The chunk count that makes a strided sample cover every element of a ``numel``-long partition.
+
+        ``stride = max(numel // chunks, width)``, so coverage is complete once the stride falls to
+        ``width`` -- i.e. once ``chunks >= numel / width``. Sampling is what makes the digest cheap, and
+        cheap is what lets it run every step; but a strided sample can only prove a difference exists,
+        never that one is absent. Measured on a ZeRO-2 offload resume: a 503,552-element group is
+        covered exhaustively by the default count and read identical, while a 4,538,761,984-element
+        group is 0.37% sampled -- and the post-update difference appeared only in the sparsely sampled
+        one, where "identical" was never actually established. Full coverage costs minutes on a
+        partition that size, so it is gated to the single step under investigation rather than run
+        every step.
+        """
+        return max(1, -(-numel // width))
+
+    def engine_master_digest(self, model, *, stepped: bool = False, step: Optional[int] = None) -> Dict[str, Any]:
+        """Digest of the float32 master this strategy's optimizer actually updates.
 
         Offload tiers keep the trained precision in a flat CPU partition that the model's parameters
         are only a bfloat16 view of, so digesting the parameters cannot show whether an update landed:
@@ -263,8 +348,16 @@ class TransformerStrategyBase(ABC):
         partition rather than taken from its head, because a prefix sample is exactly what let a
         partition that differed past its first elements report as identical.
 
-        ``stepped`` tells the implementation whether its engine has already run this step's update,
-        which is what selects the step counter a full-coverage gate compares against.
+        ``agg`` sizes and locates a difference; ``bits`` decides whether two runs are identical at all.
+        A strategy that reports neither leaves its tier without any identity-capable field, and every
+        conclusion drawn from the loop's plain parameter digest on that tier is unqualified -- that
+        digest reads whatever buffer the parallelism wrapper happens to expose, which depends on how the
+        model was constructed rather than on the trained values.
+
+        ``stepped`` tells an engine-owning strategy whether its engine has already run this step's
+        update, which is what selects the counter its full-coverage gate compares against. ``step`` is
+        the same number supplied by the caller, for a strategy whose update happens in the loop and
+        which therefore has no counter of its own to read.
         """
         return {}
 
