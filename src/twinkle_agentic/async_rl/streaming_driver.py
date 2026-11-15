@@ -188,6 +188,9 @@ class StreamingDriver:
     #: ... or when more than ``MAX_FAILURE_RATE`` of the last ``FAILURE_WINDOW`` episodes failed.
     FAILURE_WINDOW = 256
     MAX_FAILURE_RATE = 0.5
+    #: One ``adjust`` call still running past this many seconds is reported as stuck: it hung
+    #: inside the adapter holding its lock, so rebalancing is down until the call returns.
+    ADJUST_STUCK_TIMEOUT = 300.0
 
     def __init__(self,
                  dataloader: Any,
@@ -268,7 +271,16 @@ class StreamingDriver:
             'stopped': 0, 'regenerated': 0
         }
         self._adjusting = False
+        #: monotonic stamps: when the running ``adjust`` started, and when its being stuck was last reported.
+        self._adjust_started = 0.0
+        self._adjust_reported = 0.0
         self._wait_time = 0.0
+        #: the last batch's wait share spent joining the lend thread and reclaiming (excluded from
+        #: ``_idle_ratio`` so the machinery's own cost never reads as a sampler bottleneck)
+        self._reclaim_cost = 0.0
+        #: the lend->reclaim cycle now in flight (the thread, until the reclaim in ``_next_batch``'s
+        #: finally completes): while it runs the adapter's lock is legitimately held
+        self._lending = None
         self._returned_at: Optional[float] = None
         self._idle_ratio = 0.0
         self._iter_started = False
@@ -300,9 +312,12 @@ class StreamingDriver:
         """
         self._start()
         started = time.monotonic()
+        waited = 0.0
         if self._returned_at is not None:
             busy = started - self._returned_at
-            self._idle_ratio = self._wait_time / max(self._wait_time + busy, 1e-9)
+            # only the sampler-caused wait counts: the machinery's own reclaim is not a reason to lend
+            waited = max(self._wait_time - self._reclaim_cost, 0.0)
+            self._idle_ratio = waited / max(waited + busy, 1e-9)
         # the trainer may have synced just before asking: judge staleness against that version
         version = self._read_version()
         with self._lock:
@@ -311,8 +326,11 @@ class StreamingDriver:
         # the trainer waits from here on: its devices may be lent until the batch is ready
         lending = None
         if self.cluster_adapter is not None and short:
-            lending = threading.Thread(target=self._lend, name='twinkle-cluster-lend', daemon=True)
+            lending = threading.Thread(target=self._lend, args=(waited,), name='twinkle-cluster-lend', daemon=True)
             lending.start()
+        #: mirrors ``lending`` from its start until the reclaim below completes -- an ``adjust``
+        #: queued behind that cycle is not stuck, so the watchdog stays quiet while it runs
+        self._lending = lending
         try:
             with self._lock:
                 while True:
@@ -328,9 +346,12 @@ class StreamingDriver:
                     self._lock.wait(0.5)
         finally:
             if self.cluster_adapter is not None:
+                settle = time.monotonic()
                 if lending is not None:
                     lending.join()
                 self.cluster_adapter.reclaim()
+                self._reclaim_cost = time.monotonic() - settle
+                self._lending = None
         # ONE locked section: collect the batch and build its light facts. The rows are handed
         # out exactly as they travel (a reference under ray, a dict in-process) -- the driver
         # never opens one; the score columns ride the facts instead, aligned row for row, and
@@ -494,10 +515,29 @@ class StreamingDriver:
         return self._handed // self.sync_interval
 
     def _maybe_adjust(self) -> None:
-        """Hand ``adjust`` to a thread of its own; skipped while the previous one still runs."""
-        if self.cluster_adapter is None or self._adjusting:
+        """Hand ``adjust`` to a thread of its own; skipped while the previous one still runs.
+
+        One still running past ``ADJUST_STUCK_TIMEOUT`` is only reported, not replaced: it holds
+        the adapter's lock (hung, or warming a large set of weights), so a new call would just
+        queue behind it; if it ever returns, the ``finally`` below re-arms the next version
+        change. A lend->reclaim cycle in flight holds the same lock legitimately -- an ``adjust``
+        queued behind one is not reported.
+        """
+        if self.cluster_adapter is None:
+            return
+        if self._adjusting:
+            if self._lending is not None:
+                return  # a lend->reclaim cycle legitimately holds the adapter lock: queueing is not stuck
+            now = time.monotonic()
+            stuck = now - self._adjust_started
+            if stuck >= self.ADJUST_STUCK_TIMEOUT and now - self._adjust_reported >= self.ADJUST_STUCK_TIMEOUT:
+                self._adjust_reported = now
+                logger.warning(f'cluster adapter adjust has been running for {stuck:.0f}s '
+                               '(a large weight warm takes this long too and a stuck RPC looks '
+                               'the same); rebalancing is paused until it returns')
             return
         self._adjusting = True
+        self._adjust_started = time.monotonic()
 
         def _adjust():
             try:
@@ -509,10 +549,10 @@ class StreamingDriver:
 
         threading.Thread(target=_adjust, name='twinkle-cluster-adjust', daemon=True).start()
 
-    def _lend(self) -> None:
+    def _lend(self, waited: float) -> None:
         """Run ``lend`` while the trainer waits; ``reclaim`` joins this thread before undoing it."""
         try:
-            self.cluster_adapter.lend(self._idle_ratio)
+            self.cluster_adapter.lend(self._idle_ratio, waited=waited)
         except Exception as exc:  # noqa: BLE001 -- lending is an optimisation, never fatal
             logger.warning(f'cluster adapter lend failed: {type(exc).__name__}: {exc}')
 

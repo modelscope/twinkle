@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import statistics
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -21,6 +22,10 @@ _ALLOWED_OVERRIDE_KEYS = frozenset({
     'flex_gpus',
     'max_num_seqs',
 })
+#: The lend gate's cost stands on the rolling average of the last so many measured lend cycles.
+_SWITCH_COST_WINDOW = 3
+#: Stand-in cycle cost (seconds) until a first lend->reclaim cycle has been measured.
+_SWITCH_COST_FALLBACK_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -497,7 +502,8 @@ class ClusterAdapter:
       calls apart, until the ratio falls under ``ratio_down``.
     * :meth:`lend` while the trainer waits for a batch: when it spent more than ``lend_idle_ratio``
       of the last step waiting, ``model`` is offloaded and the busiest role grows onto
-      ``lend_ranks``.
+      ``lend_ranks`` -- but only when that wait also outruns the measured cost of a lend cycle
+      (the rolling average of the last few cycles; 10 s stand-in until one is measured).
     * :meth:`reclaim` before the batch is handed out retires the replicas on ``lend_ranks`` (their
       requests are resubmitted to the other replicas) and reloads ``model``.
 
@@ -548,6 +554,10 @@ class ClusterAdapter:
         self._cooldown = 0
         #: the role holding replicas on ``lend_ranks``, until ``reclaim``
         self._lent: Optional[str] = None
+        #: measured seconds of each lend->reclaim cycle (grow leg + retire/reload leg), most recent last
+        self._switch_overheads: List[float] = []
+        #: the grow leg's seconds of the cycle now running; ``reclaim`` folds it into the history
+        self._lend_duration = 0.0
         self._lock = threading.Lock()
 
     def adjust(self) -> None:
@@ -568,10 +578,18 @@ class ClusterAdapter:
             if self._engaged and self._move(hot, cold):
                 self._cooldown = self.cooldown
 
-    def lend(self, train_idle_ratio: float) -> None:
-        """Offload the trainer and grow the busiest role onto ``lend_ranks``; only while it waits."""
+    def lend(self, train_idle_ratio: float, waited: Optional[float] = None) -> None:
+        """Offload the trainer and grow the busiest role onto ``lend_ranks``; only while it waits.
+
+        ``waited`` is the last wait's sampler-caused seconds (the trainer's whole wait minus the
+        machinery's own reclaim cost): lending costs one grow leg plus one reclaim leg, so it is
+        skipped unless that wait would have outrun the cycles' measured cost (``None`` leaves the
+        decision to ``train_idle_ratio`` alone).
+        """
         with self._lock:
             if not self.lend_ranks or self._lent is not None or train_idle_ratio <= self.lend_idle_ratio:
+                return
+            if waited is not None and waited <= self._switch_cost():
                 return
             pressures = {name: float(handle.pressure()) for name, handle in self.roles.items()}
             name = max(pressures, key=pressures.get)
@@ -579,6 +597,7 @@ class ClusterAdapter:
             count = len(self.lend_ranks) // width
             if count == 0:
                 return
+            started = time.monotonic()
             self.model.offload_to_cpu()
             try:
                 self.roles[name].add_workers(
@@ -586,6 +605,7 @@ class ClusterAdapter:
             except BaseException:
                 self.model.reload_to_gpu()
                 raise
+            self._lend_duration = time.monotonic() - started
             self._lent = name
             logger.info(f'ClusterAdapter: lent trainer ranks {list(self.lend_ranks[:count * width])} to {name}.')
 
@@ -595,10 +615,18 @@ class ClusterAdapter:
             if self._lent is None:
                 return
             name, self._lent = self._lent, None
+            started = time.monotonic()
             try:
                 self.roles[name].remove_workers(ranks=list(self.lend_ranks))
             finally:
                 self.model.reload_to_gpu()
+            self._switch_overheads.append(self._lend_duration + (time.monotonic() - started))
+            self._lend_duration = 0.0
+
+    def _switch_cost(self) -> float:
+        """The rolling-average seconds of one lend->reclaim cycle; a stand-in value until one is measured."""
+        recent = self._switch_overheads[-_SWITCH_COST_WINDOW:]
+        return sum(recent) / len(recent) if recent else _SWITCH_COST_FALLBACK_S
 
     def _move(self, hot: str, cold: Optional[str]) -> bool:
         """One replica's devices to ``hot``: spare ranks first, else a replica retired from ``cold``."""
