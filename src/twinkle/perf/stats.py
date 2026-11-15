@@ -86,20 +86,22 @@ def describe_shape(obj: Any) -> str:
     return '(' + ', '.join('x'.join(str(dim) for dim in t.shape) for t in tensors) + ')'
 
 
-def memory_stats(*, synchronize: bool = False) -> dict[str, int]:
+def memory_stats(*, synchronize: bool = False, device_prefix: str = "cuda") -> dict[str, int]:
     """Raw per-process allocator peaks and host-wide used RAM, in bytes.
 
     Counters are lifetime peaks, not step peaks. Host usage is not process RSS.
     Reading never resets counters. Device synchronization is an explicit opt-in
     measurement barrier, disabled by default.
     Unsupported counters are absent rather than invented zeroes.
+
+    ``device_prefix`` names the torch device module (``torch.cuda`` etc.); perf stays free of
+    twinkle imports, so platform knowledge enters here as a parameter -- the model layer
+    passes the platform hook's answer. The bare default serves the common CUDA case.
     """
     import psutil
 
-    from twinkle import Platform
-
     result = {"cpu_memory_used_bytes": psutil.virtual_memory().used}
-    device = getattr(torch, Platform.device_prefix(), None)
+    device = getattr(torch, device_prefix, None)
     if device is not None and getattr(device, "is_available", lambda: False)():
         if synchronize:
             device.synchronize()
