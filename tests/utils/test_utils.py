@@ -296,6 +296,37 @@ class TestSelectiveLogSoftmax:
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-4, atol=1e-5)
 
+    def test_npu_cross_entropy_logps_skip_missing_api(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+
+        from twinkle.utils.torch_utils import _npu_cross_entropy_log_probs
+
+        monkeypatch.setitem(sys.modules, 'torch_npu', SimpleNamespace())
+        logits = torch.randn(2, 7)
+        index = torch.tensor([1, 3])
+
+        assert _npu_cross_entropy_log_probs(logits, index) is None
+
+    def test_npu_cross_entropy_logps_skip_incompatible_api(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+
+        from twinkle.utils.torch_utils import _npu_cross_entropy_log_probs
+
+        def incompatible_cross_entropy(*args):
+            raise TypeError('unexpected signature')
+
+        monkeypatch.setitem(
+            sys.modules,
+            'torch_npu',
+            SimpleNamespace(npu_cross_entropy_loss=incompatible_cross_entropy),
+        )
+        logits = torch.randn(2, 7)
+        index = torch.tensor([1, 3])
+
+        assert _npu_cross_entropy_log_probs(logits, index) is None
+
 
 class TestPadAndStackTensors:
 
