@@ -244,6 +244,58 @@ class TestSelectiveLogSoftmax:
         torch.autograd.backward(list(out_ref), [torch.ones_like(o) for o in out_ref])
         assert torch.allclose(x_new.grad, x_ref.grad, atol=1e-5)
 
+    @pytest.mark.parametrize('return_entropy', [False, True])
+    def test_noncontiguous_logits_and_int32_index_can_backward_twice(self, return_entropy):
+        base = torch.randn(6, 37, requires_grad=True)
+        logits = base[:, ::2]
+        index = torch.randint(0, logits.shape[-1], (6, ), dtype=torch.int32)
+        result = selective_log_softmax(logits, index, return_entropy=return_entropy)
+        outputs = result if return_entropy else (result, )
+        gradients = [torch.randn_like(output) for output in outputs]
+
+        first = torch.autograd.grad(outputs, logits, gradients, retain_graph=True)
+        second = torch.autograd.grad(outputs, logits, gradients)
+        for first_gradient, second_gradient in zip(first, second):
+            torch.testing.assert_close(first_gradient, second_gradient, rtol=0, atol=0)
+
+    def test_npu_cross_entropy_logps_match_log_softmax(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+
+        from twinkle.utils.torch_utils import _npu_cross_entropy_log_probs
+
+        calls = []
+
+        def fake_cross_entropy(logits, index, weight, reduction, ignore_index, label_smoothing):
+            calls.append((weight, reduction, ignore_index, label_smoothing))
+            losses = F.cross_entropy(
+                logits,
+                index,
+                weight=weight,
+                reduction=reduction,
+                ignore_index=ignore_index,
+                label_smoothing=label_smoothing,
+            )
+            return losses, None, None, None
+
+        monkeypatch.setitem(sys.modules, 'torch_npu',
+                            SimpleNamespace(npu_cross_entropy_loss=fake_cross_entropy))
+
+        logits = torch.randn(6, 37, dtype=torch.float32, requires_grad=True)
+        index = torch.randint(0, logits.shape[-1], (6, ))
+        reference_logits = logits.detach().clone().requires_grad_(True)
+        weights = torch.randn(logits.shape[0])
+
+        actual = _npu_cross_entropy_log_probs(logits, index)
+        expected = F.log_softmax(reference_logits, dim=-1).gather(
+            -1, index.unsqueeze(-1)).squeeze(-1)
+        actual_gradient = torch.autograd.grad((actual * weights).sum(), logits)[0]
+        expected_gradient = torch.autograd.grad((expected * weights).sum(), reference_logits)[0]
+
+        assert calls == [(None, 'none', -100, 0.0)]
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-4, atol=1e-5)
+
 
 class TestPadAndStackTensors:
 
