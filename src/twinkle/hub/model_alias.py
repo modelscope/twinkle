@@ -6,6 +6,10 @@ import os
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from twinkle.utils import get_logger
+
+logger = get_logger()
+
 MODEL_ID_ALIASES_ENV = 'TWINKLE_MODEL_ID_ALIASES'
 
 
@@ -45,7 +49,10 @@ def load_model_alias_map(raw: str | Mapping[str, str] | None = None) -> dict[str
         return {str(key): str(value) for key, value in raw.items() if key and value}
     try:
         data = json.loads(raw)
-    except Exception:
+    except Exception as error:
+        # A silently empty map would send the alias to the hub for a 404 far from the cause.
+        logger.warning(
+            '%s holds invalid JSON; every model id alias is ignored (%s).', MODEL_ID_ALIASES_ENV, error)
         return {}
     if not isinstance(data, dict):
         return {}

@@ -4,7 +4,7 @@ from .ledger import turn_token_spans
 from .multi_turn import (
     EpisodeError,
     MultiTurnRollout,
-    RolloutSample,
+    RolloutStatus,
     StreamDelta,
     StreamDone,
     StreamToolCall,
@@ -12,5 +12,5 @@ from .multi_turn import (
 
 __all__ = [
     'ChatEndpoint', 'EpisodeError', 'MultiTurnRollout', 'PolicyEndpoint', 'ResponsesEndpoint',
-    'RolloutSample', 'StreamDelta', 'StreamDone', 'StreamToolCall', 'turn_token_spans',
+    'RolloutStatus', 'StreamDelta', 'StreamDone', 'StreamToolCall', 'turn_token_spans',
 ]

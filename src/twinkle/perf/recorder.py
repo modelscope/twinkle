@@ -200,6 +200,11 @@ class TimeRecorder:
             edge[1] += total_ns
             self._events.append(
                 (current.sid, parent_sid, current.name, current.tid, current.start_ns, end_ns, self_ns, total_ns))
+            if len(self._events) > 2 * _EVENT_STREAM_RETENTION:
+                # A process that is never dumped (an actor the control side replaced but left
+                # alive) would otherwise grow the stream without bound: trim at twice the
+                # retention so a normal window (within it) never loses its events here.
+                del self._events[:len(self._events) - _EVENT_STREAM_RETENTION]
             if self._first_start_ns is None or current.start_ns < self._first_start_ns:
                 self._first_start_ns = current.start_ns
             if self._last_end_ns is None or end_ns > self._last_end_ns:

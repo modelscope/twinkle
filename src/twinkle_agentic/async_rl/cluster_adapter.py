@@ -510,6 +510,18 @@ class ClusterAdapter:
     A new replica is passed to ``warmups[role]`` before it takes requests (the sampler's
     ``checkpoint_manager.warm`` loads the current weights into it). ``widths[role]`` is the device
     count of one replica of that role (default 1).
+
+    Known gap (TODO): ``adjust``'s move does not weigh its own cost, the way :meth:`lend` weighs
+    a lend cycle against its measured seconds. Retiring the idlest role's replica aborts its
+    in-flight requests (each resubmits elsewhere -- at-least-once re-execution of paid work) and
+    the grown role pays a warmup weight sync before the new replica serves; the decision sees
+    only the pressure ratio and a blind ``cooldown`` between moves. Nor is the re-execution
+    visible anywhere: resubmitted requests are counted only inside the continuous-work retry
+    budget. First steps when this is picked up: surface the resubmission count as a metric, time
+    each move the way ``_switch_overheads`` times lend cycles, and gate moves on measured cost
+    vs. expected benefit instead of the flat cooldown. Neither signal here answers whether a
+    role sits on the iteration's critical path (parallel roles can be busy without deciding the
+    wall time) -- that needs the offline timeline (chrome trace) on a real run, driven by hand.
     """
 
     def __init__(self,
