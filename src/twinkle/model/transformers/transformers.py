@@ -1871,19 +1871,27 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # bfloat16 parameters are refreshed from the float32 master by ``non_blocking`` copies
         # (deepspeed ``runtime/zero/stage_1_and_2.py`` does
         # ``bit16_partitions[partition_id].data.copy_(bit16_partition_buffer.data,
-        # non_blocking=True)``), which return before the bytes have landed.
-        #
-        # Measured on a real fresh/resume pair: the digest disagreed on 56 of 723 parameters by about
-        # 3e-5 in ``sum``. That is seven orders of magnitude above what the reduction itself can
-        # produce -- ``math.fsum`` over every element agrees with ``torch.sum`` exactly on these
-        # tensors, and forcing a different addition order by a transposed-contiguous round trip moves
-        # the sum by 1.8e-12 -- and at the same time twenty-five times BELOW the smallest change a
-        # single bfloat16 element can make (~7.5e-4 at that magnitude). Only a partially landed copy
-        # fits both bounds: on a 6.4e8-element parameter whose total update that step was 3.6, an
-        # error of 3e-5 is ~5.3e3 elements, 0.00084% of it, still holding the previous value.
-        #
-        # Synchronizing first is what makes the reading mean something. This method only runs when the
+        # non_blocking=True)``), which return before the bytes have landed. Synchronizing first lands
+        # every copy already issued, so one digest is not a mixture. This method only runs when the
         # step-delta probe is on, so training that is not being measured pays nothing.
+        #
+        # What it does NOT buy: it cannot make this step's write-back happen before ``post`` is
+        # digested, because that copy is issued after the digest point. So ``post`` of step N reads
+        # the bfloat16 parameters before step N's write-back and ``pre`` of step N+1 reads them after
+        # it, and the two straddle the update. Measured on one uninterrupted offload run: ``post``(15)
+        # and ``pre``(16) disagree on 317 of 723 parameters, ``post``(16) and ``pre``(17) on 315 --
+        # always in ``sum``/``norm`` only, never in ``absmax``, because the elements that move are the
+        # low-magnitude ones, whose bfloat16 ulp is orders of magnitude below the absmax's.
+        #
+        # That is why a fresh/resume pair disagreeing on 56 parameters here is not evidence of
+        # anything: those 56 are a strict subset of the 317 a single arm produces against itself. On
+        # an offload tier the bfloat16 parameters are a view of the master, and ``engine_master_digest``
+        # -- which carries an exact per-element ``bits`` fingerprint -- is the field that can serve as
+        # an identity criterion. An earlier revision of this comment argued from the size of the 56's
+        # ``sum`` difference (3e-5, "twenty-five times below the smallest change a single bfloat16
+        # element can make") that a partially landed copy was the only possible cause. That bound took
+        # the ulp at the absmax magnitude as if every element had it; the intra-arm control above is
+        # what actually explains the number.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         out = {}
