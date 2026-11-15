@@ -395,8 +395,8 @@ class Advantage:
         ``prm_segments`` is ``{'end_turns': [...], 'scores': {scorer: [per-segment float | None]}}``:
         ``end_turns[k]`` is the cumulative count of assistant turns closed by segment ``k``, and
         segment ``k``'s ``prm_weights``-folded score covers the response tokens of its turns
-        (``turn_token_spans`` of the trajectory). Same math as the driver's
-        ``ProcessReward``, reading the score row instead of the sample record.
+        (``turn_token_spans`` of the trajectory). Reads the score row the driver stamped
+        (``prm_segments``), never the sample record.
         """
         segments = score.get('prm_segments')
         if not segments:
