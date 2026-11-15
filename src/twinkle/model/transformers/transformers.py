@@ -2043,6 +2043,20 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # ``opt_id`` and ``fp32_optimizer_states`` are the last two ``adam_update`` inputs that were
             # never measured on a real run; reading all three closes the input list.
             'inner_adamw_modes': [getattr(inner_opt, 'adam_w_mode', None)],
+            # The scalars above are read from the wrapper's ``param_groups``. The fused CPU kernel is
+            # handed the INNER optimizer's groups instead, and a resume that rebuilds the optimizer can
+            # leave the two disagreeing while every wrapper-side reading still matches. ``weight_decay``
+            # is the one that matters: the wd=0 group's decay factor is 1.0 whatever else changes, so a
+            # divergence confined to the wd!=0 group is what an inner-only wd difference would look like,
+            # and that is exactly the measured signature. Only scalars are recorded -- a group also holds
+            # its ``params``, which are the tensors under measurement.
+            'inner_param_groups': [{
+                'lr': group.get('lr'),
+                'weight_decay': group.get('weight_decay'),
+                'eps': group.get('eps'),
+                'betas': list(group.get('betas') or ()),
+                'bias_correction': group.get('bias_correction'),
+            } for group in getattr(inner_opt, 'param_groups', []) or []],
             'inner_opt_ids': [getattr(inner_opt, 'opt_id', None)],
             'inner_fp32_states': [getattr(inner_opt, 'fp32_optimizer_states', None)],
             'inner_optimizer': type(optimizer).__name__,

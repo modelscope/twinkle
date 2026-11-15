@@ -25,6 +25,11 @@ _LOADED_MODULES: dict[str, ModuleType] = {}
 #: and its ``@register`` side effects re-run -- in every worker.
 WORKER_SETUP_HOOK_ENV = "TWINKLE_WORKER_SETUP_HOOK"
 
+#: The import path Ray needs to reach :func:`run_worker_setup_hook`. A string rather than the
+#: function itself, because Ray serialises ``runtime_env`` to JSON and rejects a callable there
+#: ("Object of type function is not JSON serializable").
+WORKER_SETUP_HOOK = f"{__name__}.run_worker_setup_hook"
+
 
 def run_worker_setup_hook() -> None:
     """Ray ``worker_process_setup_hook``: invoke the driver-registered setup hook, if any.

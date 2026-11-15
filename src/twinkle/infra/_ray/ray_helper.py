@@ -284,7 +284,19 @@ class RayHelper:
             num_gpus = None
             if resources:
                 num_gpus = int(resources.pop('GPU')) if 'GPU' in resources else None
-            ray.init(ignore_reinit_error=True, resources=resources or None, num_gpus=num_gpus)
+            # The worker setup hook has to be installed here, at the job level, and not on each
+            # actor's runtime_env: Ray 2.56 accepts ``worker_process_setup_hook`` in a per-actor
+            # ``RuntimeEnv`` and then silently never calls it. Measured with a three-arm probe on this
+            # Ray -- per-actor only: the hook never ran; job level only: it ran; job level plus a
+            # per-actor ``RuntimeEnv`` carrying ``env_vars`` (the shape ``create_workers`` builds): it
+            # ran, in the same worker process that hosted the actor, and the per-actor ``env_vars``
+            # still applied. Nothing warned in the first arm, so a plugin the driver imported reached
+            # every actor as a module name no worker could import.
+            from twinkle.utils.loader import WORKER_SETUP_HOOK
+            ray.init(ignore_reinit_error=True,
+                     resources=resources or None,
+                     num_gpus=num_gpus,
+                     runtime_env={'worker_process_setup_hook': WORKER_SETUP_HOOK})
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.
@@ -634,10 +646,11 @@ class RayHelper:
                 # blocking continuous-work methods off the actor's event loop.
                 env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-            # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
-            # ("Object of type function is not JSON serializable"). Pass the import path instead.
-            runtime_env = RuntimeEnv(
-                env_vars=env_vars, worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
+            # No ``worker_process_setup_hook`` here: Ray ignores that field in a per-actor runtime_env
+            # and honours it only at the job level, where ``initialize`` installs it. This env_vars is
+            # merged with the job-level runtime_env rather than replacing it, so the hook still runs in
+            # these workers while each gets its own RANK / WORLD_SIZE / visible-device values.
+            runtime_env = RuntimeEnv(env_vars=env_vars)
             # The placement group already reserves a worker's full accelerator allocation and the
             # visible-device env pins the actor to its ranks, so no fractional accelerator is requested:
             # Ray would translate the bundle's device id through the already narrowed visible list.
