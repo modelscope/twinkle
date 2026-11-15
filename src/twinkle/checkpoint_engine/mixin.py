@@ -240,6 +240,20 @@ class CheckpointEngineMixin:
             raise errors[0]
 
     @remote_function(dispatch='all', lazy_collect=True)
+    @staticmethod
+    def _fingerprint_published(pairs, tag: str = ''):
+        """Record each weight's exact fingerprint as it enters the transport, if the probe is on.
+
+        Wrapping the stream here rather than inside an engine is what makes one record cover every
+        transport: NCCL, IPC, HCCL and XPU engines all consume the generator this returns, so the
+        published side of a reconciliation is instrumented once. Laziness is preserved -- the engine
+        still pulls one tensor at a time and peak memory stays at one bucket.
+        """
+        from twinkle.checkpoint_engine.weight_keys import record_weight_fingerprint
+        for seq, (name, tensor) in enumerate(pairs):
+            record_weight_fingerprint('engine', 'send', seq, name, tensor, tag=tag)
+            yield name, tensor
+
     def send_weights(
         self,
         adapter_name: str = None,
@@ -260,6 +274,8 @@ class CheckpointEngineMixin:
                 model_keys=model_keys,
                 **kwargs,
             )
+        weight_generator = self._fingerprint_published(
+            weight_generator, tag=f'{type(engine).__name__}.rank{engine.rank}')
 
         # In local (paired EMA) mode every rank is a sender in its own 2-rank group.
         # In broadcast mode only engine rank 0 actually sends; others consume silently

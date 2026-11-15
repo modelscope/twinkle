@@ -2,13 +2,7 @@
 from typing import Any, List, Optional, Sequence, Tuple
 
 from twinkle import remote_class, remote_function
-from .base import Advantage, _mean, weighted_score
-
-
-def _check_unit(name: str, value: float) -> float:
-    if not 0.0 <= value <= 1.0:
-        raise ValueError(f'{name} must be in [0, 1]')
-    return value
+from .base import Advantage, _check_unit, _mean, weighted_score
 
 
 @remote_class(execute='first')

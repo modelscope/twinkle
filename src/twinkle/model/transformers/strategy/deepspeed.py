@@ -359,8 +359,332 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         get_logger().info('ZeRO-3: switched gradient checkpointing to use_reentrant=True '
                           '(non-reentrant recompute sees partitioned parameters).')
 
-    def unwrap_model(self, model):
-        return self.accelerator.unwrap_model(model, keep_torch_compile=False)
+    def optimizer_checkpoint_exists(self, output_dir: str) -> bool:
+        # ``engine.save_checkpoint`` records the tag it wrote in ``latest`` and puts the state under
+        # that subdirectory; both halves must be there for ``engine.load_checkpoint`` to find it.
+        latest = os.path.join(output_dir, 'latest')
+        if not os.path.exists(latest):
+            return False
+        with open(latest) as handle:
+            tag = handle.read().strip()
+        return bool(tag) and os.path.isdir(os.path.join(output_dir, tag))
+
+    def owns_update_step(self) -> bool:
+        return True
+
+    def engine_counters(self, model) -> Dict[str, int]:
+        """The engine's own update and micro-batch counters, which decide the accumulation boundary."""
+        engine = _resolve_engine(model)
+        return {name: int(getattr(engine, name)) for name in ('global_steps', 'micro_steps')}
+
+    #: Where each offload tier keeps the float32 master it actually updates: ZeRO-2 one flat partition
+    #: per group, ZeRO-3 the live partitioned copies, and the saved-state form read when restoring.
+    _FP32_PARTITION_ATTRS = ('single_partition_of_fp32_groups', 'fp32_partitioned_groups_flat', 'fp32_flat_groups')
+
+    @classmethod
+    def _fp32_partitions(cls, model):
+        """The attribute name and the list of float32 master partitions this tier updates."""
+        optimizer = getattr(_resolve_engine(model), 'optimizer', None)
+        for attr in cls._FP32_PARTITION_ATTRS:
+            candidate = getattr(optimizer, attr, None)
+            if candidate:
+                return attr, candidate
+        return None, None
+
+    @staticmethod
+    def _chunk_stats(flat, chunks: int = 64, width: int = 4096) -> list:
+        """Per-chunk ``[sum, absmax, sum_of_squares]`` over a strided sample of a flat partition.
+
+        The partitions are billions of elements, so digesting them whole each step would cost more than
+        the training itself. ``chunks`` samples of ``width`` elements are taken at even strides instead:
+        cheap, and -- unlike a prefix window -- able to see a difference anywhere in the partition.
+
+        Every reduction here is exact and therefore independent of the schedule it runs under. That is a
+        hard requirement, not a preference: ``torch.sum`` reduces in parallel past a few thousand
+        elements, so the addition order follows thread scheduling and identical data yields a different
+        last digit between two runs. A digest that drifts on identical input reports differences that are
+        not there, which is worse than no digest at all -- measured on a ZeRO-2 resume that restores
+        exactly, a per-chunk ``torch.sum`` differed by two float64 ULP on a 5e3-magnitude group whose
+        elements cancel, while its absmax and norm matched. ``math.fsum`` is correctly rounded and
+        ``max`` is exact, so neither depends on order; converting with ``tolist`` first is what makes
+        that available, and float32/bf16 to float64 is lossless so nothing is given up by doing it.
+        """
+        import math
+
+        numel = flat.numel()
+        if numel == 0:
+            return []
+        stride = max(numel // chunks, width)
+        starts = list(range(0, numel - width + 1, stride)) or [0]
+        # The strided walk stops at the last start that still fits a whole chunk, so an even stride leaves
+        # the partition's tail unsampled -- anchored here, because a difference only past the sampled
+        # region is exactly what this digest exists to catch.
+        if numel >= width and (numel - width) % stride and starts[-1] != numel - width:
+            starts.append(numel - width)
+        out = []
+        for start in starts:
+            values = flat[start:start + width].tolist()
+            out.append([math.fsum(values), max(abs(v) for v in values), math.fsum(v * v for v in values)])
+        return out
+
+    @staticmethod
+    def _aggregate(stats: list) -> list:
+        """``[sum, absmax, norm]`` combined from per-chunk stats in a fixed order."""
+        import math
+
+        if not stats:
+            return [0.0, 0.0, 0.0]
+        return [
+            math.fsum(s[0] for s in stats),
+            max(s[1] for s in stats),
+            math.sqrt(math.fsum(s[2] for s in stats)),
+        ]
+
+    @staticmethod
+    def _bits_fingerprint(flat, block: int = 1 << 24) -> list:
+        """Two order-independent exact integers that change if any element's bits change.
+
+        Delegates to :func:`twinkle.utils.torch_utils.bits_fingerprint`, which the weight-sync
+        engines use for the same purpose: an exact per-element comparison that does not depend on
+        the reduction schedule. See there for why integer accumulation is used instead of the exact
+        float reductions, which cost minutes on a billion-element partition.
+        """
+        from twinkle.utils.torch_utils import bits_fingerprint
+        return bits_fingerprint(flat, block=block)
+
+    @staticmethod
+    def _full_coverage_chunks(numel: int, width: int = 4096) -> int:
+        """The chunk count that makes a strided sample cover every element of a ``numel``-long partition.
+
+        ``stride = max(numel // chunks, width)``, so coverage is complete once the stride falls to
+        ``width`` -- i.e. once ``chunks >= numel / width``. Sampling is what makes the digest cheap, and
+        cheap is what lets it run every step; but a strided sample can only prove a difference exists,
+        never that one is absent. Measured on a ZeRO-2 offload resume: a 503,552-element group is
+        covered exhaustively by the default count and read identical, while a 4,538,761,984-element
+        group is 0.37% sampled -- and the post-update difference appeared only in the sparsely sampled
+        one, where "identical" was never actually established. Full coverage costs minutes on a
+        partition that size, so it is gated to the single step under investigation rather than run
+        every step.
+        """
+        return max(1, -(-numel // width))
+
+    def engine_master_digest(self, model, *, stepped: bool = False) -> Dict[str, Any]:
+        """Per-group float statistics over a sample, plus an exact fingerprint of every element.
+
+        ``agg`` is ``[sum, absmax, norm]`` over a strided sample and is what localizes and sizes a
+        difference; ``bits`` is exact over the whole partition and is what decides whether two runs are
+        identical at all. ``TWINKLE_STEP_DELTA_PROBE_FULL_STEP`` additionally names one global step at
+        which the float statistics are computed over every element, for when a difference has to be
+        sized and located rather than merely detected.
+
+        ``stepped`` says whether ``engine.step`` has already run for the step being digested, which is
+        what selects the counter reading the full-coverage gate compares against.
+        """
+        _, partitions = self._fp32_partitions(model)
+        if not partitions:
+            return {}
+        full_step = os.environ.get('TWINKLE_STEP_DELTA_PROBE_FULL_STEP')
+        # ``global_steps`` counts completed updates, so before ``engine.step`` the update about to run
+        # is ``global_steps + 1``, and after it the one just run is ``global_steps`` itself. Applying
+        # the pre-step reading at a post-step call site misses the target step by one and silently
+        # drops that digest back to the 64-chunk sample -- measured at FULL_STEP=16 on a ZeRO-2 offload
+        # run: ``master_pre[0]`` came back ``covered=True`` with 1108097 chunks while ``master_post[0]``
+        # came back ``covered=False`` with 64, i.e. 0.37% of a 4,538,761,984-element partition, which is
+        # exactly the side a difference has to be sized and located on.
+        engine_step = _resolve_engine(model).global_steps + (0 if stepped else 1)
+        at_full_step = bool(full_step) and engine_step == int(full_step)
+        out = {}
+        for index, group in enumerate(partitions):
+            if group is None:
+                continue
+            flat = group.detach().flatten()
+            chunks = self._full_coverage_chunks(flat.numel()) if at_full_step else 64
+            out[str(index)] = {
+                'agg': self._aggregate(self._chunk_stats(flat, chunks=chunks)),
+                'chunks': chunks,
+                'covered': at_full_step,
+                'bits': self._bits_fingerprint(flat),
+            }
+        return out
+
+    def engine_optim_moment_digest(self, model) -> Dict[str, Any]:
+        """Per-group ``[sum, absmax, norm]`` of the Adam moments the next update will read.
+
+        The last unmeasured input to the update. On a ZeRO-2 offload resume, the fp32 master, the
+        gradient the update consumes, the lr, betas, eps, weight decay and the Adam step counter all
+        read identically to the fresh run at the first resumed step, and the post-update master still
+        differs -- so either the moments differ or the update itself does, and nothing else is left to
+        distinguish those. They live in the *inner* optimizer's state, keyed by the fp32 partition
+        tensor the ZeRO optimizer updates rather than by any model parameter, which on this tier the
+        inner optimizer never sees.
+        """
+        import torch
+
+        chunks = int(os.environ.get('TWINKLE_STEP_DELTA_PROBE_CHUNKS', 64))
+        _, partitions = self._fp32_partitions(model)
+        if not partitions:
+            return {}
+        inner = getattr(_resolve_engine(model).optimizer, 'optimizer', None)
+        state = getattr(inner, 'state', None) or {}
+        out: Dict[str, Any] = {'sources': [], 'chunks': chunks}
+        for index, partition in enumerate(partitions):
+            if partition is None:
+                continue
+            # Tensors hash by identity, and the partition tensor is itself the inner optimizer's
+            # "parameter", so this is the same lookup the update performs.
+            entry = state.get(partition)
+            if not isinstance(entry, dict):
+                continue
+            step = entry.get('step')
+            out[f'adam_step[{index}]'] = int(step.item()) if hasattr(step, 'item') else (
+                int(step) if step is not None else None)
+            # The value is not the whole input. ``ops/adam/cpu_adam.py`` hands ``state['step']``
+            # directly to the C++ ``adam_update``, so a restore that puts a tensor where a fresh run
+            # holds an int reaches the binding as a different type while ``int(...)`` above reports
+            # the same number for both. The type is recorded beside the value to keep that visible.
+            out[f'adam_step_type[{index}]'] = type(step).__name__
+            for moment in ('exp_avg', 'exp_avg_sq'):
+                value = entry.get(moment)
+                if torch.is_tensor(value):
+                    name = f'{moment}[{index}]'
+                    flat = value.detach().flatten()
+                    stats = self._chunk_stats(flat, chunks=chunks)
+                    out[name] = {
+                        'agg': self._aggregate(stats),
+                        'chunks': [s[0] for s in stats],
+                        # Exact over every element, so an identical fingerprint means the restored moments
+                        # are bit-identical rather than merely agreeing on a 0.37% sample.
+                        'bits': self._bits_fingerprint(flat),
+                    }
+                    out['sources'].append(name)
+        if not out['sources']:
+            out['unreadable'] = ['<inner optimizer>.state[fp32_partition]']
+        return out
+
+    def engine_grad_partition_digest(self, model) -> Dict[str, Any]:
+        """``[sum, absmax, norm]`` of the float32 gradients the offload optimizer updates from.
+
+        ZeRO-2 keeps the reduced gradients in ``averaged_gradients`` and hands the CPU optimizer the
+        ``.grad`` of its own float32 partition; ZeRO-3 exposes neither under those names. Each tier is
+        read through whatever it has, and the names actually found are reported in ``sources``, so a
+        tier carrying no readable gradient shows up as such instead of reading as "gradients matched".
+        """
+        import torch
+
+        # The default stride samples 2.6% of a multi-billion element partition. That is enough to say a
+        # difference exists and roughly where, but not enough to say it is confined there: a post-update
+        # parameter digest can show changes in parameters whose gradient chunk was never sampled. The
+        # count is tunable so a single investigation can pay for a denser read without every run doing so.
+        chunks = int(os.environ.get('TWINKLE_STEP_DELTA_PROBE_CHUNKS', 64))
+        out: Dict[str, Any] = {'sources': [], 'chunks': chunks}
+        attr, partitions = self._fp32_partitions(model)
+        if partitions:
+            for index, group in enumerate(partitions):
+                grad = getattr(group, 'grad', None) if group is not None else None
+                if torch.is_tensor(grad):
+                    name = f'{attr}[{index}].grad'
+                    flat = grad.detach().flatten()
+                    stats = self._chunk_stats(flat, chunks=chunks)
+                    out[name] = {
+                        'agg': self._aggregate(stats),
+                        'chunks': [s[0] for s in stats],
+                        'bits': self._bits_fingerprint(flat),
+                    }
+                    out['sources'].append(name)
+        averaged = getattr(getattr(_resolve_engine(model), 'optimizer', None), 'averaged_gradients', None)
+        if isinstance(averaged, dict):
+            for index in sorted(averaged):
+                for slot, grad in enumerate(averaged[index] or []):
+                    if torch.is_tensor(grad):
+                        name = f'averaged_gradients[{index}][{slot}]'
+                        out[name] = self._aggregate(self._chunk_stats(grad.detach().flatten(), chunks=chunks))
+                        out['sources'].append(name)
+        if not out['sources']:
+            # Name the failure instead of returning a bare empty digest. Two empty digests compare equal,
+            # so a tier whose gradient is not readable from here would otherwise sign off as "gradients
+            # matched". ZeRO-2 without offload reaches this after ``step`` by design: it assigns the flat
+            # gradient to the fp32 partition inside ``step`` and clears both it and ``averaged_gradients``
+            # before returning, so the gradient that update consumed is only readable beforehand.
+            out['unreadable'] = list(self._FP32_PARTITION_ATTRS) + ['averaged_gradients']
+        return out
+
+    def engine_grad_partition_layout(self, model) -> Dict[str, Any]:
+        """Where each parameter sits inside the flat fp32 gradient partition, per group.
+
+        A digest can only say that a range of the flat partition differs; turning that range into
+        parameter names is what points at a code path, since the flat layout follows the order the
+        parameters were registered. Gated by its own env flag because the layout is a few hundred
+        entries per group and is identical at every step -- it is read once, not tracked per step.
+        """
+        if not os.environ.get('TWINKLE_STEP_DELTA_PROBE_LAYOUT'):
+            return {}
+        optimizer = getattr(_resolve_engine(model), 'optimizer', None)
+        names = {id(param): name for name, param in model.named_parameters()}
+        out: Dict[str, Any] = {}
+        for index, params in enumerate(getattr(optimizer, 'params_in_partition', None) or []):
+            entries = []
+            offset = 0
+            for param in params:
+                numel = param.numel()
+                entries.append([names.get(id(param), '?'), offset, numel])
+                offset += numel
+            out[str(index)] = {'total': offset, 'params': entries}
+        return out
+
+    def take_engine_step_probe(self) -> Dict[str, Any]:
+        """The digests ``engine_backward`` recorded around ``engine.step``, consumed once."""
+        return self.__dict__.pop('_engine_step_probe', {})
+
+    def engine_backward(self, model, loss, *, sync_gradients: bool) -> None:
+        """Drive the engine for one micro-batch: backward always, the update at the boundary.
+
+        This is the split accelerate's own ``DeepSpeedEngineWrapper.backward`` performs, mapped onto
+        the loop's explicit backward-then-step sequence. ``set_gradient_accumulation_boundary`` tells
+        the engine whether this micro-batch closes an accumulation window, which is what makes
+        ``engine.step`` apply the update (and scale the loss by the window size) only there; the
+        engine's ``step`` then also does the clipping from ``gradient_clipping`` in the DeepSpeed
+        config and the zero_grad, so the loop's own ``step`` and ``zero_grad`` -- both no-ops on
+        accelerate's ``DeepSpeedOptimizerWrapper`` -- leave the update exactly once.
+        """
+        engine = _resolve_engine(model)
+        engine.set_gradient_accumulation_boundary(is_boundary=sync_gradients)
+        engine.backward(loss)
+        if sync_gradients:
+            # The step probe brackets the update where it actually happens. The loop's
+            # ``clip_grad_and_step`` runs after this, so a digest taken there sees an already-updated
+            # master on both sides and would report "no change" over a step that did change it.
+            probe = os.environ.get('TWINKLE_STEP_DELTA_PROBE')
+            if probe:
+                self.__dict__['_engine_step_probe'] = {
+                    'grad_partition_pre': self.engine_grad_partition_digest(model),
+                    'layout': self.engine_grad_partition_layout(model),
+                    'master_pre': self.engine_master_digest(model),
+                    # Read before the update, since the update overwrites the moments in place: this is
+                    # the value the update is about to consume, which is the one that has to match.
+                    'optim_moment_pre': self.engine_optim_moment_digest(model),
+                }
+            engine.step()
+            if probe:
+                step_probe = self.__dict__['_engine_step_probe']
+                step_probe['master_post'] = self.engine_master_digest(model, stepped=True)
+                # ZeRO-2 assigns this step's reduced gradient to the float32 partition's ``.grad``
+                # inside ``step`` and the CPU optimizer consumes it there, so the partition read BEFORE
+                # the step is the previous step's gradient -- on a first step after a restore it is a
+                # cold buffer that means something else entirely. The gradient the update actually used
+                # is only readable afterwards.
+                step_probe['grad_partition_post'] = self.engine_grad_partition_digest(model)
+
+    def engine_grad_norm(self, model):
+        engine = _resolve_engine(model)
+        norm = engine.get_global_grad_norm()
+        # The engine keeps the norm as a tensor on the model's device, while the metric path mixes
+        # it with values gathered from the other ranks -- whose tensors stay on THEIR device -- so a
+        # tensor here dies with "Expected all tensors to be on the same device". Hand back a number.
+        if norm is None:
+            return None
+        return float(norm) if hasattr(norm, 'item') else norm
+
+    def unwrap_model(self, model):        return self.accelerator.unwrap_model(model, keep_torch_compile=False)
 
     def offload_to_cpu(self, model, optimizer=None, *, offload_model: bool = True) -> None:
         """Move this rank's ZeRO parameters and/or Adam state to CPU for colocation.
@@ -497,6 +821,186 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         save_dir = os.path.dirname(output_path)
         engine.save_checkpoint(save_dir)
 
+    def _probe_fp32_master(self, engine, load_dir: str) -> None:
+        """Compare the live fp32 master weights against the ones in the checkpoint.
+
+        Gated by ``TWINKLE_OPT_MASTER_PROBE`` (a path prefix). With ZeRO offload the model's
+        parameters are bfloat16 and the precision the optimizer actually updates lives in a flat
+        float32 partition held by the CPU optimizer, so a checkpoint restore that brings back the
+        moments but not that partition leaves the run updating a master rebuilt from bf16 weights.
+        Restoring the moments alone looks like success: the first resumed step reproduces the source
+        run's loss, grad_norm and gradients exactly, because the forward only ever sees the bf16
+        weights, and the drift appears one step later.
+
+        Every element of each partition is compared, in chunks. These files are tens of gigabytes, so
+        the read goes through mmap and the comparison streams rather than materialising the artifact.
+        """
+        prefix = os.environ.get('TWINKLE_OPT_MASTER_PROBE')
+        if not prefix:
+            return
+        import glob
+        import json
+
+        import torch
+
+        rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+        optimizer = getattr(engine, 'optimizer', None)
+        live = None
+        live_attr = None
+        for attr in ('single_partition_of_fp32_groups', 'fp32_partitioned_groups_flat', 'fp32_flat_groups'):
+            candidate = getattr(optimizer, attr, None)
+            if candidate:
+                live, live_attr = candidate, attr
+                break
+        paths = (sorted(glob.glob(os.path.join(load_dir, 'global_step*', f'*rank_{rank}_*optim_states.pt')))
+                 or sorted(glob.glob(os.path.join(load_dir, f'*rank_{rank}_*optim_states.pt'))))
+        record = {
+            'rank': rank,
+            'live_attr': live_attr,
+            'live_groups': len(live) if live is not None else 0,
+            'artifact': os.path.basename(paths[0]) if paths else None,
+        }
+        if live is None or not paths:
+            record['error'] = 'no live master or no optim-states artifact found'
+            with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
+                handle.write(json.dumps(record) + '\n')
+            return
+        try:
+            saved_obj = torch.load(paths[0], map_location='cpu', mmap=True, weights_only=True)
+        except Exception:
+            # DeepSpeed's optim-states artifact can carry non-tensor members (a loss-scaler object,
+            # the ds_config dict) that weights-only loading refuses. This file was written by this
+            # process's own save into this run's own output directory, so it is not untrusted input.
+            saved_obj = torch.load(paths[0], map_location='cpu', mmap=True, weights_only=False)
+        saved_osd = saved_obj.get('optimizer_state_dict', saved_obj)
+        saved = None
+        for key in ('single_partition_of_fp32_groups', 'fp32_flat_groups'):
+            if saved_osd.get(key):
+                saved = saved_osd[key]
+                record['saved_key'] = key
+                break
+        detail = []
+        base = getattr(optimizer, 'optimizer', None)
+        live_state = getattr(base, 'state', None) or {}
+        # ZeRO-2 offload nests the moments under ``base_optimizer_state``, ZeRO-3 under
+        # ``optimizer_state_dict``; both then hold a torch-style ``{'state': {group: {...}},
+        # 'param_groups': ...}`` whose per-group leaf carries step / exp_avg / exp_avg_sq.
+        saved_container = None
+        saved_container_key = None
+        for key in ('base_optimizer_state', 'optimizer_state_dict'):
+            if isinstance(saved_osd.get(key), dict):
+                saved_container, saved_container_key = saved_osd[key], key
+                break
+        saved_state = saved_container.get('state') if saved_container is not None else None
+        record['saved_moment_container'] = saved_container_key
+        record['saved_moment_groups'] = len(saved_state) if isinstance(saved_state, dict) else None
+        for index, live_group in enumerate(live):
+            if live_group is None or saved is None or index >= len(saved) or saved[index] is None:
+                detail.append({'group': index, 'skipped': True})
+                continue
+            saved_group = saved[index]
+            entry = {'group': index}
+            entry.update(self._compare_flat(live_group, saved_group, check_bf16=True))
+            entry.update(self._compare_moments(live_state, live_group, saved_state, index))
+            detail.append(entry)
+        record['detail'] = detail
+        with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
+            handle.write(json.dumps(record) + '\n')
+
+    @staticmethod
+    def _compare_flat(live_tensor, saved_tensor, *, chunk: int = 1 << 24, check_bf16: bool = False) -> dict:
+        """Compare two flat partitions element by element, in full, one chunk at a time.
+
+        A bounded window left most of a multi-gigabyte partition unexamined, so a restore that was
+        wrong past the first million elements still reported ``exact``. Chunking covers every element
+        while keeping peak memory at a chunk: the saved side is mmap-backed, so a slice reads only what
+        the comparison touches, and the live side is never copied whole.
+        """
+        import torch
+
+        live = live_tensor.detach().flatten()
+        saved = saved_tensor.detach().flatten()
+        total = min(live.numel(), saved.numel())
+        differing = 0
+        worst = 0.0
+        bf16_of_saved = True
+        for start in range(0, total, chunk):
+            stop = min(start + chunk, total)
+            live_values = live[start:stop].to(torch.float32)
+            saved_values = saved[start:stop].to(torch.float32)
+            differing += int((live_values != saved_values).sum())
+            if differing:
+                worst = max(worst, float((live_values - saved_values).abs().max()))
+            if check_bf16 and bf16_of_saved:
+                bf16_of_saved = bool((live_values == saved_values.to(torch.bfloat16).to(torch.float32)).all())
+        out = {
+            'numel': int(live_tensor.numel()),
+            'compared': int(total),
+            'differing': differing,
+            'exact': differing == 0,
+            'worst_abs_diff': worst,
+        }
+        if check_bf16:
+            # True means the master holds bf16-rounded values, whether because the partition was never
+            # restored and was rebuilt from the bf16 parameters, or because it was restored through a
+            # narrowing copy. Either way the fp32 precision is gone.
+            out['live_is_bf16_of_saved'] = bf16_of_saved
+        return out
+
+    @staticmethod
+    def _compare_moments(live_state, live_group, saved_state, index) -> dict:
+        """Compare the restored Adam moments against the checkpoint's, over their whole partition.
+
+        A faithful master with unfaithful moments is indistinguishable from a faithful everything on
+        the first resumed step: that step's loss, grad_norm and clipped gradients all reproduce the
+        source run exactly, because they depend only on the weights, and the wrong moments change the
+        update that follows. ZeRO-2 offload stores them under ``base_optimizer_state`` keyed by group
+        then by position within the group; the live ones hang off the inner CPU optimizer, keyed by
+        the fp32 partition tensor itself.
+        """
+        import torch
+
+        out = {}
+        live_entry = None
+        try:
+            live_entry = live_state.get(live_group) if hasattr(live_state, 'get') else None
+        except TypeError:
+            live_entry = None
+        saved_entry = saved_state.get(index) if isinstance(saved_state, dict) else None
+        for key in ('exp_avg', 'exp_avg_sq'):
+            live_tensor = live_entry.get(key) if isinstance(live_entry, dict) else None
+            saved_tensor = saved_entry.get(key) if isinstance(saved_entry, dict) else None
+            if not torch.is_tensor(live_tensor) or not torch.is_tensor(saved_tensor):
+                out[key] = {
+                    'present': (torch.is_tensor(live_tensor), torch.is_tensor(saved_tensor)),
+                }
+                continue
+            out[key] = DeepSpeedStrategy._compare_flat(live_tensor, saved_tensor)
+        live_step = live_entry.get('step') if isinstance(live_entry, dict) else None
+        saved_step = saved_entry.get('step') if isinstance(saved_entry, dict) else None
+        out['step'] = {
+            'live': int(live_step.item()) if torch.is_tensor(live_step) else live_step,
+            'saved': int(saved_step.item()) if torch.is_tensor(saved_step) else saved_step,
+        }
+        return out
+
+    @staticmethod
+    def _has_optimizer_state(load_dir: str) -> bool:
+        """Whether the checkpoint carries a DeepSpeed optimizer-state artifact for this rank.
+
+        Distinguishes "this checkpoint has no optimizer state to restore" (a module-only resume, or a
+        checkpoint written by a different world size) from "it has one and loading it failed". Only the
+        first is a legitimate reason to keep going.
+        """
+        import glob
+
+        rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+        return any(
+            glob.glob(pattern) for pattern in (
+                os.path.join(load_dir, 'global_step*', f'*rank_{rank}_*optim_states.pt'),
+                os.path.join(load_dir, f'*rank_{rank}_*optim_states.pt'),
+            ))
+
     def load_optimizer_checkpoint(
         self,
         model,
@@ -516,7 +1020,16 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         try:
             engine.load_checkpoint(load_dir)
         except (KeyError, FileNotFoundError, RuntimeError) as e:
-            logger.warning(f'Failed to load deepspeed checkpoint: {e}')
+            # A resume whose optimizer state did not load keeps training and looks healthy: the forward
+            # only reads the model weights, so the first resumed step reproduces the source run's loss
+            # and grad_norm exactly and the divergence appears one update later, with nothing in the log
+            # to explain it. Swallowing that into a warning turns a stopped run into a silently wrong one.
+            if self._has_optimizer_state(load_dir):
+                raise RuntimeError(
+                    f'Failed to load the DeepSpeed optimizer state from {load_dir}: {e}. Training on an '
+                    'unrestored optimizer diverges from the source run one step after the resume.') from e
+            logger.warning(f'{load_dir} carries no optimizer state for this rank; resumed the model only: {e}')
+        self._probe_fp32_master(engine, load_dir)
 
     def get_full_state_dict(self, model) -> dict:
         """Collect full state dict (with persistent buffers), gathering ZeRO-3 partitioned params."""

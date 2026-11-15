@@ -244,9 +244,10 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             raise ValueError('Spectral Hybrid checkpoint was not saved at a supported optimizer-step boundary.')
         if optimizer_group.optimizer is None:
             raise ValueError('Spectral Hybrid optimizer must be configured before resuming training.')
-        optimizer_path = os.path.join(training_dir, 'optimizer.pt')
-        if not os.path.isfile(optimizer_path):
-            raise ValueError('Spectral Hybrid training state is missing optimizer.pt.')
+        # The strategy owns the optimizer artifact's layout (DeepSpeed writes its own directory and
+        # no optimizer.pt), so ask it rather than naming the file.
+        if not self.strategy.optimizer_checkpoint_exists(training_dir):
+            raise ValueError(f'Spectral Hybrid training state in {training_dir} has no optimizer checkpoint.')
         saved_scheduler = trainer_state.get('scheduler_class')
         if saved_scheduler != self._class_identity(optimizer_group.lr_scheduler):
             raise ValueError('Spectral Hybrid scheduler configuration does not match the checkpoint.')
@@ -337,8 +338,6 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
                 component_states=kwargs.get('component_states', {}),
             )
             self._write_hybrid_training_manifest(training_dir, adapter_name)
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            torch.save(self._get_training_rng_state(), os.path.join(training_dir, f'rng_state_rank_{rank}.pt'))
             if dist.is_initialized():
                 dist.barrier()
         return checkpoint_dir
@@ -380,13 +379,14 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             if current_config != checkpoint_config:
                 raise ValueError('Spectral Hybrid adapter config does not match checkpoint.')
 
-        rank = dist.get_rank() if dist.is_initialized() else 0
         adapter_state = load_file(adapter_path, device='cpu')
         self.multi_adapter.set_state_dict(adapter_name, adapter_state)
         self.fft_slots.set_fft_state_dict(adapter_name, adapter_state)
         if not resume_only_model:
+            # _restore_training_state loads this rank's RNG state (and falls back, with a warning, to
+            # a checkpoint written before RNG state became per rank); loading it again here repeated
+            # the read and raised on such a checkpoint instead of degrading.
             trainer_state = self._restore_training_state(training_dir, adapter_name=adapter_name)
-            self._load_rng_state(os.path.join(training_dir, f'rng_state_rank_{rank}.pt'))
         result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],

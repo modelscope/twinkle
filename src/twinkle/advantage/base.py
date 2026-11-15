@@ -50,6 +50,18 @@ def _mean(rows: Sequence[Sequence[float]]) -> float:
     return sum(flat) / len(flat) if flat else 0.0
 
 
+def _check_unit(name: str, value: float) -> float:
+    """Reject a discount / trace-decay knob outside [0, 1], where the recursion stops converging.
+
+    Both the constructor and a per-call override go through this, so one range rule covers the two
+    ways a caller can set the knob. Validating only the override would let ``gamma=1.1`` in at
+    construction and silently produce advantages that grow instead of decay.
+    """
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f'{name} must be in [0, 1]')
+    return value
+
+
 class Advantage:
     """The model-free advantage estimation step: one call per rollout batch, before training.
 
@@ -178,8 +190,8 @@ class Advantage:
         self.rlsd_negative_only = rlsd_negative_only
         self.teacher_kl_coef = teacher_kl_coef
         self.kl_coef = kl_coef
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
+        self.gamma = _check_unit('gamma', float(gamma))
+        self.gae_lambda = _check_unit('gae_lambda', float(gae_lambda))
         self.normalize = normalize
         # Pure math, instantiated locally: the subclass is the remote boundary, these run in it.
         self._kl = KLEstimator()

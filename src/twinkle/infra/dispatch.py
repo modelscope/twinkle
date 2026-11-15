@@ -759,7 +759,20 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                        _resolve_sticky_key(sticky_key, func, args, kwargs),
                                        RayHelper.has_ref(args, kwargs))
                 future = call.start()
-                return future if lazy_collect is True else future.result(timeout=_rgt)
+                if lazy_collect is True:
+                    return future
+                try:
+                    return future.result(timeout=_rgt)
+                except TimeoutError as exc:
+                    # Every other path here waits through ``ray.get``, whose timeout is a
+                    # ``ray.exceptions.GetTimeoutError``. A continuous-work call instead waits on a
+                    # ``concurrent.futures.Future``, whose native timeout is a plain ``TimeoutError``,
+                    # so a caller catching the infra's one timeout type would silently miss these.
+                    # ``GetTimeoutError`` subclasses ``TimeoutError``, so narrowing the type here
+                    # unifies the two paths without breaking anyone catching the builtin.
+                    import ray
+                    raise ray.exceptions.GetTimeoutError(
+                        f'{func.__name__}: no result within {_rgt}s') from exc
 
             execute_method = RayHelper.execute_all_async if not sync else functools.partial(
                 RayHelper.execute_all_sync, timeout=_rgt)
@@ -856,11 +869,38 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     return _call_impl(self, *args, **kwargs)
             return _call_impl(self, *args, **kwargs)
 
-        # Same hazard as the continuous-work companion: __wrapped__ makes inspect.signature (and so
-        # Ray's argument validation) report the original method's parameters, so the
-        # _dispatch_context that _call_replicas adds for ref-carrying calls is rejected as an
-        # unexpected keyword. This wrapper takes *args/**kwargs by design.
-        del wrapper.__wrapped__
+        # Ray validates an actor call against ``inspect.signature(inspect.unwrap(method))``: it
+        # unwraps first (``ray/actor.py``, ``method = inspect.unwrap(method)``) and only then reads
+        # the signature, so a pin on this wrapper never reaches the validator -- ``functools.wraps``
+        # set ``__wrapped__`` to the undecorated body and unwrap descends straight past the pin to
+        # it. The pin therefore belongs on the body, which is the object Ray ends up holding.
+        # ``__wrapped__`` stays in place: reaching the undecorated body through it is how the test
+        # suite drives these methods at all.
+        #
+        # The declared parameter is metadata only. ``_call_impl`` and ``_worker_entry`` both pop
+        # ``_dispatch_context`` before the body runs, so the body never receives it; declaring it is
+        # what lets the ref-carrying dispatch path put it on the wire. The body's own parameters are
+        # kept in the pin rather than replaced with a var-args form, so ``inspect.signature`` stays
+        # honest for anyone reading the component.
+        _params = list(inspect.signature(func).parameters.values())
+        if not any(_p.name == '_dispatch_context' for _p in _params):
+            _context = inspect.Parameter('_dispatch_context', inspect.Parameter.KEYWORD_ONLY,
+                                         default=None)
+            # A keyword-only parameter may not follow ``**kwargs``, so it goes just before one.
+            _at = next((_i for _i, _p in enumerate(_params)
+                        if _p.kind is inspect.Parameter.VAR_KEYWORD), len(_params))
+            _params.insert(_at, _context)
+        func.__signature__ = inspect.Signature(parameters=_params)
+
+        # ``self`` must be declared here: Ray extracts an actor method's signature with
+        # ``extract_signature(func, ignore_first=True)``, which drops the first parameter on the
+        # assumption that it is ``self``. Without it the pin loses ``args`` and every positional
+        # argument is refused with "too many positional arguments".
+        wrapper.__signature__ = inspect.Signature(parameters=[
+            inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
+            inspect.Parameter('args', inspect.Parameter.VAR_POSITIONAL),
+            inspect.Parameter('kwargs', inspect.Parameter.VAR_KEYWORD),
+        ])
 
         def _worker_entry(self, *args, **kwargs):
             # What the awaitable companion runs on the replica: always the body, never a Future.

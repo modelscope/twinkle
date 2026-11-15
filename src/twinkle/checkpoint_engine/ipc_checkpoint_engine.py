@@ -240,6 +240,17 @@ class IPCCheckpointEngine(CheckpointEngine):
         from torch.multiprocessing.reductions import reduce_tensor
         self._handle = reduce_tensor(self.send_buf)
 
+    def _record_fingerprint(self, side: str, seq: int, name: str, tensor: torch.Tensor) -> None:
+        """Append one tensor's exact fingerprint to this side's reconciliation file, if the probe is on.
+
+        Delegates to the shared recorder. ``via='ipc'`` keeps these rows apart from the ones the
+        transport-agnostic sites write, because this pair brackets a different span -- the sender's
+        buffer and the receiver's mapping of it -- than the publish / sampler-arrival pair does, and
+        a run may legitimately produce both.
+        """
+        from twinkle.checkpoint_engine.weight_keys import record_weight_fingerprint
+        record_weight_fingerprint('ipc', side, seq, name, tensor, tag=f'ch{self.channel}.rank{self.rank}')
+
     async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
         """Pack weights into the buffer bucket by bucket and tell the receiver where they are."""
         if self.rank == _IDLE_RANK:
@@ -254,6 +265,7 @@ class IPCCheckpointEngine(CheckpointEngine):
         total = 0
 
         for name, tensor in weights:
+            self._record_fingerprint('send', total, name, tensor)
             flat = tensor.detach().contiguous().reshape(-1).view(torch.uint8)
             nbytes = flat.numel()
             start = (offset + _ALIGNMENT - 1) // _ALIGNMENT * _ALIGNMENT
@@ -300,6 +312,7 @@ class IPCCheckpointEngine(CheckpointEngine):
     async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
         """Yield views onto the sender's buffer. Callers that keep a tensor must clone it."""
         assert self.rank is not None and self.rank != _SENDER_RANK, 'The sender rank does not receive.'
+        seq = 0
         while True:
             message = recv_auth_pyobj(
                 self.socket,
@@ -314,7 +327,12 @@ class IPCCheckpointEngine(CheckpointEngine):
                 buffer = self._map(message['handle'])
             for meta in bucket_meta:
                 start, nbytes = meta['offset'], meta['nbytes']
-                yield meta['name'], buffer[start:start + nbytes].view(meta['dtype']).view(meta['shape'])
+                received = buffer[start:start + nbytes].view(meta['dtype']).view(meta['shape'])
+                # Fingerprinted before the acknowledgement below: the sender overwrites this buffer
+                # as soon as the ack reaches it, so this is the last point the bytes are readable.
+                self._record_fingerprint('recv', seq, meta['name'], received)
+                seq += 1
+                yield meta['name'], received
             # Consumers copy with non_blocking=True, so the acknowledgement has to wait for the copies
             # and not merely for the loop above.
             Torch.synchronize()

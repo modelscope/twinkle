@@ -605,6 +605,16 @@ class TwinkleWorkerExtension:
         ``MegatronModel.send_weights``), so no name transformation is done
         here.
         """
+        # The last point before these tensors become vLLM's own weights. Every transport (device IPC,
+        # shared memory, chunked reassembly) and every call site (borrowed bucket, cloned bucket, LoRA
+        # accumulation, the collective_rpc path) funnels through here, so one record covers them all.
+        # Tagged with this worker's rank because each TP worker loads its own shard. Recorded before
+        # the LoRA name conversion below so the names pair with the sender's.
+        from twinkle.checkpoint_engine.weight_keys import record_weight_fingerprint
+        for _seq, (_name, _tensor) in enumerate(weights):
+            record_weight_fingerprint('vllm_worker', 'recv', _seq, _name, _tensor,
+                                      tag=f'rank{getattr(self, "local_rank", 0)}')
+
         if peft_config and base_sync_done:
             from twinkle.patch.vllm_lora_weights import TensorLoRARequest
 

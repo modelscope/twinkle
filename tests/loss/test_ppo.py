@@ -94,9 +94,10 @@ def test_ppo_rollout_updates_actor_and_critic():
     labels = torch.tensor([[-100, 1, 2, 3], [-100, 4, 5, 6]])
     old_logps = [[-0.9, -1.1, -1.0], [-1.2, -0.8, -1.1]]
     old_values = [[0.1, 0.2, 0.3], [0.2, 0.1, 0.4]]
-    token_rewards = GAEAdvantage.build_token_rewards([1.0, -0.5], [3, 3])
-    advantages, returns = GAEAdvantage(gamma=1.0, gae_lambda=0.95, normalize=True)(
-        token_rewards, old_values)
+    # A scalar reward row IS the terminal reward: token_advantages places it on the row's last token,
+    # which is what the removed build_token_rewards helper used to do as a separate step.
+    advantages, returns = GAEAdvantage(gamma=1.0, gae_lambda=0.95, normalize=True).token_advantages(
+        [1.0, -0.5], old_values)
 
     actor_logps = torch.nn.Parameter(torch.tensor([
         [0.0, -0.7, -1.3, -0.8],

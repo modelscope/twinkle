@@ -1532,7 +1532,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         loss_value = optimizer_config.train_status.loss_value
         assert loss_value is not None, 'Do forwarding and calculating loss before backward'
         scaler = optimizer_config.scaler
-        if scaler is None and self.mixed_precision == 'fp16':
+        # A strategy that owns the update does its own loss scaling: DeepSpeed scales the loss inside
+        # engine.backward by both the accumulation window and its own fp16 loss-scale factor. A
+        # GradScaler beside it would scale twice, and its update() would then read gradients that
+        # were never unscaled by it.
+        if scaler is None and self.mixed_precision == 'fp16' and not self.strategy.owns_update_step():
             self.set_grad_scaler(adapter_name=adapter_name)
             scaler = optimizer_config.scaler
 
@@ -1540,7 +1544,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             optimizer_config.cur_step += 1
         should_sync = (optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps'))
                        if sync_gradients is None else bool(sync_gradients))
-        no_sync_ctx = _no_sync_context(self.model, should_sync)
+        # A strategy that owns the update tells the engine where its accumulation window ends, and
+        # the engine then manages gradient synchronization itself. Entering no_sync beside it trips
+        # DeepSpeed's reentry assertion at ZeRO-1, where gradients are NOT partitioned and so the
+        # ZeRO-2/3 guard inside _no_sync_context does not fire.
+        no_sync_ctx = (contextlib.nullcontext() if self.strategy.owns_update_step() else
+                       _no_sync_context(self.model, should_sync))
 
         router_replay_mode = kwargs.pop('router_replay_mode', None)
         rr = None
@@ -1549,7 +1558,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             rr = self._router_replay(RouterReplayAction.REPLAY_BACKWARD)
 
         with no_sync_ctx:
-            if scaler is not None:
+            if self.strategy.owns_update_step():
+                self.strategy.engine_backward(self.model, loss_value, sync_gradients=should_sync)
+            elif scaler is not None:
                 scaler.scale(loss_value).backward()
             else:
                 loss_value.backward()
@@ -1604,7 +1615,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         **kwargs,
     ):
         # DDP must see no_sync during the forward as well as the backward.
-        with _no_sync_context(getattr(self, "model", None), sync_gradients is not False):
+        no_sync = (contextlib.nullcontext() if self.strategy.owns_update_step() else
+                   _no_sync_context(getattr(self, "model", None), sync_gradients is not False))
+        with no_sync:
             outputs = self.forward(
                 inputs=inputs,
                 loss_key=loss_key,
@@ -1784,6 +1797,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if not optimizer_config.do_grad_sync(kwargs.get('gradient_accumulation_steps')):
             return
 
+        if self.strategy.owns_update_step():
+            # The engine clipped inside the step it just performed and owns the norm it computed;
+            # clipping again over ZeRO-partitioned parameters would be both wrong and a full gather.
+            grad_norm = self.strategy.engine_grad_norm(self.model)
+            optimizer_config._last_grad_norm = grad_norm
+            optimizer_config.train_status.num_tokens = 0
+            return grad_norm
+
         optimizer = optimizer_config.optimizer
         scaler = optimizer_config.scaler
         context = contextlib.nullcontext
@@ -1824,10 +1845,161 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     @remote_function(dispatch='all', sync=True)
     @timed
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
+        probe = os.environ.get('TWINKLE_STEP_DELTA_PROBE')
+        # ``stepped=True`` at both loop-level sites: ``engine_backward`` has already run ``engine.step``
+        # for this step by the time the loop reaches here, so the engine's counter reads the step being
+        # digested rather than the one before it.
+        pre = self._digest_parameters('param') if probe else None
+        master_pre = self.strategy.engine_master_digest(self.model, stepped=True) if probe else None
         self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
+        grad = self._digest_parameters('grad') if probe else None
         self.step(**kwargs)
+        if probe:
+            self._write_step_probe(probe, pre, grad, master_pre=master_pre, **kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
+
+    @staticmethod
+    def _shard(tensor):
+        # FSDP2 parameters are DTensors whose moments and shards live per rank, so the digest is
+        # taken on the local shard: each rank reports its own piece and two runs are compared
+        # rank-wise. ``full_tensor()`` would all-gather instead, which is a collective that every
+        # rank must enter for the same names in the same order -- unusable from a per-rank probe.
+        tensor = tensor.detach()
+        return tensor.to_local() if hasattr(tensor, 'to_local') else tensor
+
+    def _digest_parameters(self, kind: str):
+        # A digest of a buffer that an asynchronous copy is still filling measures a mixture of two
+        # states, and reports a difference that is timing rather than data. On the offload tiers the
+        # bfloat16 parameters are refreshed from the float32 master by ``non_blocking`` copies
+        # (deepspeed ``runtime/zero/stage_1_and_2.py`` does
+        # ``bit16_partitions[partition_id].data.copy_(bit16_partition_buffer.data,
+        # non_blocking=True)``), which return before the bytes have landed. Synchronizing first lands
+        # every copy already issued, so one digest is not a mixture. This method only runs when the
+        # step-delta probe is on, so training that is not being measured pays nothing.
+        #
+        # What it does NOT buy: it cannot make this step's write-back happen before ``post`` is
+        # digested, because that copy is issued after the digest point. So ``post`` of step N reads
+        # the bfloat16 parameters before step N's write-back and ``pre`` of step N+1 reads them after
+        # it, and the two straddle the update. Measured on one uninterrupted offload run: ``post``(15)
+        # and ``pre``(16) disagree on 317 of 723 parameters, ``post``(16) and ``pre``(17) on 315 --
+        # always in ``sum``/``norm`` only, never in ``absmax``, because the elements that move are the
+        # low-magnitude ones, whose bfloat16 ulp is orders of magnitude below the absmax's.
+        #
+        # That is why a fresh/resume pair disagreeing on 56 parameters here is not evidence of
+        # anything: those 56 are a strict subset of the 317 a single arm produces against itself. On
+        # an offload tier the bfloat16 parameters are a view of the master, and ``engine_master_digest``
+        # -- which carries an exact per-element ``bits`` fingerprint -- is the field that can serve as
+        # an identity criterion. An earlier revision of this comment argued from the size of the 56's
+        # ``sum`` difference (3e-5, "twenty-five times below the smallest change a single bfloat16
+        # element can make") that a partially landed copy was the only possible cause. That bound took
+        # the ulp at the absmax magnitude as if every element had it; the intra-arm control above is
+        # what actually explains the number.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        out = {}
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            tensor = param if kind == 'param' else param.grad
+            if tensor is None:
+                continue
+            tensor = self._shard(tensor).double()
+            if tensor.numel() == 0:
+                # ZeRO-3 partitions parameters across ranks, so a rank can legitimately hold an
+                # empty local shard. ``max()`` and ``norm()`` raise on a zero-element tensor
+                # instead of returning an identity, and an empty shard contributes nothing to any
+                # aggregate, so it digests as zeros -- the key stays present, which keeps two runs
+                # comparable parameter by parameter.
+                out[name] = [0.0, 0.0, 0.0]
+                continue
+            out[name] = [float(tensor.sum()), float(tensor.abs().max()), float(tensor.norm())]
+        return out
+
+    def _write_step_probe(self, prefix, pre, grad, *, master_pre=None, **kwargs):
+        # Answers one question a resumed run cannot answer from its loss curve alone: which
+        # parameters received a different update. The loss and the global grad_norm are aggregates
+        # -- they can match to four decimals while a subset of parameters is updated wrongly, which
+        # is exactly the signature of a resume that reproduces its first step and then drifts.
+        post = self._digest_parameters('param')
+        # On an offload tier the parameters are only a bfloat16 view of the float32 master, so they read
+        # identically before and after the step; the master digest is what shows the update landed.
+        master_post = self.strategy.engine_master_digest(self.model, stepped=True)
+        engine_step = self.strategy.take_engine_step_probe()
+        rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+        step_no = self.__dict__.setdefault('_probe_step_no', 0) + 1
+        self.__dict__['_probe_step_no'] = step_no
+        # The optimizer is not an attribute of the model: it lives on the OptimizerGroup selected by
+        # adapter name, resolved here the same way ``step`` resolves it so the probe reads the very
+        # object that was just stepped.
+        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+        optimizer = self.optimizer_group[adapter_name].optimizer
+        optimizer_step = None
+        for group in optimizer.param_groups:
+            for param in group['params']:
+                state = optimizer.state.get(param)
+                if state is not None and 'step' in state:
+                    counter = state['step']
+                    optimizer_step = int(counter.item()) if hasattr(counter, 'item') else int(counter)
+                    break
+            if optimizer_step is not None:
+                break
+        record = {
+            'rank': rank,
+            'step_no': step_no,
+            # The storage dtype settles where a precision loss originates: bf16 parameters mean the
+            # checkpoint was downcast by copying into a narrower destination, while float32
+            # parameters holding bf16-representable values mean the cast happened inside the
+            # distributed load itself.
+            'param_dtypes': sorted({str(t.dtype) for t in self.model.parameters()}),
+            'optimizer_step': optimizer_step,
+            'lrs': [float(g.get('lr', 0.0)) for g in optimizer.param_groups],
+            'weight_decays': [float(g.get('weight_decay', 0.0)) for g in optimizer.param_groups],
+            'group_sizes': [len(g['params']) for g in optimizer.param_groups],
+            # betas and eps are the remaining Adam inputs a resume can silently fail to carry over:
+            # they live only in param_groups, so a checkpoint that restores the state and the
+            # learning rate can still step with different bias correction or a different denominator.
+            'betas': [tuple(g.get('betas', ())) for g in optimizer.param_groups],
+            'eps': [float(g.get('eps', 0.0)) for g in optimizer.param_groups],
+            # ``bias_correction`` is the last argument the fused CPU Adam receives per group
+            # (``ops/adam/cpu_adam.py`` passes ``group['bias_correction']`` straight into
+            # ``adam_update``), and ``adamw_mode`` is baked into the C++ optimizer once at
+            # ``create_adam`` rather than read per step. Neither is reconstructible from the values
+            # above, so a resume that rebuilds the optimizer with a different one of them steps
+            # differently while every recorded scalar still reads equal.
+            'bias_corrections': [g.get('bias_correction') for g in optimizer.param_groups],
+            'adamw_modes': [getattr(optimizer, 'adam_w_mode', None)],
+            'inner_optimizer': type(optimizer).__name__,
+            'engine_counters': self.strategy.engine_counters(self.model),
+            # The console line rounds grad_norm to four decimals, which hides exactly the low-bit
+            # difference that would separate "the update is wrong" from "the gradient is wrong".
+            # Where the engine owns the update, param.grad is already consumed by the time the probe
+            # runs, so the engine's own full-precision norm is the only readable form of it.
+            'engine_grad_norm': (self.strategy.engine_grad_norm(self.model)
+                                 if self.strategy.owns_update_step() else None),
+            'pre': pre,
+            'grad': grad,
+            'post': post,
+            # Where the strategy owns the update, it brackets ``engine.step`` itself and its record is
+            # the only one that can show a change: the pair computed here is taken after that step has
+            # already run, so on such a tier it reads as an unchanged master over a step that moved it.
+            'master_pre': engine_step.get('master_pre', master_pre or {}),
+            'master_post': engine_step.get('master_post', master_post),
+            'grad_partition_pre': engine_step.get('grad_partition_pre', {}),
+            # The Adam moments the update is about to consume, read before it overwrites them in place.
+            # The last input to the update that was never measured: with the master, the gradient it
+            # consumes, lr, betas, eps, weight decay and the Adam step all equal across a resume, the
+            # post-update master still differed, so the moments are what separates "restore lost them"
+            # from "the update itself is not reproducible".
+            'optim_moment_pre': engine_step.get('optim_moment_pre', {}),
+            # ZeRO-2 hands the CPU optimizer this step's reduced gradient inside ``step``, so the
+            # partition read before it is the PREVIOUS step's gradient; the one read after is the
+            # gradient this update actually consumed.
+            'grad_partition_post': engine_step.get('grad_partition_post', {}),
+            'grad_partition_layout': engine_step.get('layout', {}),
+        }
+        with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
+            handle.write(json.dumps(record) + '\n')
 
     def _create_param_group(self,
                             adapter_name: str,
@@ -1920,12 +2092,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     group['betas'] = optim_params['betas']
 
         with context():
-            if scaler is not None:
+            if scaler is not None and not self.strategy.owns_update_step():
                 scaler.step(optimizer, **kwargs)
                 scaler.update()
                 optimizer_config.scaler_has_nan = sum(v.item()
                                                       for v in scaler._found_inf_per_device(optimizer).values()) > 0
             else:
+                # Under such a strategy the engine already applied the update inside backward, and
+                # accelerate's DeepSpeedOptimizerWrapper.step is a documented no-op.
                 optimizer.step(**kwargs)
 
     @remote_function()
@@ -2334,6 +2508,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         optimizer_config = self.optimizer_group[adapter_name]
 
+        # RNG state is per rank, so it is written here rather than below the master-only return:
+        # each rank's generator has advanced by its own dropout draws, and one master-written file
+        # would replay rank 0's stream on every rank. Wherever the forward is stochastic
+        # (``lora_dropout``, attention dropout) that changes the first resumed step's loss, so a
+        # resume diverges from its source run immediately instead of continuing it. The barrier keeps
+        # ``trainer_state.json`` -- the resume completion marker written just below -- from ever
+        # marking a checkpoint complete while another rank's RNG file is still unwritten.
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        torch.save(self._get_training_rng_state(), os.path.join(output_dir, f'rng_state_rank_{rank}.pt'))
+        if dist.is_initialized():
+            dist.barrier()
+
         if not Platform.is_master():
             return
 
@@ -2364,8 +2550,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 },
                 os.path.join(output_dir, 'scaler.pt'),
             )
-
-        torch.save(self._get_training_rng_state(), os.path.join(output_dir, 'rng_state.pt'))
 
     def _save_tokenizer(self, output_dir, **kwargs):
         adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
@@ -2450,10 +2634,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_path = os.path.join(checkpoint_dir, 'optimizer.pt')
         scheduler_path = os.path.join(checkpoint_dir, 'scheduler.pt')
 
-        if strict and not os.path.exists(optimizer_path):
+        if strict and not self.strategy.optimizer_checkpoint_exists(checkpoint_dir):
             raise FileNotFoundError(
-                f'{optimizer_path} is missing although trainer_state.json marks a full checkpoint: '
-                'resuming would silently train on with a fresh optimizer. Restore the file from a '
+                f'{checkpoint_dir} holds no optimizer checkpoint although trainer_state.json marks a '
+                'full one: resuming would silently train on with a fresh optimizer. Restore it from a '
                 'healthy copy, or start a new run from the weights with the model-only load path '
                 '(e.g. --resume_only_model true).')
         if strict and optimizer_config.lr_scheduler is not None and not os.path.exists(scheduler_path):
@@ -2463,7 +2647,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 'copy, or start a new run from the weights with the model-only load path '
                 '(e.g. --resume_only_model true).')
 
-        if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
+        if self.strategy.optimizer_checkpoint_exists(checkpoint_dir) and optimizer_config.optimizer is not None:
             if self.strategy.needs_wrapped_optimizer_state() and not self._model_wrapped:
                 self._lazy_wrap_model()
             optimizer = optimizer_config.optimizer
@@ -2570,7 +2754,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         scaler_path = os.path.join(checkpoint_dir, 'scaler.pt')
         if os.path.exists(scaler_path) and optimizer_config.scaler is not None:
             self._load_scaler_state(scaler_path, adapter_name=adapter_name)
-        rng_path = os.path.join(checkpoint_dir, 'rng_state.pt')
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        rng_path = os.path.join(checkpoint_dir, f'rng_state_rank_{rank}.pt')
+        if not os.path.exists(rng_path):
+            # A checkpoint written before RNG state became per rank carries one master-written file.
+            # Restoring it puts rank 0's stream on every rank, which is closer than no replay but not
+            # exact, so name the consequence instead of letting the resume look faithful.
+            legacy_path = os.path.join(checkpoint_dir, 'rng_state.pt')
+            if os.path.exists(legacy_path):
+                logger.warning(f'{legacy_path} is a single master-written RNG state; rank {rank} replays '
+                               'it instead of its own stream. A stochastic forward (lora_dropout, '
+                               'attention dropout) will not reproduce the source run bit for bit.')
+                rng_path = legacy_path
         if os.path.exists(rng_path):
             self._load_rng_state(rng_path)
         optimizer_config.cur_step = trainer_state['cur_step']
