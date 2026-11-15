@@ -190,6 +190,21 @@ def template(request):
         pytest.skip(f'Failed to build template for {request.param}: {e}')
 
 
+def _skip_without_chat_template(template) -> None:
+    """Skip a model whose processor carries no chat template.
+
+    A Base release ships no conversational format, so ``Template.encode`` reaches
+    ``apply_chat_template`` and raises instead of returning ids. There is then no reference to match
+    and nothing to assert about alignment either, so the model is skipped rather than filtered out of
+    discovery -- the parts of this file that do not encode messages still cover it. The processor is
+    the object ``Template._apply_chat_template`` calls, so it is the only one whose template matters:
+    a tokenizer can carry one while the processor does not.
+    """
+    if getattr(template.processor, 'chat_template', None) is None:
+        pytest.skip('this release carries no chat template (a Base checkpoint), so encode() '
+                    'has no reference to match against')
+
+
 # ---------------------------------------------------------------------------
 # Part B: encode() must reproduce apply_chat_template() byte-for-byte
 # ---------------------------------------------------------------------------
@@ -284,6 +299,7 @@ class TestEncodeMatchesApplyChatTemplate:
 
     @staticmethod
     def _encoded_text(template, trajectory, **kwargs) -> str:
+        _skip_without_chat_template(template)
         encoded = template.encode(trajectory, **kwargs)
         return template.tokenizer.decode(encoded['input_ids'])
 
@@ -366,6 +382,7 @@ class TestEncodeMatchesApplyChatTemplate:
 
     def test_labels_align_with_input_ids(self, template):
         """Sanity: the assistant span is supervised, the prompt span is not."""
+        _skip_without_chat_template(template)
         trajectory = Trajectory(messages=[Message(**m) for m in _PLAIN_CASES['single_turn']])
         encoded = template.encode(trajectory)
         assert len(encoded['labels']) == len(encoded['input_ids'])
