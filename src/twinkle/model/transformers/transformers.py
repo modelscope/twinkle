@@ -2006,6 +2006,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         else:
             optim_moment_post = self.strategy.engine_optim_moment_digest(
                 self.model, optimizer, step=step_no)
+        inner_opt = self._innermost_optimizer(optimizer)
         record = {
             'rank': rank,
             'step_no': step_no,
@@ -2041,11 +2042,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # kept beside it rather than replaced, to leave the gap visible in the data.
             # ``opt_id`` and ``fp32_optimizer_states`` are the last two ``adam_update`` inputs that were
             # never measured on a real run; reading all three closes the input list.
-            'inner_adamw_modes': [getattr(_innermost_optimizer(optimizer), 'adam_w_mode', None)],
-            'inner_opt_ids': [getattr(_innermost_optimizer(optimizer), 'opt_id', None)],
-            'inner_fp32_states': [
-                getattr(_innermost_optimizer(optimizer), 'fp32_optimizer_states', None)
-            ],
+            'inner_adamw_modes': [getattr(inner_opt, 'adam_w_mode', None)],
+            'inner_opt_ids': [getattr(inner_opt, 'opt_id', None)],
+            'inner_fp32_states': [getattr(inner_opt, 'fp32_optimizer_states', None)],
             'inner_optimizer': type(optimizer).__name__,
             'engine_counters': self.strategy.engine_counters(self.model),
             # The console line rounds grad_norm to four decimals, which hides exactly the low-bit
