@@ -122,6 +122,9 @@ def megatron_model(monkeypatch):
         _lazy_finish_param_config=lambda: None,
         _get_default_group=lambda: 'default',
         _not_encoded=lambda _: False,
+        # The real splitter, not a stub: it decides what reaches the processor, and these tests
+        # assert loss equivalence against an independent computation.
+        _rollout_features=MegatronModel._rollout_features,
         optimizer_group={'default': group},
         strategy=SimpleNamespace(unwrap_model=lambda _: [chunk]),
         model=[chunk],

@@ -37,6 +37,11 @@ class TrainingHarness:
         self.sync_enabled = True
         self.calls = []
         self.model = SimpleNamespace(no_sync=self.no_sync, training=True)
+        # The loop drives the update here rather than an engine, which is the path these tests
+        # measure: the harness supplies ``model.no_sync`` and records ``sync_enabled`` to assert
+        # where synchronization happened. A strategy that owned the step would route backward
+        # through ``engine_backward`` and bypass both.
+        self.strategy = SimpleNamespace(owns_update_step=lambda: False)
         self.calculate_loss = MethodType(TransformersModel.calculate_loss.__wrapped__, self)
         self.backward = MethodType(TransformersModel.backward.__wrapped__, self)
 
