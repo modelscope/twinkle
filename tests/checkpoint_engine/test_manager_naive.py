@@ -244,6 +244,8 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
     events = []
 
     class _Backend:
+        # The manager reads this off the backend class to sign which engine the channel runs on.
+        backend_name = 'nccl'
 
         @classmethod
         def build_topology(cls, trainer_world_size, rollout_world_size, metadata):
@@ -265,6 +267,9 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
             events.append(('model_init_submitted', kwargs))
             return lambda: events.append(('model_init_waited', kwargs))
 
+        def activate_checkpoint_engine(self, backend, channel, auth_key=None):
+            pass
+
         def send_weights(self, **kwargs):
             events.append(('send_submitted', kwargs))
             return lambda: events.append(('send_waited', kwargs))
@@ -284,6 +289,12 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
         def init_checkpoint_process_group(self, **kwargs):
             events.append(('sampler_init_submitted', kwargs))
             return lambda: events.append(('sampler_init_waited', kwargs))
+
+        def activate_checkpoint_engine(self, backend, channel, auth_key=None):
+            # The receiver half reports the replicas the channel was opened for. Not recorded in
+            # ``events``: this case is about the standalone prepare/init/receive/finalize lifecycle, and
+            # which engine the actors were configured with is what the colocate case asserts.
+            return ['member']
 
         def receive_weights(self, **kwargs):
             events.append(('receive_submitted', kwargs))
@@ -306,6 +317,7 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
 
     assert manager.requested_mode == 'auto'
     assert manager.mode == 'standalone'
+    assert manager.backend == 'nccl'
     assert [event if isinstance(event, str) else event[0] for event in events] == [
         'model_prepare',
         'sampler_prepare',
@@ -332,13 +344,18 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
 
 def test_colocate_mode_configures_actor_backends(monkeypatch):
     configured = []
-    backend = object()
+    # A class rather than a bare sentinel: the manager reads ``backend_cls.backend_name`` to record
+    # which engine the channel runs on, and the assertions below still need the identity preserved.
+    backend = type('backend', (), {'backend_name': 'ipc'})
 
     class _ActorRole:
         _actors = [object()]
 
-        def set_checkpoint_engine_backend(self, name):
-            configured.append(name)
+        def activate_checkpoint_engine(self, backend, channel, auth_key=None):
+            # This is how the manager tells each actor which engine its channel runs on; the model side
+            # ignores the return, the receiver side reports the replicas the channel was opened for.
+            configured.append(backend)
+            return ['member']
 
     def decide_backend(platform=None, mode='standalone'):
         assert platform == 'GPU'
@@ -351,4 +368,5 @@ def test_colocate_mode_configures_actor_backends(monkeypatch):
 
     assert manager.mode == 'colocate'
     assert manager.backend_cls is backend
+    assert manager.backend == 'ipc'
     assert configured == ['ipc', 'ipc']
