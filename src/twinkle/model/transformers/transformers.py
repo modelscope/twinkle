@@ -1930,6 +1930,15 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # learning rate can still step with different bias correction or a different denominator.
             'betas': [tuple(g.get('betas', ())) for g in optimizer.param_groups],
             'eps': [float(g.get('eps', 0.0)) for g in optimizer.param_groups],
+            # ``bias_correction`` is the last argument the fused CPU Adam receives per group
+            # (``ops/adam/cpu_adam.py`` passes ``group['bias_correction']`` straight into
+            # ``adam_update``), and ``adamw_mode`` is baked into the C++ optimizer once at
+            # ``create_adam`` rather than read per step. Neither is reconstructible from the values
+            # above, so a resume that rebuilds the optimizer with a different one of them steps
+            # differently while every recorded scalar still reads equal.
+            'bias_corrections': [g.get('bias_correction') for g in optimizer.param_groups],
+            'adamw_modes': [getattr(optimizer, 'adam_w_mode', None)],
+            'inner_optimizer': type(optimizer).__name__,
             'engine_counters': self.strategy.engine_counters(self.model),
             # The console line rounds grad_norm to four decimals, which hides exactly the low-bit
             # difference that would separate "the update is wrong" from "the gradient is wrong".

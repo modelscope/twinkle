@@ -529,6 +529,11 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             step = entry.get('step')
             out[f'adam_step[{index}]'] = int(step.item()) if hasattr(step, 'item') else (
                 int(step) if step is not None else None)
+            # The value is not the whole input. ``ops/adam/cpu_adam.py`` hands ``state['step']``
+            # directly to the C++ ``adam_update``, so a restore that puts a tensor where a fresh run
+            # holds an int reaches the binding as a different type while ``int(...)`` above reports
+            # the same number for both. The type is recorded beside the value to keep that visible.
+            out[f'adam_step_type[{index}]'] = type(step).__name__
             for moment in ('exp_avg', 'exp_avg_sq'):
                 value = entry.get(moment)
                 if torch.is_tensor(value):
