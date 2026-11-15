@@ -1942,6 +1942,27 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             }
         return out
 
+    @staticmethod
+    def _innermost_optimizer(optimizer):
+        """The object that actually holds the fused optimizer's own attributes.
+
+        An engine-owned update wraps the optimizer more than once: accelerate's
+        ``DeepSpeedOptimizerWrapper`` holds the ZeRO stage optimizer, which holds the
+        ``DeepSpeedCPUAdam`` that carries ``adam_w_mode``, ``opt_id`` and ``fp32_optimizer_states``.
+        A fixed ``.optimizer`` therefore stops one level too high and reads None for every one of them
+        -- and None on both arms of a resume comparison is equal, so the field looks decisive while
+        saying nothing. Walking until an attribute appears makes the depth of the wrapping irrelevant.
+        """
+        current = optimizer
+        for _ in range(4):
+            if hasattr(current, 'adam_w_mode') or hasattr(current, 'opt_id'):
+                return current
+            inner = getattr(current, 'optimizer', None)
+            if inner is None or inner is current:
+                break
+            current = inner
+        return current
+
     def _write_step_probe(self, prefix, pre, grad, *, master_pre=None, **kwargs):
         # Answers one question a resumed run cannot answer from its loss curve alone: which
         # parameters received a different update. The loss and the global grad_norm are aggregates
@@ -2013,15 +2034,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # The field above is vacuous on every tier that wraps the optimizer: the wrapper does not
             # expose ``adam_w_mode``, so it reads None on both arms of a comparison -- equal, and
             # therefore proving nothing. The flag that actually reaches the fused CPU kernel lives on
-            # the inner optimizer (``DeepSpeedCPUAdam.adam_w_mode``, set once at ``create_adam`` and
-            # passed into every ``adam_update`` call), so it is read there as well. The vacuous wrapper
-            # reading is kept beside it rather than replaced, to leave the gap visible in the data.
+            # the inner ``DeepSpeedCPUAdam`` (``adam_w_mode``, set once at ``create_adam`` and passed
+            # into every ``adam_update`` call), so it is read there as well. It is not one level down
+            # but two -- the wrapper holds the ZeRO optimizer, which holds the CPU Adam -- which is why
+            # the walk is by attribute and not by a fixed ``.optimizer``. The vacuous wrapper reading is
+            # kept beside it rather than replaced, to leave the gap visible in the data.
             # ``opt_id`` and ``fp32_optimizer_states`` are the last two ``adam_update`` inputs that were
             # never measured on a real run; reading all three closes the input list.
-            'inner_adamw_modes': [getattr(getattr(optimizer, 'optimizer', None), 'adam_w_mode', None)],
-            'inner_opt_ids': [getattr(getattr(optimizer, 'optimizer', None), 'opt_id', None)],
+            'inner_adamw_modes': [getattr(_innermost_optimizer(optimizer), 'adam_w_mode', None)],
+            'inner_opt_ids': [getattr(_innermost_optimizer(optimizer), 'opt_id', None)],
             'inner_fp32_states': [
-                getattr(getattr(optimizer, 'optimizer', None), 'fp32_optimizer_states', None)
+                getattr(_innermost_optimizer(optimizer), 'fp32_optimizer_states', None)
             ],
             'inner_optimizer': type(optimizer).__name__,
             'engine_counters': self.strategy.engine_counters(self.model),
