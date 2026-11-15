@@ -50,6 +50,25 @@ def _mean(rows: Sequence[Sequence[float]]) -> float:
     return sum(flat) / len(flat) if flat else 0.0
 
 
+def _absmean(rows: Sequence[Sequence[float]]) -> float:
+    flat = [abs(float(value)) for row in rows for value in row]
+    return sum(flat) / len(flat) if flat else 0.0
+
+
+def _zero_row_fraction(rows: Sequence[Sequence[float]]) -> float:
+    """The fraction of rows whose advantage is zero on every token.
+
+    A group whose members all scored the same is centered to exactly zero, so it contributes no
+    gradient at all. ``mean_advantage`` cannot report this: centering makes it near zero whether
+    every group is degenerate or none is, which is why a run that learned nothing and a run that
+    learned normally look the same on that number.
+    """
+    if not rows:
+        return 0.0
+    zero = sum(1 for row in rows if not any(float(value) != 0.0 for value in row))
+    return zero / len(rows)
+
+
 def _check_unit(name: str, value: float) -> float:
     """Reject a discount / trace-decay knob outside [0, 1], where the recursion stops converging.
 
@@ -348,7 +367,9 @@ class Advantage:
             columns['teacher_logps'] = teacher_logps
         new_trajs = self._write_back(trajs, columns)
         summary: Dict[str, Any] = {'estimator': type(self).__name__, 'num_rows': len(trajs),
-                                   'mean_advantage': _mean(advantages)}
+                                   'mean_advantage': _mean(advantages),
+                                   'absmean_advantage': _absmean(advantages),
+                                   'zero_advantage_rows': _zero_row_fraction(advantages)}
         if self.log_rollout_offpolicy_metrics:
             summary['rollout_correction'] = self._correction(old_logps, rollout_logps)
         return new_trajs, summary

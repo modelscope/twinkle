@@ -198,3 +198,65 @@ class TestRLOOAdvantage:
         # adv_3 = 3 - (36-3)/3 = 3 - 11 = -8
         # adv_15 = 15 - (36-15)/3 = 15 - 7 = 8
         assert result.shape == (4,)
+
+
+class TestAdvantageDegeneracyReport:
+    """The summary quantities that separate "this batch learned nothing" from "it trained normally".
+
+    A GRPO group whose members all scored the same is centered to exactly zero, so it contributes no
+    gradient: the step's loss and grad_norm are both zero by arithmetic, not by failure. ``mean`` cannot
+    report which happened, because centering drives it to zero in both cases.
+
+    PLAN
+    | # | case | input | expected | failure it kills |
+    |---|------|-------|----------|------------------|
+    | 1 | mean is blind to degeneracy | degenerate vs differentiated | both 0.0 | keeping mean as the only reported signal |
+    | 2 | absmean separates them | same | 0.0 vs > 0 | a magnitude that cancels signed values |
+    | 3 | zero-row fraction counts all-zero rows | degenerate / differentiated / half-and-half | 1.0 / 0.0 / 0.5 | miscounting how much of the batch trained |
+    | 4 | negative advantages | ``[[-2.0, 2.0]]`` | absmean 2.0 | a signed mean reading 0.0 over a healthy batch |
+    | 5 | negative zero | ``[[-0.0, 0.0]]`` | zero_rows 1.0 | ``-0.0`` read as nonzero, under-reporting degeneracy |
+    | 6 | empty batch | ``[]`` | 0.0 and 0.0 | a division by zero on an empty batch |
+    | 7 | a row with no tokens | ``[[]]`` | absmean 0.0, zero_rows 1.0 | a tokenless row counted as differentiated |
+    | 8 | NaN advantage | ``[[nan]]`` | zero_rows 0.0 | NaN folded into the degenerate count |
+    """
+
+    DEGENERATE = [[0.0, 0.0], [0.0, 0.0]]
+    DIFFERENTIATED = [[1.0, -1.0], [-1.0, 1.0]]
+
+    def test_mean_cannot_tell_a_degenerate_batch_from_a_trained_one(self):
+        from twinkle.advantage.base import _mean
+        assert _mean(self.DEGENERATE) == _mean(self.DIFFERENTIATED) == 0.0
+
+    def test_absmean_separates_them(self):
+        from twinkle.advantage.base import _absmean
+        assert _absmean(self.DEGENERATE) == 0.0
+        assert _absmean(self.DIFFERENTIATED) == 1.0
+
+    def test_zero_row_fraction_counts_the_rows_that_trained_nothing(self):
+        from twinkle.advantage.base import _zero_row_fraction
+        assert _zero_row_fraction(self.DEGENERATE) == 1.0
+        assert _zero_row_fraction(self.DIFFERENTIATED) == 0.0
+        assert _zero_row_fraction(self.DEGENERATE[:1] + self.DIFFERENTIATED[:1]) == 0.5
+
+    def test_negative_advantages_are_measured_by_magnitude(self):
+        from twinkle.advantage.base import _absmean, _mean
+        assert _mean([[-2.0, 2.0]]) == 0.0
+        assert _absmean([[-2.0, 2.0]]) == 2.0
+
+    def test_negative_zero_counts_as_a_zero_advantage(self):
+        from twinkle.advantage.base import _zero_row_fraction
+        assert _zero_row_fraction([[-0.0, 0.0]]) == 1.0
+
+    def test_an_empty_batch_reports_zeros_not_an_error(self):
+        from twinkle.advantage.base import _absmean, _zero_row_fraction
+        assert _absmean([]) == 0.0
+        assert _zero_row_fraction([]) == 0.0
+
+    def test_a_row_with_no_tokens_contributed_nothing(self):
+        from twinkle.advantage.base import _absmean, _zero_row_fraction
+        assert _absmean([[]]) == 0.0
+        assert _zero_row_fraction([[]]) == 1.0
+
+    def test_a_nan_advantage_is_not_counted_as_degenerate(self):
+        from twinkle.advantage.base import _zero_row_fraction
+        assert _zero_row_fraction([[float('nan')]]) == 0.0
