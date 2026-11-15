@@ -55,8 +55,8 @@ class VLLMWeightSender:
                 os.remove(endpoint[6:])
 
     @staticmethod
-    async def _fingerprint_received(pairs, tag: str = ''):
-        """Record each weight's exact fingerprint as it reaches the sampler, if the probe is on.
+    async def _fingerprint_published(pairs, tag: str = ''):
+        """Record each weight's exact fingerprint as it is packed for the worker, if the probe is on.
 
         Streaming is preserved: this yields each pair as it arrives rather than collecting the model,
         so the bucket-by-bucket memory bound the caller relies on is unchanged.
@@ -64,7 +64,7 @@ class VLLMWeightSender:
         from twinkle.checkpoint_engine.weight_keys import record_weight_fingerprint
         seq = 0
         async for name, tensor in pairs:
-            record_weight_fingerprint('sampler', 'recv', seq, name, tensor, tag=tag)
+            record_weight_fingerprint('vllm_sender', 'send', seq, name, tensor, tag=tag)
             seq += 1
             yield name, tensor
 
@@ -123,12 +123,13 @@ class VLLMWeightSender:
 
             weight_aiter = _sync_iter()
 
-        # The arrival point of the published stream: the trainer wraps the same pairs before they
-        # enter the transport (CheckpointEngineMixin._fingerprint_published), so equal fingerprints
-        # for a name across the two files mean the transport preserved every element -- which is the
-        # question a checkpoint cannot answer. Wrapped before the peek below so the first tensor,
-        # which the peek consumes, is recorded like every other.
-        weight_aiter = self._fingerprint_received(weight_aiter, tag=zmq_handle or '')
+        # The publish point of the direct-to-vLLM path: the trainer's export generator is consumed
+        # here and packed into zmq buckets, so this is where the bytes leave the training process.
+        # Its counterpart is TwinkleWorkerExtension._load_weights, where the same bytes become the
+        # worker's own weights; equal fingerprints for a name across the two mean the transport was
+        # lossless -- the question a checkpoint cannot answer. Wrapped before the peek below so the
+        # first tensor, which the peek consumes, is recorded like every other.
+        weight_aiter = self._fingerprint_published(weight_aiter, tag=zmq_handle or '')
 
         # Peek first tensor to detect device (supported accelerator → IPC, CPU → SHM).
         try:
