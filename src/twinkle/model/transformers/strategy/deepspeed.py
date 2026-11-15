@@ -468,7 +468,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         """
         return max(1, -(-numel // width))
 
-    def engine_master_digest(self, model) -> Dict[str, Any]:
+    def engine_master_digest(self, model, *, stepped: bool = False) -> Dict[str, Any]:
         """Per-group float statistics over a sample, plus an exact fingerprint of every element.
 
         ``agg`` is ``[sum, absmax, norm]`` over a strided sample and is what localizes and sizes a
@@ -476,14 +476,23 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         identical at all. ``TWINKLE_STEP_DELTA_PROBE_FULL_STEP`` additionally names one global step at
         which the float statistics are computed over every element, for when a difference has to be
         sized and located rather than merely detected.
+
+        ``stepped`` says whether ``engine.step`` has already run for the step being digested, which is
+        what selects the counter reading the full-coverage gate compares against.
         """
         _, partitions = self._fp32_partitions(model)
         if not partitions:
             return {}
         full_step = os.environ.get('TWINKLE_STEP_DELTA_PROBE_FULL_STEP')
-        # Before ``engine.step`` the engine's counter still holds the number of completed updates, so the
-        # update about to run is ``global_steps + 1``.
-        at_full_step = bool(full_step) and _resolve_engine(model).global_steps + 1 == int(full_step)
+        # ``global_steps`` counts completed updates, so before ``engine.step`` the update about to run
+        # is ``global_steps + 1``, and after it the one just run is ``global_steps`` itself. Applying
+        # the pre-step reading at a post-step call site misses the target step by one and silently
+        # drops that digest back to the 64-chunk sample -- measured at FULL_STEP=16 on a ZeRO-2 offload
+        # run: ``master_pre[0]`` came back ``covered=True`` with 1108097 chunks while ``master_post[0]``
+        # came back ``covered=False`` with 64, i.e. 0.37% of a 4,538,761,984-element partition, which is
+        # exactly the side a difference has to be sized and located on.
+        engine_step = _resolve_engine(model).global_steps + (0 if stepped else 1)
+        at_full_step = bool(full_step) and engine_step == int(full_step)
         out = {}
         for index, group in enumerate(partitions):
             if group is None:
@@ -657,7 +666,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             engine.step()
             if probe:
                 step_probe = self.__dict__['_engine_step_probe']
-                step_probe['master_post'] = self.engine_master_digest(model)
+                step_probe['master_post'] = self.engine_master_digest(model, stepped=True)
                 # ZeRO-2 assigns this step's reduced gradient to the float32 partition's ``.grad``
                 # inside ``step`` and the CPU optimizer consumes it there, so the partition read BEFORE
                 # the step is the previous step's gradient -- on a first step after a restore it is a

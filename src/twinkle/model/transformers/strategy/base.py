@@ -254,7 +254,7 @@ class TransformerStrategyBase(ABC):
         """
         return {}
 
-    def engine_master_digest(self, model) -> Dict[str, Any]:
+    def engine_master_digest(self, model, *, stepped: bool = False) -> Dict[str, Any]:
         """Digest of the float32 master partitions this strategy's optimizer actually updates.
 
         Offload tiers keep the trained precision in a flat CPU partition that the model's parameters
@@ -262,6 +262,9 @@ class TransformerStrategyBase(ABC):
         they read the same values before and after the step. Sampling is spread across the whole
         partition rather than taken from its head, because a prefix sample is exactly what let a
         partition that differed past its first elements report as identical.
+
+        ``stepped`` tells the implementation whether its engine has already run this step's update,
+        which is what selects the step counter a full-coverage gate compares against.
         """
         return {}
 

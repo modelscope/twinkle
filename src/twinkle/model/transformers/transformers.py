@@ -1846,8 +1846,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     @timed
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
         probe = os.environ.get('TWINKLE_STEP_DELTA_PROBE')
+        # ``stepped=True`` at both loop-level sites: ``engine_backward`` has already run ``engine.step``
+        # for this step by the time the loop reaches here, so the engine's counter reads the step being
+        # digested rather than the one before it.
         pre = self._digest_parameters('param') if probe else None
-        master_pre = self.strategy.engine_master_digest(self.model) if probe else None
+        master_pre = self.strategy.engine_master_digest(self.model, stepped=True) if probe else None
         self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         grad = self._digest_parameters('grad') if probe else None
         self.step(**kwargs)
@@ -1921,7 +1924,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         post = self._digest_parameters('param')
         # On an offload tier the parameters are only a bfloat16 view of the float32 master, so they read
         # identically before and after the step; the master digest is what shows the update landed.
-        master_post = self.strategy.engine_master_digest(self.model)
+        master_post = self.strategy.engine_master_digest(self.model, stepped=True)
         engine_step = self.strategy.take_engine_step_probe()
         rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
         step_no = self.__dict__.setdefault('_probe_step_no', 0) + 1
