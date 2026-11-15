@@ -14,12 +14,9 @@ import importlib
 #: consumers OUTSIDE this package live here; the rest is reachable via its defining submodule.
 _EXPORTS = {
     'ClusterAdapter': 'cluster_adapter',
-    'PRM_SEGMENT_TURNS': 'streaming_driver',
-    'ProcessReward': 'process_reward',
     'StreamingDriver': 'streaming_driver',
     'estimate_plan': 'cluster_adapter',
     'resource_device_groups': 'cluster_adapter',
-    'weighted_score': 'process_reward',
 }
 
 __all__ = list(_EXPORTS)
