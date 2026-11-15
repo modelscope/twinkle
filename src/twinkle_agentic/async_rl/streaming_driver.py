@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from twinkle import remote_class, remote_function
@@ -133,6 +133,9 @@ class _Episode:
     prm_pending: int = 0
     #: The PRM segment the episode waits for before its next step (only with ``on_step``).
     held: Optional[int] = None
+    #: The episode's training rows as the last step returned them (one, or one per collected
+    #: segment); an unfinished episode holds none.
+    deliver: List[Any] = field(default_factory=list)
 
 
 @remote_class(execute='first', max_concurrency=8)
@@ -355,7 +358,9 @@ class StreamingDriver:
         # ONE locked section: collect the batch and build its light facts. The rows are handed
         # out exactly as they travel (a reference under ray, a dict in-process) -- the driver
         # never opens one; the score columns ride the facts instead, aligned row for row, and
-        # the identity fields were stamped on the rows at admission. Nothing here scales with
+        # the identity fields were stamped on the rows at admission. An episode delivered as
+        # several rows (collected segments) contributes each of them: its episode-level sample
+        # and score entry repeat per row, aligned. Nothing here scales with
         # the tokens, so the event thread is never held up; collecting and counting move
         # together, so the batch is never half-published.
         with self._lock:
@@ -367,10 +372,29 @@ class StreamingDriver:
             while len(trajs) < self.batch_size and self._ready:
                 for episode in self._ready.popleft():
                     episode.sample.version_span = self._version - episode.sample.policy_version
-                    trajs.append(episode.traj)
-                    samples.append(episode.sample)
-                    scores.append(self._score_update(episode))
-                    version_spans.append(episode.sample.version_span)
+                    score = self._score_update(episode)
+                    lengths = (episode.sample.extra or {}).get('row_token_lengths')
+                    if len(episode.deliver) == 1 or not lengths:
+                        # The identity path: one row carries the episode's own facts verbatim.
+                        row_samples = [episode.sample] * len(episode.deliver)
+                    else:
+                        if len(lengths) != len(episode.deliver):
+                            raise RuntimeError(
+                                f'episode {episode.sample.episode_id!r}: {len(episode.deliver)} delivered rows '
+                                f'but {len(lengths)} row lengths on its status.')
+                        # A collected episode's rows carry their own length facts: the episode
+                        # totals would repeat on every row and weigh the metrics by row count.
+                        extra = {key: value for key, value in (episode.sample.extra or {}).items()
+                                 if key != 'row_token_lengths'}
+                        row_samples = [
+                            replace(episode.sample, token_lengths=tuple(map(int, pair)),
+                                    extra=dict(extra, segment_index=index))
+                            for index, pair in enumerate(lengths)]
+                    for row, row_sample in zip(episode.deliver, row_samples):
+                        trajs.append(row)
+                        samples.append(row_sample)
+                        scores.append(score)
+                        version_spans.append(row_sample.version_span)
             self._ready_rows -= len(trajs)
             self._handed += 1
             self._lock.notify_all()
@@ -422,7 +446,8 @@ class StreamingDriver:
         kept = deque()
         for members in self._ready:
             if self._version - min(episode.version for episode in members) > self.max_staleness:
-                self._ready_rows -= len(members)
+                rows = sum(len(episode.deliver) for episode in members)
+                self._ready_rows -= rows
                 self._live -= len(members)
                 self._counters['dropped_stale'] += len(members)
             else:
@@ -634,7 +659,7 @@ class StreamingDriver:
             if episode.lost:
                 if kind == 'step' and exc is None and not future.result()[1].done:
                     # dropped while this step ran: release its rollout state now
-                    self.rollout.stop(future.result()[0], episode_id=episode.episode_id)
+                    self.rollout.stop(future.result()[0][0], episode_id=episode.episode_id)
                 return
             if exc is not None and not (kind == 'step' and _is_episode_error(exc)):
                 raise exc
@@ -657,12 +682,14 @@ class StreamingDriver:
                 self._maybe_finish(episode)
             self._lock.notify_all()
 
-    def _on_step(self, episode: _Episode, traj: Any, sample: RolloutStatus) -> None:
-        episode.traj = traj
+    def _on_step(self, episode: _Episode, trajs: Any, sample: RolloutStatus) -> None:
+        episode.traj = trajs[0]
         episode.sample = sample
         episode.done = bool(sample.done)
+        if episode.done:
+            episode.deliver = list(trajs)
         if self.prms and episode.role != _BASELINE and (episode.done or self.prm_segment is None
-                                                         or self.prm_segment(sample, traj)):
+                                                         or self.prm_segment(sample, trajs[0])):
             segment = self._score_prm(episode)
             if self.on_step is not None and not episode.done:
                 episode.held = segment
@@ -672,7 +699,7 @@ class StreamingDriver:
             self._failures.append(False)
             self._score_orm(episode)
         else:
-            self._step(episode, traj)
+            self._step(episode, trajs[0])
 
     def _score_prm(self, episode: _Episode) -> int:
         if episode.prm is None:
@@ -807,7 +834,7 @@ class StreamingDriver:
     def _accept(self, group: _Group) -> None:
         del self._groups[group.key]
         self._ready.append(list(group.members))
-        self._ready_rows += len(group.members)
+        self._ready_rows += sum(len(episode.deliver) for episode in group.members)
 
     def _drop_group(self, group: _Group) -> None:
         """Give the group up: its counted rows leave the bound, its unfinished episodes stop (under the lock)."""

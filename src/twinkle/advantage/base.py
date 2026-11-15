@@ -106,7 +106,8 @@ class Advantage:
                  gamma: float = 1.0,
                  gae_lambda: float = 0.95,
                  normalize: bool = True,
-                 kl_coef: float = 0.0) -> None:
+                 kl_coef: float = 0.0,
+                 segment_discount: float = 1.0) -> None:
         """GRPO-family knobs: ``num_generations`` / ``scale_rewards`` / ``beta`` / ``kl_in_reward``
         / ``kl_kind`` (the k3 per-row mean folds into the reward), ``reward_weights`` (the ORM
         fold), ``use_prm`` + ``prm_orm_mix`` + ``prm_weights`` (PRM fusion), ``teacher_reweight``
@@ -138,7 +139,10 @@ class Advantage:
                       ('rlsd_reweight_clip_range', rlsd_reweight_clip_range != 5.0),
                       ('rlsd_negative_only', rlsd_negative_only),
                       ('rollout_importance_sampling_mode', rollout_importance_sampling_mode),
-                      ('log_rollout_offpolicy_metrics', log_rollout_offpolicy_metrics)]
+                      ('log_rollout_offpolicy_metrics', log_rollout_offpolicy_metrics),
+                      # the group-relative half this base runs is scalar-only; a token-level
+                      # estimator has no episode fold to discount.
+                      ('segment_discount', segment_discount != 1.0)]
             if kl_coef == 0.0:
                 # kl_kind reaches the token-reward fold only through kl_coef, so with kl_coef at 0
                 # nothing reads it. Two values are still legitimate: 'k3' is this constructor's own
@@ -192,6 +196,11 @@ class Advantage:
         self.kl_coef = kl_coef
         self.gamma = _check_unit('gamma', float(gamma))
         self.gae_lambda = _check_unit('gae_lambda', float(gae_lambda))
+        # An episode delivered as several rows (collected segments) shares one advantage; this
+        # discounts an earlier row's share by the trainable tokens its episode still generates
+        # after it (CompactionRL's trajectory-position correction, gamma-only): 1.0 -- the
+        # default -- is the uniform broadcast.
+        self.segment_discount = _check_unit('segment_discount', float(segment_discount))
         self.normalize = normalize
         # Pure math, instantiated locally: the subclass is the remote boundary, these run in it.
         self._kl = KLEstimator()
@@ -301,11 +310,46 @@ class Advantage:
             raise ValueError(f'the trajectories carry different ORM scorer counts {sorted(widths)}; every row '
                              'of a batch is scored by the same scorer set (a missing score is None, not a '
                              'shorter row).')
-        reward_matrix = torch.tensor(matrix_rows, dtype=torch.float32)
+        # An episode delivered as several rows (collected segments) counts ONCE in the group
+        # statistics -- its reward entering the mean per row would weight compacted episodes by
+        # their segment count -- and the per-episode advantage is broadcast back to every row.
+        folded, owner = self._episode_fold(trajs, matrix_rows)
+        if folded is None:
+            reward_matrix = torch.tensor(matrix_rows, dtype=torch.float32)
+            response_lengths = [len(traj['response_token_ids']) for traj in trajs]
+        else:
+            if self.use_prm:
+                raise ValueError('use_prm does not read a batch of segment rows: PRM segment alignment '
+                                 'across collected segments is not implemented (drop the PRM fusion or '
+                                 "run with segment_policy='drop').")
+            episode_response = {}
+            for index, traj in enumerate(trajs):
+                episode_response[owner[index]] = episode_response.get(owner[index], 0) + \
+                    len(traj['response_token_ids'])
+            reward_matrix = torch.tensor([matrix_rows[index] for index in folded], dtype=torch.float32)
+            response_lengths = [episode_response[episode] for episode in range(len(folded))]
         self._check_groups(trajs)
         baseline_rows = [list(((score.get('rewards') or {}).get('baseline') or {}).values()) for score in scores]
         baselines = ([weighted_score(row, self.reward_weights) for row in baseline_rows]
                      if any(baseline_rows) else None)
+        if folded is not None:
+            # The KL lane and the remax baselines are per-row while the folded reward matrix is
+            # per-episode: fold them along the same owner map, or the per-row inputs would not
+            # carry the episode count compute_advantages sees. The KL folds as the response-token
+            # weighted mean (each row's value is its per-token mean, so the episode's is the mean
+            # over all its tokens); a baseline is stamped on every row of the episode, so its
+            # first row carries it.
+            if kl_values is not None:
+                totals = [0.0] * len(folded)
+                weights = [0] * len(folded)
+                for index, traj in enumerate(trajs):
+                    episode = owner[index]
+                    weight = len(traj['response_token_ids'])
+                    totals[episode] += kl_values[index] * weight
+                    weights[episode] += weight
+                kl_values = [total / max(1, weights[episode]) for episode, total in enumerate(totals)]
+            if baselines is not None:
+                baselines = [baselines[index] for index in folded]
         advantages = compute_advantages(
             reward_matrix,
             self.num_generations,
@@ -315,9 +359,14 @@ class Advantage:
             kl_in_reward=self.kl_in_reward,
             beta=float(self.beta or 0.0),
             kl_values=kl_values,
-            response_lengths=[len(traj['response_token_ids']) for traj in trajs],
+            response_lengths=response_lengths,
             f_norm=float(self.f_norm),
             reward_baselines=baselines)
+        if folded is not None:
+            # The per-episode advantage broadcast onto the episode's rows, each earlier row
+            # optionally discounted by the trainable tokens its episode still generates after it.
+            scale = self._segment_scale(trajs, owner)
+            advantages = [float(advantages[owner[index]]) * scale[index] for index in range(len(trajs))]
         if self.use_prm:
             # advantage = mix * process + (1 - mix) * orm_advantage on every response token: mix=0
             # is standard GRPO, mix=1 pure PRM. The scalar ORM lane broadcasts over the token rows.
@@ -354,6 +403,58 @@ class Advantage:
         return new_trajs, summary
 
     # ---------------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _episode_fold(trajs: List[Trajectory], matrix_rows: List[List[float]]) -> Tuple[Optional[List[int]], List[int]]:
+        """Fold the batch's rows to one per episode: ``(folded, owner)``.
+
+        An episode delivered as several rows (collected segments under
+        ``segment_policy='collect'``) is ONE unit of training: its reward counts once in the
+        group statistics and once in every length-based correction. ``owner[i]`` is the folded
+        row index the i-th trajectory belongs to; ``folded`` lists the index of each distinct
+        episode's first row, or is ``None`` when every episode is one row (the identity path,
+        byte-for-byte the batch as it arrived). Rows of one episode must arrive consecutively.
+        """
+        owner: List[int] = []
+        index_of: Dict[Any, int] = {}
+        folded: List[int] = []
+        previous = None
+        for index, traj in enumerate(trajs):
+            key = traj.get('episode_id')
+            if key is None:
+                raise ValueError(f'trajectory at row {index} has no episode_id; folding segment rows '
+                                 'needs it.')
+            if key in index_of:
+                if index_of[key] != previous:
+                    raise ValueError(f"episode {key!r}'s rows are not consecutive: every episode's rows "
+                                     'arrive as one block.')
+            else:
+                index_of[key] = len(folded)
+                folded.append(index)
+            previous = index_of[key]
+            owner.append(index_of[key])
+        if len(folded) == len(trajs):
+            return None, owner
+        return folded, owner
+
+    def _segment_scale(self, trajs: List[Trajectory], owner: List[int]) -> List[float]:
+        """One row's broadcast multiplier: gamma ** (trainable tokens after it, same episode).
+
+        With ``segment_discount=1`` -- the default -- every row of an episode carries the
+        episode's advantage verbatim (the uniform broadcast). Below 1, a row is discounted by
+        the tokens its episode still generates after it, so the outcome reaches earlier
+        segments weakened the further away it happened to end (CompactionRL's
+        trajectory-position correction, gamma-only).
+        """
+        if self.segment_discount >= 1.0:
+            return [1.0] * len(trajs)
+        after = [0.0] * len(trajs)
+        tail: Dict[int, float] = {}
+        for index in range(len(trajs) - 1, -1, -1):
+            episode = owner[index]
+            after[index] = tail.get(episode, 0.0)
+            tail[episode] = after[index] + len(trajs[index].get('response_token_ids') or [])
+        return [self.segment_discount ** tokens for tokens in after]
 
     def _write_back(self, trajs: List[Trajectory], columns: Dict[str, List[Any]]) -> List[Trajectory]:
         """Write whole-batch columns onto copies of the trajectories; the caller replaces references."""
@@ -423,24 +524,36 @@ class Advantage:
         return per_token
 
     def _check_groups(self, trajs: List[Trajectory]) -> None:
-        """Every prompt group arrives as one consecutive block of exactly ``num_generations`` rows."""
+        """Every prompt group arrives as one consecutive block of exactly ``num_generations``
+        episodes -- an episode delivered as several rows (collected segments) counts once."""
         if self.num_generations <= 1:
             return
-        blocks: List[Tuple[Any, List[Trajectory]]] = []
+        blocks: List[Tuple[Any, int]] = []
+        seen: Dict[Any, int] = {}
+        folded_keys: List[Any] = []
         for traj in trajs:
             key = traj.get('group_key')
             if key is None:
                 raise ValueError(f'trajectory {traj.get("episode_id")!r} has no group_key; grouped estimation '
                                  'needs it.')
+            episode = traj.get('episode_id')
+            position = seen.get(episode)
+            if position is None:
+                position = len(folded_keys)
+                seen[episode] = position
+                folded_keys.append(key)
+            elif folded_keys[position] != key:
+                raise ValueError(f'episode {episode!r} carries two group keys; one episode, one group.')
+        for index, key in enumerate(folded_keys):
             if not blocks or blocks[-1][0] != key:
-                blocks.append((key, [traj]))
+                blocks.append((key, 1))
             else:
-                blocks[-1][1].append(traj)
+                blocks[-1] = (key, blocks[-1][1] + 1)
         keys = [key for key, _ in blocks]
         if len(set(keys)) != len(keys):
             raise ValueError('group_key blocks are not contiguous: every prompt group must arrive as one '
-                             'consecutive block of rows.')
-        for key, rows in blocks:
-            if len(rows) != self.num_generations:
-                raise ValueError(f'group {key!r} carries {len(rows)} rows; num_generations='
+                             'consecutive block of episodes.')
+        for key, count in blocks:
+            if count != self.num_generations:
+                raise ValueError(f'group {key!r} carries {count} episodes; num_generations='
                                  f'{self.num_generations} requires complete groups.')
