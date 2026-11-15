@@ -99,7 +99,20 @@ def test_loss_without_micro_batch_semantics_fails_when_split():
 
 def test_transformers_forward_backward_keeps_original_default_path():
     class ModelHarness:
+        # Collaborators of the borrowed ``TransformersModel`` methods. Each is a ``staticmethod`` on
+        # ``TrainableModel``; a bare assignment would rebind it as an instance method and hand ``self``
+        # to its first parameter. Borrowed uniformly because which subset a given entry point reaches
+        # depends on the branches the case drives, not on the class.
+        _rollout_features = staticmethod(TransformersModel._rollout_features)
+        resolve_output_frame_request = staticmethod(TransformersModel.resolve_output_frame_request)
+        _capture_response_rows = staticmethod(TransformersModel._capture_response_rows)
+        # The loop drives the update here rather than an engine, which is the path under test.
+        strategy = SimpleNamespace(owns_update_step=lambda: False)
+
         _forward_backward_single = TransformersModel._forward_backward_single
+        # # ``{n}`` is a ``staticmethod`` on ``TrainableModel``; a bare assignment would rebind it as an
+        # # instance method here and hand ``self`` to its first parameter.
+        _rollout_features = staticmethod(TransformersModel._rollout_features)
         _forward_backward_micro_batch = TransformersModel._forward_backward_micro_batch
         _not_encoded = staticmethod(lambda inputs: False)
 
@@ -156,7 +169,20 @@ def test_transformers_forward_backward_executes_real_micro_batches(
             pass
 
     class ModelHarness:
+        # Collaborators of the borrowed ``TransformersModel`` methods. Each is a ``staticmethod`` on
+        # ``TrainableModel``; a bare assignment would rebind it as an instance method and hand ``self``
+        # to its first parameter. Borrowed uniformly because which subset a given entry point reaches
+        # depends on the branches the case drives, not on the class.
+        _rollout_features = staticmethod(TransformersModel._rollout_features)
+        resolve_output_frame_request = staticmethod(TransformersModel.resolve_output_frame_request)
+        _capture_response_rows = staticmethod(TransformersModel._capture_response_rows)
+        # The loop drives the update here rather than an engine, which is the path under test.
+        strategy = SimpleNamespace(owns_update_step=lambda: False)
+
         _forward_backward_single = TransformersModel._forward_backward_single
+        # # ``{n}`` is a ``staticmethod`` on ``TrainableModel``; a bare assignment would rebind it as an
+        # # instance method here and hand ``self`` to its first parameter.
+        _rollout_features = staticmethod(TransformersModel._rollout_features)
         _build_micro_batch_plan = TransformersModel._build_micro_batch_plan
         _forward_backward_micro_batch = TransformersModel._forward_backward_micro_batch
         _forward_backward_micro_batches = TransformersModel._forward_backward_micro_batches
@@ -395,6 +421,16 @@ def test_forward_only_micro_batches_restore_order_and_slice_masks(algorithm, mic
     import torch
 
     class ModelHarness:
+        # Collaborators of the borrowed ``TransformersModel`` methods. Each is a ``staticmethod`` on
+        # ``TrainableModel``; a bare assignment would rebind it as an instance method and hand ``self``
+        # to its first parameter. Borrowed uniformly because which subset a given entry point reaches
+        # depends on the branches the case drives, not on the class.
+        _rollout_features = staticmethod(TransformersModel._rollout_features)
+        resolve_output_frame_request = staticmethod(TransformersModel.resolve_output_frame_request)
+        _capture_response_rows = staticmethod(TransformersModel._capture_response_rows)
+        # The loop drives the update here rather than an engine, which is the path under test.
+        strategy = SimpleNamespace(owns_update_step=lambda: False)
+
         _build_micro_batch_plan = TransformersModel._build_micro_batch_plan
 
         def __init__(self):
@@ -413,6 +449,9 @@ def test_forward_only_micro_batches_restore_order_and_slice_masks(algorithm, mic
 
         _prepare_forward_only_inputs = TransformersModel._prepare_forward_only_inputs
         _forward_only_micro_batches = TransformersModel._forward_only_micro_batches
+        # # ``{n}`` is a ``staticmethod`` on ``TrainableModel``; a bare assignment would rebind it as an
+        # # instance method here and hand ``self`` to its first parameter.
+        resolve_output_frame_request = staticmethod(TransformersModel.resolve_output_frame_request)
 
         def _forward_only_single(self, *, inputs, sampling_masks, **kwargs):
             ids = [item['sample_id'] for item in inputs]
@@ -442,6 +481,16 @@ def test_forward_only_micro_batches_restore_order_and_slice_masks(algorithm, mic
 
 def test_forward_only_without_micro_batches_prepares_inputs_once():
     class ModelHarness:
+        # Collaborators of the borrowed ``TransformersModel`` methods. Each is a ``staticmethod`` on
+        # ``TrainableModel``; a bare assignment would rebind it as an instance method and hand ``self``
+        # to its first parameter. Borrowed uniformly because which subset a given entry point reaches
+        # depends on the branches the case drives, not on the class.
+        _rollout_features = staticmethod(TransformersModel._rollout_features)
+        resolve_output_frame_request = staticmethod(TransformersModel.resolve_output_frame_request)
+        _capture_response_rows = staticmethod(TransformersModel._capture_response_rows)
+        # The loop drives the update here rather than an engine, which is the path under test.
+        strategy = SimpleNamespace(owns_update_step=lambda: False)
+
         optimizer_group = {'adapter': object()}
 
         def _get_default_group(self):
@@ -545,6 +594,16 @@ def test_forward_only_accumulates_aux_loss_using_training_micro_batch_scale(redu
     loss = CrossEntropyLoss(reduction=reduction)
 
     class ModelHarness:
+        # Collaborators of the borrowed ``TransformersModel`` methods. Each is a ``staticmethod`` on
+        # ``TrainableModel``; a bare assignment would rebind it as an instance method and hand ``self``
+        # to its first parameter. Borrowed uniformly because which subset a given entry point reaches
+        # depends on the branches the case drives, not on the class.
+        _rollout_features = staticmethod(TransformersModel._rollout_features)
+        resolve_output_frame_request = staticmethod(TransformersModel.resolve_output_frame_request)
+        _capture_response_rows = staticmethod(TransformersModel._capture_response_rows)
+        # The loop drives the update here rather than an engine, which is the path under test.
+        strategy = SimpleNamespace(owns_update_step=lambda: False)
+
         optimizer_group = {'adapter': SimpleNamespace(get_loss=lambda key: loss)}
 
         def _get_default_group(self):
@@ -558,6 +617,9 @@ def test_forward_only_accumulates_aux_loss_using_training_micro_batch_scale(redu
 
         _prepare_forward_only_inputs = TransformersModel._prepare_forward_only_inputs
         _forward_only_micro_batches = TransformersModel._forward_only_micro_batches
+        # # ``{n}`` is a ``staticmethod`` on ``TrainableModel``; a bare assignment would rebind it as an
+        # # instance method here and hand ``self`` to its first parameter.
+        resolve_output_frame_request = staticmethod(TransformersModel.resolve_output_frame_request)
 
         def _forward_only_single(self, *, inputs, **kwargs):
             value = float(inputs[0]['input_ids'][0])
@@ -643,9 +705,22 @@ def test_forward_only_encodes_trajectories_once(micro_batch_size):
     optimizer_config = SimpleNamespace(template=template)
 
     class ModelHarness:
+        # Collaborators of the borrowed ``TransformersModel`` methods. Each is a ``staticmethod`` on
+        # ``TrainableModel``; a bare assignment would rebind it as an instance method and hand ``self``
+        # to its first parameter. Borrowed uniformly because which subset a given entry point reaches
+        # depends on the branches the case drives, not on the class.
+        _rollout_features = staticmethod(TransformersModel._rollout_features)
+        resolve_output_frame_request = staticmethod(TransformersModel.resolve_output_frame_request)
+        _capture_response_rows = staticmethod(TransformersModel._capture_response_rows)
+        # The loop drives the update here rather than an engine, which is the path under test.
+        strategy = SimpleNamespace(owns_update_step=lambda: False)
+
         optimizer_group = {'adapter': optimizer_config}
         _prepare_forward_only_inputs = TransformersModel._prepare_forward_only_inputs
         _forward_only_micro_batches = TransformersModel._forward_only_micro_batches
+        # # ``{n}`` is a ``staticmethod`` on ``TrainableModel``; a bare assignment would rebind it as an
+        # # instance method here and hand ``self`` to its first parameter.
+        resolve_output_frame_request = staticmethod(TransformersModel.resolve_output_frame_request)
 
         def _get_default_group(self):
             return 'adapter'
