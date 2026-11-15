@@ -159,8 +159,12 @@ class StreamingDriver:
         prms: process scorers, run on the trajectory so far at every closed segment.
         prm_names: each PRM's name in the handed-out ``prm_segments['scores']``; ``None`` names
             them by position (``prm_0`` ...).
-        prm_segment: ``prm_segment(sample) -> bool``, whether the step just finished closes a PRM
-            segment (default: every step; the last step always does).
+        prm_segment: ``prm_segment(sample, traj) -> bool``, whether the step just finished closes a
+            PRM segment (default: every step; the last step always does). ``traj`` is the
+            trajectory as the driver holds it -- the in-process dict on local direct calls, the
+            stashed object reference under ray (the driver never materializes it itself; a
+            content-based segmentation resolves it at its own cost, e.g. one ``ray.get`` per
+            step).
         on_step: ``on_step(sample, prm_scores) -> bool``, called with a closed segment's scores;
             ``False`` stops the episode (it is dropped like a failed one).
         on_sample: ``on_sample(sample) -> Optional[bool]``, called on every scored episode;
@@ -200,7 +204,7 @@ class StreamingDriver:
                  orm_names: Optional[Sequence[str]] = None,
                  prms: Sequence[Any] = (),
                  prm_names: Optional[Sequence[str]] = None,
-                 prm_segment: Optional[Callable[[RolloutSample], bool]] = None,
+                 prm_segment: Optional[Callable[[RolloutSample, Any], bool]] = None,
                  on_step: Optional[Callable[[RolloutSample, List[Any]], bool]] = None,
                  on_sample: Optional[Callable[[RolloutSample], Optional[bool]]] = None,
                  on_group: Optional[Callable[[Any, List[RolloutSample], int], List[Any]]] = None,
@@ -618,7 +622,7 @@ class StreamingDriver:
         episode.sample = sample
         episode.done = bool(sample.done)
         if self.prms and episode.role != _BASELINE and (episode.done or self.prm_segment is None
-                                                         or self.prm_segment(sample)):
+                                                         or self.prm_segment(sample, traj)):
             segment = self._score_prm(episode)
             if self.on_step is not None and not episode.done:
                 episode.held = segment
