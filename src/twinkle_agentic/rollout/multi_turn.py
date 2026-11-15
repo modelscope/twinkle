@@ -2,7 +2,7 @@
 """The rollout: one episode advanced one step at a time.
 
 ``step(traj)`` takes an episode one generation further -- with its tool round, or with one
-request of an agent program -- and returns ``(traj, RolloutSample)``. The first step of an
+request of an agent program -- and returns ``(traj, RolloutStatus)``. The first step of an
 episode opens it (its env session, its tools, its agent); the step that ends it returns the
 merged, trainable trajectory and releases everything. A caller that drives many episodes (the
 streaming driver) interleaves their steps; a caller that wants whole episodes uses ``__call__``.
@@ -90,7 +90,7 @@ class StreamDone:
 
 
 @dataclass
-class RolloutSample:
+class RolloutStatus:
     """The light half of one step: what the driver and the recipe read, never the tokens.
 
     The trajectory itself travels apart (by reference under ray). The rollout fills the episode
@@ -356,7 +356,7 @@ class MultiTurnRollout:
             the sampler call (e.g. to route some turns to another backend).
         followup_fn: ``(trajectory, n_followups) -> text | (text, SamplingParams) | None``.
         on_episode_end: ``(trajectory, env, episode_id) -> value``, run before the env session
-            closes (a check that reads the workspace); a dict lands in ``RolloutSample.extra``.
+            closes (a check that reads the workspace); a dict lands in ``RolloutStatus.extra``.
         stop_after_stuck_turns: stuck tool turns in a row that end the episode; 0 never.
         max_malformed_retries: replies with unparsable tool markup told so and retried.
         adapter_path / use_base_model: which weights every generation uses.
@@ -465,7 +465,7 @@ class MultiTurnRollout:
     # ------------------------------------------------------------------ entries
 
     @remote_function(enable_continous_work=True, sticky_key=_episode_key, stash=(0,), lazy_collect=True)
-    def step(self, traj: Trajectory, episode_id: str | None = None) -> tuple[Trajectory, RolloutSample]:
+    def step(self, traj: Trajectory, episode_id: str | None = None) -> tuple[Trajectory, RolloutStatus]:
         """Advance the episode one generation; ``(traj, sample)`` with ``sample.done`` on the last.
 
         The first call of an episode opens it from ``traj``; later calls pass the ``traj`` the
@@ -559,7 +559,7 @@ class MultiTurnRollout:
 
     # ------------------------------------------------------------------ episode
 
-    def _step(self, traj: Trajectory, episode_id: str | None) -> tuple[Trajectory, RolloutSample]:
+    def _step(self, traj: Trajectory, episode_id: str | None) -> tuple[Trajectory, RolloutStatus]:
         episode_id = episode_id or _episode_id_of(traj)
         if not episode_id:
             raise ValueError('step needs an episode id: pass episode_id= or set user_data.episode_id.')
@@ -608,7 +608,7 @@ class MultiTurnRollout:
         ep.ledger.open(ep.trajectory, tools=opening_tools)
         ep.budget = self.max_turns
 
-    def _finish(self, ep: _Episode, **fields: Any) -> tuple[Trajectory, RolloutSample]:
+    def _finish(self, ep: _Episode, **fields: Any) -> tuple[Trajectory, RolloutStatus]:
         """Merge the trajectory, run ``on_episode_end``, close the session, release the episode."""
         traj = ep.ledger.merge(
             ep.trajectory, turns=ep.ledger.turns, stop_reason=ep.stop_reason, truncated=ep.truncated, **fields)
@@ -637,7 +637,7 @@ class MultiTurnRollout:
             extra['episode_end'] = episode_end
         input_ids = traj.get('input_ids') or []
         response = traj.get('response_token_ids') or []
-        sample = RolloutSample(
+        sample = RolloutStatus(
             episode_id=ep.episode_id,
             turns=int(traj.get('turns') or 0),
             done=True,
@@ -650,9 +650,9 @@ class MultiTurnRollout:
         )
         return traj, sample
 
-    def _continue(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _continue(self, ep: _Episode) -> tuple[Trajectory, RolloutStatus]:
         """The episode goes on: return its message view."""
-        return self._view(ep), RolloutSample(
+        return self._view(ep), RolloutStatus(
             episode_id=ep.episode_id, turns=ep.ledger.turns, stop_reason=ep.stop_reason)
 
     def _view(self, ep: _Episode) -> Trajectory:
@@ -778,7 +778,7 @@ class MultiTurnRollout:
 
     # ---------------------------------------------------------------- tool loop
 
-    def _tool_step(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _tool_step(self, ep: _Episode) -> tuple[Trajectory, RolloutStatus]:
         """One generation and, when it called tools, their round."""
         ledger = ep.ledger
         ep.spent += 1
@@ -885,13 +885,13 @@ class MultiTurnRollout:
             return self._finish_tool_episode(ep)
         return self._next_turn(ep)
 
-    def _next_turn(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _next_turn(self, ep: _Episode) -> tuple[Trajectory, RolloutStatus]:
         """Another generation is due -- unless the budget is spent, which ends the episode here."""
         if ep.spent >= ep.budget:
             return self._finish_tool_episode(ep)
         return self._continue(ep)
 
-    def _finish_tool_episode(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _finish_tool_episode(self, ep: _Episode) -> tuple[Trajectory, RolloutStatus]:
         # ``truncated`` says something was cut off; these say what ended the tool-calling
         # part -- an episode can run out of turns, be handed a follow-up, and finish it.
         return self._finish(ep, stuck_stop=ep.stuck_stop, tool_stop=ep.tool_stop, followups=ep.followups)
@@ -957,7 +957,7 @@ class MultiTurnRollout:
 
         threading.Thread(target=run, name=f'agent-{ep.episode_id[:8]}', daemon=True).start()
 
-    def _harness_step(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _harness_step(self, ep: _Episode) -> tuple[Trajectory, RolloutStatus]:
         """Answer the agent's next request, or end the episode when the program exited."""
         try:
             item = ep.requests.get(timeout=max(ep.deadline - time.monotonic(), 0.0))
@@ -973,7 +973,7 @@ class MultiTurnRollout:
                 item.reply.set_exception(error)
             raise
 
-    def _agent_exited(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _agent_exited(self, ep: _Episode) -> tuple[Trajectory, RolloutStatus]:
         code, output = ep.exit or (None, '')
         tail = (output or '')[-_OUTPUT_TAIL:]
         if ep.ledger is None:
@@ -985,7 +985,7 @@ class MultiTurnRollout:
         ep.stop_reason = STOP_NO_TOOL
         return self._finish(ep, segments=ep.segments, agent_exit_code=code)
 
-    def _serve(self, ep: _Episode, request: EndpointRequest) -> tuple[Trajectory, RolloutSample]:
+    def _serve(self, ep: _Episode, request: EndpointRequest) -> tuple[Trajectory, RolloutStatus]:
         """Sample one reply to the agent's request, record it, and answer the request."""
         canonical = [_canonical(message) for message in request.messages]
         tools_key = json.dumps(request.tools, sort_keys=True, ensure_ascii=False)
@@ -1047,7 +1047,7 @@ class MultiTurnRollout:
             return self._finish(ep, segments=ep.segments)
         return self._continue(ep)
 
-    def _end_agent_truncated(self, ep: _Episode, request: EndpointRequest) -> tuple[Trajectory, RolloutSample]:
+    def _end_agent_truncated(self, ep: _Episode, request: EndpointRequest) -> tuple[Trajectory, RolloutStatus]:
         """No room for the request: end on what is recorded (closing the session ends the agent)."""
         request.reply.set_exception(RuntimeError(f'episode {ep.episode_id!r} reached its length limit'))
         ep.truncated = True
@@ -1110,6 +1110,6 @@ class MultiTurnRollout:
 
 
 __all__ = [
-    'EpisodeError', 'MAX_FOLLOWUPS', 'MultiTurnRollout', 'RolloutSample', 'STOP_GENERATION_ERROR', 'STOP_LENGTH',
+    'EpisodeError', 'MAX_FOLLOWUPS', 'MultiTurnRollout', 'RolloutStatus', 'STOP_GENERATION_ERROR', 'STOP_LENGTH',
     'STOP_MAX_TURNS', 'STOP_NO_TOOL', 'StreamDelta', 'StreamDone', 'StreamToolCall', 'is_error_observation'
 ]

@@ -36,13 +36,13 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 from twinkle import remote_class, remote_function
 from twinkle.data_format import user_data_get
 from twinkle.utils import get_logger
-from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutSample
+from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutStatus
 
 logger = get_logger()
 
 __all__ = ['StreamingDriver', 'PRM_SEGMENT_TURNS']
 
-#: The ``RolloutSample.extra`` key recording each PRM segment's end: the episode's ``turns`` when the
+#: The ``RolloutStatus.extra`` key recording each PRM segment's end: the episode's ``turns`` when the
 #: segment closed, one per column of ``prm_rewards``.
 PRM_SEGMENT_TURNS = 'prm_segment_turns'
 
@@ -65,7 +65,7 @@ def _role_of(traj: Any) -> str:
     return str(role or '')
 
 
-def _sample_facts(samples: Sequence[RolloutSample], scores: Sequence[Dict[str, Any]],
+def _sample_facts(samples: Sequence[RolloutStatus], scores: Sequence[Dict[str, Any]],
                    version_spans: Sequence[int]) -> Dict[str, Any]:
     """The delivery facts of one batch, off the samples -- never the trajectories.
 
@@ -121,7 +121,7 @@ class _Episode:
     role: str
     version: int
     traj: Any = None
-    sample: Optional[RolloutSample] = None
+    sample: Optional[RolloutStatus] = None
     done: bool = False
     #: Set once the episode has no further work: scored (``finished``) or given up (``lost``).
     finished: bool = False
@@ -175,7 +175,7 @@ class StreamingDriver:
             marks a baseline). Returning non-baseline trajectories replaces the group with them (the
             new group is offered to ``on_group`` again); once replacing is no longer allowed, or when
             only baselines are returned, the baselines run and their ORM rows are attached to the
-            group's samples (``RolloutSample.baseline``) once they are scored.
+            group's samples (``RolloutStatus.baseline``) once they are scored.
         max_group_regenerations: how many times a group may be replaced (by ``on_group`` or to make
             up for missing members) before it is accepted as is, or dropped if incomplete.
         cluster_adapter: rebalances replicas after each version change (``adjust``), lends the
@@ -207,10 +207,10 @@ class StreamingDriver:
                  orm_names: Optional[Sequence[str]] = None,
                  prms: Sequence[Any] = (),
                  prm_names: Optional[Sequence[str]] = None,
-                 prm_segment: Optional[Callable[[RolloutSample, Any], bool]] = None,
-                 on_step: Optional[Callable[[RolloutSample, List[Any]], bool]] = None,
-                 on_sample: Optional[Callable[[RolloutSample], Optional[bool]]] = None,
-                 on_group: Optional[Callable[[Any, List[RolloutSample], int], List[Any]]] = None,
+                 prm_segment: Optional[Callable[[RolloutStatus, Any], bool]] = None,
+                 on_step: Optional[Callable[[RolloutStatus, List[Any]], bool]] = None,
+                 on_sample: Optional[Callable[[RolloutStatus], Optional[bool]]] = None,
+                 on_group: Optional[Callable[[Any, List[RolloutStatus], int], List[Any]]] = None,
                  max_group_regenerations: int = 0,
                  cluster_adapter: Any = None):
         if num_generations < 1 or batch_size < 1 or batch_size % num_generations:
@@ -361,7 +361,7 @@ class StreamingDriver:
         with self._lock:
             self._drop_stale()
             trajs: List[Any] = []
-            samples: List[RolloutSample] = []
+            samples: List[RolloutStatus] = []
             scores: List[Dict[str, Any]] = []
             version_spans: List[int] = []
             while len(trajs) < self.batch_size and self._ready:
@@ -657,7 +657,7 @@ class StreamingDriver:
                 self._maybe_finish(episode)
             self._lock.notify_all()
 
-    def _on_step(self, episode: _Episode, traj: Any, sample: RolloutSample) -> None:
+    def _on_step(self, episode: _Episode, traj: Any, sample: RolloutStatus) -> None:
         episode.traj = traj
         episode.sample = sample
         episode.done = bool(sample.done)

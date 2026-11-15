@@ -230,14 +230,14 @@ def test_a_second_scope_cannot_close_or_stop_an_already_owned_client():
 
 
 def test_recipe_trains_and_publishes_through_real_sdk_methods(monkeypatch):
-    from twinkle_agentic.rollout.multi_turn import RolloutSample
+    from twinkle_agentic.rollout.multi_turn import RolloutStatus
 
     path = Path(__file__).parents[2] / 'cookbook/client/async_rl/streaming_multi_turn_grpo.py'
     monkeypatch.syspath_prepend(str(path.parent))
     spec = importlib.util.spec_from_file_location('scoped_training_recipe', path)
     recipe = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(recipe)
-    samples = [RolloutSample(
+    samples = [RolloutStatus(
         encoded={'input_ids': [1, 10], 'labels': [10, -100]}, response_token_ids=[10],
         rollout_logprobs=[-0.1], response_loss_mask=[1], orm_reward=[reward], group_key='group',
         extra={'trajectory_idx': index, 'adapter_uri': 'policy-0'},
