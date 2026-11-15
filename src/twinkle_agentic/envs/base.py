@@ -168,26 +168,13 @@ class Env(ABC):
     snapshot_budget = 20000
     snapshot_skip = ('__pycache__', '.git', '.ipynb_checkpoints')
 
-    #: Seconds a session may go untouched before ``reset`` reclaims it: a caller that died or never
-    #: called ``close`` would otherwise hold a sandbox forever. Must stay below ``session_wait_timeout``
-    #: -- a waiter only lives that long, so a higher threshold leaves the reclaim unable to fire while
-    #: the pool is contended, which is the only moment it is needed. An episode whose session is
-    #: reclaimed this way fails its next call and is dropped, which is the intended degradation: one
-    #: abandoned episode costs itself, not the run.
-    session_idle_timeout = 300.0
-    #: Seconds ``reset`` waits for a free session before it gives up with ``TimeoutError``, reclaiming
-    #: sessions that went idle while it waited.
+    #: Seconds a session may go untouched before the next ``reset`` closes it: a caller that died
+    #: or never called ``close`` would otherwise hold a sandbox forever.
+    session_idle_timeout = 1800.0
+    #: Seconds ``reset`` waits for a free session before it gives up with ``TimeoutError``.
     session_wait_timeout = 600.0
-    #: One ``acquire`` attempt inside that wait, after which ``reset`` looks for reclaimable sessions
-    #: again. Waiting the whole budget in one call would strand the reclaim on the far side of it.
-    session_reclaim_slice = 5.0
 
     def __init__(self, max_sessions: int = 64):
-        if self.session_idle_timeout >= self.session_wait_timeout:
-            raise ValueError(
-                f'{type(self).__name__}: session_idle_timeout ({self.session_idle_timeout:.0f}s) must be '
-                f'below session_wait_timeout ({self.session_wait_timeout:.0f}s): a session abandoned by a '
-                'caller that never closed it could then never be reclaimed while reset waits for one.')
         self._max_sessions = max(1, int(max_sessions))
         self._session_slots = threading.Semaphore(self._max_sessions)
         self._sessions: Dict[str, _Session] = {}
@@ -239,21 +226,14 @@ class Env(ABC):
     def reset(self, episode_id: str, traj: Optional[Trajectory] = None) -> StepResult:
         """Open the episode's session (closing an earlier one under the same id); returns the first observation.
 
-        Waits while every session is taken, up to :attr:`session_wait_timeout`, reclaiming the sessions
-        that go idle during the wait: the callers holding them may be gone, and this is the only place
-        that can notice while the pool is full.
+        Waits while every session is taken, up to :attr:`session_wait_timeout`.
         """
+        self._close_idle_sessions()
         if episode_id in self._sessions:
             self.close(episode_id)
-        deadline = time.monotonic() + self.session_wait_timeout
-        while True:
-            self._close_idle_sessions()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.0:
-                raise TimeoutError(f'{type(self).__name__}: no free session within {self.session_wait_timeout:.0f}s '
-                                   f'({self._max_sessions} in use).')
-            if self._session_slots.acquire(timeout=min(remaining, self.session_reclaim_slice)):
-                break
+        if not self._session_slots.acquire(timeout=self.session_wait_timeout):
+            raise TimeoutError(f'{type(self).__name__}: no free session within {self.session_wait_timeout:.0f}s '
+                               f'({self._max_sessions} in use).')
         try:
             state, result = self._open(traj)
         except BaseException:
