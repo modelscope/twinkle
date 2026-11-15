@@ -246,6 +246,47 @@ class TestLossMetric:
         m.accumulate({'labels': torch.tensor([1])}, {'loss': torch.tensor(1.0)}, grad_norm=0.5)
         assert m.calculate()['grad_norm'] == '0.500000'
 
+    def test_loss_zero_grad_norm_is_reported_not_dropped(self):
+        """A measured zero norm is a value, not an absence.
+
+        GRPO reaches it whenever every generation in a group scores the same, so the
+        group-normalized advantage is identically zero and the update contributes nothing. That is
+        precisely the number a user debugging a non-learning run needs, and it must not render the
+        same way as the norm never having been plumbed through.
+        """
+        m = _no_dist_metric(LossMetric)
+        m.accumulate({'labels': torch.tensor([1])}, {'loss': torch.tensor(1.0)}, grad_norm=0.0)
+        assert m.calculate()['grad_norm'] == '0.000000'
+
+    def test_loss_grad_norm_absent_when_never_accumulated(self):
+        """The other half of the contract: no norm measured means no key, not a fabricated zero.
+
+        Without this the zero case above could be made to pass by emitting unconditionally.
+        """
+        m = _no_dist_metric(LossMetric)
+        m.accumulate({'labels': torch.tensor([1])}, {'loss': torch.tensor(1.0)})
+        result = m.calculate()
+        assert 'grad_norm' not in result
+        assert m.grad_norm is None
+
+    def test_loss_grad_norm_aggregation_skips_ranks_that_measured_none(self):
+        """A rank that never accumulated contributes no value, and must not poison the reduction.
+
+        ``max`` over a mix of ``None`` and a float raises, so the unset ranks have to be filtered
+        before the reduction rather than carried into it.
+        """
+        m = _no_dist_metric(LossMetric)
+        rows = [{'loss': 1.0, 'count': 1, 'grad_norm': None, 'num_tokens': 0, 'channel_loss': {}},
+                {'loss': 1.0, 'count': 1, 'grad_norm': 0.0, 'num_tokens': 0, 'channel_loss': {}}]
+        m.gather_results = lambda local: rows
+        assert m.calculate()['grad_norm'] == '0.000000'
+
+    def test_loss_grad_norm_aggregation_absent_when_no_rank_measured_one(self):
+        m = _no_dist_metric(LossMetric)
+        rows = [{'loss': 1.0, 'count': 1, 'grad_norm': None, 'num_tokens': 0, 'channel_loss': {}}]
+        m.gather_results = lambda local: rows
+        assert 'grad_norm' not in m.calculate()
+
     def test_loss_no_loss_skips(self):
         m = _no_dist_metric(LossMetric)
         m.accumulate({'labels': torch.tensor([1])}, {})
@@ -681,6 +722,17 @@ class TestEmbeddingMetric:
         m.accumulate({'labels': labels}, {'embeddings': embeddings, 'loss': torch.tensor(2.5)})
         result = m.calculate()
         assert 'loss' in result
+
+    def test_embedding_zero_grad_norm_is_reported_not_dropped(self):
+        """The same contract as ``LossMetric``, on the parallel implementation."""
+        m = _no_dist_metric(EmbeddingMetric)
+        m.accumulate({'labels': torch.tensor([1, 0])}, {'embeddings': torch.randn(2, 8)}, grad_norm=0.0)
+        assert m.calculate()['grad_norm'] == '0.000000'
+
+    def test_embedding_grad_norm_absent_when_never_accumulated(self):
+        m = _no_dist_metric(EmbeddingMetric)
+        m.accumulate({'labels': torch.tensor([1, 0])}, {'embeddings': torch.randn(2, 8)})
+        assert 'grad_norm' not in m.calculate()
 
     def test_embedding_metric_no_embeddings_skips(self):
         m = _no_dist_metric(EmbeddingMetric)

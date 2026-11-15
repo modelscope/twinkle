@@ -17,7 +17,12 @@ class LossMetric(Metric):
         super().__init__(device_mesh, process_group, **kwargs)
         self.total_loss = 0
         self.total_count = 0
-        self.grad_norm = 0
+        # ``None`` means no gradient norm reached this metric, and must stay distinguishable from a
+        # measured ``0.0``. A zero norm is the signal that an update contributed nothing -- in GRPO
+        # it happens whenever every generation in a group scores the same, so the group-normalized
+        # advantage is identically zero -- whereas absence means the norm was never plumbed through.
+        # The two have opposite remedies, so they must not render the same way.
+        self.grad_norm = None
         self.num_tokens = 0
         self.channel_loss = {}
 
@@ -53,7 +58,7 @@ class LossMetric(Metric):
     def reset(self):
         self.total_loss = 0
         self.total_count = 0
-        self.grad_norm = 0
+        self.grad_norm = None
         self.num_tokens = 0
         self.channel_loss = {}
 
@@ -69,7 +74,10 @@ class LossMetric(Metric):
 
         total_loss = sum(r['loss'] for r in all_results)
         total_count = sum(r['count'] for r in all_results)
-        grad_norm = max(r['grad_norm'] for r in all_results)
+        # Ranks that never accumulated a norm contribute ``None`` rather than a value, so they are
+        # left out of the max instead of dragging it down to a zero that no rank actually measured.
+        gathered_norms = [r['grad_norm'] for r in all_results if r['grad_norm'] is not None]
+        grad_norm = max(gathered_norms) if gathered_norms else None
         num_tokens = sum(r['num_tokens'] for r in all_results)
         channel_loss = {}
         for row in all_results:
@@ -87,7 +95,7 @@ class LossMetric(Metric):
         results = {}
         if avg_loss is not None:
             results['loss'] = f'{avg_loss:.5f}'
-        if grad_norm > 0:
+        if grad_norm is not None:
             results['grad_norm'] = f'{grad_norm:.6f}'
         for channel in sorted(channel_loss, key=lambda value: '' if value is None else str(value)):
             loss_sum, token_count = channel_loss[channel]
