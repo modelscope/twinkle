@@ -31,6 +31,9 @@ def test_gradient_checkpointing_option_reaches_the_backbone(enabled, monkeypatch
 
 def _wrapper(module, manager, wrap_model):
     wrapper = object.__new__(MultiLoraTransformersModel)
+    # ``_lazy_wrap_model`` reads ``model_arch['aligner']`` by subscript. ``__init__`` normalizes
+    # these three roles to lists, so a shell that skips ``__init__`` has to carry the same shape.
+    wrapper.model_arch = {'language_model': [], 'vision_tower': [], 'aligner': []}
     torch.nn.Module.__init__(wrapper)
     wrapper.model = module
     wrapper.multi_adapter = manager

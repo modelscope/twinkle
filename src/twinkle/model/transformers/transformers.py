@@ -1073,8 +1073,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # unwrapped module. Hooks registered there still fire: the wrapper's forward calls
         # the inner module's __call__.
         unwrapped_model = self.strategy.unwrap_model(self.model)
+        # The multimodal pre-forward hook registered per optimizer group fires on every group's
+        # forward and serves only the one this call selected; the context is what tells it which.
+        # Without it the hook falls back to the default group, so a model with several groups
+        # processes every forward with the wrong template.
         with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), \
-                _resolve_mm_graph_context(unwrapped_model, optimizer_config.template):
+                _resolve_mm_graph_context(unwrapped_model, optimizer_config.template), \
+                self._mm_forward_context(optimizer_config):
             with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                 # Without gradient checkpointing use_cache stays True, and Transformers skips
                 # detecting padding-free packed sequences whenever a KV cache exists.
@@ -1292,7 +1297,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 unwrapped_model.disable_adapter()
                 if disable_lora and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
             # unwrapped on purpose: task patches probe head/module attributes DDP does not forward.
-            with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), lora_ctx:
+            # See ``forward``: the per-group multimodal hook needs to know which group this call
+            # selected, and the forward-only path resolves it from ``adapter_name`` just the same.
+            with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), \
+                    lora_ctx, self._mm_forward_context(optimizer_config):
                 with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                     # In eval mode use_cache defaults to True, and Transformers skips detecting
                     # padding-free packed sequences whenever a KV cache exists.

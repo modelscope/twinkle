@@ -36,7 +36,13 @@ class VisionLanguageModel(torch.nn.Module):
 
 class EncodedProcessor(InputProcessor):
     def __call__(self, inputs, **kwargs):
-        return dict(inputs)
+        # ``_prepare_forward_only_inputs`` normalizes a lone dict into a one-row list before the
+        # processor sees it, and the contract is that the processor collates the rows back into a
+        # single dict. Passing the list straight through made ``dict(inputs)`` read the row's three
+        # keys as one oversized key-value pair.
+        rows = inputs if isinstance(inputs, list) else [inputs]
+        assert len(rows) == 1, 'this stand-in collates exactly one row'
+        return dict(rows[0])
 
 
 @pytest.fixture
@@ -50,6 +56,9 @@ def wrapper():
     wrapper.hf_config = model.config
     wrapper.sp_strategy = None
     wrapper._model_wrapped = False
+    # ``_lazy_wrap_model`` reads ``model_arch['aligner']`` by subscript. ``__init__`` normalizes
+    # these three roles to lists, so a shell that skips ``__init__`` has to carry the same shape.
+    wrapper.model_arch = {'language_model': [], 'vision_tower': [], 'aligner': []}
     wrapper._enable_expert_parallel = False
     wrapper._gdn_padding_free_enabled = False
     wrapper._maybe_apply_expert_parallel = lambda: None
@@ -65,10 +74,14 @@ def wrapper():
         template = object.__new__(Qwen3_5Template)
         template.processor = object.__new__(ProcessorMixin)
         template.pre_forward_hook = Mock(wraps=template.pre_forward_hook)
+        loss = SimpleNamespace(require_logps=False)
         groups[name] = SimpleNamespace(
             optimizer=torch.optim.Adam([parameter]), template=template, processor=EncodedProcessor(),
-            loss_instance=SimpleNamespace(require_logps=False), train_status=SimpleNamespace(),
+            loss_instance=loss, train_status=SimpleNamespace(),
             eval_status=SimpleNamespace(), accumulate_metrics=lambda training: None, _handler=None,
+            # ``forward_only`` asks the group which loss to use. With one loss registered the real
+            # ``get_loss`` returns it, which is the shape this stand-in has.
+            get_loss=lambda loss_key=None: loss,
         )
     wrapper.optimizer_group = groups
     return wrapper
