@@ -1971,6 +1971,20 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     break
             if optimizer_step is not None:
                 break
+        # Where the loop owns the update there is no engine record bracketing it, and by the time
+        # this probe runs the step has already consumed and overwritten the moments in place. The
+        # read is therefore post-update and is named so: ``post(N)`` is ``pre(N+1)``, so the two
+        # keys tile the same sequence rather than reporting the same instant under two names.
+        # Where the engine owns the update it brackets the step itself and reports its own
+        # post-update read; a ``.get`` default would be evaluated eagerly and would recompute a
+        # full moment digest every step, so the branch is explicit.
+        if 'optim_moment_post' in engine_step:
+            optim_moment_post = engine_step['optim_moment_post']
+        elif engine_step:
+            optim_moment_post = {}
+        else:
+            optim_moment_post = self.strategy.engine_optim_moment_digest(
+                self.model, optimizer, step=step_no)
         record = {
             'rank': rank,
             'step_no': step_no,
@@ -2023,8 +2037,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # this probe runs the step has already consumed and overwritten the moments in place. The
             # read is therefore post-update and is named so: ``post(N)`` is ``pre(N+1)``, so the two
             # keys tile the same sequence rather than reporting the same instant under two names.
-            'optim_moment_post': ({} if engine_step else self.strategy.engine_optim_moment_digest(
-                self.model, optimizer, step=step_no)),
+            'optim_moment_post': optim_moment_post,
             # ZeRO-2 hands the CPU optimizer this step's reduced gradient inside ``step``, so the
             # partition read before it is the PREVIOUS step's gradient; the one read after is the
             # gradient this update actually consumed.

@@ -430,6 +430,28 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             }
         return out
 
+    @staticmethod
+    def _buffer_identity(tensor) -> Dict[str, Any]:
+        """Where a buffer physically is, beside the fingerprint of what it contains.
+
+        ``bits`` proves two readings have identical *contents*; it cannot tell whether the C++
+        ``adam_update`` consumed the same storage the Python-side ``state`` dict points at. Two tensors
+        holding equal values at different addresses are indistinguishable by any content fingerprint, so
+        the addresses are recorded beside it. ``storage_ptr`` differs from ``ptr`` whenever the tensor is
+        a view -- equal ``storage_ptr`` with different ``ptr`` is the signature of two views into one
+        buffer, which is the aliased-buffer shape of the divergence. ``pinned`` separates the
+        pinned-host-buffer mechanism from the plain-host one without needing a second run.
+        """
+        identity = {
+            'ptr': int(tensor.data_ptr()),
+            'storage_ptr': int(tensor.untyped_storage().data_ptr()),
+            'device': str(tensor.device),
+            'dtype': str(tensor.dtype),
+        }
+        if tensor.device.type == 'cpu':
+            identity['pinned'] = bool(tensor.is_pinned())
+        return identity
+
     def engine_optim_moment_digest(self, model, optimizer=None, *, step: Optional[int] = None) -> Dict[str, Any]:
         """Per-group ``[sum, absmax, norm]`` of the Adam moments the next update will read.
 
@@ -482,6 +504,8 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                         # Exact over every element, so an identical fingerprint means the restored moments
                         # are bit-identical rather than merely agreeing on a 0.37% sample.
                         'bits': self._bits_fingerprint(flat),
+                        'numel': int(value.numel()),
+                        **self._buffer_identity(value),
                     }
                     out['sources'].append(name)
         if not out['sources']:
@@ -516,6 +540,11 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                         'agg': self._aggregate(stats),
                         'chunks': [s[0] for s in stats],
                         'bits': self._bits_fingerprint(flat),
+                        'numel': int(grad.numel()),
+                        # The pinned-host-buffer and async-copy mechanisms are properties of WHERE this
+                        # gradient lives, not of what it contains, so no content fingerprint can separate
+                        # them; the address and the pinned flag can, from the same run.
+                        **self._buffer_identity(grad),
                     }
                     out['sources'].append(name)
         averaged = getattr(getattr(_resolve_engine(model), 'optimizer', None), 'averaged_gradients', None)
@@ -600,6 +629,13 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 # cold buffer that means something else entirely. The gradient the update actually used
                 # is only readable afterwards.
                 step_probe['grad_partition_post'] = self.engine_grad_partition_digest(model)
+                # The moments after the update. Without this the only readable moment state on a tier
+                # whose engine owns the step is the pre-update one, so "the update consumed a buffer
+                # other than the one the state dict points at" stays indistinguishable from "the update
+                # is not reproducible": both leave ``optim_moment_pre`` equal across the two arms. Equal
+                # pre with unequal post is the former, and unequal ``ptr``/``storage_ptr`` between the
+                # two readings names the buffer that was written instead.
+                step_probe['optim_moment_post'] = self.engine_optim_moment_digest(model)
 
     def engine_grad_norm(self, model):
         engine = _resolve_engine(model)
