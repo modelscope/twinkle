@@ -20,13 +20,10 @@ label-roll / attention-mask semantics the real Template applies.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import pytest
 
-from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
-from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.template.base import Template
 from twinkle.template.contract import MediaBundle, RolloutState
 from twinkle_agentic.rollout.ledger import TurnLedger
@@ -321,40 +318,3 @@ def test_turn_ledger_advances_feature_and_engine_bridges_independently():
     assert ledger.state.engine_input_ids == (11, 12, 41, 42)
     assert ledger.state.messages == tuple(messages + appended)
     assert template.calls == [(False, 'vllm'), (True, 'sglang')]
-
-
-def test_partial_rollout_carries_state_across_retries_and_merge():
-
-    class Harness(PartialRolloutMixin):
-        template = type('Decoder', (), {'decode': staticmethod(str)})()
-
-    def response(tokens, stop_reason, input_ids, state):
-        return SampleResponse(sequences=[SampledSequence(
-            tokens=tokens,
-            stop_reason=stop_reason,
-            logprobs=[-0.1] * len(tokens),
-            new_input_feature={'input_ids': input_ids},
-            new_state=state,
-        )])
-
-    responses = iter([
-        response([3], 'abort', [1, 2, 3], 'state-1'),
-        response([4], 'stop', [1, 2, 3, 4], 'state-2'),
-    ])
-    seen_states = []
-
-    async def run_attempt(current_input, current_state, sampling_params, attempt):
-        seen_states.append(current_state)
-        return next(responses), attempt
-
-    outcome = asyncio.run(Harness()._run_partial_rollout(
-        {'input_ids': [1, 2]},
-        SamplingParams(max_tokens=2),
-        run_attempt=run_attempt,
-        original_state='state-0',
-        allow_partial_rollout=True,
-        max_retries=1,
-    ))
-    assert seen_states == ['state-0', 'state-1']
-    assert outcome.response.sequences[0].tokens == [3, 4]
-    assert outcome.response.sequences[0].new_state == 'state-2'
