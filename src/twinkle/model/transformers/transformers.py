@@ -1866,6 +1866,26 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         return tensor.to_local() if hasattr(tensor, 'to_local') else tensor
 
     def _digest_parameters(self, kind: str):
+        # A digest of a buffer that an asynchronous copy is still filling measures a mixture of two
+        # states, and reports a difference that is timing rather than data. On the offload tiers the
+        # bfloat16 parameters are refreshed from the float32 master by ``non_blocking`` copies
+        # (deepspeed ``runtime/zero/stage_1_and_2.py`` does
+        # ``bit16_partitions[partition_id].data.copy_(bit16_partition_buffer.data,
+        # non_blocking=True)``), which return before the bytes have landed.
+        #
+        # Measured on a real fresh/resume pair: the digest disagreed on 56 of 723 parameters by about
+        # 3e-5 in ``sum``. That is seven orders of magnitude above what the reduction itself can
+        # produce -- ``math.fsum`` over every element agrees with ``torch.sum`` exactly on these
+        # tensors, and forcing a different addition order by a transposed-contiguous round trip moves
+        # the sum by 1.8e-12 -- and at the same time twenty-five times BELOW the smallest change a
+        # single bfloat16 element can make (~7.5e-4 at that magnitude). Only a partially landed copy
+        # fits both bounds: on a 6.4e8-element parameter whose total update that step was 3.6, an
+        # error of 3e-5 is ~5.3e3 elements, 0.00084% of it, still holding the previous value.
+        #
+        # Synchronizing first is what makes the reading mean something. This method only runs when the
+        # step-delta probe is on, so training that is not being measured pays nothing.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         out = {}
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
