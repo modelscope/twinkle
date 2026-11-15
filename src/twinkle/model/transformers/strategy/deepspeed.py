@@ -425,8 +425,15 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             out[str(index)] = {
                 'agg': self._aggregate(self._chunk_stats(flat, chunks=chunks)),
                 'chunks': chunks,
-                'covered': at_full_step,
+                'covered': self._coverage_complete(flat.numel(), chunks) if at_full_step else False,
                 'bits': self._bits_fingerprint(flat),
+                'numel': int(flat.numel()),
+                # The master partition is the buffer ``adam_update`` writes, so it is the one surface
+                # whose identity was still unmeasured after the moments and the gradient partitions were
+                # both shown to keep one storage across the update. Reading it here means a divergence
+                # that survives identical inputs and identical moment output can still be traced to the
+                # destination buffer rather than left as an unexplained residue.
+                **self._buffer_identity(group),
             }
         return out
 

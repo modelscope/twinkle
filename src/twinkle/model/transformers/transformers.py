@@ -2010,6 +2010,19 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # differently while every recorded scalar still reads equal.
             'bias_corrections': [g.get('bias_correction') for g in optimizer.param_groups],
             'adamw_modes': [getattr(optimizer, 'adam_w_mode', None)],
+            # The field above is vacuous on every tier that wraps the optimizer: the wrapper does not
+            # expose ``adam_w_mode``, so it reads None on both arms of a comparison -- equal, and
+            # therefore proving nothing. The flag that actually reaches the fused CPU kernel lives on
+            # the inner optimizer (``DeepSpeedCPUAdam.adam_w_mode``, set once at ``create_adam`` and
+            # passed into every ``adam_update`` call), so it is read there as well. The vacuous wrapper
+            # reading is kept beside it rather than replaced, to leave the gap visible in the data.
+            # ``opt_id`` and ``fp32_optimizer_states`` are the last two ``adam_update`` inputs that were
+            # never measured on a real run; reading all three closes the input list.
+            'inner_adamw_modes': [getattr(getattr(optimizer, 'optimizer', None), 'adam_w_mode', None)],
+            'inner_opt_ids': [getattr(getattr(optimizer, 'optimizer', None), 'opt_id', None)],
+            'inner_fp32_states': [
+                getattr(getattr(optimizer, 'optimizer', None), 'fp32_optimizer_states', None)
+            ],
             'inner_optimizer': type(optimizer).__name__,
             'engine_counters': self.strategy.engine_counters(self.model),
             # The console line rounds grad_norm to four decimals, which hides exactly the low-bit

@@ -345,7 +345,7 @@ class TransformerStrategyBase(ABC):
         return bits_fingerprint(flat, block=block)
 
     @staticmethod
-    def _full_coverage_chunks(numel: int, width: int = 4096) -> int:
+    def _full_coverage_chunks(numel: int, width: int = 4096, element_budget: int = 1 << 26) -> int:
         """The chunk count that makes a strided sample cover every element of a ``numel``-long partition.
 
         ``stride = max(numel // chunks, width)``, so coverage is complete once the stride falls to
@@ -357,8 +357,29 @@ class TransformerStrategyBase(ABC):
         one, where "identical" was never actually established. Full coverage costs minutes on a
         partition that size, so it is gated to the single step under investigation rather than run
         every step.
+
+        Bounded by an element budget. ``_chunk_stats`` converts each chunk to a Python list and reduces
+        it with ``math.fsum`` so the result cannot depend on thread scheduling, which makes the cost of
+        full coverage grow with the partition rather than with the chunk count: a 4,538,761,984-element
+        partition asks for ~1.1M chunks, and one such digest measured ~14 minutes on the fsdp2 tier,
+        turning a 15-step pair into a seven-hour run. The budget bounds that cost. Callers must then
+        report coverage from what the chunk count actually buys (``_coverage_complete``) rather than from
+        having asked for full coverage -- a truncated digest that claims ``covered=True`` is the same
+        false green as a strided sample claiming to have seen everything.
         """
-        return max(1, -(-numel // width))
+        needed = max(1, -(-numel // width))
+        return min(needed, max(1, element_budget // width))
+
+    @staticmethod
+    def _coverage_complete(numel: int, chunks: int, width: int = 4096) -> bool:
+        """Whether ``chunks`` strided windows of ``width`` reach every element of a ``numel``-long partition.
+
+        ``_chunk_stats`` uses ``stride = max(numel // chunks, width)``, so the sample is exhaustive
+        exactly when the stride has fallen to ``width``, i.e. when ``chunks * width >= numel``. This is
+        the honest form of the ``covered`` flag: it reads what was obtained, which the element budget in
+        ``_full_coverage_chunks`` can make less than what was requested.
+        """
+        return chunks * width >= numel
 
     def engine_master_digest(self, model, *, stepped: bool = False, step: Optional[int] = None) -> Dict[str, Any]:
         """Digest of the float32 master this strategy's optimizer actually updates.

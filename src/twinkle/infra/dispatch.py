@@ -64,7 +64,7 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'first', 'las
             tensor_dict: Merge per-worker output dicts, stacking tensors (deduplicated by data rank).
             dp_flatten: Deduplicate per-worker lists by data rank, then flatten in input order.
         result: The results returned by workers.
-        device_mesh: The device_mesh, needed by `last_pp`
+        device_mesh: The device_mesh, needed by `last_pp_first`
     Returns:
         The collected results.
     """
