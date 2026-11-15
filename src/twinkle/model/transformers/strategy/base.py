@@ -361,6 +361,23 @@ class TransformerStrategyBase(ABC):
         """
         return {}
 
+    def engine_optim_moment_digest(self, model, optimizer=None, *, step: Optional[int] = None) -> Dict[str, Any]:
+        """Digest of the Adam moments the next update will read, or an empty dict.
+
+        The last input to the update that is otherwise unmeasured: with the master, the gradient, lr,
+        betas, eps, weight decay and the Adam step counter all reading identically across two runs, the
+        post-update master can still differ, and nothing else is left to distinguish "the restore lost
+        the moments" from "the update itself is not reproducible".
+
+        Where the moments live depends on who owns the update. A strategy whose engine owns it keeps
+        them in an inner optimizer keyed by the engine's own partition tensor, and reads them itself
+        around the step. A strategy whose loop owns the update holds them in the loop's optimizer, keyed
+        by the model parameters, so the caller passes that optimizer in.
+
+        ``step`` is the step the caller is digesting, for a strategy with no engine counter to read.
+        """
+        return {}
+
     def engine_grad_partition_digest(self, model) -> Dict[str, Any]:
         """Digest of the float32 gradient partitions the optimizer consumes, or an empty dict.
 

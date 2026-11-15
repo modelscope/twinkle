@@ -758,6 +758,60 @@ class AccelerateStrategy(TransformerStrategyBase):
             }
         return out
 
+    def engine_optim_moment_digest(self, model, optimizer=None, *, step: Optional[int] = None) -> Dict[str, Any]:
+        """Per-parameter ``bits`` fingerprint of the Adam moments this rank's FSDP2 shard holds.
+
+        FSDP2 keeps no engine of its own: the loop steps the optimizer, whose state is keyed by the
+        model parameters directly, and each moment is sharded exactly like the parameter it belongs to.
+        So the moments are read from that optimizer rather than from a partition tensor, and the read
+        takes each rank's own shard -- the same reason ``engine_master_digest`` avoids
+        ``to_local_tensor``, which would all-gather and report the gathered buffer rather than what
+        this rank's update actually consumes.
+        """
+        import torch
+
+        if optimizer is None:
+            return {}
+        full_step = os.environ.get('TWINKLE_STEP_DELTA_PROBE_FULL_STEP')
+        at_full_step = bool(full_step) and step is not None and int(step) == int(full_step)
+        chunks_default = int(os.environ.get('TWINKLE_STEP_DELTA_PROBE_CHUNKS', 64))
+        out: Dict[str, Any] = {'sources': [], 'chunks': chunks_default}
+        for name, param in self.unwrap_model(model).named_parameters():
+            if not param.requires_grad:
+                continue
+            entry = optimizer.state.get(param)
+            if not isinstance(entry, dict):
+                continue
+            counter = entry.get('step')
+            out[f'adam_step[{name}]'] = int(counter.item()) if hasattr(counter, 'item') else (
+                int(counter) if counter is not None else None)
+            # The value is not the whole input: a restore that puts a tensor where a fresh run holds an
+            # int reaches the kernel as a different type while ``int(...)`` reports the same number for
+            # both. Recorded beside the value so that stays visible.
+            out[f'adam_step_type[{name}]'] = type(counter).__name__
+            for moment in ('exp_avg', 'exp_avg_sq'):
+                value = entry.get(moment)
+                if not torch.is_tensor(value):
+                    continue
+                local = value.to_local() if hasattr(value, 'to_local') else value
+                if local.numel() == 0 or not local.is_floating_point():
+                    continue
+                flat = local.detach().flatten()
+                chunks = self._full_coverage_chunks(flat.numel()) if at_full_step else chunks_default
+                key = f'{moment}[{name}]'
+                out[key] = {
+                    'agg': self._aggregate(self._chunk_stats(flat, chunks=chunks)),
+                    'chunks': chunks,
+                    'covered': at_full_step,
+                    'bits': self._bits_fingerprint(flat),
+                    'dtype': str(local.dtype),
+                    'numel': int(flat.numel()),
+                }
+                out['sources'].append(key)
+        if not out['sources']:
+            out['unreadable'] = ['<loop optimizer>.state[parameter]']
+        return out
+
     def _match_master_weight_precision(self, model) -> None:
         """Put trainable parameters in the dtype the FSDP2 wrap will train them at, before a load.
 

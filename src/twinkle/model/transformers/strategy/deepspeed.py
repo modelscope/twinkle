@@ -430,8 +430,12 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             }
         return out
 
-    def engine_optim_moment_digest(self, model) -> Dict[str, Any]:
+    def engine_optim_moment_digest(self, model, optimizer=None, *, step: Optional[int] = None) -> Dict[str, Any]:
         """Per-group ``[sum, absmax, norm]`` of the Adam moments the next update will read.
+
+        ``optimizer`` and ``step`` are the loop-side handles a strategy needs when the loop owns the
+        update; ZeRO owns it, so both are unused here and the moments come from the engine's own
+        inner optimizer, resolved from ``model``.
 
         The last unmeasured input to the update. On a ZeRO-2 offload resume, the fp32 master, the
         gradient the update consumes, the lr, betas, eps, weight decay and the Adam step counter all
