@@ -234,18 +234,17 @@ class RayHelper:
                 for worker_id in worker_ids:
                     pool.pop(worker_id, None)
 
+            def remove_actors(self, worker_ids: List[str]):
+                """Drop these replicas from every pool (a shutdown only ever removes its own)."""
+                for pool in self.pools.values():
+                    for worker_id in worker_ids:
+                        pool.pop(worker_id, None)
+
             def occupied(self) -> List[Tuple[str, Any, Tuple[int, ...]]]:
                 """``(group, slot, ranks)`` of every replica of every pool."""
                 return [(member['group'], member.get('slot'), tuple(member.get('ranks') or ()))
                         for pool in self.pools.values() for member in pool.values()]
-
-            def all_actors(self) -> List[Any]:
-                return [member['actor'] for pool in self.pools.values() for member in pool.values()]
-
-            def clear(self):
-                self.config.clear()
-                self.pools.clear()
-
+        
         registry_name = os.environ.get('TWINKLE_RAY_REGISTRY_NAME', 'config_registry')
         registry_namespace = os.environ.get('TWINKLE_RAY_NAMESPACE')
         try:
@@ -304,28 +303,38 @@ class RayHelper:
 
     @staticmethod
     def shutdown():
-        """Terminate every actor this run created, release the placement groups and stop Ray."""
+        """Terminate the actors this process created, release the placement groups, stop Ray.
+
+        Only this process's own actors die: a shared namespace's other runs keep theirs and their
+        pool entries (killing through the registry would take out every replica of every pool in
+        the namespace). The registry itself is still killed and rebuilt by the next
+        ``initialize``; a peer holding a stale handle fails loudly rather than losing its
+        replicas. A crashed run leaves its dead replicas listed until freed by hand --
+        ``_free_placements`` then reports their slots as occupied.
+        """
         import ray
         if not RayHelper.ray_inited():
             return
         actors = list(RayHelper._created_actors)
-        if RayHelper._registry is not None:
-            try:
-                actors.extend(ray.get(RayHelper._registry.all_actors.remote()))
-            except Exception:  # noqa
-                pass
         for actor in actors:
             try:
                 ray.kill(actor, no_restart=True)
             except Exception:  # noqa
                 pass
         RayHelper._created_actors.clear()
+        if RayHelper._registry is not None:
+            try:
+                from ..continuous_work import worker_id_of
+
+                ray.get(RayHelper._registry.remove_actors.remote(
+                    [worker_id_of(actor) for actor in actors]))
+            except Exception:  # noqa
+                pass
         if RayHelper.resource_manager is not None:
             RayHelper.resource_manager.destroy_placement_group()
             RayHelper.resource_manager = None
         if RayHelper._registry is not None:
             try:
-                ray.get(RayHelper._registry.clear.remote())
                 ray.kill(RayHelper._registry)
             except Exception:  # noqa
                 pass
@@ -581,8 +590,12 @@ class RayHelper:
             placements = list(info['placements'])
         if not placements:
             return []
+        # The class name must be read before ``_get_remote_component`` wraps it: afterwards it is
+        # Ray's ActorClass, every actor would be named ``group-ActorClass-...`` and two handles
+        # built from the same line would collide on the same name.
+        class_name = worker_cls.__name__
         worker_cls = RayHelper._get_remote_component(worker_cls)
-        key = f'{group}-{worker_cls.__class__.__name__}-{instance_id}'
+        key = f'{group}-{class_name}-{instance_id}'
         if execute == 'peer':
             placements = placements[Platform.get_peer_index(len(placements))]
             ip, port = RayHelper.get_master_id_port(placements[0]['placement_group'])

@@ -49,7 +49,7 @@ def _tag_exc(exc: BaseException, caller: Optional[str]) -> None:
         pass
 
 
-def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp', 'last_pp_first',
+def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'first', 'last_pp_first',
                                         'tensor_dict', 'dp_flatten'], Callable],
                   result: List[Any],
                   device_mesh: DeviceMesh = None):
@@ -60,9 +60,7 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
             none: Return as is.
             flatten: Flat the nested results.
             mean: Average the results.
-            sum: Sum the results.
             first: Only return the first result.
-            last_pp: Only return the results of the last pp rank.
             tensor_dict: Merge per-worker output dicts, stacking tensors (deduplicated by data rank).
             dp_flatten: Deduplicate per-worker lists by data rank, then flatten in input order.
         result: The results returned by workers.
@@ -73,7 +71,7 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
     if not result:
         return result
 
-    if isinstance(result[0], tuple):
+    if isinstance(result[0], tuple) and method != 'none':
         output = []
         # if each result of a worker is a tuple
         for i in range(len(result[0])):
@@ -82,6 +80,8 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
             output.append(_collect_func(method, _single_result, device_mesh=device_mesh))
         return output
     if method == 'none':
+        # As-is: a single worker's tuple stays a tuple (never a positional list) -- the return
+        # type must not drift between local and ray deployments.
         if isinstance(result, list) and len(result) == 1:
             # unwrap the result
             return result[0]
@@ -104,13 +104,8 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
                     output[key] = vals
             return output
         return np.mean(result)
-    elif method == 'sum':
-        return np.sum(result)
     elif method == 'first':
         return result[0]
-    elif method == 'last_pp':
-        assert device_mesh is not None
-        return [r for i, r in enumerate(result) if i in device_mesh.get_pp_last_ranks()]
     elif method == 'last_pp_first':
         # Return the first result from the last PP stage workers.
         # Falls back to result[0] when PP = 1 (all workers are the last stage).
@@ -352,9 +347,6 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         kwargs[device_mesh_name] = infra._device_mesh
                     assert len(infra._device_group) == 1  # only one device group is allowed
                     infra._device_group[0]._device_mesh[self.__class__.__name__] = device_mesh
-                    if self.__class__.__name__ == 'DataLoader' and 'min_batch_size' not in kwargs:
-                        # TODO An ugly special setting for dataloader to set the min batch size
-                        kwargs['min_batch_size'] = device_mesh.data_world_size
                     init_method(self, *args, **kwargs)
                 else:
                     if device_mesh is not None:
@@ -390,10 +382,6 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         device_mesh = DeviceMesh.from_sizes(dp_size=1)
                         kwargs[device_mesh_name] = device_mesh
 
-                    if self.__class__.__name__ == 'DataLoader' and 'min_batch_size' not in kwargs:
-                        # TODO An ugly special setting for dataloader to set the min batch size
-                        kwargs['min_batch_size'] = kwargs['batch_size']
-
                     if remote_group:
                         if device_mesh is None:
                             if infra._device_mesh is not None:
@@ -408,7 +396,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         device_group = [dg for dg in infra._device_group if dg.name == remote_group][0]
                         device_group._device_mesh[self.__class__.__name__] = device_mesh
 
-                iter_stash = getattr(getattr(cls, '__iter__', None), '_stash', None)
+                # ``__iter_origin__`` (set once, below) is the user-declared iterator: without it,
+                # a second instantiation of the same class would read the stash off our own
+                # first-round wrapper, whose ``_stash`` is None.
+                iter_origin = getattr(cls, '__iter_origin__', None) or getattr(cls, '__iter__', None)
+                iter_stash = getattr(iter_origin, '_stash', None)
 
                 # This will solve the iterator cannot be passed through ray.
                 def __iter__(_self):
@@ -459,7 +451,13 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         _collect = self.__iter__._collect
                         _lazy = self.__iter__._lazy_collect
                         import ray
-                        cls.__iter_origin__ = cls.__iter__
+                        # The user's original iterator is recorded ONCE: a later instantiation of
+                        # the same class must not overwrite it with our own wrapper, whose body
+                        # calls ``__iter_origin__`` back -- a chain of such wrappers would recurse
+                        # forever if Ray ever re-serialised the current class instead of its
+                        # cached snapshot.
+                        if not hasattr(cls, '__iter_origin__'):
+                            cls.__iter_origin__ = cls.__iter__
                         cls.__iter__ = __iter__
                         # Return 2 object refs to enable get the stop flag in driver
                         cls.__next__ = ray.method(num_returns=2)(__next__)
@@ -625,7 +623,7 @@ def _stash_channels(result: Any, channels: Union[bool, Sequence[Union[int, str]]
 
 def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
-                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp', 'last_pp_first',
+                    collect: Union[Literal['none', 'flatten', 'mean', 'first', 'last_pp_first',
                                            'tensor_dict', 'dp_flatten'], Callable] = 'none',
                     sync: bool = False,
                     lazy_collect: Optional[bool] = None,
@@ -649,10 +647,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             'none': Return as-is
             'flatten': Return a flattened list
             'mean': Return the mean value of all processes
-            'sum': Return the sum value of all processes
             'first': Return the first worker's result but executed in each process, usually
                 works for scenarios of all-gather (e.g., get length).
-            'last_pp': Return the last pp's result.
             'tensor_dict': Merge per-worker output dicts (model forward outputs).
             'dp_flatten': Deduplicate per-worker lists by data rank, then flatten.
             Callable: A callable that handles the collection
@@ -670,7 +666,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             resubmitted elsewhere. Without ``lazy_collect=True`` the call returns the results; with it,
             a ``concurrent.futures.Future`` -- in local mode too, where the call runs on the
             instance's thread pool (sized by ``max_concurrency``). Requires the class to be declared
-            with ``max_concurrency`` above 1 to reach the worker's engine concurrently.
+            with ``max_concurrency`` above 1 to reach the worker's engine concurrently. A
+            resubmission is at-least-once: a request whose replica drained after finishing it
+            (or halfway through it) runs again elsewhere, so the method must tolerate being
+            called twice on the same request.
         sticky_key: Pin calls sharing a key to one replica (session affinity): a ``param.field.path``
             string read off the bound arguments, or a callable taking ``(args, kwargs)``. The binding
             lives in the caller's process (LRU, idle expiry); a vanished replica is rebound.
@@ -841,9 +840,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             try:
                 dispatch_context = kwargs.pop('_dispatch_context', None)
                 if infra._mode == 'local':
+                    # The same entry the ray path runs: Future resolution, the drain check and
+                    # stash all apply here too, or a component method handing back a plain engine
+                    # Future would return it nested in local mode and materialised in ray.
+                    # (stash is a no-op outside a worker -- ``_stash_value`` passes through.)
                     if continuous_lazy:
-                        return _local_executor(self).submit(func, self, *args, **kwargs)
-                    return func(self, *args, **kwargs)
+                        return _local_executor(self).submit(_run_here, self, args, kwargs, None)
+                    return _run_here(self, args, kwargs, None)
                 elif infra._mode == 'ray':
                     check_unsafe(*args, **kwargs)
                     if hasattr(self, '_actors'):

@@ -47,7 +47,8 @@ _CW_SESSION_IDLE_TIMEOUT = 30 * 60
 _CW_SESSION_CACHE_SIZE = 10_000
 # How long a process trusts its cached membership before re-reading the registry.
 _POOL_TTL = 1.0
-# How many times one request is resubmitted after its replica drained or died.
+# How many times a FAILED PART is resubmitted after its replica drained or died: the budget
+# is shared by the whole call (every part draws from these 8, not 8 per part).
 _CW_MAX_RETRIES = 8
 
 # Prefix of the awaitable companion generated for a continuous-work method. The
@@ -284,14 +285,25 @@ class _PoolView:
         with self.lock:
             return list(self.members.values())
 
-    def evict(self, worker_id: str):
-        """Forget a replica that answered draining or died, so the next pick avoids it."""
+    def evict(self, worker_id: str, *, dead: bool = False):
+        """Forget a replica that answered draining or died, so the next pick avoids it.
+
+        ``dead`` (a RayActorError) also removes it from the registry pool: a dead replica never
+        comes back, and the next refresh would re-add it straight from the registry (load 0,
+        first pick) until the call's retries burn out on it while healthy replicas idle. A
+        draining replica stays -- its removal is the remove_workers flow's to make, and a
+        refresh only reads back members whose state is ACTIVE.
+        """
         with self.lock:
             self.members.pop(worker_id, None)
             for key in [key for key, binding in self.bindings.items() if binding[0] == worker_id]:
                 self.bindings.pop(key)
             if self.key is not None:
                 self.refreshed = 0.0
+                if dead:
+                    from ._ray import RayHelper
+
+                    RayHelper.pool_remove(self.key, [worker_id])
 
     def assign(self, count: int, sticky_value=None) -> List[Tuple[str, Any, List[int]]]:
         """Split ``count`` requests over members: the sticky owner if bound, else least loaded first."""
@@ -343,7 +355,13 @@ _POOL_VIEWS: Dict[str, _PoolView] = {}
 
 
 def _pool_view(handle) -> _PoolView:
-    """The view a handle routes through: its registry pool, or the fixed actor set it holds."""
+    """The view a handle routes through: its registry pool, or the fixed actor set it holds.
+
+    A warmup sub-handle (``_pool_key=None``, only the new replicas) keys its entry by that
+    actor set; such views accumulate one per add_workers call and are never dropped -- a
+    bounded, known leak, kept rather than weak-ref complexity for entries that live for the
+    process anyway.
+    """
     key = handle.__dict__.get('_pool_key')
     if key is None:
         key = 'fixed:' + ','.join(worker_id_of(actor) for actor in handle._actors)
@@ -445,7 +463,9 @@ class _ContinuousCall:
     def _on_part(self, worker_id, part, value, exc):
         self.view.release(worker_id, len(part))
         if exc is not None and _is_retryable(exc) and self.retries < _CW_MAX_RETRIES:
-            self.view.evict(worker_id)
+            import ray
+
+            self.view.evict(worker_id, dead=isinstance(exc, ray.exceptions.RayActorError))
             with self.lock:
                 self.retries += 1
             _retry_executor().submit(self._submit, part, True)
