@@ -1910,6 +1910,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # what actually explains the number.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        from twinkle.utils.torch_utils import bits_fingerprint
         out = {}
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
@@ -1917,16 +1918,28 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             tensor = param if kind == 'param' else param.grad
             if tensor is None:
                 continue
-            tensor = self._shard(tensor).double()
-            if tensor.numel() == 0:
+            tensor = self._shard(tensor)
+            numel = tensor.numel()
+            if numel == 0:
                 # ZeRO-3 partitions parameters across ranks, so a rank can legitimately hold an
                 # empty local shard. ``max()`` and ``norm()`` raise on a zero-element tensor
                 # instead of returning an identity, and an empty shard contributes nothing to any
                 # aggregate, so it digests as zeros -- the key stays present, which keeps two runs
                 # comparable parameter by parameter.
-                out[name] = [0.0, 0.0, 0.0]
+                out[name] = {'agg': [0.0, 0.0, 0.0], 'bits': [0, 0], 'numel': 0}
                 continue
-            out[name] = [float(tensor.sum()), float(tensor.abs().max()), float(tensor.norm())]
+            bits = bits_fingerprint(tensor.detach().flatten())
+            flat = tensor.detach().double().flatten()
+            out[name] = {
+                'agg': [float(flat.sum()), float(flat.abs().max()), float(flat.norm())],
+                # ``agg`` is a reduction: it can show that two runs differ but never that they agree,
+                # since a difference confined to elements that cancel or that sit far below the absmax
+                # leaves all three numbers untouched. ``bits`` is the identity criterion, and this
+                # digest covers every element rather than a strided sample, so agreement over it does
+                # establish identity.
+                'bits': bits,
+                'numel': numel,
+            }
         return out
 
     def _write_step_probe(self, prefix, pre, grad, *, master_pre=None, **kwargs):
