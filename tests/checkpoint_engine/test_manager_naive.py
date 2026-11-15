@@ -318,21 +318,31 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
     assert manager.requested_mode == 'auto'
     assert manager.mode == 'standalone'
     assert manager.backend == 'nccl'
-    assert [event if isinstance(event, str) else event[0] for event in events] == [
-        'model_prepare',
-        'sampler_prepare',
-        'build_topology',
-        'model_init_submitted',
-        'sampler_init_submitted',
-        'model_init_waited',
-        'sampler_init_waited',
-        'send_submitted',
-        'receive_submitted',
-        'send_waited',
-        'receive_waited',
-        'model_finalize',
-        'sampler_finalize',
-    ]
+    # The two rendezvous pairs run on their own threads through ``_together``, which submits both
+    # calls before waiting on either -- but nothing orders the two threads against each other, so one
+    # may submit and finish waiting before the other submits at all. What the product guarantees is
+    # which events exist, the order of the calls it makes serially, and that each half of a rendezvous
+    # is submitted before it is waited on. Asserting a total order over the concurrent pairs asserted
+    # one interleaving out of several legal ones, and failed whenever the pool scheduled the other.
+    names = [event if isinstance(event, str) else event[0] for event in events]
+    assert sorted(names) == sorted([
+        'model_prepare', 'sampler_prepare', 'build_topology',
+        'model_init_submitted', 'sampler_init_submitted',
+        'model_init_waited', 'sampler_init_waited',
+        'send_submitted', 'receive_submitted', 'send_waited', 'receive_waited',
+        'model_finalize', 'sampler_finalize',
+    ])
+    position = {name: index for index, name in enumerate(names)}
+    # Serial in the product: both sides prepare, then the topology is built, then the rendezvous begin.
+    assert position['model_prepare'] < position['sampler_prepare'] < position['build_topology']
+    for half in ('model_init', 'sampler_init', 'send', 'receive'):
+        assert position[f'{half}_submitted'] < position[f'{half}_waited']
+    assert position['build_topology'] < min(position['model_init_submitted'],
+                                           position['sampler_init_submitted'])
+    assert max(position['model_init_waited'], position['sampler_init_waited']) < min(
+        position['send_submitted'], position['receive_submitted'])
+    assert max(position['send_waited'], position['receive_waited']) < position['model_finalize']
+    assert position['model_finalize'] < position['sampler_finalize']
     receive_kwargs = next(
         event[1]
         for event in events
