@@ -334,11 +334,21 @@ class TestSelectiveLogSoftmax:
         assert _npu_cross_entropy_log_probs(logits, index) is None
 
     @pytest.mark.skipif(not _NPU_AVAILABLE, reason='requires NPU')
-    def test_npu_fp32_fast_path_matches_log_softmax(self):
+    def test_npu_fp32_fast_path_matches_log_softmax(self, monkeypatch):
+        import twinkle.utils.torch_utils as torch_utils_module
+
         logits = torch.randn(64, 151936, device='npu', dtype=torch.float32, requires_grad=True)
         index = torch.randint(0, logits.shape[-1], (64, ), device='npu')
         reference_logits = logits.detach().clone().requires_grad_(True)
 
+        vendor_log_probs = torch_utils_module._npu_cross_entropy_log_probs
+
+        def checked_vendor_log_probs(*args, **kwargs):
+            result = vendor_log_probs(*args, **kwargs)
+            assert result is not None, 'test must exercise the real vendor cross-entropy op'
+            return result
+
+        monkeypatch.setattr(torch_utils_module, '_npu_cross_entropy_log_probs', checked_vendor_log_probs)
         actual = selective_log_softmax(logits, index)
         expected = reference_logits.log_softmax(-1).gather(
             -1, index.unsqueeze(-1)).squeeze(-1)
