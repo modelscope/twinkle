@@ -64,7 +64,7 @@ for epoch in range(2):
     print(f'Saved checkpoint for epoch {epoch} to {result.path}')
 ```
 
-On the Transformers backend, resumable checkpoints (Twinkle's `save_optimizer=True` or Tinker's `save_state()`) require a complete gradient accumulation window, followed by the optimizer step and gradient clearing. Pending gradients are not included in checkpoints, so saving optimizer state before that point is rejected. Weights-only exports remain available. Older checkpoints saved during accumulation can only be used to restart training from model weights.
+On the Transformers backend, finish the current gradient accumulation and optimizer update before saving a training checkpoint with Tinker's `save_state()` or Twinkle's `save(..., save_optimizer=True)`. Weights-only exports do not have this restriction.
 
 With the code above, you can train a self-cognition LoRA based on `Qwen/Qwen3.8-27B`. This LoRA will change the model's name and creator to the names specified during training. To perform inference using this LoRA:
 
