@@ -49,6 +49,27 @@ PRM_SEGMENT_TURNS = 'prm_segment_turns'
 _BASELINE = 'baseline'
 
 
+def _record_driver_probe(event: str, episode_id: str = '', **fields: Any) -> None:
+    """Append one driver event per call when ``TWINKLE_DRIVER_PROBE`` names a directory.
+
+    The rollout-side dispatch probe shows an episode's opening step returning and then no
+    continuation ever being submitted. This records the other half of that hand-off: whether the
+    step future resolved, whether its completion reached the event queue, and whether the loop
+    that drains the queue is still turning. Without it the two possible causes -- a future that
+    never resolves and a queue that is never drained -- are indistinguishable from outside.
+    """
+    import json
+    import os
+    root = os.environ.get('TWINKLE_DRIVER_PROBE')
+    if not root:
+        return
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f'driver.{os.getpid()}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps({'t': time.monotonic(), 'event': event, 'episode_id': episode_id,
+                                 **fields}, default=str) + '\n')
+
+
 def _is_episode_error(exc: BaseException) -> bool:
     return isinstance(exc, EpisodeError) or isinstance(getattr(exc, 'cause', None), EpisodeError)
 
@@ -515,6 +536,8 @@ class StreamingDriver:
                     self._version = max(self._version, version)
                     self._admit()
                     self._lock.notify_all()
+                _record_driver_probe('admit', live=self._live, capacity=self._capacity(),
+                                     qsize=self._events.qsize(), version=version)
                 if version != adjusted:
                     adjusted = version
                     self._maybe_adjust()
@@ -522,6 +545,7 @@ class StreamingDriver:
                     event = self._events.get(timeout=0.1)
                 except queue.Empty:
                     continue
+                _record_driver_probe('event_dequeued', event[1].episode_id, kind=event[0])
                 while event is not None:
                     self._handle(*event)
                     try:
@@ -529,6 +553,7 @@ class StreamingDriver:
                     except queue.Empty:
                         event = None
         except BaseException as exc:  # noqa
+            _record_driver_probe('run_stopped', error=f'{type(exc).__name__}: {exc}')
             logger.error(f'StreamingDriver stopped: {type(exc).__name__}: {exc}')
             with self._lock:
                 self._error = exc
@@ -647,11 +672,18 @@ class StreamingDriver:
 
     def _step(self, episode: _Episode, traj: Any) -> None:
         future = self.rollout.step(traj, episode_id=episode.episode_id)
-        future.add_done_callback(lambda f, episode=episode: self._events.put(('step', episode, None, f)))
+        _record_driver_probe('step_submitted', episode.episode_id)
+
+        def _done(f, episode=episode):
+            _record_driver_probe('step_future_done', episode.episode_id)
+            self._events.put(('step', episode, None, f))
+
+        future.add_done_callback(_done)
 
     # ------------------------------------------------------------------ completions
 
     def _handle(self, kind: str, episode: _Episode, index: Optional[int], future: Any) -> None:
+        _record_driver_probe('handle', episode.episode_id, kind=kind)
         exc = future.exception()
         with self._lock:
             if self._closed:
