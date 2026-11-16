@@ -129,6 +129,13 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
                 'episode_id': before.get('episode_id'),
                 'src_idx': src_idx,
                 'orm': (scores[index].get('rewards') or {}).get('orm') or {},
+                # The estimator's own inputs, recorded raw so a reader can rebuild its baseline
+                # independently: opo weights the group baseline by response length, remax subtracts
+                # a per-sample greedy baseline. Without these two columns the probe can only assert
+                # that an unscored row landed at zero, not that the SCORED rows beside it were left
+                # unpolluted -- which is the half of the contract those two estimators need checked.
+                'response_length': len(before.get('response_token_ids') or []),
+                'baseline_raw': (scores[index].get('rewards') or {}).get('baseline') or {},
                 'targets': added,
             }, default=str) + '\n')
 
