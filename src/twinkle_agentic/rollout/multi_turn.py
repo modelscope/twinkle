@@ -284,6 +284,10 @@ class _Episode:
         self.ledger = None
         self.tool_manager: Optional[ToolManager] = None
         self.env_open = False
+        #: Set by ``_discard``. ``_open`` blocks in ``env.reset`` while every session slot is taken, and
+        #: the episode can be discarded meanwhile, so the call that returns afterwards has to be able to
+        #: tell that nobody owns its session any more. See ``MultiTurnRollout._open``.
+        self.discarded = False
         self.touched = time.monotonic()
         self.busy = False
         # The tool loop: see ``MultiTurnRollout._tool_step``.
@@ -614,6 +618,21 @@ class MultiTurnRollout:
     def _open(self, ep: _Episode) -> None:
         if self.env is not None:
             result = self.env.reset(ep.episode_id, ep.trajectory)
+            if ep.discarded:
+                # ``env.reset`` waits for a free session slot, and the episode can be discarded while it
+                # waits -- an idle release, or another step's failure calling ``_discard`` for this id.
+                # The session this call has just created then belongs to nobody: ``_discard`` already ran
+                # and closed an env session that did not exist yet, and the episode is out of
+                # ``_episodes``, so no later ``_finish`` will ever close it. Close it here instead. A
+                # permit that is not returned is not reused, so leaking one per discarded opening
+                # exhausts the pool even when the pool is larger than the admission bound.
+                try:
+                    self.env.close(ep.episode_id)
+                except Exception:  # noqa
+                    logger.warning(f'closing the env session opened for discarded episode '
+                                   f'{ep.episode_id!r} failed.', exc_info=True)
+                raise EpisodeError(f'episode {ep.episode_id!r} was discarded while its env session was '
+                                   'waiting to open.')
             ep.env_open = True
             ep.trajectory = self._with_observation(ep.trajectory, result)
         if self.harness is not None:
@@ -719,12 +738,19 @@ class MultiTurnRollout:
             ep = self._episodes.pop(episode_id, None)
         if ep is None:
             return
+        # Set before anything that can block: ``_open`` may be inside ``env.reset`` at this moment and has
+        # to see the flag the instant that call returns.
+        ep.discarded = True
         if ep.requests is not None and self._policy_endpoint is not None:
             self._policy_endpoint.close(episode_id)
-        if self.env is not None and ep.env_open:
+        if self.env is not None:
             ep.env_open = False
             try:
-                # Kills whatever the session still runs, the agent program included.
+                # Kills whatever the session still runs, the agent program included. Not gated on
+                # ``env_open``: that flag is only set once ``env.reset`` returns, so gating it skipped the
+                # close for exactly the episodes discarded while their reset was still waiting for a slot.
+                # ``Env.close`` is idempotent -- no session under this id, no effect -- so an unconditional
+                # close costs nothing and covers the window the flag cannot.
                 self.env.close(episode_id)
             except Exception:  # noqa
                 logger.warning(f'closing the env session of episode {episode_id!r} failed.', exc_info=True)

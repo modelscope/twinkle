@@ -763,12 +763,23 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                 try:
                     return future.result(timeout=_rgt)
                 except TimeoutError as exc:
+                    # ``future.result`` raises ``TimeoutError`` for two different failures, and only one of
+                    # them is a timeout of this call. The wait expiring leaves the future unfinished; the
+                    # callee raising its own ``TimeoutError`` leaves it finished and carrying that
+                    # exception. Rewrapping both destroyed the second one's only diagnosis: an ``Env.reset``
+                    # that ran out of session slots says "no free session within 600s (8 in use)", which
+                    # reached the caller as "reset: no result within Nones" -- a pool that is exhausted
+                    # reading as a call that was slow, with the timeout that was never even set named as
+                    # the cause. Re-raise the callee's exception untouched and wrap only a real wait.
+                    #
                     # Every other path here waits through ``ray.get``, whose timeout is a
                     # ``ray.exceptions.GetTimeoutError``. A continuous-work call instead waits on a
                     # ``concurrent.futures.Future``, whose native timeout is a plain ``TimeoutError``,
                     # so a caller catching the infra's one timeout type would silently miss these.
                     # ``GetTimeoutError`` subclasses ``TimeoutError``, so narrowing the type here
                     # unifies the two paths without breaking anyone catching the builtin.
+                    if future.done():
+                        raise
                     import ray
                     raise ray.exceptions.GetTimeoutError(
                         f'{func.__name__}: no result within {_rgt}s') from exc
