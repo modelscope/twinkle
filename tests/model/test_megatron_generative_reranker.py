@@ -41,10 +41,11 @@ def test_full_determinism_selects_torch_gdn_kernels(monkeypatch):
 @pytest.mark.parametrize('deterministic', [False, True])
 def test_multilora_selects_deterministic_kernels_before_eager_wrap(monkeypatch, deterministic):
     from transformers.models.qwen3_next.modeling_qwen3_next import torch_chunk_gated_delta_rule
-    from twinkle import initialize
+    import twinkle.infra as infra
     import twinkle.model.megatron.multi_lora_megatron as module
 
-    initialize(mode='local')
+    monkeypatch.setattr(infra, '_mode', 'local')
+    monkeypatch.setattr(infra, '_device_group', None)
     gdn = type('Qwen3NextGatedDeltaNet', (torch.nn.Module,), {})()
     original = lambda *args: None
     gdn.chunk_gated_delta_rule = original
