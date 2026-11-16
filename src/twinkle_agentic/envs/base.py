@@ -232,15 +232,36 @@ class Env(ABC):
         if episode_id in self._sessions:
             self.close(episode_id)
         if not self._session_slots.acquire(timeout=self.session_wait_timeout):
-            raise TimeoutError(f'{type(self).__name__}: no free session within {self.session_wait_timeout:.0f}s '
-                               f'({self._max_sessions} in use).')
+            with self._sessions_lock:
+                now = time.monotonic()
+                holders = sorted((eid, now - session.touched) for eid, session in self._sessions.items())
+            detail = ', '.join(f'{eid} idle {age:.0f}s' for eid, age in holders[:8])
+            raise TimeoutError(
+                f'{type(self).__name__}: no free session within {self.session_wait_timeout:.0f}s '
+                f'({self._max_sessions} permits, {len(holders)} sessions registered). '
+                f'Holders: {detail or "none"}. '
+                'Fewer registered sessions than permits means the missing permits are held by resets '
+                'still inside _open, or were stranded by an earlier overwrite.')
         try:
             state, result = self._open(traj)
         except BaseException:
             self._session_slots.release()
             raise
         with self._sessions_lock:
+            displaced = self._sessions.get(episode_id)
             self._sessions[episode_id] = _Session(state)
+        if displaced is not None:
+            # A second reset for this id registered its session while this one was still opening. The
+            # entry it displaced holds a permit of its own, and close() releases one permit per call and
+            # can only ever see the entry that survived -- so overwriting without releasing here strands
+            # one permit per occurrence and the pool shrinks until every reset times out.
+            try:
+                self._close(displaced.state)
+            except Exception:  # noqa
+                logger.warning(f'{type(self).__name__}: closing the session displaced by a concurrent '
+                               f'reset of episode {episode_id!r} failed.', exc_info=True)
+            finally:
+                self._session_slots.release()
         return result
 
     @remote_function(enable_continous_work=True, sticky_key='episode_id')
