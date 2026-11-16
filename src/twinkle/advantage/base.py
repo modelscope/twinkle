@@ -92,9 +92,10 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
     score row is what distinguishes those two cases.
 
     Only the columns the estimator ADDED are recorded, so the probe reports the training targets
-    rather than echoing the whole trajectory. A token-level target is summarized by its length and
-    sum: a per-token list would spend the file on one row, and the scalar family's contract is what
-    the per-row zero test reads.
+    rather than echoing the whole trajectory. A token-level target is summarized by its length, sum
+    and largest absolute element: a per-token list would spend the file on one row, and the sum alone
+    cannot prove a row is all zeros (equal positive and negative entries cancel), which is exactly
+    what the unscored-row contract asserts.
     """
     import json
     import os
@@ -111,10 +112,12 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
             for field, value in after.items():
                 if field in before:
                     continue
-                if isinstance(value, (list, tuple)):
-                    added[field] = {'len': len(value), 'sum': float(sum(value))}
-                elif isinstance(value, torch.Tensor):
-                    added[field] = {'len': value.numel(), 'sum': float(value.sum())}
+                if isinstance(value, torch.Tensor):
+                    added[field] = {'len': value.numel(), 'sum': float(value.sum()),
+                                    'absmax': float(value.abs().max()) if value.numel() else 0.0}
+                elif isinstance(value, (list, tuple)):
+                    added[field] = {'len': len(value), 'sum': float(sum(value)),
+                                    'absmax': max((abs(v) for v in value), default=0.0)}
                 else:
                     added[field] = value
             src_idx = ground_truth(before, 'src_idx')
