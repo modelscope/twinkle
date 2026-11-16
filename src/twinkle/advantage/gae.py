@@ -43,11 +43,22 @@ class GAEAdvantage(Advantage):
         old_values = self._lane('value_out', value_out, 'values', trajs)
         kl_rows = self._kl(old_logps, ref_logps, kind=self.kl_kind, reduce='none')
         rm_scores = [weighted_score(self._orm_row(score), self.reward_weights) for score in scores]
+        # A row whose every ORM scorer failed folds to nan: it carries no reward signal, so it must
+        # not bootstrap a value target either. Zero it before shaping and drop its advantage/return
+        # afterwards -- a nan left in the reward would spread through the GAE recursion to every
+        # earlier token of the row, and a fake 0 would train it as a genuine zero reward.
+        unscored = [value != value for value in rm_scores]
+        rm_scores = [0.0 if value != value else value for value in rm_scores]
         token_rewards = self._shape(rm_scores, kl_rows, beta=self.kl_coef, profile='token')
         advantages, returns = self.token_advantages(token_rewards, old_values)
+        advantages = [[0.0] * len(row) if unscored[index] else row
+                      for index, row in enumerate(advantages)]
+        returns = [[0.0] * len(row) if unscored[index] else row
+                   for index, row in enumerate(returns)]
         new_trajs = self._write_back(trajs, {'advantages': advantages, 'returns': returns,
                                              'old_logps': old_logps, 'old_values': old_values})
         return new_trajs, {'estimator': type(self).__name__, 'num_rows': len(trajs),
+                           'unscored_rows': sum(unscored),
                            'mean_advantage': _mean(advantages), 'mean_return': _mean(returns),
                            'absmean_advantage': _absmean(advantages),
                            'zero_advantage_rows': _zero_row_fraction(advantages),

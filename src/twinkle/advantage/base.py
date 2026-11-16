@@ -25,15 +25,24 @@ from .teacher_signal import TeacherReweight
 
 
 def weighted_score(values: Optional[Sequence[Any]], weights: Optional[Sequence[float]]) -> float:
-    """One score row folded by ``weights`` (default all-ones); ``None`` / nan entries count as 0."""
-    row = [0.0 if value is None or value != value else float(value) for value in (values or ())]
-    if not row:
-        return 0.0
+    """One score row folded by ``weights`` (default all-ones); failed entries drop out.
+
+    A ``None`` / nan entry is one reward function that did not score, so it contributes nothing and
+    the valid ones beside it still fold -- the same ``nansum`` semantics ``reduce_rewards`` applies
+    to the reward matrix. A row where EVERY entry failed (or that is empty) folds to **nan**, not
+    0.0: that sample was never scored, and a fake 0 is indistinguishable from a genuine zero score.
+    The distinction matters wherever the fold is subtracted or bootstrapped rather than averaged --
+    a remax baseline of 0 turns ``reward - baseline`` into the full reward, fabricating an advantage
+    on a row that carries no signal. Callers mask the nan rows out and count them.
+    """
+    row = [float('nan') if value is None or value != value else float(value) for value in (values or ())]
+    if not row or all(value != value for value in row):
+        return float('nan')
     if weights is None:
         weights = [1.0] * len(row)
     if len(weights) != len(row):
         raise ValueError(f'{len(weights)} weights for {len(row)} scores.')
-    return sum(value * float(weight) for value, weight in zip(row, weights))
+    return sum(value * float(weight) for value, weight in zip(row, weights) if value == value)
 
 
 def _rlsd_lambda(lam: float, warmup: int, decay: int, global_step: int) -> float:
@@ -457,7 +466,16 @@ class Advantage:
             # is standard GRPO, mix=1 pure PRM. The scalar ORM lane broadcasts over the token rows.
             process = [self._process_row(traj, score) for traj, score in zip(trajs, scores)]
             mix = float(self.prm_orm_mix)
+            # A segment whose every scorer failed folds to nan, so that episode's process reward is
+            # unusable. Zeroing the nan keeps it from poisoning the blend (nan * 0 is still nan, so
+            # even mix=0 would otherwise come out nan), and when the process lane actually carries
+            # weight the row loses its signal entirely rather than training on a fabricated blend.
+            prm_unscored = [any(value != value for value in row) for row in process]
+            process = [[0.0 if value != value else value for value in row] for row in process]
             advantages = self._combine([process, advantages], weights=[mix, 1.0 - mix])
+            if mix != 0.0:
+                advantages = [[0.0] * len(row) if prm_unscored[index] else row
+                              for index, row in enumerate(advantages)]
         elif self.teacher_reweight is not None:
             if self.teacher_reweight == 'rlsd':
                 advantages = self._teacher(
@@ -485,6 +503,12 @@ class Advantage:
                                    'mean_advantage': _mean(advantages),
                                    'absmean_advantage': _absmean(advantages),
                                    'zero_advantage_rows': _zero_row_fraction(advantages)}
+        # Rows that carried no signal, counted per lane so a silently broken scorer is visible:
+        # zero advantage alone cannot distinguish "never scored" from "scored and average".
+        if baselines is not None:
+            summary['unscored_baseline_rows'] = sum(value != value for value in baselines)
+        if self.use_prm:
+            summary['unscored_prm_rows'] = sum(prm_unscored)
         if self.log_rollout_offpolicy_metrics:
             summary['rollout_correction'] = self._correction(old_logps, rollout_logps)
         return new_trajs, summary

@@ -60,10 +60,14 @@ class ReMaxAdvantage(Advantage):
         rewards = reduce_rewards(rewards, kwargs.get('reward_weights'))
         # A row whose every scorer failed is NaN out of the fold and must contribute no training
         # signal. Zeroing the reward alone does not achieve that: subtracting the baseline would
-        # leave -baseline behind, a fabricated advantage on a row that was never scored. The mask
-        # is taken here because nan_to_num below destroys the only record of which rows failed.
-        unscored = torch.isnan(rewards)
+        # leave -baseline behind, a fabricated advantage on a row that was never scored. The same
+        # holds on the baseline side -- a baseline whose own scorer failed folds to NaN, and
+        # treating it as a real 0 would credit the row with its entire reward as excess over the
+        # baseline. The mask is taken here because nan_to_num below destroys the only record of
+        # which rows failed, on either side.
+        unscored = torch.isnan(rewards) | torch.isnan(reward_baselines)
         rewards = torch.nan_to_num(rewards, nan=0.0)
+        reward_baselines = torch.nan_to_num(reward_baselines, nan=0.0)
         rewards = apply_kl_in_reward(
             rewards,
             kl_in_reward=kwargs.get('kl_in_reward', False),
