@@ -665,7 +665,7 @@ class StreamingDriver:
         # version. The rollout reads the episode id to route its steps back to this episode.
         traj = dict(traj)
         traj.update(episode_id=episode.episode_id, group_key=group.key, role=role,
-                    policy_version=episode.version)
+                    policy_version=episode.version, group_attempt=group.attempt)
         self._inflight += 1
         self._step(episode, traj)
         return episode

@@ -136,6 +136,11 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
                 # unpolluted -- which is the half of the contract those two estimators need checked.
                 'response_length': len(before.get('response_token_ids') or []),
                 'baseline_raw': (scores[index].get('rewards') or {}).get('baseline') or {},
+                # Which regeneration attempt this row's group was admitted on. dynamic_sample's
+                # contract is that a group whose spread comes only from failed scorers is resampled,
+                # not kept; the attempt index is what tells a resampled-then-exhausted group from one
+                # the admission kept outright, which a reward column alone cannot distinguish.
+                'group_attempt': before.get('group_attempt'),
                 'targets': added,
             }, default=str) + '\n')
 
