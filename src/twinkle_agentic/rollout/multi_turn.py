@@ -47,6 +47,27 @@ MAX_FOLLOWUPS = 20
 #: ceiling only: how many episodes are in flight is the driver's admission, not this.
 ROLLOUT_MAX_CONCURRENCY = 1024
 
+def _record_dispatch_probe(event: str, episode_id: str, **fields: Any) -> None:
+    """Append one dispatch event per call when ``TWINKLE_DISPATCH_PROBE`` names a directory.
+
+    A deadlock can show eight env sessions held by live agents while no thread is inside
+    ``_harness_step`` answering them. Stacks say where everything is blocked, not the dispatch
+    order that got it there, so this records each step entry, each session open, and each harness
+    wait/item/serve per episode. Env-gated: unset, it does nothing.
+    """
+    import json
+    import os
+
+    root = os.environ.get('TWINKLE_DISPATCH_PROBE')
+    if not root:
+        return
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f'dispatch.{os.getpid()}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps({'t': time.monotonic(), 'event': event, 'episode_id': episode_id,
+                                 **fields}, default=str) + '\n')
+
+
 #: Put on an episode's request queue when its agent program exits.
 _AGENT_EXITED = object()
 #: Seconds past the agent's own timeout before a step stops waiting for it.
@@ -602,6 +623,7 @@ class MultiTurnRollout:
             elif 'turns' not in traj:
                 raise ValueError(f'episode {episode_id!r} is already running; every episode needs its own id.')
             ep.busy = True
+        _record_dispatch_probe('step_entry', episode_id, opening=opening)
         try:
             if opening:
                 self._open(ep)
@@ -617,7 +639,9 @@ class MultiTurnRollout:
 
     def _open(self, ep: _Episode) -> None:
         if self.env is not None:
+            _record_dispatch_probe('reset_start', ep.episode_id)
             result = self.env.reset(ep.episode_id, ep.trajectory)
+            _record_dispatch_probe('reset_returned', ep.episode_id, discarded=ep.discarded)
             if ep.discarded:
                 # ``env.reset`` waits for a free session slot, and the episode can be discarded while it
                 # waits -- an idle release, or another step's failure calling ``_discard`` for this id.
@@ -637,6 +661,7 @@ class MultiTurnRollout:
             ep.trajectory = self._with_observation(ep.trajectory, result)
         if self.harness is not None:
             self._start_agent(ep)
+            _record_dispatch_probe('agent_started', ep.episode_id)
             return
         ep.tool_manager = self._episode_tools(ep.episode_id)
         ep.ledger = self._new_ledger(ep.episode_id)
@@ -1032,16 +1057,24 @@ class MultiTurnRollout:
 
     def _harness_step(self, ep: _Episode) -> tuple[list, RolloutStatus]:
         """Answer the agent's next request, or end the episode when the program exited."""
+        wait = max(ep.deadline - time.monotonic(), 0.0)
+        _record_dispatch_probe('harness_wait', ep.episode_id, wait=wait)
         try:
-            item = ep.requests.get(timeout=max(ep.deadline - time.monotonic(), 0.0))
+            item = ep.requests.get(timeout=wait)
         except queue.Empty:
+            _record_dispatch_probe('harness_timeout', ep.episode_id)
             raise EpisodeError(f'episode {ep.episode_id!r}: the agent did not finish within '
                                f'{self.harness.timeout:.0f}s.') from None
+        _record_dispatch_probe('harness_item', ep.episode_id, exited=item is _AGENT_EXITED)
         if item is _AGENT_EXITED:
             return self._agent_exited(ep)
         try:
-            return self._serve(ep, item)
+            result = self._serve(ep, item)
+            _record_dispatch_probe('harness_served', ep.episode_id)
+            return result
         except BaseException as error:
+            _record_dispatch_probe('harness_serve_error', ep.episode_id,
+                                   error=f'{type(error).__name__}: {error}')
             if not item.reply.done():
                 item.reply.set_exception(error)
             raise
