@@ -63,6 +63,35 @@ _LIFTED_TRAJECTORY_FIELDS = (
 )
 
 
+def _record_rollout_identity(rows) -> None:
+    """Append each handed-over row's rollout ids beside the trainer's own columns, if the probe is on.
+
+    The contract being measured is that the response tokens a rollout GENERATED arrive bit-identical
+    in what the trainer consumes. This is the last seam where both are in scope: the caller next
+    filters to ``InputProcessor.FEATURE_KEYS``, which drops ``response_token_ids`` and the row
+    identity, and the processor then pads/collates, after which a row can no longer be singled out.
+    """
+    import os
+    root = os.environ.get('TWINKLE_ROLLOUT_IDENTITY_PROBE')
+    if not root:
+        return
+    import json
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f'identity.{os.getpid()}.jsonl')
+
+    def flat(value):
+        return value.tolist() if hasattr(value, 'tolist') else list(value)
+
+    with open(path, 'a', encoding='utf-8') as handle:
+        for row in rows:
+            record = {key: row.get(key) for key in ('episode_id', 'group_key', 'policy_version', 'role')}
+            for key in ('response_token_ids', 'input_ids', 'labels', 'completion_mask', 'response_positions'):
+                value = row.get(key)
+                if value is not None:
+                    record[key] = flat(value)
+            handle.write(json.dumps(record) + '\n')
+
+
 def _freeze_then_activate(named_params,
                           *,
                           freeze_ratio: float = 0.0,
@@ -502,6 +531,7 @@ class TrainableModel(ABC):
         rows = inputs if isinstance(inputs, list) else [inputs]
         if not rows or not isinstance(rows[0], dict) or 'response_token_ids' not in rows[0]:
             return inputs, kwargs
+        _record_rollout_identity(rows)
         if lift:
             kwargs = dict(kwargs)
             for field in _LIFTED_TRAJECTORY_FIELDS:
