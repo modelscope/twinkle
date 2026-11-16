@@ -324,7 +324,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
 
         tensors = {**dict(head.named_parameters()), **dict(head.named_buffers())}
         expected = {f'task_head.{name}' for name in tensors}
-        legacy = {f'task_head.{name}' for name in head.named_parameters()}
+        legacy = {f'task_head.{name}' for name, _ in head.named_parameters()}
         if set(state) not in (expected, legacy):
             raise ValueError(
                 f'task_head checkpoint keys {sorted(state)} do not match the head it restores: '

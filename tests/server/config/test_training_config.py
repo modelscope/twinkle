@@ -451,3 +451,16 @@ def test_native_backends_preserve_loader_and_precision_configuration(backend, mo
     assert model.backend == backend and model.mode == mode
     assert model.config.model_loader == 'worker_only.loader:load'
     assert model.config.mixed_precision == 'no'
+
+
+@pytest.mark.parametrize('backend', ['transformers', 'megatron'])
+@pytest.mark.parametrize('mode', ['lora', 'full'])
+def test_resolved_native_st_without_model_cls_is_rejected(tmp_path, backend, mode):
+    from twinkle.server.config.training import TrainingModelConfig
+
+    (tmp_path / 'modules.json').write_text('[]')
+    values = model_config(mode)
+    values.update(model_id=str(tmp_path), backend=backend)
+    values['config']['task_type'] = 'embedding'
+    with pytest.raises(ValidationError, match='native sentence-transformers checkpoint requires model_cls'):
+        TrainingModelConfig.model_validate(values)

@@ -17,6 +17,13 @@ if TYPE_CHECKING:
     from .application_spec import ApplicationSpec
 
 
+def validate_native_st_model(model_path: str, task_type: str | None, model_cls: str | None) -> None:
+    if task_type == 'embedding' and model_cls is None and (Path(model_path) / 'modules.json').is_file():
+        raise ValueError(
+            'native sentence-transformers checkpoint requires model_cls; '
+            'the generic embedding wrapper cannot preserve its module pipeline')
+
+
 class SpectralHybridArgs(BaseModel):
     """Strict server-owned Spectral Hybrid allocation and optimizer defaults."""
 
@@ -111,11 +118,7 @@ class ModelArgs(TrainingArguments, LoraArguments):
 
     @model_validator(mode="after")
     def _validate_spectral_backend(self):
-        if (self.task_type == 'embedding' and self.model_cls is None
-                and (Path(self.model_id) / 'modules.json').is_file()):
-            raise ValueError(
-                'native sentence-transformers checkpoint requires model_cls; '
-                'the generic embedding wrapper cannot preserve its module pipeline')
+        validate_native_st_model(self.model_id, self.task_type, self.model_cls)
         if self.strategy is not None and self.backend != "transformers":
             raise ValueError("strategy is only supported by the transformers backend")
         if self.gradient_checkpointing is not None and self.backend != "transformers":
@@ -204,6 +207,7 @@ class TrainingModelConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_backend(self):
+        validate_native_st_model(self.model_id, self.config.task_type, self.config.model_cls)
         if (
             self.name.startswith("/")
             or any(part in ("", ".", "..") for part in self.name.split("/"))

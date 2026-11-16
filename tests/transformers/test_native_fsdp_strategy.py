@@ -95,6 +95,7 @@ def test_lazy_wrapping_rebinds_each_tenants_optimizer_without_other_parameters(t
                               _model_wrapped=False, _enable_expert_parallel=False, sp_strategy=None,
                               _maybe_apply_expert_parallel=lambda: None, _ensure_sp_strategy=lambda: None,
                               _ensure_gdn_padding_free_patch=lambda: None,
+                              _apply_deterministic_model_kernels=lambda: None,
                               _rebind_lr_scheduler=TransformersModel._rebind_lr_scheduler,
                               register_mm_forward_hook=lambda group: None)
     with patch.object(original, 'to', return_value=replacement), patch(
@@ -215,3 +216,20 @@ def test_independent_task_head_checkpoint_includes_nonpersistent_buffers():
     set_state.assert_called_once()
     assert set_state.call_args.args[1].keys() == {'weight', 'bias'}
     torch.testing.assert_close(head.calibration, torch.tensor([3.0]))
+
+
+@pytest.mark.parametrize('persistent', [False, True])
+def test_independent_task_head_loads_legacy_parameters_without_changing_calibration(persistent):
+    head = torch.nn.Linear(2, 1)
+    head.register_buffer('calibration', torch.tensor([7.0]), persistent=persistent)
+    head._twinkle_independent_fsdp = True
+    strategy = NativeFSDPStrategy(enable_ep=False)
+    legacy = {f'task_head.{name}': torch.full_like(param, 3.0)
+              for name, param in head.named_parameters()}
+    options = strategy._prepare_optimizer_state_dict_options(for_load=True)
+    options.broadcast_from_rank0 = False
+    with patch.object(strategy, '_prepare_optimizer_state_dict_options', return_value=options):
+        assert strategy.restore_independent_task_head_state(head, legacy)
+    for param in head.parameters():
+        torch.testing.assert_close(param, torch.full_like(param, 3.0))
+    torch.testing.assert_close(head.calibration, torch.tensor([7.0]))

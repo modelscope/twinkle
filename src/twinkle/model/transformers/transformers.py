@@ -372,7 +372,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # applying runtime overrides such as ``attn_implementation``.  Keep Twinkle's
         # config reference aligned with the config that the model actually uses.
         self.hf_config = self.model.config
-        self._apply_deterministic_model_kernels()
         logger.info_once(
             f'[TransformersModel] attn_implementation: requested={kwargs.get("attn_implementation")!r}, '
             f'resolved={getattr(self.model.config, "_attn_implementation", None)!r}')
@@ -681,6 +680,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
+            self._apply_deterministic_model_kernels()
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
             self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=self._enable_expert_parallel)
             self._maybe_apply_expert_parallel()

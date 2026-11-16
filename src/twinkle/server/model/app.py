@@ -17,6 +17,7 @@ from twinkle import DeviceGroup, remote_class
 from twinkle.model.base import TrainableModel
 from twinkle.server.config.backend_dispatch import BackendSelector
 from twinkle.server.config.task_queue import TaskQueueConfig
+from twinkle.server.config.training import validate_native_st_model
 from twinkle.server.deployment import bind_deployment, build_deployment_app
 from twinkle.server.runtime import init_twinkle_runtime
 from twinkle.server.state import ServerState, get_server_state
@@ -65,6 +66,7 @@ def _validate_model_task(kw: dict[str, Any]) -> None:
     from twinkle.hub import HubOperation
 
     path = HubOperation.download_model(kw['model_id'])
+    validate_native_st_model(path, task_type, kw.get('model_cls'))
     loader = kw.get('model_loader')
     config = (loader.process_config(loader.build_config(path)) if loader is not None else
               AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code()))

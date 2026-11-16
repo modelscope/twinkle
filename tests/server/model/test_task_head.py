@@ -273,3 +273,26 @@ def test_transformers_decision_uses_loader_architecture(monkeypatch, mode):
         assert 'task' not in received and 'task_head_loader' not in received
     else:
         assert received['task'] == 'decision'
+
+
+@pytest.mark.parametrize('model_id', ['ms://sentence-transformers/LaBSE',
+                                    'hf://sentence-transformers/LaBSE', 'configured-alias'])
+@pytest.mark.parametrize('model_cls', [None, 'swift.dev.model.sentence_transformer_model:SentenceTransformerModel'])
+def test_native_st_guard_uses_resolved_directory(tmp_path, monkeypatch, model_id, model_cls):
+    from transformers import AutoConfig
+    from twinkle.hub import HubOperation
+
+    (tmp_path / 'modules.json').write_text('[]')
+    monkeypatch.setattr(HubOperation, 'download_model', lambda path: str(tmp_path))
+    config_reads = []
+    monkeypatch.setattr(AutoConfig, 'from_pretrained',
+                        lambda *a, **kw: config_reads.append(a) or SimpleNamespace(architectures=['BertModel']))
+    kwargs = {'model_id': model_id, 'task_type': 'embedding'}
+    if model_cls is not None:
+        kwargs['model_cls'] = model_cls
+        _validate_model_task(kwargs)
+        assert config_reads
+    else:
+        with pytest.raises(ValueError, match='native sentence-transformers checkpoint requires model_cls'):
+            _validate_model_task(kwargs)
+        assert not config_reads
