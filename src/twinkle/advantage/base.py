@@ -156,6 +156,11 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
                 # score. Without them a reader can only assert that an unscored row landed at zero,
                 # not rebuild mix*process + (1-mix)*orm for the scored rows beside it.
                 'prm_segments': scores[index].get('prm_segments'),
+                # The turn boundaries the PRM broadcast fills against. Without them a reader can
+                # see each segment's score but cannot check it landed on the turns that segment
+                # closed -- which is the whole multi-segment contract, as opposed to the
+                # single-segment case where every token trivially belongs to the one segment.
+                'turn_spans': [list(span) for span in turn_token_spans(before)],
                 # Which regeneration attempt this row's group was admitted on. dynamic_sample's
                 # contract is that a group whose spread comes only from failed scorers is resampled,
                 # not kept; the attempt index is what tells a resampled-then-exhausted group from one
