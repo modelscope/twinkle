@@ -50,6 +50,32 @@ class PackedSeqParams:
 
 
 @remote_class()
+def _record_collated(inputs, padding_side: str) -> None:
+    """Save the batch AFTER collation when ``TWINKLE_COLLATED_PROBE`` names a directory.
+
+    The pre-collate seam (the trainer's per-sample dump) cannot see padding: it is the collator that
+    introduces it, together with attention_mask and the padded loss_scale column. The contracts that
+    need those -- padding carries weight 0.0, and attention_mask is 0 exactly where the row was
+    padded -- are only checkable here, on the worker, after the whole pipeline has run.
+    """
+    import os
+    root = os.environ.get('TWINKLE_COLLATED_PROBE')
+    if not root:
+        return
+    import torch
+    os.makedirs(root, exist_ok=True)
+    rows = inputs if isinstance(inputs, list) else [inputs]
+    tensors = {}
+    for key, value in (rows[0] if rows else {}).items():
+        if torch.is_tensor(value):
+            tensors[key] = value.detach().to('cpu').contiguous()
+    if not tensors:
+        return
+    index = len([n for n in os.listdir(root) if n.startswith('collated.')])
+    torch.save({'tensors': tensors, 'scalars': {'rows': len(rows), 'padding_side': padding_side}},
+               os.path.join(root, f'collated.{os.getpid()}.{index:05d}.pt'))
+
+
 class InputProcessor:
     padding_map = {
         "input_ids": 0,
@@ -135,6 +161,7 @@ class InputProcessor:
     def __call__(self, inputs: InputFeature | list[InputFeature], **kwargs) -> InputFeature | list[InputFeature]:
         for pipe in self.process_pipeline:
             inputs = pipe(inputs, **kwargs)
+        _record_collated(inputs, self.padding_side)
         return inputs
 
     def prepare_outputs(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature] | InputFeature:
