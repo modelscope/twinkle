@@ -65,14 +65,26 @@ def _record_collated(inputs, padding_side: str) -> None:
     import torch
     os.makedirs(root, exist_ok=True)
     rows = inputs if isinstance(inputs, list) else [inputs]
+    row = rows[0] if rows else {}
     tensors = {}
-    for key, value in (rows[0] if rows else {}).items():
+    for key, value in row.items():
         if torch.is_tensor(value):
             tensors[key] = value.detach().to('cpu').contiguous()
+        elif key in ('attention_mask', 'completion_mask', 'labels', 'loss_scale', 'position_ids', 'input_ids'):
+            # A sequence column that reached the collator as a list/ndarray is still a real column;
+            # dropping it here would read as "the batch has no attention_mask" when it has one.
+            try:
+                tensors[key] = torch.as_tensor(value).detach().to('cpu').contiguous()
+            except Exception:  # noqa # not numeric after all; the key list below still records it
+                pass
     if not tensors:
         return
     index = len([n for n in os.listdir(root) if n.startswith('collated.')])
-    torch.save({'tensors': tensors, 'scalars': {'rows': len(rows), 'padding_side': padding_side}},
+    ids = tensors.get('input_ids')
+    torch.save({'tensors': tensors,
+                'scalars': {'rows': int(ids.shape[0]) if ids is not None and ids.dim() >= 1 else len(rows),
+                            'padding_side': padding_side,
+                            'keys': {key: type(value).__name__ for key, value in row.items()}}},
                os.path.join(root, f'collated.{os.getpid()}.{index:05d}.pt'))
 
 
