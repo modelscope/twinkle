@@ -76,6 +76,13 @@ def test_npu_fused_kernel_requires_triton(monkeypatch, device_type, dtype, trito
 
 
 @pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
+def test_npu_bf16_without_triton_falls_back_to_reference(monkeypatch):
+    monkeypatch.setattr(importlib.util, 'find_spec', lambda name: None)
+
+    _check_forward_backward('npu', torch.bfloat16, True, shape=(8, 16, 97))
+
+
+@pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize('return_entropy', [False, True])
 @pytest.mark.parametrize('shape', [(1, 8, 31), (37, 24, 257), (17, 12, 5000)])
