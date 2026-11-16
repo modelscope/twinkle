@@ -23,6 +23,7 @@ from twinkle.data_format.sampling import SampledSequence, SampleResponse, Sampli
 from twinkle.infra import remote_class, remote_function
 from twinkle.template.base import Template
 from twinkle.utils import get_logger
+from twinkle_agentic.envs.base import NoSlot
 from twinkle_agentic.envs.env_tool import EnvTool
 from twinkle_agentic.protocol.api_sampler import APIGenerationError
 from twinkle_agentic.tools.tool_manager import ToolManager
@@ -132,6 +133,9 @@ class RolloutStatus:
     done: bool = False
     stop_reason: str | None = None
     truncated: bool = False
+    #: The opening ``env.reset`` found no free session permit and was asked not to wait (wait=0).
+    #: The episode produced no sample and is not failed: the driver retries this member later.
+    no_slot: bool = False
     #: (prompt_tokens, response_tokens) of the final trajectory; None before the episode ends.
     token_lengths: tuple[int, int] | None = None
     #: Whether the final trajectory carries the sampler-exported MoE routing.
@@ -504,7 +508,8 @@ class MultiTurnRollout:
     # ------------------------------------------------------------------ entries
 
     @remote_function(enable_continous_work=True, sticky_key=_episode_key, stash=(0,), lazy_collect=True)
-    def step(self, traj: Trajectory, episode_id: str | None = None) -> tuple[list, RolloutStatus]:
+    def step(self, traj: Trajectory, episode_id: str | None = None,
+             session_wait: Optional[float] = None) -> tuple[list, RolloutStatus]:
         """Advance the episode one generation; ``(rows, sample)`` with ``sample.done`` on the last.
 
         The first call of an episode opens it from ``traj``; later calls pass the first ``row``
@@ -514,8 +519,12 @@ class MultiTurnRollout:
         one per collected segment otherwise -- independently coded, sharing one identity and
         one outcome. Raises :class:`EpisodeError` for an episode that cannot produce a sample;
         it is released either way.
+
+        ``session_wait`` is forwarded to the opening ``env.reset`` only: the driver's admission
+        loop passes ``0`` so a full session pool returns a ``no_slot`` status (retry later) instead
+        of blocking; the batch ``__call__`` and ``stream`` leave it ``None`` (inherit the env default).
         """
-        return self._step(traj, episode_id)
+        return self._step(traj, episode_id, session_wait)
 
     @remote_function(enable_continous_work=True, sticky_key=_episode_key, lazy_collect=True)
     def stop(self, traj: Trajectory, episode_id: str | None = None) -> None:
@@ -605,7 +614,8 @@ class MultiTurnRollout:
 
     # ------------------------------------------------------------------ episode
 
-    def _step(self, traj: Trajectory, episode_id: str | None) -> tuple[list, RolloutStatus]:
+    def _step(self, traj: Trajectory, episode_id: str | None,
+              session_wait: Optional[float] = None) -> tuple[list, RolloutStatus]:
         episode_id = episode_id or _episode_id_of(traj)
         if not episode_id:
             raise ValueError('step needs an episode id: pass episode_id= or set user_data.episode_id.')
@@ -626,7 +636,11 @@ class MultiTurnRollout:
         _record_dispatch_probe('step_entry', episode_id, opening=opening)
         try:
             if opening:
-                self._open(ep)
+                if self._open(ep, session_wait):
+                    # No free session permit and we were asked not to wait: the episode is already
+                    # discarded by _open. Report it along the normal return channel (not an exception,
+                    # which the driver would raise) so the admission loop can retry this member later.
+                    return [traj], RolloutStatus(episode_id=episode_id, no_slot=True)
             if self.harness is not None:
                 return self._harness_step(ep)
             return self._tool_step(ep)
@@ -637,11 +651,17 @@ class MultiTurnRollout:
             ep.busy = False
             ep.touched = time.monotonic()
 
-    def _open(self, ep: _Episode) -> None:
+    def _open(self, ep: _Episode, session_wait: Optional[float] = None) -> bool:
+        """Open the episode's env session and first turn. Returns True only on a no-slot sentinel."""
         if self.env is not None:
             _record_dispatch_probe('reset_start', ep.episode_id)
-            result = self.env.reset(ep.episode_id, ep.trajectory)
+            result = self.env.reset(ep.episode_id, ep.trajectory, wait=session_wait)
             _record_dispatch_probe('reset_returned', ep.episode_id, discarded=ep.discarded)
+            if isinstance(result, NoSlot):
+                # The pool is full and this call was asked not to wait. Drop the registration we just
+                # made (no session was opened, so there is nothing to close) and let _step report it.
+                self._discard(ep.episode_id)
+                return True
             if ep.discarded:
                 # ``env.reset`` waits for a free session slot, and the episode can be discarded while it
                 # waits -- an idle release, or another step's failure calling ``_discard`` for this id.
@@ -662,7 +682,7 @@ class MultiTurnRollout:
         if self.harness is not None:
             self._start_agent(ep)
             _record_dispatch_probe('agent_started', ep.episode_id)
-            return
+            return False
         ep.tool_manager = self._episode_tools(ep.episode_id)
         ep.ledger = self._new_ledger(ep.episode_id)
         # A trajectory that named no tools advertises the manager's, so the prompt
@@ -672,6 +692,7 @@ class MultiTurnRollout:
             opening_tools = list(ep.tool_manager.tool_infos() or [])
         ep.ledger.open(ep.trajectory, tools=opening_tools)
         ep.budget = self.max_turns
+        return False
 
     def _finish(self, ep: _Episode, **fields: Any) -> tuple[list, RolloutStatus]:
         """Merge the trajectory, run ``on_episode_end``, close the session, release the episode.

@@ -70,7 +70,8 @@ class LocalEnv(Env):
                  max_sessions: int = 64,
                  command_timeout: int = 60,
                  memory_limit_gb: Optional[float] = 2.0,
-                 envs: Optional[Dict[str, str]] = None):
+                 envs: Optional[Dict[str, str]] = None,
+                 session_wait_timeout: Optional[float] = 600.0):
         """
         Args:
             root: directory holding the episodes' working directories, created if absent; a fresh
@@ -81,8 +82,10 @@ class LocalEnv(Env):
             memory_limit_gb: address-space cap per call, so one runaway script
                 cannot take the trainer down with it. ``None`` to not cap.
             envs: extra environment variables for the child process.
+            session_wait_timeout: default seconds ``reset`` waits for a free session (per-call
+                ``wait`` overrides it); ``None`` waits forever, ``0`` returns NoSlot immediately.
         """
-        super().__init__(max_sessions)
+        super().__init__(max_sessions, session_wait_timeout=session_wait_timeout)
         self._root = os.path.abspath(root) if root else tempfile.mkdtemp(prefix='twinkle_localenv_')
         os.makedirs(self._root, exist_ok=True)
         self._command_timeout = command_timeout

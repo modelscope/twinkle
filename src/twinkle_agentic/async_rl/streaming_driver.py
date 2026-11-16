@@ -26,6 +26,7 @@ from __future__ import annotations
 import copy
 import math
 import queue
+import random
 import threading
 import time
 import uuid
@@ -157,6 +158,19 @@ class _Episode:
     #: The episode's training rows as the last step returned them (one, or one per collected
     #: segment); an unfinished episode holds none.
     deliver: List[Any] = field(default_factory=list)
+    #: The trajectory this episode was submitted with, kept so a no-slot retry can resubmit the same
+    #: member slot without touching group_attempt or the quality-regeneration budget.
+    submit_traj: Any = None
+    #: No-slot retry state (scheduling delay, not failure): when to retry next, the wall-clock deadline
+    #: after which the group is dropped, and how many no-slot returns this member has accumulated.
+    no_slot_retry_at: Optional[float] = None
+    no_slot_deadline: Optional[float] = None
+    no_slot_attempts: int = 0
+    #: Whether this episode currently contributes 1 to ``_inflight``. True from submission until it
+    #: finishes, is lost, or returns no-slot (the call returned, the member waits to retry). Lets
+    #: ``_drop_group`` decrement exactly the episodes still counted, so a no-slot member waiting retry
+    #: is not decremented a second time.
+    counted_inflight: bool = False
 
 
 @remote_class(execute='first', max_concurrency=8)
@@ -215,6 +229,12 @@ class StreamingDriver:
     #: One ``adjust`` call still running past this many seconds is reported as stuck: it hung
     #: inside the adapter holding its lock, so rebalancing is down until the call returns.
     ADJUST_STUCK_TIMEOUT = 300.0
+    #: No-slot retry backoff: exponential from NO_SLOT_BASE_DELAY, capped at NO_SLOT_MAX_DELAY, plus
+    #: uniform jitter in [0, NO_SLOT_JITTER] so many groups hitting a full pool at once do not retry in
+    #: lockstep (a sentinel storm). The wall-clock ceiling is the per-instance max_no_slot_wait.
+    NO_SLOT_BASE_DELAY = 0.5
+    NO_SLOT_MAX_DELAY = 15.0
+    NO_SLOT_JITTER = 0.5
 
     def __init__(self,
                  dataloader: Any,
@@ -236,7 +256,8 @@ class StreamingDriver:
                  on_sample: Optional[Callable[[RolloutStatus], Optional[bool]]] = None,
                  on_group: Optional[Callable[[Any, List[RolloutStatus], int], List[Any]]] = None,
                  max_group_regenerations: int = 0,
-                 cluster_adapter: Any = None):
+                 cluster_adapter: Any = None,
+                 max_no_slot_wait: float = 1800.0):
         if num_generations < 1 or batch_size < 1 or batch_size % num_generations:
             raise ValueError(f'batch_size ({batch_size}) must be a positive multiple of num_generations '
                              f'({num_generations}): a batch holds whole groups.')
@@ -270,6 +291,10 @@ class StreamingDriver:
         self.on_group = on_group
         self.max_group_regenerations = max_group_regenerations
         self.cluster_adapter = cluster_adapter
+        #: Wall-clock ceiling on how long one member may keep retrying a full session pool before its
+        #: group is loudly dropped. Scheduling delay is not quality regeneration: it never spends
+        #: max_group_regenerations or increments group_attempt, but it must still be bounded.
+        self.max_no_slot_wait = max_no_slot_wait
 
         self._lock = threading.Condition()
         self._events: 'queue.Queue[Tuple[Any, ...]]' = queue.Queue()
@@ -292,7 +317,7 @@ class StreamingDriver:
         self._consecutive_failures = 0
         self._counters: Dict[str, int] = {
             'admitted': 0, 'dropped_stale': 0, 'dropped_sample': 0, 'dropped_group': 0, 'episode_errors': 0,
-            'stopped': 0, 'regenerated': 0
+            'stopped': 0, 'regenerated': 0, 'no_slot': 0, 'no_slot_dropped': 0
         }
         self._adjusting = False
         #: monotonic stamps: when the running ``adjust`` started, and when its being stuck was last reported.
@@ -386,6 +411,17 @@ class StreamingDriver:
         # together, so the batch is never half-published.
         with self._lock:
             self._drop_stale()
+            if self.checkpoint_manager is not None:
+                # Same-window backstop the old whole-group min(version) drop provided: after _drop_stale
+                # every ready member is within max_staleness of the current version, so a group's own
+                # span cannot exceed it. A violation means a member slipped through staleness handling.
+                for members in self._ready:
+                    versions = [episode.version for episode in members]
+                    if versions and max(versions) - min(versions) > self.max_staleness:
+                        raise RuntimeError(
+                            f'ready group spans {max(versions) - min(versions)} policy versions '
+                            f'({min(versions)}..{max(versions)}), more than max_staleness='
+                            f'{self.max_staleness}; per-member staleness left an over-age member.')
             trajs: List[Any] = []
             samples: List[RolloutStatus] = []
             scores: List[Dict[str, Any]] = []
@@ -457,22 +493,33 @@ class StreamingDriver:
         return score
 
     def _drop_stale(self) -> None:
-        """Drop ready groups more than ``max_staleness`` versions behind (under the lock).
+        """Retire over-age members of ready groups, per member (under the lock).
 
         Without a checkpoint manager the policy never changes, so nothing is stale: the version then
-        only paces admission.
+        only paces admission. A member more than ``max_staleness`` versions behind is lost back into its
+        group's ``missing`` and the group returns to ``_groups`` for ``_settle`` to regenerate exactly
+        those slots -- the fresh members are kept, not buried with the stale ones. ``_accept`` asserts the
+        group's version span stays within ``max_staleness``, the same-window backstop the old whole-group
+        ``min(version)`` drop used to provide.
         """
         if self.checkpoint_manager is None:
             return
         kept = deque()
         for members in self._ready:
-            if self._version - min(episode.version for episode in members) > self.max_staleness:
-                rows = sum(len(episode.deliver) for episode in members)
-                self._ready_rows -= rows
-                self._live -= len(members)
-                self._counters['dropped_stale'] += len(members)
-            else:
+            stale = [episode for episode in members if self._version - episode.version > self.max_staleness]
+            if not stale:
                 kept.append(members)
+                continue
+            group = members[0].group
+            self._ready_rows -= sum(len(episode.deliver) for episode in members)
+            self._groups[group.key] = group
+            for episode in stale:
+                episode.lost = True
+                episode.counted_inflight = False
+                group.missing += 1
+                self._live -= 1
+                self._counters['dropped_stale'] += 1
+            self._settle(group)
         self._ready = kept
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
@@ -535,6 +582,7 @@ class StreamingDriver:
                 with self._lock:
                     self._version = max(self._version, version)
                     self._admit()
+                    self._retry_no_slot_due()
                     self._lock.notify_all()
                 _record_driver_probe('admit', live=self._live, capacity=self._capacity(),
                                      qsize=self._events.qsize(), version=version)
@@ -666,12 +714,16 @@ class StreamingDriver:
         traj = dict(traj)
         traj.update(episode_id=episode.episode_id, group_key=group.key, role=role,
                     policy_version=episode.version, group_attempt=group.attempt)
+        episode.submit_traj = traj
         self._inflight += 1
+        episode.counted_inflight = True
         self._step(episode, traj)
         return episode
 
     def _step(self, episode: _Episode, traj: Any) -> None:
-        future = self.rollout.step(traj, episode_id=episode.episode_id)
+        # session_wait=0: the admission loop never blocks on a full session pool -- a no-slot status
+        # comes back along the return channel and the member is retried later (see _no_slot).
+        future = self.rollout.step(traj, episode_id=episode.episode_id, session_wait=0)
         _record_driver_probe('step_submitted', episode.episode_id)
 
         def _done(f, episode=episode):
@@ -699,7 +751,14 @@ class StreamingDriver:
                 if exc is not None:
                     self._fail(episode, exc)
                 else:
-                    self._on_step(episode, *future.result())
+                    rows, sample = future.result()
+                    if sample.no_slot:
+                        # Short-circuit BEFORE _on_step: a no-slot return must not write traj/sample/done,
+                        # must not score a PRM segment (a bogus end_turn would break _process_row), and
+                        # must not advance the turn. It is a scheduling delay, handled by retry.
+                        self._no_slot(episode)
+                    else:
+                        self._on_step(episode, rows, sample)
             elif kind == 'orm':
                 episode.orm[index] = future.result()[0]
                 episode.orm_pending -= 1
@@ -781,6 +840,7 @@ class StreamingDriver:
         """An episode that will produce no sample: its group is short one member (under the lock)."""
         episode.lost = True
         self._inflight -= 1
+        episode.counted_inflight = False
         group = episode.group
         if episode.role == _BASELINE:
             self._drop_group(group)
@@ -788,6 +848,56 @@ class StreamingDriver:
         group.missing += 1
         self._live -= 1
         self._settle(group)
+
+    def _no_slot(self, episode: _Episode) -> None:
+        """A step found no free session permit (under the lock): retry this member later, not a failure.
+
+        Only ``_inflight`` moves -- the call returned, so the episode is no longer counted; ``missing``
+        and ``_live`` stay put because the member still owns its slot and will produce a sample, and
+        ``group_attempt`` is untouched because a scheduling delay is not a quality regeneration. The
+        episode stays neither finished nor lost, so ``_settle``'s all-done gate keeps the group waiting
+        (siblings keep running, finished samples are kept) until the retry succeeds or the deadline drops it.
+        """
+        self._inflight -= 1
+        episode.counted_inflight = False
+        self._counters['no_slot'] += 1
+        now = time.monotonic()
+        if episode.no_slot_deadline is None:
+            episode.no_slot_deadline = now + self.max_no_slot_wait
+        episode.no_slot_attempts += 1
+        delay = min(self.NO_SLOT_BASE_DELAY * (2 ** (episode.no_slot_attempts - 1)), self.NO_SLOT_MAX_DELAY)
+        episode.no_slot_retry_at = now + delay + random.uniform(0, self.NO_SLOT_JITTER)
+
+    def _retry_no_slot_due(self) -> None:
+        """Resubmit members whose no-slot backoff has elapsed (under the lock, called from ``_run``).
+
+        Each retry replaces only its own member/baseline slot with a fresh episode submitted from the
+        same trajectory at the same group attempt -- never the ``_settle`` loop that redoes ALL lost
+        members. The carried attempt count and deadline keep the exponential backoff and the wall-clock
+        ceiling monotonic across retries.
+        """
+        now = time.monotonic()
+        for group in list(self._groups.values()):
+            if group.key not in self._groups:
+                continue
+            for slots in (group.members, group.baselines):
+                for index, episode in enumerate(slots):
+                    if episode.no_slot_retry_at is None or episode.no_slot_retry_at > now:
+                        continue
+                    if episode.no_slot_deadline is not None and now > episode.no_slot_deadline:
+                        self._counters['no_slot_dropped'] += 1
+                        logger.warning(f'group {group.key} dropped: member {episode.episode_id} could not get '
+                                       f'a session slot within {self.max_no_slot_wait:.0f}s '
+                                       f'({episode.no_slot_attempts} no-slot retries)')
+                        self._drop_group(group)
+                        break
+                    episode.no_slot_retry_at = None
+                    fresh = self._submit(group, copy.deepcopy(episode.submit_traj), episode.role)
+                    fresh.no_slot_attempts = episode.no_slot_attempts
+                    fresh.no_slot_deadline = episode.no_slot_deadline
+                    slots[index] = fresh
+                if group.key not in self._groups:
+                    break
 
     def _maybe_finish(self, episode: _Episode) -> None:
         if not episode.done or episode.finished or episode.lost or episode.orm_pending or episode.prm_pending:
@@ -812,6 +922,7 @@ class StreamingDriver:
             return
         episode.finished = True
         self._inflight -= 1
+        episode.counted_inflight = False
         self._settle(episode.group)
 
     # ------------------------------------------------------------------ groups
@@ -879,8 +990,9 @@ class StreamingDriver:
             episode.lost = True
             if episode.role != _BASELINE:
                 self._live -= 1
-            if not episode.finished:
+            if episode.counted_inflight:
                 self._inflight -= 1
+                episode.counted_inflight = False
                 if episode.held is not None:
                     # waiting for its PRM scores, no step in flight; a stepping one is stopped when it returns
                     self.rollout.stop(episode.traj, episode_id=episode.episode_id)

@@ -218,6 +218,7 @@ class AgentEnv(Env):
                  refresh_timeout: bool = True,
                  include_default_tools: bool = True,
                  pre_tool_call: Optional[Callable[[str, Dict[str, Any]], Optional[str]]] = None,
+                 session_wait_timeout: Optional[float] = 600.0,
                  **kwargs):
         """
         Args:
@@ -257,7 +258,7 @@ class AgentEnv(Env):
         if not template:
             raise ValueError("AgentEnv requires 'template'. Build one first, e.g. "
                              '`aenv pull ubuntu:22.04 --name my-env`.')
-        super().__init__(max_sessions)
+        super().__init__(max_sessions, session_wait_timeout=session_wait_timeout)
         # Where this deployment lives travels with the instance, as arguments to
         # the SDK, rather than through the E2B_* environment variables the SDK
         # would otherwise read: those are process-global, so two AgentEnvs

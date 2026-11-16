@@ -124,13 +124,30 @@ class SessionNotFound(KeyError):
     """The episode has no open session here: never reset, already closed, or its replica is gone."""
 
 
+@dataclass(frozen=True)
+class NoSlot:
+    """``reset`` found every session permit taken and was asked not to wait (``wait=0``).
+
+    A value, not an exception: the driver's admission loop treats a full pool as a scheduling
+    delay (retry the member later), not a failure, so it must travel back along the normal
+    ``(rows, RolloutStatus)`` return channel rather than raise. Frozen and field-less so it
+    pickles by value across the Ray boundary and ``isinstance`` identifies it on either side --
+    a module-level singleton compared with ``is`` would not survive the pickle.
+    """
+
+
 class _Session:
-    __slots__ = ('state', 'reward', 'touched')
+    __slots__ = ('state', 'reward', 'touched', 'script_inflight')
 
     def __init__(self, state: Any):
         self.state = state
         self.reward = 0.0
         self.touched = time.monotonic()
+        #: A whole script (agent program / verifier) is executing in this session right now. Such a
+        #: session is alive even when it makes no env calls for a long time, so idle reaping must
+        #: skip it -- ``touched`` only refreshes on env method calls and would otherwise age out a
+        #: running program and reclaim its permit mid-run.
+        self.script_inflight = False
 
 
 class Env(ABC):
@@ -174,11 +191,15 @@ class Env(ABC):
     #: Seconds ``reset`` waits for a free session before it gives up with ``TimeoutError``.
     session_wait_timeout = 600.0
 
-    def __init__(self, max_sessions: int = 64):
+    def __init__(self, max_sessions: int = 64, session_wait_timeout: Optional[float] = 600.0):
         self._max_sessions = max(1, int(max_sessions))
         self._session_slots = threading.Semaphore(self._max_sessions)
         self._sessions: Dict[str, _Session] = {}
         self._sessions_lock = threading.Lock()
+        #: Instance default for how long ``reset`` waits for a free permit; a per-call ``wait``
+        #: override (see :meth:`reset`) takes precedence. Three states: positive = wait up to this
+        #: many seconds then raise; None = wait forever; 0 = return :class:`NoSlot` immediately.
+        self.session_wait_timeout = session_wait_timeout
 
     # ------------------------------------------------------------------
     # Hooks
@@ -216,28 +237,40 @@ class Env(ABC):
     def _close_idle_sessions(self) -> None:
         now = time.monotonic()
         with self._sessions_lock:
-            idle = [eid for eid, session in self._sessions.items() if now - session.touched > self.session_idle_timeout]
+            idle = [eid for eid, session in self._sessions.items()
+                    if not session.script_inflight and now - session.touched > self.session_idle_timeout]
         for eid in idle:
             logger.warning(f'{type(self).__name__}: closing session {eid!r}, idle for over '
                            f'{self.session_idle_timeout:.0f}s.')
             self.close(eid)
 
     @remote_function(enable_continous_work=True, sticky_key='episode_id')
-    def reset(self, episode_id: str, traj: Optional[Trajectory] = None) -> StepResult:
+    def reset(self, episode_id: str, traj: Optional[Trajectory] = None, wait: Optional[float] = None) -> Any:
         """Open the episode's session (closing an earlier one under the same id); returns the first observation.
 
-        Waits while every session is taken, up to :attr:`session_wait_timeout`.
+        ``wait`` overrides the instance :attr:`session_wait_timeout` for this call only: a positive
+        number waits up to that many seconds then raises ``TimeoutError``; ``None`` waits forever;
+        ``0`` returns :class:`NoSlot` immediately when every permit is taken (the driver's admission
+        loop uses this to retry a member later instead of blocking). ``wait=None`` inherits the
+        instance default, so the batch ``__call__`` and ``stream`` paths keep their current behavior.
         """
         self._close_idle_sessions()
         if episode_id in self._sessions:
             self.close(episode_id)
-        if not self._session_slots.acquire(timeout=self.session_wait_timeout):
+        effective = self.session_wait_timeout if wait is None else wait
+        if effective is None:
+            acquired = self._session_slots.acquire()
+        else:
+            acquired = self._session_slots.acquire(timeout=effective)
+        if not acquired:
+            if effective == 0:
+                return NoSlot()
             with self._sessions_lock:
                 now = time.monotonic()
                 holders = sorted((eid, now - session.touched) for eid, session in self._sessions.items())
             detail = ', '.join(f'{eid} idle {age:.0f}s' for eid, age in holders[:8])
             raise TimeoutError(
-                f'{type(self).__name__}: no free session within {self.session_wait_timeout:.0f}s '
+                f'{type(self).__name__}: no free session within {effective:.0f}s '
                 f'({self._max_sessions} permits, {len(holders)} sessions registered). '
                 f'Holders: {detail or "none"}. '
                 'Fewer registered sessions than permits means the missing permits are held by resets '
@@ -307,7 +340,12 @@ class Env(ABC):
             value is the script's, except for a timeout, which is
             :data:`TIMEOUT_EXIT_CODE`.
         """
-        return self._run_script(self._session(episode_id).state, source, interpreter, timeout)
+        session = self._session(episode_id)
+        session.script_inflight = True
+        try:
+            return self._run_script(session.state, source, interpreter, timeout)
+        finally:
+            session.script_inflight = False
 
     @remote_function(enable_continous_work=True, sticky_key='episode_id')
     def workspace(self, episode_id: str) -> Optional[str]:

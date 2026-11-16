@@ -219,8 +219,9 @@ class OpenEnv(Env):
                  action_cls=None,
                  action_mapper=None,
                  max_sessions: int = 64,
+                 session_wait_timeout: Optional[float] = 600.0,
                  **kwargs):
-        super().__init__(max_sessions=max_sessions)
+        super().__init__(max_sessions=max_sessions, session_wait_timeout=session_wait_timeout)
         if env_cls is None and env_name is None:
             raise ValueError("Either 'env_name' or 'env_cls' is required. "
                              "Example: OpenEnv(env_name='openspiel_env', env_kwargs={'game_name': 'blackjack'})")
@@ -422,6 +423,7 @@ class OpenEnvClient(Env):
                  message_timeout_s: float = 120.0,
                  client_kwargs: Optional[Dict[str, Any]] = None,
                  max_sessions: int = 64,
+                 session_wait_timeout: Optional[float] = 600.0,
                  **kwargs):
         """
         Args:
@@ -446,7 +448,7 @@ class OpenEnvClient(Env):
             client_kwargs: Extra kwargs for the OpenEnv client constructor.
             max_sessions: Sessions this component holds open at once.
         """
-        super().__init__(max_sessions=max_sessions)
+        super().__init__(max_sessions=max_sessions, session_wait_timeout=session_wait_timeout)
         if env_cls is None and env_name is None:
             raise ValueError("Either 'env_name' or 'env_cls' is required. "
                              "Example: OpenEnvClient(env_name='coding_env', base_url='http://host:8000')")
