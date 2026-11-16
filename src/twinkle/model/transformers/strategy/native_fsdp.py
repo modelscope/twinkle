@@ -28,6 +28,8 @@ def _shard_builtin_task_heads(model, *, mesh, reshard_after_forward, mp_policy):
     # The head wrapper owns unsharding for the readout backward instead of the root wrapper.
     heads = [getattr(model, name, None) for name in ('score', 'classifier')]
     heads.extend((getattr(model, 'task_heads', None) or {}).values())
+    # Future tenants can bind any preallocated slot after the root is already sharded.
+    heads.extend(module for name, module in model.named_children() if name.startswith('task_head_slot_'))
     seen = set()
     for head in heads:
         if (head is None or id(head) in seen or getattr(head, 'keep_fp32', False)

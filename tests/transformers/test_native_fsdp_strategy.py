@@ -131,10 +131,18 @@ def test_builtin_score_head_is_sharded_before_the_root_model():
     assert model_call.args[0] is model
 
 
-def test_attached_standard_head_is_sharded_independently():
+@pytest.mark.parametrize('preallocated', [False, True])
+def test_attached_standard_head_is_sharded_independently(preallocated):
     model = torch.nn.Module()
     model.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
-    model.task_heads = {'': torch.nn.Linear(4, 1).to(torch.bfloat16)}
+    if preallocated:
+        from twinkle.model.multi_lora import MultiLoraTaskHeadSlots
+
+        slots = MultiLoraTaskHeadSlots(2)
+        slots.build(model, lambda: torch.nn.Linear(4, 1).to(torch.bfloat16))
+        slots.bind('a', model)
+    else:
+        model.task_heads = {'': torch.nn.Linear(4, 1).to(torch.bfloat16)}
     strategy = NativeFSDPStrategy(device_mesh=MagicMock(), mixed_precision='bf16', enable_ep=False)
 
     with patch('twinkle.model.transformers.strategy.native_fsdp._build_fsdp_mesh',
@@ -142,9 +150,13 @@ def test_attached_standard_head_is_sharded_independently():
          patch('twinkle.model.transformers.strategy.native_fsdp.fully_shard') as fully_shard:
         strategy.wrap_model(model)
 
-    assert fully_shard.call_count == 2
-    assert fully_shard.call_args_list[0].args[0] is model.task_heads['']
-    assert model.task_heads['']._twinkle_independent_fsdp
+    assert fully_shard.call_count == (3 if preallocated else 2)
+    if preallocated:
+        slots.bind('b', model)
+        assert model.task_heads['b']._twinkle_independent_fsdp
+        assert fully_shard.call_args_list[1].args[0] is model.task_heads['b']
+    assert fully_shard.call_args_list[0].args[0] is model.task_heads['a' if preallocated else '']
+    assert all(head._twinkle_independent_fsdp for head in model.task_heads.values())
 
 
 def test_optimizer_restore_accepts_lazy_state_for_unused_parameters():

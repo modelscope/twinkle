@@ -542,6 +542,8 @@ Attached-head checkpoints save parameters and calibration buffers together, incl
 
 For full-parameter Megatron decision training, optimizer checkpoints use MCore's native model-space format with CPU aggregation. Reserve host memory for the complete optimizer state; restore uses the format recorded in checkpoint metadata. Other tasks and Megatron FSDP retain their existing formats.
 
+Real-device validation covers text-only StartLux 4B with Transformers LoRA and Megatron LoRA/full. Transformers full and multimodal training remain unvalidated. Native ST save/resume and family-loader compatibility for derived text-only Qwen3.5 checkpoints depend on separate Swift patches, currently pending and not delivered by this PR. The complete ST Megatron path is not connected yet.
+
 ### Automatic sampling scaling
 
 Set instance counts and the scaling target in the `args` of your `import_path: sampler` entry. For example:
