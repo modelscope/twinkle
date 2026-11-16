@@ -1074,20 +1074,28 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         """
         if not self.is_zero_stage(3):
             return
-        engine = _resolve_engine(model)
+        zero_params = [p for p in params if hasattr(p, 'ds_id')]
+        if not zero_params:
+            return
+        try:
+            engine = _resolve_engine(model)
+        except ValueError:
+            # ZeRO-3 partitions parameters at load time, but the engine is built lazily at the first
+            # training step (_lazy_wrap_model). The initial weight sync runs before that, so the
+            # parameters are already sharded while no engine exists yet. There is also no optimizer
+            # or parameter offloader at that point, hence no in-flight gather to drain: gather the
+            # parameters directly instead of refusing to read them.
+            zero_params[0].all_gather(param_list=zero_params)
+            return
         optimizer = getattr(engine, 'optimizer', None)
         parameter_offload = getattr(optimizer, 'parameter_offload', None)
         if parameter_offload is None:
             # An engine shape we have not met: fall back to a synchronous gather with no
             # re-partition (the old behavior) rather than guessing at internals.
-            zero_params = [p for p in params if hasattr(p, 'ds_id')]
-            if zero_params:
-                zero_params[0].all_gather(param_list=zero_params)
+            zero_params[0].all_gather(param_list=zero_params)
             return
         parameter_offload.partition_all_parameters()
-        zero_params = [p for p in params if hasattr(p, 'ds_id')]
-        if zero_params:
-            zero_params[0].all_gather(param_list=zero_params)
+        zero_params[0].all_gather(param_list=zero_params)
 
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
         """Collect LoRA parameters, trained modules_to_save copies and their buffers, gathering under ZeRO-3."""
