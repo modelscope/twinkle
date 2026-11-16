@@ -511,25 +511,6 @@ Release models when training finishes; Twinkle clients can call `remove_adapter(
 
 Complete configurations are available in `cookbook/client/server/transformer/server_config.yaml` and `cookbook/client/server/megatron/server_config.yaml`.
 
-### Swift decision models
-
-Install a Swift version compatible with Twinkle on both the server and client. For example, to deploy StartLux for LoRA training, replace the corresponding fields in an existing model application's `args`, keeping its device layout and instance limits:
-
-```yaml
-model_id: ms://StartLuxAI/StartLux-Decision-v1.1-4B-AutoThink
-backend: transformers
-train_mode: lora
-task_type: decision
-model_loader: swift.dev.model.loader:build_model_loader
-max_loras: 2
-env_vars:
-  TWINKLE_TRUST_REMOTE_CODE: '1'
-```
-
-`TWINKLE_TRUST_REMOTE_CODE` allows model code to be loaded; enable it only for trusted models. For client-side training, use the model's corresponding Swift data processing, template and loss configuration. Configure different tasks as separate model applications.
-
-To use Megatron, set `backend: megatron` and configure its device group and parallelism. The model must be supported by the Megatron backend. When saving optimizer state for full-parameter Megatron decision training, reserve host memory for the complete optimizer state.
-
 ### Automatic sampling scaling
 
 Set instance counts and the scaling target in the `args` of your `import_path: sampler` entry. For example:
