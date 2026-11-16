@@ -648,7 +648,11 @@ class GRPOLoss(Loss):
                     entropies[alignment_mask].float(), 1.0 - self.top_entropy_quantile)
                 entropy_mask = entropies.ge(threshold)
 
-        if truncated is not None:
+        if self.overlong_filter and truncated is not None:
+            # Overlong completions are excluded from the objective only when overlong_filter is on, matching
+            # the fused-linear path (liger_fused_linear_grpo._fused_call). The per-row ``truncated`` flags are
+            # always supplied by the RL loop, but with the filter off a truncated completion still trains on
+            # its generated tokens -- masking it unconditionally would zero the whole sample's gradient.
             truncated_mask = torch.as_tensor(truncated, dtype=torch.bool, device=device).reshape(-1, 1)
             mask = mask & ~truncated_mask
 

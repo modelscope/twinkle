@@ -464,3 +464,40 @@ class TestAdvancedControlsWithoutAdvantages:
         mask = torch.ones(2, 4, dtype=torch.bool)
         with pytest.raises(AssertionError, match='rows but the mask batch'):
             loss._pad_and_align_to_batch(torch.randn(3, 4), mask, mask.device, torch.float32)
+
+
+class TestOverlongFilterGate:
+    """The per-row ``truncated`` (overlong) flags exclude a sample only when ``overlong_filter`` is on.
+
+    The configured surrogate used to apply ``mask & ~truncated_mask`` unconditionally, so an overlapping
+    run -- ``rollout_importance_sampling_mode`` active forces the configured pipeline while
+    ``overlong_filter`` stays at its default False -- zeroed a whole sample's gradient whenever a
+    completion hit ``max_new_tokens`` (nonzero advantage, zero loss/grad). The fused-linear path
+    (``liger_fused_linear_grpo._fused_call``) already gates on ``overlong_filter``; these cases pin the
+    plain configured path to the same contract. Reverse-verification: restoring the unconditional mask
+    makes ``test_truncated_flag_is_ignored_when_overlong_filter_off`` go red (flagged loss drops to 0).
+    """
+
+    def _batch(self):
+        inputs = {'labels': torch.tensor([[1, 1]])}
+        outputs = {'logps': torch.tensor([[-0.5, -0.5]], requires_grad=True)}
+        return inputs, outputs
+
+    def _kwargs(self, outputs):
+        logps = outputs['logps'].detach()
+        return dict(old_logps=logps, advantages=torch.tensor([[2.0]]), rollout_logps=logps)
+
+    def test_truncated_flag_is_ignored_when_overlong_filter_off(self):
+        loss = GRPOLoss(rollout_importance_sampling_mode='token_truncate')
+        inputs, outputs = self._batch()
+        kwargs = self._kwargs(outputs)
+        baseline = loss(inputs, outputs, **kwargs)['loss']
+        flagged = loss(inputs, outputs, truncated=[True], **kwargs)['loss']
+        assert baseline.item() != 0.0  # the row really carries training signal
+        torch.testing.assert_close(flagged, baseline)
+
+    def test_truncated_sample_excluded_when_overlong_filter_on(self):
+        loss = GRPOLoss(overlong_filter=True, rollout_importance_sampling_mode='token_truncate')
+        inputs, outputs = self._batch()
+        result = loss(inputs, outputs, truncated=[True], **self._kwargs(outputs))
+        assert result['loss'].item() == 0.0
