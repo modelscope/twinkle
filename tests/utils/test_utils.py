@@ -8,6 +8,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+try:
+    import torch_npu  # noqa: F401
+    _NPU_AVAILABLE = torch.npu.is_available()
+except (ImportError, RuntimeError):
+    _NPU_AVAILABLE = False
+
 from twinkle.utils import (
     deep_getattr,
     is_valid_ipv6_address,
@@ -326,6 +332,22 @@ class TestSelectiveLogSoftmax:
         index = torch.tensor([1, 3])
 
         assert _npu_cross_entropy_log_probs(logits, index) is None
+
+    @pytest.mark.skipif(not _NPU_AVAILABLE, reason='requires NPU')
+    def test_npu_fp32_fast_path_matches_log_softmax(self):
+        logits = torch.randn(64, 151936, device='npu', dtype=torch.float32, requires_grad=True)
+        index = torch.randint(0, logits.shape[-1], (64, ), device='npu')
+        reference_logits = logits.detach().clone().requires_grad_(True)
+
+        actual = selective_log_softmax(logits, index)
+        expected = reference_logits.log_softmax(-1).gather(
+            -1, index.unsqueeze(-1)).squeeze(-1)
+        grad_logps = torch.randn_like(actual)
+        actual_gradient = torch.autograd.grad(actual, logits, grad_logps)[0]
+        expected_gradient = torch.autograd.grad(expected, reference_logits, grad_logps)[0]
+
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-4, atol=1e-5)
 
 
 class TestPadAndStackTensors:
