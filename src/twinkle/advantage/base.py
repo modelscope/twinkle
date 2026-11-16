@@ -505,6 +505,7 @@ class Advantage:
                                    'zero_advantage_rows': _zero_row_fraction(advantages)}
         # Rows that carried no signal, counted per lane so a silently broken scorer is visible:
         # zero advantage alone cannot distinguish "never scored" from "scored and average".
+        summary['unscored_orm_rows'] = sum(all(value != value for value in row) for row in matrix_rows)
         if baselines is not None:
             summary['unscored_baseline_rows'] = sum(value != value for value in baselines)
         if self.use_prm:

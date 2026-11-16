@@ -59,6 +59,9 @@ class GAEAdvantage(Advantage):
                                              'old_logps': old_logps, 'old_values': old_values})
         return new_trajs, {'estimator': type(self).__name__, 'num_rows': len(trajs),
                            'unscored_rows': sum(unscored),
+                           # Per-row form of the same count: the caller re-indexes the lane when a
+                           # restore drops rows, and a scalar would keep counting the dropped ones.
+                           'unscored_flags': list(unscored),
                            'mean_advantage': _mean(advantages), 'mean_return': _mean(returns),
                            'absmean_advantage': _absmean(advantages),
                            'zero_advantage_rows': _zero_row_fraction(advantages),
