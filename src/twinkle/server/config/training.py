@@ -73,6 +73,16 @@ class TrainingArguments(BaseModel):
     num_labels: int | None = Field(default=None, gt=0, strict=True)
     language_model_only: bool | None = Field(default=None, strict=True)
 
+    @field_validator('extra_torch_kwargs')
+    @classmethod
+    def _validate_torch_kwargs(cls, value):
+        if value is not None:
+            allowed = {'seed', 'full_determinism', 'tf32'}
+            unknown = set(value) - allowed
+            if unknown:
+                raise ValueError(f'unsupported extra_torch_kwargs keys {sorted(unknown)}; expected {sorted(allowed)}')
+        return value
+
     @model_validator(mode="after")
     def _validate_head(self):
         if self.task_type == "seq_cls" and self.num_labels is None:

@@ -1,3 +1,4 @@
+import sys
 from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
@@ -58,26 +59,34 @@ def test_weights_only_load_refreshes_target_master_params_and_preserves_adam_sta
     assert other.master.item() == other.model_parameter.item() == 11.
 
 
-@pytest.mark.parametrize('task,sharding', [(None, 'dp_reshardable'), ('decision', 'dp_reshardable'),
-                                          ('decision', 'fsdp_dtensor')])
-def test_mcore_optimizer_save_uses_versioned_torch_dist_strategy(tmp_path, monkeypatch, task, sharding):
+@pytest.mark.parametrize('api', ['legacy', 'current'])
+@pytest.mark.parametrize('sharding', ['dp_reshardable', 'fsdp_dtensor'])
+def test_mcore_optimizer_save_uses_versioned_torch_dist_strategy(tmp_path, monkeypatch, api, sharding):
     pytest.importorskip('megatron.core', reason='requires the optional Megatron backend')
     from megatron.core import dist_checkpointing
     from megatron.core import parallel_state as mpu
 
     captured = {}
 
-    def save(state_dict, checkpoint_dir, sharded_strategy=None, common_strategy=None,
-             validate_access_integrity=True, async_sharded_save=False,
-             preprocess_common_before_consistancy_check=None, content_metadata=None):
-        captured.update(strategy=sharded_strategy, async_save=async_sharded_save,
-                        metadata=content_metadata)
+    def record(strategy, async_save, **kwargs):
+        captured.update(strategy=strategy, async_save=async_save, **kwargs)
 
-    monkeypatch.setattr(dist_checkpointing, 'save', save)
+    def legacy_save(state_dict, checkpoint_dir, sharded_strategy=None, common_strategy=None,
+                    validate_access_integrity=True, async_sharded_save=False,
+                    preprocess_common_before_consistancy_check=None):
+        record(sharded_strategy, async_sharded_save)
+
+    def current_save(state_dict, checkpoint_dir, sharded_strategy=None, common_strategy=None,
+                     validate_access_integrity=True, async_sharded_save=False,
+                     preprocess_common_before_consistancy_check=None, content_metadata=None,
+                     async_strategy='nvrx'):
+        record(sharded_strategy, async_sharded_save, metadata=content_metadata, async_strategy=async_strategy)
+
+    monkeypatch.setattr(dist_checkpointing, 'save', legacy_save if api == 'legacy' else current_save)
     monkeypatch.setattr(mpu, 'get_data_parallel_world_size', lambda **kwargs: 1)
     metadata = {'sharded': True, 'distrib_optim_sharding_type': sharding}
     wrapper = SimpleNamespace(
-        model=object(), _head_task=task,
+        model=object(),
         strategy=SimpleNamespace(get_sharded_sd_metadata=lambda: metadata),
         _generate_state_dict=lambda **kwargs: {'optimizer': {}},
     )
@@ -90,18 +99,21 @@ def test_mcore_optimizer_save_uses_versioned_torch_dist_strategy(tmp_path, monke
     assert captured['strategy'].version == 1
     assert captured['strategy'].thread_count == 3
     assert captured['async_save'] is False
-    assert captured['metadata'] is metadata
-    expected = 'fully_reshardable' if task == 'decision' and sharding == 'dp_reshardable' else sharding
-    assert metadata['distrib_optim_sharding_type'] == expected
-    assert metadata.get('distrib_optim_fully_reshardable_mem_efficient', False) == (expected == 'fully_reshardable')
+    assert metadata == {'sharded': True, 'distrib_optim_sharding_type': sharding}
+    if api == 'current':
+        assert captured['metadata'] is metadata
+        assert captured['async_strategy'] == 'mcore'
+    else:
+        assert 'metadata' not in captured
+        assert 'async_strategy' not in captured
     assert (tmp_path / 'latest_checkpointed_iteration.txt').read_text() == '1'
 
 
-def test_mixed_precision_optimizer_checkpoint_uses_the_actual_main_param_order(monkeypatch):
+def test_mixed_precision_optimizer_checkpoint_uses_the_actual_main_param_order():
     pytest.importorskip('megatron.core', reason='requires the optional Megatron backend')
-    import torch
-    from megatron.core import optimizer as mcore_optimizer
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    from twinkle.model.megatron.megatron import _align_distributed_optimizer_param_order
 
     low = torch.nn.Parameter(torch.ones(8, dtype=torch.bfloat16))
     head = torch.nn.Parameter(torch.ones(3))
@@ -109,33 +121,28 @@ def test_mixed_precision_optimizer_checkpoint_uses_the_actual_main_param_order(m
     distributed = object.__new__(DistributedOptimizer)
     distributed.model_float16_groups = [[low]]
     distributed.model_fp32_groups = [[head]]
-    # MCore builds these indices in gradient-buffer order, then reorders the
-    # inner optimizer's main parameters to FP32 first. A mixed group must agree.
     distributed.model_param_group_index_map = {low: (0, 0), head: (0, 1)}
     distributed.optimizer = torch.optim.Adam([head, master])
-    distributed.config = SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False)
-    chained = SimpleNamespace(chained_optimizers=[distributed])
-    monkeypatch.setattr(mcore_optimizer, 'get_megatron_optimizer', lambda **kwargs: chained)
-    wrapper = SimpleNamespace(model=[SimpleNamespace(ddp_config=SimpleNamespace(use_distributed_optimizer=True))],
-                              use_distributed_optimizer=True, mixed_precision='bf16')
+    distributed.ddp_config = SimpleNamespace(use_custom_fsdp=False)
+    distributed.config = SimpleNamespace(
+        use_precision_aware_optimizer=False, use_precision_aware_optimizer_no_fp8_or_ds_fp8=False)
 
-    MegatronModel._create_megatron_optimizer(wrapper)
+    _align_distributed_optimizer_param_order(SimpleNamespace(chained_optimizers=[distributed]))
 
     for param, expected in [(low, master), (head, head)]:
         assert distributed._get_main_param_and_optimizer_states(param)['param'] is expected
 
 
-def test_mcore_persisted_classifier_uses_independent_output_head(monkeypatch):
-    mcore_bridge = pytest.importorskip('mcore_bridge', reason='requires the optional Megatron bridge')
-    import torch
-    from mcore_bridge.bridge.gpt_bridge import GPTBridge
-
+def test_mcore_persisted_classifier_config(monkeypatch):
+    pytest.importorskip('megatron.core', reason='requires the optional Megatron backend')
     from twinkle import Platform
     from twinkle.model.megatron.bridge.mcore import MCoreBridgeBackend
 
-    monkeypatch.setattr(mcore_bridge, 'hf_to_mcore_config',
-                        lambda config: {'untie_embeddings_and_output_weights': False})
-    monkeypatch.setattr(mcore_bridge, 'ModelConfig', lambda **kwargs: kwargs)
+    bridge = SimpleNamespace(
+        ModelConfig=lambda **kwargs: kwargs,
+        hf_to_mcore_config=lambda config: {'untie_embeddings_and_output_weights': False},
+    )
+    monkeypatch.setitem(sys.modules, 'mcore_bridge', bridge)
     monkeypatch.setattr(Platform, 'get_platform', lambda: SimpleNamespace(
         configure_model_config=lambda config: None))
     strategy = SimpleNamespace(params_type='float32', sequence_parallel=False, variable_seq_lengths=False)
@@ -147,10 +154,19 @@ def test_mcore_persisted_classifier_uses_independent_output_head(monkeypatch):
     assert config['task_type'] == 'seq_cls'
     assert config['num_labels'] == 3
     assert config['untie_embeddings_and_output_weights'] is True
+    with pytest.raises(ValueError, match='task_type'):
+        MCoreBridgeBackend().build_model_config(hf_config, {}, strategy, task_type='causal_lm')
+    with pytest.raises(ValueError, match='num_labels'):
+        MCoreBridgeBackend().build_model_config(hf_config, {}, strategy, num_labels=2)
+
+
+def test_mcore_persisted_classifier_uses_independent_output_head():
+    pytest.importorskip('mcore_bridge', reason='requires the optional Megatron bridge')
+    from mcore_bridge.bridge.gpt_bridge import GPTBridge
 
     bridge = object.__new__(GPTBridge)
     bridge.config = SimpleNamespace(
-        task_type=config['task_type'], untie_embeddings_and_output_weights=True, padded_vocab_size=13)
+        task_type='seq_cls', untie_embeddings_and_output_weights=True, padded_vocab_size=13)
     bridge.is_multimodal = False
     bridge.tp_size = bridge.etp_size = 1
     bridge.tp_rank = bridge.etp_rank = 0

@@ -2501,6 +2501,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         checkpoint_dir = os.path.join(output_dir, name)
         if optimizer_config.cur_step % interval != 0:
             return
+        if kwargs.get('save_optimizer', False):
+            self._validate_training_state_save(adapter_name)
         if isinstance(self.strategy, NativeFSDPStrategy) and self.strategy.use_rank0_pretrained_broadcast():
             # Initial adapter snapshots precede the first forward. Materialize on every
             # rank before state-dict collectives: non-source ranks still hold meta tensors.
@@ -2604,9 +2606,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             if lr_scheduler is not None:
                 torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, 'scheduler.pt'))
 
-    def _save_training_state(self, output_dir, **kwargs):
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
-        defer_trainer_state = kwargs.pop('defer_trainer_state', False)
+    def _validate_training_state_save(self, adapter_name):
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.require_finalized('save training state')
         optimizer = optimizer_config.optimizer
@@ -2616,6 +2616,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             raise ValueError(
                 'save_optimizer=True requires a complete gradient accumulation window; '
                 'finish the pending backward/optimizer steps and zero_grad before saving, or save weights only.')
+
+    def _save_training_state(self, output_dir, **kwargs):
+        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
+        defer_trainer_state = kwargs.pop('defer_trainer_state', False)
+        self._validate_training_state_save(adapter_name)
+        optimizer_config = self.optimizer_group[adapter_name]
         # The optimizer/scheduler files are written before _write_weights() gets a chance to
         # create the checkpoint dir via save_pretrained; torch.save then raises
         # "Parent directory ... does not exist". This lives HERE (not at the top of save()) so it

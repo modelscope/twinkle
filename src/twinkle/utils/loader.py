@@ -157,7 +157,7 @@ def construct_class(
     """Try to load a class.
 
     Args:
-        func: Class/instance, built-in name, plugin path, or trusted ``module:Class`` spec.
+        func: The input class or class name/plugin name to load instance from
         class_T: The base class of the instance
         module_T: The module of the class_T
         **init_args: The args to construct the instruct
@@ -179,16 +179,7 @@ def construct_class(
                 cls = getattr(module, func)
                 break
         else:
-            module_name, separator, name = func.partition(':')
-            if (separator and all(part.isidentifier() for part in module_name.split('.'))
-                    and name.isidentifier() and not Path(func).exists()):
-                if not trust_remote_code():
-                    raise ValueError('Component import specs require TWINKLE_TRUST_REMOTE_CODE != 0')
-                cls = getattr(importlib.import_module(module_name), name)
-                if not isinstance(cls, type) or not issubclass(cls, class_T):
-                    raise TypeError(f'{func!r} must name a {class_T.__name__} subclass')
-            else:
-                cls = Plugin.load_plugin(func, class_T)
+            cls = Plugin.load_plugin(func, class_T)
         return cls(**init_args)
     else:
         # Do nothing by default

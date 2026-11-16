@@ -444,13 +444,21 @@ def test_transformers_still_accepts_single_device():
 def test_native_backends_preserve_loader_and_precision_configuration(backend, mode):
     app = model_application()
     app['args'].update(backend=backend, train_mode=mode, mixed_precision='no',
-                       model_loader='worker_only.loader:load')
+                       model_loader='worker_only.loader:load', extra_torch_kwargs={'full_determinism': True})
     config = ServerConfig(applications=[app])
     restored = ServerConfig.model_validate(config.to_yaml_dict())
     model = restored.training_config.models[0]
     assert model.backend == backend and model.mode == mode
     assert model.config.model_loader == 'worker_only.loader:load'
     assert model.config.mixed_precision == 'no'
+    assert model.config.extra_torch_kwargs == {'full_determinism': True}
+
+
+def test_extra_torch_kwargs_rejects_unknown_keys():
+    app = model_application()
+    app['args']['extra_torch_kwargs'] = {'full_determinism': True, 'deterministic': True}
+    with pytest.raises(ValidationError, match='unsupported extra_torch_kwargs'):
+        ServerConfig(applications=[app])
 
 
 @pytest.mark.parametrize('backend', ['transformers', 'megatron'])

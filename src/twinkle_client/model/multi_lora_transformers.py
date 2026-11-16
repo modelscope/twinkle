@@ -422,7 +422,7 @@ class MultiLoraTransformersModel:
     # ------------------------------------------------------------------ #
 
     def save(self, name: str, **kwargs) -> model_types.SaveResponse:
-        """Save a checkpoint; save_optimizer=True requires a complete accumulation window."""
+        """Save a checkpoint; save_optimizer=True requires a completed update and cleared gradients."""
         return self._submit('save', model_types.SaveRequest, model_types.SaveResponse, name=name, **kwargs)
 
     def load(self, name: str, **kwargs) -> None:

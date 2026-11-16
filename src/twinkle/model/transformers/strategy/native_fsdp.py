@@ -24,10 +24,9 @@ PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
 
-def _shard_builtin_task_heads(model, *, mesh, reshard_after_forward, mp_policy):
+def _shard_attached_task_heads(model, *, mesh, reshard_after_forward, mp_policy):
     # The head wrapper owns unsharding for the readout backward instead of the root wrapper.
-    heads = [getattr(model, name, None) for name in ('score', 'classifier')]
-    heads.extend((getattr(model, 'task_heads', None) or {}).values())
+    heads = list((getattr(model, 'task_heads', None) or {}).values())
     # Future tenants can bind any preallocated slot after the root is already sharded.
     heads.extend(module for name, module in model.named_children() if name.startswith('task_head_slot_'))
     seen = set()
@@ -224,7 +223,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             world_size = self.device_mesh.world_size
             ep_fsdp_mesh_1d = self.ep_fsdp_device_mesh['ep_fsdp'] if ep_enabled else None
 
-            _shard_builtin_task_heads(
+            _shard_attached_task_heads(
                 model, mesh=fsdp_mesh, reshard_after_forward=reshard_after_forward, mp_policy=mp_policy)
             _shard_fp32_task_heads(
                 model, mesh=fsdp_mesh, reshard_after_forward=reshard_after_forward)
@@ -305,8 +304,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             full_state_dict=True,
             cpu_offload=not for_load,
             broadcast_from_rank0=for_load,
-            # Adam initializes state lazily, so unused trainable parameters have no entry to restore.
-            strict=not for_load,
+            strict=True,
         )
 
     def get_independent_task_head_state(self, head):
@@ -369,6 +367,10 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             optimizer,
             options=self._prepare_optimizer_state_dict_options(for_load=False),
         )
+        # DCP requires an entry for every trainable parameter; Adam leaves unused parameters uninitialized.
+        for group in optim_state['param_groups']:
+            for name in group['params']:
+                optim_state['state'].setdefault(name, {})
         if Platform.is_master():
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
             torch.save(optim_state, output_path)
@@ -391,12 +393,23 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         if Platform.is_master():
             optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
+        empty_states = None
+        if Platform.is_master():
+            empty_states = {name for name, value in optim_state['state'].items() if not value}
+        if dist.is_initialized():
+            payload = [empty_states]
+            dist.broadcast_object_list(payload, src=0)
+            empty_states = payload[0]
         set_optimizer_state_dict(
             model,
             optimizer,
             optim_state,
             options=self._prepare_optimizer_state_dict_options(for_load=True),
         )
+        # DCP initializes every Adam slot before loading; explicitly empty snapshots remain lazy.
+        parameters = dict(model.named_parameters())
+        for name in empty_states:
+            optimizer.state.pop(parameters[name], None)
 
     def get_ep_clip_kwargs(self, model) -> Dict[str, Any]:
         """Return EP-aware kwargs for normalize_and_clip_grad_norm."""

@@ -257,7 +257,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # ``_attach_task_head``.
         task_head_loader = kwargs.pop('task_head_loader', None)
         task = kwargs.pop('task', None)
-        self._head_task = task or ('decision' if task_head_loader is not None else None)
         num_labels = kwargs.pop('num_labels', None)
         if config is not None:
             self.hf_config = config
@@ -1982,13 +1981,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # The sharding type must match the data-parallel wrapper the strategy chose at wrap time
         # (Megatron-FSDP stores optimizer state as DTensors, plain DDP does not).
         sharded_sd_metadata = self.strategy.get_sharded_sd_metadata()
-        if (self._head_task == 'decision'
-                and sharded_sd_metadata.get('distrib_optim_sharding_type') == 'dp_reshardable'):
-            # A tiny FP32 calibration head can leave an empty local DP bucket.
-            # MCore's canonical model-space format supports that layout; gather
-            # on CPU so saving does not duplicate full optimizer state on device.
-            sharded_sd_metadata.update(distrib_optim_sharding_type='fully_reshardable',
-                                       distrib_optim_fully_reshardable_mem_efficient=True)
 
         no_save_rng = kwargs.pop('no_save_rng', False)
         rng_state = None if no_save_rng else self._get_rng_state()
@@ -2022,18 +2014,20 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # Async staging is only sound under an initialized process group (the metadata finalize
         # holds a barrier); a single-process run has no skew to hide anyway.
         async_save = kwargs.pop('async_save', False) and dist.is_initialized()
-        # Older supported MCore versions use the built-in queue without this option.
-        save_options = {'async_strategy': 'mcore'} if 'async_strategy' in inspect.signature(
-            dist_checkpointing.save).parameters else {}
+        save_parameters = inspect.signature(dist_checkpointing.save).parameters
+        save_options = {}
+        if 'async_strategy' in save_parameters:
+            # Avoid the optional nvidia-resiliency-ext queue on newer MCore.
+            save_options['async_strategy'] = 'mcore'
+        if 'content_metadata' in save_parameters:
+            save_options['content_metadata'] = sharded_sd_metadata
         async_request = dist_checkpointing.save(
             state_dict,
             iter_dir,
             save_strategy,
             async_sharded_save=async_save,
-            # Avoid the optional nvidia-resiliency-ext queue on newer MCore.
-            **save_options,
             validate_access_integrity=True,
-            content_metadata=sharded_sd_metadata,
+            **save_options,
         )
         if async_request is not None:
             # The strategy already staged the tensors to host memory; the queue's worker performs
