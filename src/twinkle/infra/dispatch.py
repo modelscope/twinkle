@@ -626,6 +626,27 @@ def _stash_channels(result: Any, channels: Union[bool, Sequence[Union[int, str]]
     raise TypeError(f'stash requires a tuple or dict return value, got {type(result).__name__}')
 
 
+def _record_return_probe(func_name: str, kwargs: dict) -> None:
+    """Append one record when a worker method finishes its whole return path, stash included.
+
+    A probe inside the method body cannot tell "the body returned" from "the caller's reference
+    became ready": the stash lifts channels to refs after the body is done, and the caller waits on
+    the reference, not on the body. Recording here separates an actor that never finished returning
+    from a finished return whose future the caller never saw resolve.
+    """
+    import os
+    root = os.environ.get('TWINKLE_DISPATCH_PROBE')
+    if not root:
+        return
+    import json
+    import time
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f'dispatch.{os.getpid()}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps({'t': time.monotonic(), 'event': 'worker_returned',
+                                 'func': func_name, 'episode_id': kwargs.get('episode_id')}) + '\n')
+
+
 def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
                     collect: Union[Literal['none', 'flatten', 'mean', 'first', 'last_pp_first',
@@ -748,6 +769,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                 # ``__iter__`` is exempt: it hands back the generator, not a batch, and the stash
                 # declared on it is applied per yielded value by the ``__next__`` wrapper.
                 result = _stash_channels(result, stash)
+            _record_return_probe(func.__name__, kwargs)
             return result
 
         def _call_replicas(self, args, kwargs):
