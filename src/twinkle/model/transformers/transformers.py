@@ -3420,7 +3420,24 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     yield name, tensor
                 print_weight_example(names)
 
-        return weight_generator()
+        # The gather above is a loan, not a gift: ZeRO-3's parameter coordinator drives the next
+        # forward from a recorded fetch trace, and parameters left AVAILABLE behind its back make
+        # that trace's prefetch queue pop the wrong entries ("tracing error ... expected the next
+        # N parameters in the parameter fetch queue"). Between steps the coordinator has already
+        # been reset, so putting the parameters back to the partitioned state restores exactly the
+        # state the gather found. The restore runs when the generator is exhausted or closed --
+        # after merge/unmerge and after every bucket has been copied out, never mid-stream.
+        restore = getattr(self.strategy, 'restore_params_after_read', None)
+        if restore is None:
+            return weight_generator()
+
+        def _restoring_generator():
+            try:
+                yield from weight_generator()
+            finally:
+                restore(self.model, list(model.parameters()))
+
+        return _restoring_generator()
 
     # ── Paired EMA support (policy→reference via checkpoint-engine) ─────────
     # send_weights / prepare_ema_sender / receive_weights_ema are inherited from

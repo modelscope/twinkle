@@ -1097,6 +1097,40 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         parameter_offload.partition_all_parameters()
         zero_params[0].all_gather(param_list=zero_params)
 
+    def restore_params_after_read(self, model, params) -> None:
+        """Put ZeRO-3 parameters back to the partitioned state after a read gather.
+
+        :meth:`gather_params_for_read` leaves parameters AVAILABLE so a reader can span them. The
+        parameter coordinator does not know about that gather: it drives the next forward from a
+        recorded fetch trace, and a parameter that is already AVAILABLE is skipped by the fetch yet
+        still sits in the prefetch queue, so the queue pops the wrong entries and the forward raises
+        a tracing error. Re-partitioning restores the state the gather found -- between steps the
+        coordinator has already been reset, so nothing else needs undoing.
+
+        Below stage 3, and for parameters ZeRO-3 does not own, this is a no-op.
+        """
+        if not self.is_zero_stage(3):
+            return
+        zero_params = [p for p in params if hasattr(p, 'ds_id')]
+        if not zero_params:
+            return
+        try:
+            engine = _resolve_engine(model)
+        except ValueError:
+            # The initial weight sync runs before the lazy engine exists. No coordinator, no
+            # in-flight handles and no active submodules at that point, so each parameter can be
+            # partitioned directly -- and must be, or the engine about to be built records its
+            # first fetch trace against parameters that are already gathered.
+            for param in zero_params:
+                param.partition()
+            return
+        parameter_offload = getattr(getattr(engine, 'optimizer', None), 'parameter_offload', None)
+        if parameter_offload is None:
+            for param in zero_params:
+                param.partition()
+            return
+        parameter_offload.partition_all_parameters()
+
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
         """Collect LoRA parameters, trained modules_to_save copies and their buffers, gathering under ZeRO-3."""
         unwrapped = self.unwrap_model(model)
