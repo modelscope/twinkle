@@ -1,5 +1,7 @@
+import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from twinkle.model.megatron.megatron import _generative_reranker_score
@@ -34,3 +36,45 @@ def test_full_determinism_selects_torch_gdn_kernels(monkeypatch):
     wrapper._apply_deterministic_model_kernels()
     assert gdn.chunk_gated_delta_rule is torch_chunk_gated_delta_rule
     assert gdn.causal_conv1d_fn is None
+
+
+@pytest.mark.parametrize('deterministic', [False, True])
+def test_multilora_selects_deterministic_kernels_before_eager_wrap(monkeypatch, deterministic):
+    from transformers.models.qwen3_next.modeling_qwen3_next import torch_chunk_gated_delta_rule
+    from twinkle import initialize
+    import twinkle.model.megatron.multi_lora_megatron as module
+
+    initialize(mode='local')
+    gdn = type('Qwen3NextGatedDeltaNet', (torch.nn.Module,), {})()
+    original = lambda *args: None
+    gdn.chunk_gated_delta_rule = original
+    gdn.causal_conv1d_fn = original
+
+    class Wrapped(Exception):
+        pass
+
+    class Strategy:
+        uses_fsdp = staticmethod(lambda _: False)
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_megatron_model(self, load_weights):
+            return [gdn]
+
+        def wrap_model(self, models):
+            assert gdn.chunk_gated_delta_rule is (torch_chunk_gated_delta_rule if deterministic else original)
+            assert gdn.causal_conv1d_fn is (None if deterministic else original)
+            raise Wrapped()
+
+    monkeypatch.setattr(module, 'requires', lambda *args: None)
+    monkeypatch.setattr(module, 'ensure_mindspeed_adaptor_patched', lambda: None)
+    monkeypatch.setattr(module.HubOperation, 'download_model', lambda *args, **kwargs: 'local-model')
+    monkeypatch.setattr(module.torch_util, 'set_device', lambda: None)
+    monkeypatch.setattr(module.MultiLoraMegatronModel, '_try_init_process_group', lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, 'MegatronStrategy', Strategy)
+    monkeypatch.setattr(module, 'MultiLora', lambda **kwargs: SimpleNamespace(patch=lambda models, **kw: models))
+    monkeypatch.setattr(torch, 'are_deterministic_algorithms_enabled', lambda: deterministic)
+    monkeypatch.setitem(sys.modules, 'twinkle.patch.megatron_peft', SimpleNamespace(MegatronPeft=lambda: lambda: None))
+    with pytest.raises(Wrapped):
+        module.MultiLoraMegatronModel('local-model', config=SimpleNamespace())
