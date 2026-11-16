@@ -145,6 +145,10 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
                 # unpolluted -- which is the half of the contract those two estimators need checked.
                 'response_length': len(before.get('response_token_ids') or []),
                 'baseline_raw': (scores[index].get('rewards') or {}).get('baseline') or {},
+                # The PRM lane's own inputs: each segment's end turn and every scorer's raw segment
+                # score. Without them a reader can only assert that an unscored row landed at zero,
+                # not rebuild mix*process + (1-mix)*orm for the scored rows beside it.
+                'prm_segments': scores[index].get('prm_segments'),
                 # Which regeneration attempt this row's group was admitted on. dynamic_sample's
                 # contract is that a group whose spread comes only from failed scorers is resampled,
                 # not kept; the attempt index is what tells a resampled-then-exhausted group from one
