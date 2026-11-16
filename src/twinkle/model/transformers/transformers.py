@@ -3358,6 +3358,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 # trim prefix(base_model.model.) and suffix(.base_layer)
                 def weight_generator():
                     if isinstance(model, PeftModel):
+                        # ZeRO-3 partitions parameters, so merge_adapter would read an empty local
+                        # LoRA shard and die on a size mismatch. Bring every parameter to a full
+                        # readable state first. The gather has to outlive the yields below, which
+                        # is why this is not the gather_parameters context manager: its __exit__
+                        # would re-partition mid-stream.
+                        gather = getattr(self.strategy, 'gather_params_for_read', None)
+                        if gather is not None:
+                            gather(model, list(model.parameters()))
                         model.merge_adapter()
                     names = []
                     for name, tensor in model.state_dict().items():

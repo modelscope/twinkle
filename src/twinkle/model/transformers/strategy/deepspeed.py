@@ -1029,7 +1029,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         state = collect_local_state(unwrapped, include_buffers=True)
         if self.is_zero_stage(3):
             params = [t for t in state.values() if isinstance(t, nn.Parameter)]
-            self._gather_zero3_params_for_snapshot(model, params)
+            self.gather_params_for_read(model, params)
         return {name: tensor.cpu() for name, tensor in state.items()}
 
     def load_full_state_dict(self, model, state_dict) -> None:
@@ -1044,8 +1044,14 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         else:
             unwrapped.load_state_dict(state_dict, strict=False)
 
-    def _gather_zero3_params_for_snapshot(self, model, params) -> None:
-        """Drain in-flight gathers, then collect ZeRO-3 params for a read-only snapshot.
+    def gather_params_for_read(self, model, params) -> None:
+        """Drain in-flight gathers, then bring ZeRO-3 params to a full readable state and KEEP them there.
+
+        A no-op below stage 3, where parameters are never partitioned. Unlike
+        :meth:`gather_parameters` this is not a context manager: the caller reads the weights over
+        a span it controls (a snapshot, or a generator that yields them bucket by bucket), and a
+        ``__exit__`` re-partitioning in the middle of that span would pull the buffers out from
+        under the reader.
 
         ``GatheredParameters``' ``__exit__`` partitions everything it gathered, which breaks the
         adapter/full save in two observed ways: a persist-flagged parameter (under the stage-3
@@ -1056,10 +1062,18 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         partition assert. The official drain is the parameter offloader's
         ``partition_all_parameters`` -- its ``release_and_reset_all`` waits every in-flight
         handle, clears the active-module references and releases all parameters to the
-        partitioned state. A plain synchronous ``all_gather`` then brings the snapshot's own
-        parameters back gathered, and they stay gathered: a snapshot only reads ``.cpu()``
-        copies, and deep speed re-partitions them on the next forward/backward cycle.
+        partitioned state. A plain synchronous ``all_gather`` then brings the caller's own
+        parameters back gathered, and they stay gathered: the reader only takes copies, and
+        DeepSpeed re-partitions them on the next forward/backward cycle.
+
+        Writes made to the gathered buffers do not reach the optimizer's shard:
+        ``Init._partition_param`` with ``has_been_updated=False`` frees ``param.data`` and returns
+        without copying it back into ``ds_tensor`` ("param.data does not store anything
+        meaningful in partitioned state"). That is what makes a merge/unmerge round trip over
+        these buffers safe for training.
         """
+        if not self.is_zero_stage(3):
+            return
         engine = _resolve_engine(model)
         optimizer = getattr(engine, 'optimizer', None)
         parameter_offload = getattr(optimizer, 'parameter_offload', None)
@@ -1085,7 +1099,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         if self.is_zero_stage(3):
             # ZeRO-3 partitions parameters only; buffers are plain tensors and pass through.
             params = [t for t in selected.values() if isinstance(t, nn.Parameter)]
-            self._gather_zero3_params_for_snapshot(model, params)
+            self.gather_params_for_read(model, params)
         return {n: t.cpu() for n, t in selected.items()}
 
     # -- DeepSpeed-specific -------------------------------------------------
