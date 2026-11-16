@@ -81,6 +81,55 @@ def _check_unit(name: str, value: float) -> float:
     return value
 
 
+def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: List[Dict[str, Any]],
+                            new_trajs: List[Trajectory]) -> None:
+    """Append one row per trajectory carrying the scores it was estimated from and the targets it got.
+
+    Set ``TWINKLE_ADVANTAGE_PROBE`` to a directory to enable it. The bad-score contract is per row --
+    an unscored member must land at exactly zero advantage while the group statistics stay computed
+    over the scored members only -- and the run's printed ``adv=``/``zero_adv=`` are batch aggregates
+    that a polluted group mean can still reproduce. Pairing each row's landed target against its own
+    score row is what distinguishes those two cases.
+
+    Only the columns the estimator ADDED are recorded, so the probe reports the training targets
+    rather than echoing the whole trajectory. A token-level target is summarized by its length and
+    sum: a per-token list would spend the file on one row, and the scalar family's contract is what
+    the per-row zero test reads.
+    """
+    import json
+    import os
+
+    root = os.environ.get('TWINKLE_ADVANTAGE_PROBE')
+    if not root:
+        return
+    from twinkle.data_format import ground_truth
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f'advantage.{os.getpid()}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        for index, (before, after) in enumerate(zip(trajs, new_trajs)):
+            added = {}
+            for field, value in after.items():
+                if field in before:
+                    continue
+                if isinstance(value, (list, tuple)):
+                    added[field] = {'len': len(value), 'sum': float(sum(value))}
+                elif isinstance(value, torch.Tensor):
+                    added[field] = {'len': value.numel(), 'sum': float(value.sum())}
+                else:
+                    added[field] = value
+            src_idx = ground_truth(before, 'src_idx')
+            if src_idx is None:
+                src_idx = before.get('src_idx')
+            handle.write(json.dumps({
+                'global_step': global_step,
+                'row': index,
+                'episode_id': before.get('episode_id'),
+                'src_idx': src_idx,
+                'orm': (scores[index].get('rewards') or {}).get('orm') or {},
+                'targets': added,
+            }, default=str) + '\n')
+
+
 class Advantage:
     """The model-free advantage estimation step: one call per rollout batch, before training.
 
@@ -265,8 +314,10 @@ class Advantage:
                 raise ValueError(f'trajectory {traj.get("episode_id")!r} has no rollout_logps; the '
                                  'importance-ratio math needs the sampler log-probs lane.')
             rollout_logps.append(lane)
-        return self._estimate(trajs, rollout_logps, scores, ref_out=ref_out, teacher_out=teacher_out,
-                              old_out=old_out, value_out=value_out, global_step=global_step)
+        result = self._estimate(trajs, rollout_logps, scores, ref_out=ref_out, teacher_out=teacher_out,
+                                old_out=old_out, value_out=value_out, global_step=global_step)
+        _record_advantage_probe(global_step, trajs, scores, result[0])
+        return result
 
     def _estimate(self, trajs: List[Trajectory], rollout_logps: List[List[float]],
                   scores: List[Dict[str, Any]], *,
