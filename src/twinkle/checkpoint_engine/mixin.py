@@ -239,7 +239,6 @@ class CheckpointEngineMixin:
         if errors:
             raise errors[0]
 
-    @remote_function(dispatch='all', lazy_collect=True)
     @staticmethod
     def _fingerprint_published(pairs, tag: str = ''):
         """Record each weight's exact fingerprint as it enters the transport, if the probe is on.
@@ -254,6 +253,7 @@ class CheckpointEngineMixin:
             record_weight_fingerprint('engine', 'send', seq, name, tensor, tag=tag)
             yield name, tensor
 
+    @remote_function(dispatch='all', lazy_collect=True)
     def send_weights(
         self,
         adapter_name: str = None,
