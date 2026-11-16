@@ -3363,9 +3363,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                         # readable state first. The gather has to outlive the yields below, which
                         # is why this is not the gather_parameters context manager: its __exit__
                         # would re-partition mid-stream.
+                        # Pass the PREPARED model, not the unwrapped one: the strategy resolves the
+                        # DeepSpeedEngine by walking .module, and unwrap_model peels the engine off,
+                        # so handing it the PeftModel finds no engine and raises. The parameters are
+                        # the same objects either way -- unwrapping does not copy them.
                         gather = getattr(self.strategy, 'gather_params_for_read', None)
                         if gather is not None:
-                            gather(model, list(model.parameters()))
+                            gather(self.model, list(model.parameters()))
                         model.merge_adapter()
                     names = []
                     for name, tensor in model.state_dict().items():
