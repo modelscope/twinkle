@@ -337,6 +337,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                 # -- plain HF classes reject the unknown keyword inside
                 # from_pretrained kwargs.
                 kwargs.pop('remote_group', None)
+                # instance_id disambiguates ray actor names for handles built from one call site.
+                # It is infra bookkeeping, so local mode drops it for the same reason: a component
+                # constructor must not receive it, or the same call site would work under --mode ray
+                # and raise TypeError under --mode local.
+                kwargs.pop('instance_id', None)
                 self._max_concurrency = concurrency
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
