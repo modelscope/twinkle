@@ -105,6 +105,10 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
     and largest absolute element: a per-token list would spend the file on one row, and the sum alone
     cannot prove a row is all zeros (equal positive and negative entries cancel), which is exactly
     what the unscored-row contract asserts.
+
+    Set ``TWINKLE_ADVANTAGE_TOKEN_PROBE`` to a second directory to ALSO record the raw per-token
+    advantages / returns / old_values there. A numeric oracle for a token-level estimator (rebuilding
+    the GAE recursion) needs every element, which the summaries above deliberately do not carry.
     """
     import json
     import os
@@ -112,6 +116,9 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
     root = os.environ.get('TWINKLE_ADVANTAGE_PROBE')
     if not root:
         return
+    token_root = os.environ.get('TWINKLE_ADVANTAGE_TOKEN_PROBE')
+    if token_root:
+        os.makedirs(token_root, exist_ok=True)
     from twinkle.data_format import ground_truth
     os.makedirs(root, exist_ok=True)
     path = os.path.join(root, f'advantage.{os.getpid()}.jsonl')
@@ -156,6 +163,23 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
                 'group_attempt': before.get('group_attempt'),
                 'targets': added,
             }, default=str) + '\n')
+            if token_root:
+                # The summary above cannot support a numeric oracle for a token-level estimator:
+                # rebuilding GAE needs every critic value and every advantage, not their sums. Kept
+                # behind its own gate and in its own directory so the default probe stays small and
+                # the existing summary judges are unaffected.
+                tokens = {key: list(after[key]) for key in ('advantages', 'returns', 'old_values')
+                          if isinstance(after.get(key), (list, tuple))}
+                if tokens:
+                    with open(os.path.join(token_root, f'tokens.{os.getpid()}.jsonl'),
+                              'a', encoding='utf-8') as th:
+                        th.write(json.dumps({
+                            'global_step': global_step, 'row': index,
+                            'episode_id': before.get('episode_id'),
+                            'orm': (scores[index].get('rewards') or {}).get('orm') or {},
+                            'response_length': len(before.get('response_token_ids') or []),
+                            'tokens': tokens,
+                        }, default=str) + '\n')
 
 
 class Advantage:
