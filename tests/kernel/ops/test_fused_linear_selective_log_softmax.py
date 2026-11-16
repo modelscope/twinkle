@@ -1,14 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import importlib.util
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from twinkle.kernel.ops.fused_linear_selective_log_softmax import fused_linear_selective_log_softmax
+from twinkle.kernel.ops.fused_linear_selective_log_softmax.functional import _should_use_npu_fused_kernel
 
 try:
     import torch_npu  # noqa: F401
-    _NPU_OK = True
-except ImportError:
+    _NPU_OK = torch.npu.is_available()
+except (ImportError, RuntimeError):
     _NPU_OK = False
 
 
@@ -53,6 +56,25 @@ def test_reference_matches_native(dtype, return_entropy):
     _check_forward_backward('cpu', dtype, return_entropy)
 
 
+@pytest.mark.parametrize(
+    ('device_type', 'dtype', 'triton_available', 'expected'),
+    [
+        ('npu', torch.bfloat16, True, True),
+        ('npu', torch.bfloat16, False, False),
+        ('npu', torch.float32, True, False),
+        ('cpu', torch.bfloat16, True, False),
+    ],
+)
+def test_npu_fused_kernel_requires_triton(monkeypatch, device_type, dtype, triton_available, expected):
+    def fake_find_spec(name):
+        assert name == 'triton'
+        return object() if triton_available else None
+
+    monkeypatch.setattr(importlib.util, 'find_spec', fake_find_spec)
+
+    assert _should_use_npu_fused_kernel(device_type, dtype) is expected
+
+
 @pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize('return_entropy', [False, True])
@@ -63,8 +85,8 @@ def test_npu_matches_native(shape, dtype, return_entropy):
 
 @pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
 def test_npu_entropy_only_backward():
-    x = torch.randn(8, 16, device='npu', requires_grad=True)
-    weight = torch.randn(97, 16, device='npu', requires_grad=True)
+    x = torch.randn(8, 16, device='npu', dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(97, 16, device='npu', dtype=torch.bfloat16, requires_grad=True)
     targets = torch.randint(0, 97, (8, ), device='npu')
     _, entropies = fused_linear_selective_log_softmax(x, weight, targets, return_entropy=True)
     _, expected = _native(x, weight, targets, 1.0, True)
@@ -72,7 +94,7 @@ def test_npu_entropy_only_backward():
     actual = torch.autograd.grad(entropies, (x, weight), grad)
     wanted = torch.autograd.grad(expected, (x, weight), grad)
     for actual_grad, expected_grad in zip(actual, wanted):
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1.6e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
@@ -94,12 +116,17 @@ def test_npu_mixed_precision_matches_native():
 
 @pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
 def test_npu_frozen_weight_skips_weight_gradient():
-    x = torch.randn(8, 16, device='npu', requires_grad=True)
-    weight = torch.randn(97, 16, device='npu')
+    x = torch.randn(8, 16, device='npu', dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(97, 16, device='npu', dtype=torch.bfloat16)
     targets = torch.randint(0, 97, (8, ), device='npu')
     logps = fused_linear_selective_log_softmax(x, weight, targets)
-    grad_x, = torch.autograd.grad(logps.sum(), x)
-    assert grad_x.shape == x.shape
+    expected = _native(x, weight, targets, 1.0, False)
+    grad = torch.randn_like(logps)
+    grad_x, = torch.autograd.grad(logps, x, grad)
+    expected_grad_x, = torch.autograd.grad(expected, x, grad)
+
+    torch.testing.assert_close(logps, expected, rtol=1.6e-2, atol=1e-2)
+    torch.testing.assert_close(grad_x, expected_grad_x, rtol=1.6e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')

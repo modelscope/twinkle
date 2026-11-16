@@ -2,6 +2,7 @@
 """Device dispatch for fused linear selective log-softmax."""
 from __future__ import annotations
 
+import importlib.util
 import math
 import torch
 import torch.nn.functional as F
@@ -29,6 +30,15 @@ def _validate_inputs(x, weight, targets, temperature):
         raise ValueError(f'temperature must be finite and positive, got {temperature!r}')
 
 
+def _should_use_npu_fused_kernel(device_type, dtype):
+    if device_type != 'npu' or dtype != torch.bfloat16:
+        return False
+    try:
+        return importlib.util.find_spec('triton') is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def fused_linear_selective_log_softmax_reference(x, weight, targets, temperature=1.0, return_entropy=False):
     """Native PyTorch semantics used on non-NPU devices and as the test oracle."""
     logits = F.linear(x, weight).div_(temperature)
@@ -51,14 +61,16 @@ def fused_linear_selective_log_softmax(x, weight, targets, temperature=1.0, retu
     with a BF16 weight follow the usual mixed-precision cast. FP32 inputs and
     non-NPU devices use the native PyTorch reference: the strict FP32 gradient
     tolerance requires native-order reductions, which measured slower than the
-    native pipeline itself, so only the BF16 path ships a fused kernel.
+    native pipeline itself, so only the BF16 path ships a fused kernel. The BF16
+    NPU path also falls back to the reference when the optional Triton runtime is
+    unavailable, rather than failing after the model forward.
     """
     temperature = float(temperature)
     _validate_inputs(x, weight, targets, temperature)
     targets = targets.long()
     if x.dtype != weight.dtype:
         x = x.to(weight.dtype)
-    if x.device.type == 'npu' and x.dtype == torch.bfloat16:
+    if _should_use_npu_fused_kernel(x.device.type, x.dtype):
         from .npu import npu_fused_linear_selective_log_softmax
         return npu_fused_linear_selective_log_softmax(x, weight, targets, temperature, return_entropy)
     return fused_linear_selective_log_softmax_reference(x, weight, targets, temperature, return_entropy)
