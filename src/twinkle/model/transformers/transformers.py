@@ -3349,6 +3349,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # making it the canonical name that ``_check_skipped_aliases`` wants to see loaded.
             return {name for name in model.state_dict() if name.split('.')[-2:-1] == ['lm_head']}
 
+        # ZeRO-3 partitions parameters, so every branch below would otherwise read an empty local
+        # shard: the base sync walks state_dict(), the LoRA-only sync walks the adapter state dict,
+        # and merge_adapter reads the LoRA matrices to fold them in. Gather once here so all three
+        # see full tensors. This is not the gather_parameters context manager: its __exit__ would
+        # re-partition mid-stream, and the generators below yield lazily across the whole sync.
+        # Pass the PREPARED model -- the strategy resolves the DeepSpeedEngine by walking .module,
+        # and unwrap_model peels the engine off, so handing it the PeftModel finds no engine. The
+        # parameter objects are the same either way; unwrapping does not copy them.
+        gather = getattr(self.strategy, 'gather_params_for_read', None)
+        if gather is not None:
+            gather(self.model, list(model.parameters()))
+
         _tied_duplicates = _tied_duplicate_names()
 
         if base_sync_done and adapter_name:
@@ -3358,18 +3370,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 # trim prefix(base_model.model.) and suffix(.base_layer)
                 def weight_generator():
                     if isinstance(model, PeftModel):
-                        # ZeRO-3 partitions parameters, so merge_adapter would read an empty local
-                        # LoRA shard and die on a size mismatch. Bring every parameter to a full
-                        # readable state first. The gather has to outlive the yields below, which
-                        # is why this is not the gather_parameters context manager: its __exit__
-                        # would re-partition mid-stream.
-                        # Pass the PREPARED model, not the unwrapped one: the strategy resolves the
-                        # DeepSpeedEngine by walking .module, and unwrap_model peels the engine off,
-                        # so handing it the PeftModel finds no engine and raises. The parameters are
-                        # the same objects either way -- unwrapping does not copy them.
-                        gather = getattr(self.strategy, 'gather_params_for_read', None)
-                        if gather is not None:
-                            gather(self.model, list(model.parameters()))
                         model.merge_adapter()
                     names = []
                     for name, tensor in model.state_dict().items():
