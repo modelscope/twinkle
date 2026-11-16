@@ -422,8 +422,9 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 continue
             flat = group.detach().flatten()
             chunks = self._full_coverage_chunks(flat.numel()) if at_full_step else 64
-            out[str(index)] = {
-                'agg': self._aggregate(self._chunk_stats(flat, chunks=chunks)),
+            stats = self._chunk_stats(flat, chunks=chunks)
+            entry = {
+                'agg': self._aggregate(stats),
                 'chunks': chunks,
                 'covered': self._coverage_complete(flat.numel(), chunks) if at_full_step else False,
                 'bits': self._bits_fingerprint(flat),
@@ -435,6 +436,16 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 # destination buffer rather than left as an unexplained residue.
                 **self._buffer_identity(group),
             }
+            if at_full_step:
+                # ``agg`` sizes a difference and ``bits`` decides whether there is one, but neither says
+                # where: on a 4,538,761,984-element group the element budget inside ``_full_coverage_chunks``
+                # makes even the full-step read partial, so a difference confined to that group could not be
+                # located. Keeping the per-chunk sums for the step under investigation turns a differing
+                # chunk range into parameter names through the layout digest, which is what separates a
+                # per-parameter branch from a difference spread evenly over the whole group. Only at that
+                # step: the list is as long as the chunk count, ~16k here and ~1.1M without the budget.
+                entry['chunk_sums'] = [s[0] for s in stats]
+            out[str(index)] = entry
         return out
 
     @staticmethod
@@ -528,6 +539,17 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         tier carrying no readable gradient shows up as such instead of reading as "gradients matched".
         """
         import torch
+
+        # An offload tier fills this partition with a ``non_blocking`` device-to-host copy, so reading it
+        # before that copy lands measures a mixture of two steps rather than one gradient. Measured, not
+        # hypothetical: inside a single digest of a single arm, the strided ``agg`` and the all-element
+        # ``bits`` -- taken one after the other from the same tensor -- disagreed with each other across a
+        # fresh/resume pair (``bits`` equal while ``agg`` differed), which is only possible if the bytes
+        # changed between the two reads. Synchronizing first lands every copy already issued, so one digest
+        # describes one instant. Same guard, same reason as ``_digest_parameters``. This method only runs
+        # when the step-delta probe is on, so training that is not being measured pays nothing.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         # The default stride samples 2.6% of a multi-billion element partition. That is enough to say a
         # difference exists and roughly where, but not enough to say it is confined there: a post-update
