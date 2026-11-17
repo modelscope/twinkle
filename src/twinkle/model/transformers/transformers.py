@@ -71,9 +71,32 @@ def _no_sync_context(model, should_sync):
     partition_gradients = getattr(model, "zero_optimization_partition_gradients", None)
     if callable(partition_gradients) and partition_gradients():
         return contextlib.nullcontext()  # ZeRO-2/3 does not support no_sync.
-    if not should_sync and hasattr(model, "no_sync"):
-        return model.no_sync()
+    if not should_sync:
+        if hasattr(model, "no_sync"):
+            return model.no_sync()
+        from torch.distributed.fsdp import FSDPModule
+        if isinstance(model, FSDPModule):
+            return _fsdp2_no_sync_context(model)
     return contextlib.nullcontext()
+
+
+@contextlib.contextmanager
+def _fsdp2_no_sync_context(model):
+    # Preserve every FSDP unit's flags across nested forward/backward contexts.
+    from torch.distributed.fsdp import FSDPModule
+    previous = []
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            group = module._get_fsdp_state()._fsdp_param_group
+            if group is not None:
+                previous.append((module, group.reduce_grads, group.all_reduce_grads))
+    try:
+        model.set_requires_gradient_sync(False)
+        yield
+    finally:
+        for module, reduce_grads, all_reduce_grads in previous:
+            module.set_requires_gradient_sync(reduce_grads, recurse=False)
+            module.set_requires_all_reduce(all_reduce_grads, recurse=False)
 
 
 def _get_vocab_size(config: PretrainedConfig) -> int:
