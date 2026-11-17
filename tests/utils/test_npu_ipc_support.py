@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -37,3 +38,20 @@ def test_npu_ipc_detection_errors_are_not_hidden(monkeypatch):
 
     with pytest.raises(RuntimeError, match='npu-smi failed'):
         npu.NPU.is_ipc_supported()
+
+
+def test_npu_fallback_identity_matches_physical_device_across_visible_masks(monkeypatch):
+    def unsupported(*args):
+        raise NotImplementedError
+
+    monkeypatch.setitem(sys.modules, 'vllm.platforms', SimpleNamespace(
+        current_platform=SimpleNamespace(get_device_uuid=unsupported)))
+    monkeypatch.setattr(npu, '_get_npu_bus_id_from_npu_smi', lambda *args: None)
+    monkeypatch.setattr(npu.socket, 'gethostname', lambda: 'node-a')
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES', '13')
+    trainer = npu.NPU.get_vllm_device_uuid(0)
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES', '6,8,9,13')
+    assert npu.NPU.get_vllm_device_uuid(3) == trainer
+    assert npu.NPU.get_vllm_device_uuid(0) != trainer
+    monkeypatch.setattr(npu.socket, 'gethostname', lambda: 'node-b')
+    assert npu.NPU.get_vllm_device_uuid(3) != trainer

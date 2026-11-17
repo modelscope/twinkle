@@ -1,4 +1,5 @@
 """Direct colocate routing must preserve rank pairing and publish only after both peers finish."""
+import threading
 from types import SimpleNamespace as NS
 
 import pytest
@@ -8,6 +9,7 @@ from twinkle.checkpoint_engine.manager import CheckpointEngineManager
 
 def manager(devices=None, targets=None, failure=False):
     events = []
+    submitted = threading.Barrier(2)
     devices = devices or ['gpu0', 'gpu1', 'gpu2', 'gpu3']
     targets = targets or [{'device_uuid': 'gpu0', 'endpoint': 'a'}, {'device_uuid': 'gpu2', 'endpoint': 'b'}]
 
@@ -15,8 +17,10 @@ def manager(devices=None, targets=None, failure=False):
         events.append((label, args, kwargs))
 
         def wait():
-            assert [row[0] for row in events][:2] == ['send', 'receive']
+            submitted.wait(timeout=5)
+            assert sorted(row[0] for row in events[:2]) == ['receive', 'send']
             events.append((label + '_done', (), {}))
+            submitted.wait(timeout=5)
             if failure == label or (failure is True and label == 'receive'):
                 raise RuntimeError(label + ' failed')
 
@@ -29,10 +33,10 @@ def manager(devices=None, targets=None, failure=False):
     state._model_keys = ['weight']
     state.base_sync_done = False
     state._peft_config = None
-    state.colocate_trainer_ranks = None
     state.model = NS(direct_weight_sync_device=lambda: devices,
                      send_weights_to_vllm=lambda *args, **kwargs: submit('send', *args, **kwargs))
-    state.sampler = NS(direct_weight_sync_metadata=lambda: targets)
+    state.sampler = NS(direct_weight_sync_metadata=lambda: targets,
+                       receive_weights_direct=lambda *args, **kwargs: submit('receive', *args, **kwargs))
     state._ensure_model_keys = lambda: None
     return state, events
 
@@ -41,7 +45,8 @@ def test_both_endpoints_are_submitted_before_waiting_and_no_payload_reaches_driv
     state, events = manager()
     assert state._sync_weights_direct_vllm(True)
     assert state.base_sync_done
-    assert [row[0] for row in events] == ['send', 'receive', 'send_done', 'receive_done']
+    assert sorted(row[0] for row in events[:2]) == ['receive', 'send']
+    assert sorted(row[0] for row in events[2:]) == ['receive_done', 'send_done']
     assert events[0][2]['auth_key'] == events[1][2]['auth_key'] == 'authenticated'
     assert events[0][2]['base_sync_done'] is False
     assert all(set(target) == {'device_uuid', 'endpoint'} for target in events[0][1][0])
@@ -58,7 +63,7 @@ def test_sender_failure_still_collects_receiver_and_releases_its_lock():
     state, events = manager(failure='send')
     with pytest.raises(RuntimeError, match='send failed'):
         state._sync_weights_direct_vllm(True)
-    assert [row[0] for row in events][-2:] == ['send_done', 'receive_done']
+    assert sorted(row[0] for row in events[-2:]) == ['receive_done', 'send_done']
     assert not state.base_sync_done
 
 
@@ -74,20 +79,17 @@ def test_invalid_physical_pairings_are_rejected_before_any_send(devices, targets
     assert not events
 
 
-def test_explicit_subset_is_paired_by_uuid():
-    state, _ = manager(targets=[{'device_uuid': 'gpu3', 'endpoint': 'c'}])
-    state.colocate_trainer_ranks = (3,)
+def test_receiver_subset_is_paired_by_uuid():
+    state, events = manager(targets=[{'device_uuid': 'gpu3', 'endpoint': 'c'}])
     assert state._sync_weights_direct_vllm(True)
-    state.colocate_trainer_ranks = (0,)
-    with pytest.raises(ValueError, match='colocate_trainer_ranks'):
-        state._sync_weights_direct_vllm(True)
+    assert next(row for row in events if row[0] == 'send')[1][0] == [
+        {'device_uuid': 'gpu3', 'endpoint': 'c'}]
 
 
-def test_each_tp_worker_has_a_local_sender_and_explicit_leaders_still_match():
+def test_each_tp_worker_has_a_local_sender():
     targets = [[{'device_uuid': f'gpu{rank}', 'endpoint': str(rank)} for rank in (0, 1)],
                [{'device_uuid': f'gpu{rank}', 'endpoint': str(rank)} for rank in (2, 3)]]
     state, events = manager(targets=targets)
-    state.colocate_trainer_ranks = (0, 2)
     assert state._sync_weights_direct_vllm(True)
     assert len(events[0][1][0]) == 4
 
@@ -97,10 +99,10 @@ def test_lora_only_update_also_uses_the_direct_transport():
     state.base_sync_done = True
     state._peft_config = {'r': 16}
     assert state._sync_weights_direct_vllm(False)
-    assert [row[0] for row in events] == ['send', 'receive', 'send_done', 'receive_done']
-    assert events[0][2]['merge_and_sync'] is False
-    assert events[0][2]['peft_config'] == {'r': 16}
-    assert events[1][2]['peft_config'] == {'r': 16}
+    assert sorted(row[0] for row in events[:2]) == ['receive', 'send']
+    assert sorted(row[0] for row in events[2:]) == ['receive_done', 'send_done']
+    assert next(row for row in events if row[0] == 'send')[2]['merge_and_sync'] is False
+    assert all(row[2]['peft_config'] == {'r': 16} for row in events[:2])
     assert state.base_sync_done
 
 
@@ -133,3 +135,15 @@ def test_non_sender_drains_the_entire_export():
     state = NS(direct_weight_sync_device=lambda: 'idle', _get_weight_generator=weights)
     CheckpointEngineMixin.send_weights_to_vllm(state, [{'device_uuid': 'gpu0', 'endpoint': 'a'}])
     assert visited == ['first', 'second', 'third']
+
+
+def test_sorted_npu_tp_masks_pair_every_worker_by_physical_uuid():
+    # Trainer rank order can differ from the sorted device masks of its TP replicas.
+    devices = ['npu6', 'npu13', 'npu8', 'npu9', 'npu10', 'npu11', 'npu7', 'npu12']
+    targets = [[{'device_uuid': f'npu{rank}', 'endpoint': str(rank)} for rank in group]
+               for group in ((6, 8, 9, 13), (7, 10, 11, 12))]
+    state, events = manager(devices=devices, targets=targets)
+    assert state._sync_weights_direct_vllm(True)
+    sent = next(row for row in events if row[0] == 'send')[1][0]
+    assert {target['device_uuid'] for target in sent} == set(devices)
+    assert len(sent) == 8

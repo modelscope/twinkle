@@ -199,10 +199,9 @@ class NPU(Platform):
             bus_id = _get_npu_bus_id_from_npu_smi(device_id)
             if bus_id:
                 return bus_id
-            # fix: If npu-smi is unavailable, fall back to deterministic hash instead of failing hard.
-            # Generic deterministic fallback to keep sender/receiver socket names aligned.
-            visible = os.environ.get(Platform.visible_device_env())
-            raw = f'{socket.gethostname()}:{visible}:{device_id}'
+            # A trainer and its vLLM worker may expose different visible-device lists.
+            # Identify their common physical device, not the process-local index or mask.
+            raw = f'{socket.gethostname()}:{_resolve_ascend_physical_device_id(device_id)}'
             return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
 
     @staticmethod

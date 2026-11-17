@@ -218,7 +218,8 @@ class TwinkleWorkerExtension:
                       if row['device_uuid'] == self.weight_sync_metadata()['device_uuid'])
         return self.update_weights_from_ipc(
             peft_config=peft_config, zmq_handle=target['endpoint'], auth_key=auth_key,
-            base_sync_done=base_sync_done, independent=True)
+            base_sync_done=base_sync_done, independent=True,
+            use_shm=not Platform.get_platform().supports_device_ipc())
 
     @streaming_weight_sync()
     def update_weights_from_ipc(
