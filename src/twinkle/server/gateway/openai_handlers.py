@@ -280,6 +280,14 @@ async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
     except Exception:
         pass
 
+    # Static adapter entries from the deployment's supported_models (name -> base_model):
+    # a swift `--adapters` deployment registers its adapter names here, so requests with
+    # the adapter's name route to the sampler that serves its base model. Registry
+    # rebuilds without the deployment present lose these entries (known limitation).
+    for entry in gateway.supported_models:
+        if entry.base_model and entry.model_name == model:
+            return entry.base_model
+
     # Check if it's directly a supported base model
     if model in gateway.supported_model_names:
         return model
@@ -455,6 +463,10 @@ def _streaming_response(
                     extra_headers=sticky_headers,
             ):
                 chunk_data = json.loads(line)
+                if isinstance(chunk_data.get('error'), str):
+                    yield f"data: {json.dumps({'error': make_error(
+                        message=chunk_data['error'], error_type='server_error')})}\n\n"
+                    return
                 openai_chunk = chunk_translator(chunk_data.get('delta', ''), chunk_data.get('finish_reason'))
                 yield f'data: {json.dumps(openai_chunk)}\n\n'
 

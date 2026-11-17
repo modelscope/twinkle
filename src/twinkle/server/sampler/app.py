@@ -104,9 +104,17 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     - Tinker inference requests (/tinker/asample) with rate limiting via TaskQueueMixin
     - Concurrent Twinkle inference requests (/twinkle/*) with future polling
     - Template configuration for trajectory encoding
+
+    ``__init__`` must stay synchronous: Ray Serve's FastAPI ingress wrapper calls the
+    user constructor synchronously (ASGIIngressWrapper in ray/serve/api.py -- an async
+    ``__init__``'s coroutine is never awaited, so none of its body runs and the first
+    health check dies on a missing attribute). The constructor's async half -- awaiting
+    engine-actor readiness and pinning the chat template through the backend gate -- is
+    completed from :meth:`check_health`, the first instance method Ray Serve awaits.
+    Failing there still fails the deployment loudly, matching the old async-init semantics.
     """
 
-    async def __init__(self,
+    def __init__(self,
                        model_id: str,
                        nproc_per_node: int,
                        device_group: dict[str, Any],
@@ -116,6 +124,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
                        queue_config: TaskQueueConfig | None = None,
                        data_plane_url: str | None = None,
                        template: dict[str, Any] | None = None,
+                       adapters: dict[str, Any] | None = None,
                        **kwargs):
         self.request_runtime = SamplerRuntime(self)
         self.device_group = DeviceGroup(**device_group)
@@ -137,6 +146,10 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         )
         self.sampler_type = sampler_type
         self.model_id = model_id
+        # Deployed LoRA name->path mapping (SamplerArgs.adapters): /twinkle/sample* fall back
+        # to it when the request carries no adapter_uri, which is the OpenAI-gateway shape --
+        # clients pass only the adapter's public name as ``model``.
+        self.deploy_adapters: dict[str, Any] = adapters or {}
         if context is not None:
             self.replica_id = context.instance_id
         else:
@@ -159,8 +172,6 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         else:
             sampler_kwargs.update(kwargs)
         self.sampler = _construct_sampler_backend(sampler_type, sampler_kwargs, data_plane_url)
-        actors = getattr(self.sampler, '_actors', ())
-        await asyncio.gather(*(actor.__ray_ready__.remote() for actor in actors))
 
         self.state: ServerState = get_server_state()
         from twinkle.server.data_plane import DataPlaneProxy
@@ -177,12 +188,28 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         self.sampler._ray_get_timeout = None
         self.sampling_guard = SamplerConcurrency()
 
+        self._template_pinned = False
+        # Async half's inputs (consumed by _complete_startup): engine readiness wait + template pin.
+        self._startup_template = template
+        self._startup_async_done = False
+
+    async def _complete_startup(self) -> None:
+        """The constructor's async half (see the class docstring for why it lives here).
+
+        Engine-actor readiness and template pinning are awaited once, from the
+        first :meth:`check_health` -- a failure there still fails the deployment
+        loudly, matching the old async-init semantics. Runs after the synchronous
+        constructor: ``_init_task_queue`` has installed the BackendGate that
+        ``call_backend`` needs.
+        """
+        actors = getattr(self.sampler, '_actors', ())
+        await asyncio.gather(*(actor.__ray_ready__.remote() for actor in actors))
+
         # Pin the chat template at construction when the deployment configured one, so the replica
         # serves Trajectory inputs from its first request without waiting for the gateway's lazy
         # name-based fallback. A pinned template also wins over any later /twinkle/set_template call
         # (see the handler), which keeps that crude fallback from clobbering an explicitly chosen one.
-        # Runs after _init_task_queue: call_backend needs the BackendGate it installs.
-        self._template_pinned = False
+        template = self._startup_template
         if template and hasattr(self.sampler, 'set_template'):
             template_kwargs = dict(template)
             template_cls = template_kwargs.pop('template_cls', None)
@@ -192,8 +219,9 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
                     f'{sorted(template_kwargs) or "none"}')
             await self.call_backend(self.sampler.set_template, template_cls, **template_kwargs)
             self._template_pinned = True
-        if sampler_type != 'mock' and not self._template_pinned:
-            await self.call_backend(self.sampler.set_template, get_template_for_model(model_id), model_id=model_id)
+        if self.sampler_type != 'mock' and not self._template_pinned:
+            await self.call_backend(self.sampler.set_template, get_template_for_model(self.model_id),
+                                    model_id=self.model_id)
 
     async def shutdown(self) -> None:
         self.sampling_guard.close()
@@ -226,6 +254,12 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         return await self.request_runtime.runtime_identity()
 
     async def check_health(self) -> None:
+        # First awaited instance method after the synchronous constructor: complete the
+        # async half once (engine readiness + template pin). A failure here fails the
+        # deployment loudly, exactly like the old async-init semantics.
+        if not self._startup_async_done:
+            self._startup_async_done = True
+            await self._complete_startup()
         self.sampling_guard.check_available()
 
     async def _on_request_start(self, request: Request) -> str:
@@ -244,6 +278,7 @@ def build_sampler_app(model_id: str,
                       queue_config: TaskQueueConfig | None = None,
                       data_plane_url: str | None = None,
                       template: dict[str, Any] | None = None,
+                      adapters: dict[str, Any] | None = None,
                       **kwargs):
     """Build a unified sampler application for text generation inference.
 
@@ -311,9 +346,10 @@ def build_sampler_app(model_id: str,
         deployment_name='SamplerManagement',
         bind_args=(model_id, nproc_per_node, device_group, device_mesh, sampler_type, engine_args, queue_config,
                    data_plane_url),
-        # ``template`` is an explicit named parameter, so it is not in ``kwargs``; forward it explicitly
-        # or the pinned-template branch in ``SamplerManagement.__init__`` never runs.
-        bind_kwargs={**kwargs, 'template': template},
+        # ``template`` / ``adapters`` are explicit named parameters, so they are not in
+        # ``kwargs``; forward them explicitly or the pinned-template / deployed-adapter
+        # branches in ``SamplerManagement.__init__`` never run.
+        bind_kwargs={**kwargs, 'template': template, 'adapters': adapters},
     )
 
 
