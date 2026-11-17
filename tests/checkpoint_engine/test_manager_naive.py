@@ -157,6 +157,57 @@ def test_local_weight_generator_failure_does_not_mark_base_sync_done():
     assert manager.base_sync_done is False
 
 
+def test_abandon_channel_marks_dirty_and_resets_asynchronously():
+    # 7675d550: a failed sync must abandon the channel (members=None, base_sync_done=False) and
+    # dispatch the peer reset on a daemon thread WITHOUT waiting for it. A synchronous close would
+    # re-enter this actor through Ray and block on _sync_lock (or on a peer stuck in the failed
+    # collective), swallowing the original error. Kills a revert to synchronous teardown: the
+    # blocking close below would then run inside _abandon_channel and `assert not closed` fails.
+    import threading
+    import time
+
+    model = _Model([('q_proj.weight', 'base')])
+    manager = CheckpointEngineManager(model, _Sampler(), platform='CPU')
+    manager._members = ['replica']
+    manager.base_sync_done = True
+    entered, release, closed = threading.Event(), threading.Event(), []
+
+    def blocking_close():
+        entered.set()
+        release.wait(timeout=5)
+        closed.append(True)
+
+    manager._close_checkpoint_channel = blocking_close
+    manager._abandon_channel()  # must return before blocking_close finishes
+    assert manager._members is None
+    assert manager.base_sync_done is False
+    assert entered.wait(timeout=2)  # the reset thread started
+    assert not closed  # close is still blocked -> abandon did not wait on it
+    release.set()
+    for _ in range(100):
+        if closed:
+            break
+        time.sleep(0.02)
+    assert closed  # the daemon-thread reset eventually ran
+
+
+def test_abandon_channel_reset_error_does_not_propagate():
+    # The reset runs best-effort: a peer that cannot serve it must not mask the original sync error.
+    # Kills a revert that lets the reset exception escape _abandon_channel synchronously.
+    model = _Model([('q_proj.weight', 'base')])
+    manager = CheckpointEngineManager(model, _Sampler(), platform='CPU')
+    manager._members = ['replica']
+    manager.base_sync_done = True
+
+    def broken_close():
+        raise RuntimeError('reset failed')
+
+    manager._close_checkpoint_channel = broken_close
+    manager._abandon_channel()  # must not raise
+    assert manager._members is None
+    assert manager.base_sync_done is False
+
+
 def test_mixed_deployment_shape_fails_at_initialization():
     model = _Model([])
     sampler = _Sampler()
