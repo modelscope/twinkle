@@ -29,9 +29,11 @@ def _native(x, weight, targets, temperature, return_entropy):
     return logps, entropies
 
 
-def _check_forward_backward(device, dtype, return_entropy, shape=(17, 12, 5000)):
+def _check_forward_backward(device, dtype, return_entropy, shape=(17, 12, 5000), seed=2026):
     rows, hidden, vocab = shape
-    torch.manual_seed(2026)
+    torch.manual_seed(seed)
+    if device == 'npu':
+        torch.npu.manual_seed(seed)
     x = torch.randn(rows, hidden, device=device, dtype=dtype, requires_grad=True)
     weight = torch.randn(vocab, hidden, device=device, dtype=dtype, requires_grad=True)
     targets = torch.randint(0, vocab, (rows, ), device=device)
@@ -159,6 +161,13 @@ def test_real_vocab_matches_native(dtype):
 @pytest.mark.parametrize('return_entropy', [False, True])
 def test_npu_real_vocab_matches_native(dtype, return_entropy):
     _check_forward_backward('npu', dtype, return_entropy, shape=(128, 2048, 151936))
+
+
+@pytest.mark.skipif(not _NPU_OK, reason='torch_npu unavailable')
+def test_npu_real_vocab_entropy_backward_normalizes_probabilities():
+    # Regression coverage for the large-logit entropy path. Reusing the forward
+    # row sum avoids an unnormalized exp(logits - lse) approximation in backward.
+    _check_forward_backward('npu', torch.bfloat16, True, shape=(256, 2048, 151936), seed=20261117)
 
 
 def test_float_targets_are_rejected():

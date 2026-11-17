@@ -56,13 +56,13 @@ def fused_linear_selective_log_softmax_reference(x, weight, targets, temperature
 def fused_linear_selective_log_softmax(x, weight, targets, temperature=1.0, return_entropy=False):
     """Compute selected log-probabilities from hidden states without exposing logits.
 
-    The Ascend Triton implementation owns the logits workspace and reuses it for its
-    gradient. It supports one first-order backward per forward. FP32 hidden states
-    with a BF16 weight follow the usual mixed-precision cast. FP32 inputs and
-    non-NPU devices use the native PyTorch reference: the strict FP32 gradient
-    tolerance requires native-order reductions, which measured slower than the
-    native pipeline itself, so only the BF16 path ships a fused kernel. The BF16
-    NPU path also falls back to the reference when the optional Triton runtime is
+    The Ascend Triton implementation owns the BF16 logits workspace and reuses it
+    for log-probability gradients. Entropy backward follows PyTorch's FP32 softmax
+    and BF16 division rounding so its gradients match the reference under the
+    strict BF16 tolerance. It supports one first-order backward per forward. FP32
+    hidden states with a BF16 weight follow the usual mixed-precision cast. FP32
+    inputs and non-NPU devices use the native PyTorch reference. The BF16 NPU path
+    also falls back to the reference when the optional Triton runtime is
     unavailable, rather than failing after the model forward.
     """
     temperature = float(temperature)

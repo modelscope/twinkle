@@ -10,7 +10,7 @@ NUM_WARPS = 8
 
 
 @triton.jit
-def stats_row_kernel(LOGITS, TARGETS, LSE, LOGPS, V, BLOCK_SIZE: tl.constexpr):
+def stats_row_kernel(LOGITS, TARGETS, ROW_MAX, ROW_SUM, LSE, LOGPS, V, BLOCK_SIZE: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     base = row * V
     target = tl.load(TARGETS + row)
@@ -28,66 +28,57 @@ def stats_row_kernel(LOGITS, TARGETS, LSE, LOGPS, V, BLOCK_SIZE: tl.constexpr):
             tl.where((tl.arange(0, BLOCK_SIZE) == local_target) & (local_target >= 0) & (local_target < BLOCK_SIZE),
                      values, 0.0), 0)
     lse = running_max + tl.log(running_sum)
+    tl.store(ROW_MAX + row, running_max)
+    tl.store(ROW_SUM + row, running_sum)
     tl.store(LSE + row, lse)
     tl.store(LOGPS + row, target_logit - lse)
 
 
 @triton.jit
-def backward_row_kernel(LOGITS, TARGETS, LSE, EXPECTED, GRAD_LOGPS, GRAD_ENTROPIES, V, HAS_ENTROPY: tl.constexpr,
-                        BLOCK_SIZE: tl.constexpr):
+def backward_row_kernel(LOGITS, TARGETS, ROW_MAX, ROW_SUM, GRAD_LOGPS, V, BLOCK_SIZE: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     base = row * V
     target = tl.load(TARGETS + row)
-    lse = tl.load(LSE + row)
+    row_max = tl.load(ROW_MAX + row)
+    row_sum = tl.load(ROW_SUM + row)
     grad_logp = tl.load(GRAD_LOGPS + row).to(tl.float32)
-    if HAS_ENTROPY:
-        grad_entropy = tl.load(GRAD_ENTROPIES + row).to(tl.float32)
-        expected = tl.load(EXPECTED + row)
-    else:
-        grad_entropy = 0.0
-        expected = 0.0
     for i in range(0, tl.cdiv(V, BLOCK_SIZE)):
         offsets = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < V
         logits = tl.load(LOGITS + base + offsets, mask=mask, other=-float('inf')).to(tl.float32)
-        probabilities = tl.exp(logits - lse)
+        probabilities = tl.exp(logits - row_max) / row_sum
         grad = -(probabilities * grad_logp)
-        if HAS_ENTROPY:
-            grad += probabilities * (grad_entropy * (expected - logits))
         grad = tl.where(offsets == target, grad + grad_logp, grad)
         tl.store(LOGITS + base + offsets, grad.to(LOGITS.dtype.element_ty), mask=mask)
 
 
 @triton.jit
-def expected_row_kernel(LOGITS, LSE, EXPECTED, V, BLOCK_SIZE: tl.constexpr):
+def expected_row_kernel(LOGITS, ROW_MAX, ROW_SUM, EXPECTED, V, BLOCK_SIZE: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     base = row * V
-    lse = tl.load(LSE + row)
+    row_max = tl.load(ROW_MAX + row)
+    row_sum = tl.load(ROW_SUM + row)
     running = 0.0
     for i in range(0, tl.cdiv(V, BLOCK_SIZE)):
         offsets = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         valid = offsets < V
         logits = tl.load(LOGITS + base + offsets, mask=valid, other=0.0).to(tl.float32)
         # Masked lanes contribute 0 to both factors, avoiding exp(-inf) * (-inf) = NaN.
-        probabilities = tl.where(valid, tl.exp(logits - lse), 0.0)
+        probabilities = tl.where(valid, tl.exp(logits - row_max) / row_sum, 0.0)
         running += tl.sum(probabilities * tl.where(valid, logits, 0.0), 0)
     tl.store(EXPECTED + row, running)
 
 
-def expected_launch(logits, lse, expected):
+def expected_launch(logits, row_max, row_sum, expected):
     rows, vocab = logits.shape
-    expected_row_kernel[(rows, )](logits, lse, expected, vocab, BLOCK, num_warps=NUM_WARPS)
+    expected_row_kernel[(rows, )](logits, row_max, row_sum, expected, vocab, BLOCK, num_warps=NUM_WARPS)
 
 
-def stats_launch(logits, targets, lse, logps):
+def stats_launch(logits, targets, row_max, row_sum, lse, logps):
     rows, vocab = logits.shape
-    stats_row_kernel[(rows, )](logits, targets, lse, logps, vocab, BLOCK, num_warps=NUM_WARPS)
+    stats_row_kernel[(rows, )](logits, targets, row_max, row_sum, lse, logps, vocab, BLOCK, num_warps=NUM_WARPS)
 
 
-def backward_launch(logits, targets, lse, expected, grad_logps, grad_entropies):
+def backward_launch(logits, targets, row_max, row_sum, grad_logps):
     rows, vocab = logits.shape
-    has_entropy = grad_entropies is not None
-    if not has_entropy:
-        grad_entropies = grad_logps
-    backward_row_kernel[(rows, )](
-        logits, targets, lse, expected, grad_logps, grad_entropies, vocab, has_entropy, BLOCK, num_warps=NUM_WARPS)
+    backward_row_kernel[(rows, )](logits, targets, row_max, row_sum, grad_logps, vocab, BLOCK, num_warps=NUM_WARPS)
