@@ -283,6 +283,24 @@ class TestResumeHorizon:
         assert 'num_training_steps' not in sd
         assert 'num_warmup_steps' not in sd
 
+    @pytest.mark.parametrize('cls', [CosineWarmupScheduler, LinearWarmupScheduler])
+    def test_load_ignores_legacy_shape_keys(self, cls):
+        # A checkpoint saved BEFORE the guard carried the shape attrs in state_dict; loading it
+        # into a resume rebuilt with a new horizon must ignore those incoming keys, not just omit
+        # them on output. Kills an incomplete fix that filters state_dict() but not load_state_dict().
+        def opt():
+            return torch.optim.SGD([nn.Parameter(torch.zeros(1))], lr=1e-5)
+        old = cls(opt(), num_warmup_steps=3, num_training_steps=30)
+        _step_through(old, range(1, 16))
+        legacy_sd = old.state_dict()
+        legacy_sd.update(num_training_steps=30, num_warmup_steps=3, num_cycles=0.5)
+        new = cls(opt(), num_warmup_steps=3, num_training_steps=40)
+        new.load_state_dict(legacy_sd)
+        assert new.num_training_steps == 40
+        assert new.num_warmup_steps == 3
+        lr = _step_through(new, range(16, 41))
+        assert lr[40] == 0.0  # rebased to the new horizon, no resurrection past the old one
+
     def test_cosine_resume_rebases_to_new_horizon(self):
         def opt():
             return torch.optim.SGD([nn.Parameter(torch.zeros(1))], lr=1e-5)
