@@ -208,6 +208,7 @@ def test_native_megatron_mean_losses_keep_existing_micro_batch_reduction(
     expected.backward()
     group = BaseOptimizerGroup(loss_instance=loss_fn, processor=Processor(), train_status=TrainStatus())
     runtime = SimpleNamespace(
+        _rollout_features=MegatronModel._rollout_features,
         _lazy_wrap_model=lambda: None,
         _lazy_finish_param_config=lambda: None,
         _get_default_group=lambda: "default",
@@ -232,4 +233,6 @@ def test_native_megatron_mean_losses_keep_existing_micro_batch_reduction(
     result = inspect.unwrap(MegatronModel.forward_backward)(
         runtime, inputs=rows, micro_batch_size=micro_batch_size, task=task)
     torch.testing.assert_close(internal.weight.grad, baseline.weight.grad)
-    assert result["loss"] == pytest.approx(expected.item())
+    # ModelOutput carries the local sum/count; LossMetric performs the division.
+    assert result["num_tokens"] == len(losses)
+    assert result["loss"] / result["num_tokens"] == pytest.approx(expected.item())
