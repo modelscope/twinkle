@@ -43,6 +43,7 @@ from twinkle.model.micro_batch import (
     merge_micro_batch_outputs,
     plan_micro_batches,
     select_batch,
+    sequence_length,
 )
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.tasks import get_task_spec_obj
@@ -65,6 +66,15 @@ from twinkle.utils.transformers_utils import filter_from_config_kwargs
 logger = get_logger()
 
 CHECKPOINT_ADAPTER_NAME = 'default'
+
+
+def _order_micro_batches(plan, inputs, optimizer_config, task):
+    if getattr(optimizer_config, '_dp_group', None) is not None and task == 'causal_lm':
+        # Align expensive micro-batches across ranks without changing their contents.
+        lengths = [sequence_length(row) for row in inputs]
+        plan.sort(key=lambda indices: (sum(lengths[i] for i in indices)
+                                       if optimizer_config.processor.padding_free else
+                                       max(lengths[i] for i in indices) * len(indices)), reverse=True)
 
 
 def _no_sync_context(model, should_sync):
@@ -1224,6 +1234,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     'logits. Run the whole batch in one forward (the default), or use the megatron backend, '
                     'whose collate splits at record level.')
         plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        _order_micro_batches(plan, inputs, optimizer_config, kwargs.get('task', 'causal_lm'))
         batches = []
         for indices in plan:
             # Control scalars/tuples never slice with the samples; a field tuple whose length
@@ -1688,6 +1699,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     ):
         local_batch_size = len(inputs)
         plan = self._build_micro_batch_plan(inputs, config, optimizer_config)
+        _order_micro_batches(plan, inputs, optimizer_config, kwargs.get('task', 'causal_lm'))
         loss_instance = optimizer_config.get_loss(loss_key)
         total_loss = 0.0
         outputs = {}

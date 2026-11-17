@@ -7,6 +7,7 @@ import torch
 
 from twinkle.loss import CrossEntropyLoss, GRPOLoss
 from twinkle.loss.grpo import BNPOLoss, CISPOLoss
+from twinkle.model.micro_batch import MicroBatchConfig
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.transformers import TransformersModel
 from twinkle.processor import InputProcessor
@@ -118,6 +119,47 @@ def test_partitioned_gradients_do_not_enter_the_unsupported_zero_no_sync():
     model.run(rows, micro_batch_size=2, advantages=[1.] * 4,
               old_logps=[[0.] * len(row['labels']) for row in rows])
     assert model.weight.grad is not None
+
+
+@pytest.mark.parametrize('padding_free', [False, True])
+def test_training_order_preserves_gradients_and_syncs_only_the_final_batch(padding_free):
+    rows = data()
+    baseline, ordered = TrainingHarness(GRPOLoss()), TrainingHarness(GRPOLoss())
+    group = ordered.optimizer_group['default']
+    group._dp_group = object()
+    group.processor.padding_free = padding_free
+    ordered._build_micro_batch_plan = lambda *args: [[0, 1], [2, 3], [4, 5], [6, 7]]
+    kwargs = {'micro_batch_size': 2, 'advantages': [1., -.5, .7, -1.2, .4, -.3, .9, -.8],
+              'old_logps': [[.03 * i] * len(row['labels']) for i, row in enumerate(rows)]}
+    baseline.run(rows, **kwargs)
+    ordered.run(rows, **kwargs)
+    expected = [[2, 3], [4, 5], [6, 7], [0, 1]] if padding_free else [[4, 5], [2, 3], [6, 7], [0, 1]]
+    assert ordered.calls == [(indices, i == 3) for i, indices in enumerate(expected)]
+    torch.testing.assert_close(ordered.normalized_gradient(), baseline.normalized_gradient(), rtol=1e-12, atol=1e-12)
+    assert group.cur_step == 1
+
+
+def test_forward_order_restores_responses_and_parallel_kwargs():
+    rows = [{'input_ids': [i] * length} for i, length in enumerate([2, 7, 4])]
+    calls = []
+
+    def single(*, inputs, sampling_masks, _response_rows, **kwargs):
+        identity = inputs[0]['input_ids'][0]
+        calls.append(identity)
+        assert sampling_masks == [identity]
+        assert _response_rows == [{'episode_id': str(identity)}]
+        return {'logps': [[float(identity)] * len(inputs[0]['input_ids'])],
+                'episode_ids': [str(identity)]}
+
+    model = SimpleNamespace(_build_micro_batch_plan=lambda *args: [[0], [1], [2]],
+                            _forward_only_single=single)
+    group = SimpleNamespace(_dp_group=object(), processor=SimpleNamespace(padding_free=False))
+    result = TransformersModel._forward_only_micro_batches(
+        model, inputs=rows, config=MicroBatchConfig(micro_batch_size=1), optimizer_config=group,
+        sampling_masks=[0, 1, 2], _response_rows=[{'episode_id': str(i)} for i in range(3)])
+    assert calls == [1, 2, 0]
+    assert result['episode_ids'] == ['0', '1', '2']
+    assert result['logps'] == [[float(i)] * len(row['input_ids']) for i, row in enumerate(rows)]
 
 
 def test_global_bnpo_normalizer_counts_only_completion_tokens():
