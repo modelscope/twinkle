@@ -886,7 +886,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 else:
                     outputs['logps'] = selective_log_softmax(logits, masked_labels)
                 del logits
-        if getattr(loss_instance, 'require_values', False):
+        if loss_require_values:
             values = outputs['logits']
             outputs['values'] = values.squeeze(-1) if values.dim() == 3 and values.shape[-1] == 1 else values
         outputs['past_key_values'] = None
