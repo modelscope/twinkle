@@ -320,6 +320,12 @@ class Decision(TaskSpec):
     megatron_context = _no_patch
 
 
+def _generative_reranker_score(logits, template):
+    """Return the positive-minus-negative token logit for a generative reranker."""
+    positive, negative = _resolve_generative_reranker_token_ids(template)
+    return logits[..., positive:positive + 1] - logits[..., negative:negative + 1]
+
+
 def _resolve_generative_reranker_token_ids(template):
     """Resolve the positive/negative token ids for a generative reranker from the template tokenizer.
 

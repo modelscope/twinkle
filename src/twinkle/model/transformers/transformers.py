@@ -3049,7 +3049,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
     def _task_head_state(self, adapter_name):
         head = self._attached_head(adapter_name)
-        getter = getattr(self.strategy, 'get_independent_task_head_state', None)
+        getter = getattr(self.strategy, 'get_task_head_state', None)
         if head is not None and getter is not None:
             state = getter(head)
             if state is not None:
@@ -3058,7 +3058,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
     def _restore_task_head_state(self, adapter_name, state) -> None:
         head = self._attached_head(adapter_name)
-        restorer = getattr(self.strategy, 'restore_independent_task_head_state', None)
+        restorer = getattr(self.strategy, 'restore_task_head_state', None)
         if head is not None and restorer is not None and restorer(head, state):
             return
         super()._restore_task_head_state(adapter_name, state)

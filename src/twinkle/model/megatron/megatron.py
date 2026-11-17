@@ -36,7 +36,7 @@ from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpo
 from twinkle.model.micro_batch import (MicroBatchConfig, agree_micro_batch_count,
                                        plan_micro_batches_contiguous, sequence_length)
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
-from twinkle.model.tasks import get_task_spec_obj
+from twinkle.model.tasks import _generative_reranker_score, get_task_spec_obj
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
@@ -91,13 +91,6 @@ def _gather_vocab_parallel(tensor):
         return tensor
     from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
     return gather_from_tensor_model_parallel_region(tensor)
-
-
-def _generative_reranker_score(logits, template):
-    from twinkle.model.tasks import _resolve_generative_reranker_token_ids
-
-    positive, negative = _resolve_generative_reranker_token_ids(template)
-    return logits[..., positive:positive + 1] - logits[..., negative:negative + 1]
 
 
 def _last_valid_positions(processor, batch, output_tensor):

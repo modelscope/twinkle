@@ -133,31 +133,6 @@ def test_builtin_score_head_remains_in_root_fsdp_group(head_sharding):
     fully_shard.assert_called_once()
     assert fully_shard.call_args.args[0] is model
     assert fully_shard.call_args.kwargs['mp_policy'].param_dtype is torch.bfloat16
-    assert not getattr(model.score, '_twinkle_independent_fsdp', False)
-
-
-@pytest.mark.parametrize('preallocated', [False, True])
-def test_attached_standard_head_is_sharded_independently(preallocated, head_sharding):
-    model = torch.nn.Module()
-    model.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
-    if preallocated:
-        from twinkle.model.multi_lora import MultiLoraTaskHeadSlots
-
-        slots = MultiLoraTaskHeadSlots(2)
-        slots.build(model, lambda: torch.nn.Linear(4, 1).to(torch.bfloat16))
-        slots.bind('a', model)
-    else:
-        model.task_heads = {'': torch.nn.Linear(4, 1).to(torch.bfloat16)}
-    strategy, fully_shard = head_sharding
-    strategy.wrap_model(model)
-
-    assert fully_shard.call_count == (3 if preallocated else 2)
-    if preallocated:
-        slots.bind('b', model)
-        assert model.task_heads['b']._twinkle_independent_fsdp
-        assert fully_shard.call_args_list[1].args[0] is model.task_heads['b']
-    assert fully_shard.call_args_list[0].args[0] is model.task_heads['a' if preallocated else '']
-    assert all(head._twinkle_independent_fsdp for head in model.task_heads.values())
 
 
 def test_nonmaster_save_ignores_empty_gathered_optimizer_state(tmp_path):
@@ -245,49 +220,62 @@ def test_fp32_task_head_is_sharded_as_separate_precision_group(head_sharding):
     strategy, fully_shard = head_sharding
     strategy.wrap_model(model)
 
-    assert fully_shard.call_count == 3
-    standard_call, head_call, model_call = fully_shard.call_args_list
-    assert standard_call.args[0] is model.standard_head
-    assert standard_call.kwargs['mp_policy'].param_dtype is torch.bfloat16
+    assert fully_shard.call_count == 2
+    head_call, model_call = fully_shard.call_args_list
     assert head_call.args[0] is model.task_head
     assert head_call.kwargs['mp_policy'].param_dtype is None
     assert head_call.kwargs['mp_policy'].reduce_dtype is None
     assert model_call.args[0] is model
     assert model_call.kwargs['mp_policy'].param_dtype is torch.bfloat16
     assert model.task_head.bias.dtype is torch.float32
-    assert model.task_head._twinkle_independent_fsdp
+    assert model.standard_head.weight.dtype is torch.bfloat16
 
 
-def test_independent_task_head_checkpoint_includes_nonpersistent_buffers():
-    head = torch.nn.Linear(2, 1)
+@pytest.fixture
+def sharded_head(tmp_path):
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    torch.distributed.init_process_group('gloo', init_method=f'file://{tmp_path / "head-pg"}', rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh('cpu', (1,))
+        head = torch.nn.Linear(2, 1)
+        for name, parameter in list(head.named_parameters()):
+            setattr(head, name, torch.nn.Parameter(distribute_tensor(parameter.detach(), mesh, [Shard(0)])))
+        yield head
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_sharded_task_head_checkpoint_includes_nonpersistent_buffers(sharded_head):
+    head = sharded_head
     head.register_buffer('calibration', torch.tensor([1.0]), persistent=False)
-    head._twinkle_independent_fsdp = True
     strategy = NativeFSDPStrategy(enable_ep=False)
-    with patch('torch.distributed.checkpoint.state_dict.get_model_state_dict',
-               return_value={'weight': head.weight.detach(), 'bias': head.bias.detach()}):
-        state = strategy.get_independent_task_head_state(head)
+    state = strategy.get_task_head_state(head)
     assert set(state) == {'task_head.weight', 'task_head.bias', 'task_head.calibration'}
 
     restored = {key: torch.full_like(value, 3.0) for key, value in state.items()}
-    with patch('torch.distributed.checkpoint.state_dict.set_model_state_dict') as set_state:
-        assert strategy.restore_independent_task_head_state(head, restored)
-    set_state.assert_called_once()
-    assert set_state.call_args.args[1].keys() == {'weight', 'bias'}
+    assert strategy.restore_task_head_state(head, restored)
+    for parameter in head.parameters():
+        torch.testing.assert_close(parameter.full_tensor(), torch.full_like(parameter.full_tensor(), 3.0))
     torch.testing.assert_close(head.calibration, torch.tensor([3.0]))
 
 
 @pytest.mark.parametrize('persistent', [False, True])
-def test_independent_task_head_loads_legacy_parameters_without_changing_calibration(persistent):
-    head = torch.nn.Linear(2, 1)
+def test_sharded_task_head_loads_legacy_parameters_without_changing_calibration(persistent, sharded_head):
+    head = sharded_head
     head.register_buffer('calibration', torch.tensor([7.0]), persistent=persistent)
-    head._twinkle_independent_fsdp = True
     strategy = NativeFSDPStrategy(enable_ep=False)
-    legacy = {f'task_head.{name}': torch.full_like(param, 3.0)
+    legacy = {f'task_head.{name}': torch.full_like(param.full_tensor(), 3.0)
               for name, param in head.named_parameters()}
-    options = strategy._prepare_optimizer_state_dict_options(for_load=True)
-    options.broadcast_from_rank0 = False
-    with patch.object(strategy, '_prepare_optimizer_state_dict_options', return_value=options):
-        assert strategy.restore_independent_task_head_state(head, legacy)
+    assert strategy.restore_task_head_state(head, legacy)
     for param in head.parameters():
-        torch.testing.assert_close(param, torch.full_like(param, 3.0))
+        torch.testing.assert_close(param.full_tensor(), torch.full_like(param.full_tensor(), 3.0))
     torch.testing.assert_close(head.calibration, torch.tensor([7.0]))
+
+
+def test_unsharded_head_keeps_the_plain_tensor_checkpoint_path():
+    head = torch.nn.Linear(2, 1)
+    strategy = NativeFSDPStrategy(enable_ep=False)
+    assert strategy.get_task_head_state(head) is None
+    assert strategy.restore_task_head_state(head, {}) is False

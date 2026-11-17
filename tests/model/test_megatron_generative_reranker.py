@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from twinkle.model.megatron.megatron import _generative_reranker_score
+from twinkle.model.tasks import _generative_reranker_score
 
 
 def test_generative_reranker_scores_yes_minus_no_and_backpropagates():
