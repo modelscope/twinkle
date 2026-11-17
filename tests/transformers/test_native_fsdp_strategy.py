@@ -234,24 +234,12 @@ def test_nonmaster_restores_lazy_slots_from_broadcast_metadata():
 
 
 def test_fp32_task_head_is_sharded_as_separate_precision_group():
-
-    class Head(torch.nn.Module):
-        keep_fp32 = True
-
-        def __init__(self):
-            super().__init__()
-            self.bias = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
-
-    class Model(torch.nn.Module):
-
-        def __init__(self):
-            super().__init__()
-            self.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
-            self.task_head = Head()
-            self.scoring_head = self.task_head
-
     strategy = NativeFSDPStrategy(device_mesh=MagicMock(), mixed_precision='bf16', enable_ep=False)
-    model = Model()
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
+    model.task_head = torch.nn.Linear(4, 1)
+    model.task_head.keep_fp32 = True
+    model.scoring_head = model.task_head
     with patch('twinkle.model.transformers.strategy.native_fsdp._build_fsdp_mesh',
                return_value=MagicMock()), \
          patch('twinkle.model.transformers.strategy.native_fsdp.fully_shard') as fully_shard:

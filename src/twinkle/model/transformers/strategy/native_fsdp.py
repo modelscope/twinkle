@@ -390,11 +390,10 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
         optim_state = {}
+        empty_states = None
         if Platform.is_master():
             optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
-        empty_states = None
-        if Platform.is_master():
             empty_states = {name for name, value in optim_state['state'].items() if not value}
         if dist.is_initialized():
             payload = [empty_states]

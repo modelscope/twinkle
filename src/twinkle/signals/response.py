@@ -52,14 +52,13 @@ def response_token_scores(outputs: Any, features: List[Dict[str, Any]], *, outpu
     values = outputs.get(output_key) if isinstance(outputs, dict) else outputs
     if values is None:
         raise RuntimeError(f'the forward returned no {output_key!r} channel.')
-    if isinstance(values, (list, tuple)) and values and isinstance(values[0], (list, tuple, np.ndarray, torch.Tensor)):
-        rows = []
-        for batch in values:
-            batch = torch.as_tensor(batch).detach().float().cpu()
-            rows.extend(batch.unbind(0) if batch.dim() > 1 else [batch])
-    else:
-        values = torch.as_tensor(values).detach().float().cpu()
-        rows = list(values.unbind(0)) if values.dim() > 1 else [values]
+    if not (isinstance(values, (list, tuple)) and values
+            and isinstance(values[0], (list, tuple, np.ndarray, torch.Tensor))):
+        values = [values]
+    rows = []
+    for batch in values:
+        batch = torch.as_tensor(batch).detach().float().cpu()
+        rows.extend(batch.unbind(0) if batch.dim() > 1 else [batch])
     if len(rows) != len(features):
         raise RuntimeError(f'forward returned {len(rows)} rows for {len(features)} features; '
                            'per-row alignment is impossible.')
