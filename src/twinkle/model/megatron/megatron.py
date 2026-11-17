@@ -179,6 +179,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         attn_impl: Optional[str] = None,
         **kwargs,
     ):
+        # Must land before backend imports can create a CUDA context (the driver latches
+        # CUDA_DEVICE_MAX_CONNECTIONS at context creation).
+        if MegatronStrategy.uses_fsdp(ddp_config):
+            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
+        else:
+            os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
         requires('megatron_core')
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
@@ -195,8 +201,6 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         self._router_replay_applied = False
         if self._router_replay_enabled:
             kwargs['moe_enable_routing_replay'] = True
-        if MegatronStrategy.uses_fsdp(ddp_config):
-            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
         torch_util.set_device()
         # mcore requires an initialised process group even at world_size==1.
         self._try_init_process_group(force=True)
