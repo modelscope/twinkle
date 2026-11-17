@@ -212,6 +212,7 @@ def test_native_megatron_mean_losses_keep_existing_micro_batch_reduction(
         _lazy_finish_param_config=lambda: None,
         _get_default_group=lambda: "default",
         _not_encoded=lambda inputs: False,
+        _rollout_features=MegatronModel._rollout_features,
         _router_replay_enabled=False,
         _maybe_apply_router_replay=lambda: None,
         _mtp=SimpleNamespace(note_num_microbatches=lambda count: None),

@@ -174,6 +174,7 @@ def test_transformers_forward_keeps_loss_metadata_out_of_model_call():
         'channel': ['math'],
     })
 
-    assert model.model.received_keys == {'input_ids'}
+    # use_cache=False is the deliberate KV-cache-disable kwarg _call_model passes, not loss metadata.
+    assert model.model.received_keys == {'input_ids', 'use_cache'}
     assert status.inputs['channel'] == ['math']
     assert torch.equal(status.inputs['loss_scale'], torch.ones(1, 2))
