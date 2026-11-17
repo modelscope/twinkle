@@ -92,6 +92,11 @@ class MultiLoraMegatronModel(MegatronModel):
         num_labels: Optional[int] = None,
         **kwargs,
     ):
+        # Set before importing the backend or creating a CUDA context.
+        if MegatronStrategy.uses_fsdp(ddp_config):
+            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
+        else:
+            os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
         requires('megatron_core')
         new_special_tokens = kwargs.pop('new_special_tokens', None)
         if new_special_tokens:
@@ -117,9 +122,6 @@ class MultiLoraMegatronModel(MegatronModel):
         self._router_replay_applied = False
         if self._router_replay_enabled:
             kwargs['moe_enable_routing_replay'] = True
-        # Same ordering constraint as MegatronModel: must precede the CUDA context creation below.
-        if MegatronStrategy.uses_fsdp(ddp_config):
-            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
         torch_util.set_device()
         # mcore requires an initialised process group even at world_size==1.
         self._try_init_process_group(force=True)
