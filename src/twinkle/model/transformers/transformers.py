@@ -3036,22 +3036,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _task_head_is_master(self) -> bool:
         return Platform.is_master()
 
-    def _task_head_state(self, adapter_name):
-        head = self._attached_head(adapter_name)
-        getter = getattr(self.strategy, 'get_task_head_state', None)
-        if head is not None and getter is not None:
-            state = getter(head)
-            if state is not None:
-                return state
-        return super()._task_head_state(adapter_name)
-
-    def _restore_task_head_state(self, adapter_name, state) -> None:
-        head = self._attached_head(adapter_name)
-        restorer = getattr(self.strategy, 'restore_task_head_state', None)
-        if head is not None and restorer is not None and restorer(head, state):
-            return
-        super()._restore_task_head_state(adapter_name, state)
-
     def _add_task_head(self, adapter_name: str, task, task_head_loader=None, num_labels=None) -> None:
         """Build one task head worker-side and register it per adapter.
 

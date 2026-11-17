@@ -75,3 +75,82 @@ def test_bad_buffer_shape_rejected_before_any_tensor_changes():
     with pytest.raises(ValueError, match='shape'):
         slots.import_state('a', host, state, _write)
     torch.testing.assert_close(head.weight, before)
+
+
+@pytest.fixture(params=[False, True], ids=['plain', 'sharded'])
+def head_model(tmp_path, request):
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+    from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
+    from twinkle.model.transformers.transformers import TransformersModel
+
+    sharded = request.param
+    if sharded:
+        torch.distributed.init_process_group(
+            'gloo', init_method=f'file://{tmp_path / "head-pg"}', rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh('cpu', (1,)) if sharded else None
+        head = nn.Linear(2, 1)
+        if sharded:
+            for name, parameter in list(head.named_parameters()):
+                setattr(head, name, nn.Parameter(distribute_tensor(parameter.detach(), mesh, [Shard(0)])))
+        host = nn.Module()
+        host.task_head = head
+        model = object.__new__(TransformersModel)
+        model.__dict__['model'] = host
+        model.strategy = NativeFSDPStrategy(device_mesh=mesh, enable_ep=False)
+        yield model, head
+    finally:
+        if sharded:
+            torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize('persistent', [False, True])
+def test_head_checkpoint_restores_buffers_and_keeps_parameters(head_model, persistent):
+    from torch.distributed.tensor import DTensor
+
+    model, head = head_model
+    head.register_buffer('calibration', torch.tensor([7.0]), persistent=persistent)
+    parameters = dict(head.named_parameters())
+    state = model._task_head_state('')
+    assert set(state) == {'task_head.weight', 'task_head.bias', 'task_head.calibration'}
+    assert all(not isinstance(value, DTensor) and value.device.type == 'cpu' for value in state.values())
+    with torch.no_grad():
+        for parameter in head.parameters():
+            parameter.zero_()
+        head.calibration.zero_()
+    model._restore_task_head_state('', state)
+    for name, parameter in head.named_parameters():
+        assert parameter is parameters[name]
+        value = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
+        torch.testing.assert_close(value, state[f'task_head.{name}'])
+    torch.testing.assert_close(head.calibration, torch.tensor([7.0]))
+
+
+@pytest.mark.parametrize('persistent', [False, True])
+def test_head_loads_legacy_parameters_without_changing_calibration(head_model, persistent):
+    from torch.distributed.tensor import DTensor
+
+    model, head = head_model
+    head.register_buffer('calibration', torch.tensor([7.0]), persistent=persistent)
+    legacy = {key: torch.full_like(value, 3.0) for key, value in model._task_head_state('').items()
+              if key != 'task_head.calibration'}
+    model._restore_task_head_state('', legacy)
+    for parameter in head.parameters():
+        value = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
+        torch.testing.assert_close(value, torch.full_like(value, 3.0))
+    torch.testing.assert_close(head.calibration, torch.tensor([7.0]))
+
+
+def test_head_rejects_bad_buffer_shape_before_loading_parameters(head_model):
+    model, head = head_model
+    head.register_buffer('calibration', torch.tensor([7.0]), persistent=False)
+    before = model._task_head_state('')
+    state = {key: value.clone() for key, value in before.items()}
+    state['task_head.weight'].fill_(99)
+    state['task_head.calibration'] = torch.ones(3)
+    with pytest.raises(ValueError, match='shape'):
+        model._restore_task_head_state('', state)
+    after = model._task_head_state('')
+    for key, value in before.items():
+        torch.testing.assert_close(after[key], value)

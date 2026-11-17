@@ -6,7 +6,6 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh as TorchDeviceMesh
 from torch.distributed.fsdp import FSDPModule, fully_shard
-from torch.distributed.tensor import DTensor
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Set
 
 from twinkle.model.state_dict_utils import collect_local_state, is_lora_state_key, is_saveable_adapter_key
@@ -25,13 +24,13 @@ PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
 
-def _shard_fp32_task_heads(model, *, mesh, reshard_after_forward):
-    # FSDP parameter groups require one storage dtype; FP32 heads cannot share the BF16 backbone group.
-    for head in model.modules():
-        if (not getattr(head, 'keep_fp32', False) or isinstance(head, FSDPModule)
-                or next(head.parameters(), None) is None):
+def _shard_fp32_modules(model, *, mesh, reshard_after_forward):
+    # FSDP parameter groups require one storage dtype; keep FP32 modules separate from the BF16 group.
+    for module in model.modules():
+        if (not getattr(module, 'keep_fp32', False) or isinstance(module, FSDPModule)
+                or next(module.parameters(), None) is None):
             continue
-        fully_shard(head, mesh=mesh, reshard_after_forward=reshard_after_forward, mp_policy=_build_mp_policy('no'))
+        fully_shard(module, mesh=mesh, reshard_after_forward=reshard_after_forward, mp_policy=_build_mp_policy('no'))
 
 
 class NativeFSDPStrategy(TransformerStrategyBase):
@@ -203,7 +202,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             world_size = self.device_mesh.world_size
             ep_fsdp_mesh_1d = self.ep_fsdp_device_mesh['ep_fsdp'] if ep_enabled else None
 
-            _shard_fp32_task_heads(model, mesh=fsdp_mesh, reshard_after_forward=reshard_after_forward)
+            _shard_fp32_modules(model, mesh=fsdp_mesh, reshard_after_forward=reshard_after_forward)
 
             for layer_mod, experts_mod in layer_pairs:
                 layer_mod._fsdp_modules = []
@@ -282,49 +281,6 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             cpu_offload=not for_load,
             broadcast_from_rank0=for_load,
         )
-
-    def get_task_head_state(self, head):
-        if not any(isinstance(parameter, DTensor) for parameter in head.parameters()):
-            return None
-        from torch.distributed.checkpoint.state_dict import get_model_state_dict
-
-        state = get_model_state_dict(head, options=self._prepare_optimizer_state_dict_options(for_load=False))
-        for name, buffer in head.named_buffers():
-            state.setdefault(name, buffer)
-        return {f'task_head.{name}': tensor.detach().clone().cpu() for name, tensor in state.items()}
-
-    def restore_task_head_state(self, head, state) -> bool:
-        if not any(isinstance(parameter, DTensor) for parameter in head.parameters()):
-            return False
-        from torch.distributed.checkpoint.state_dict import set_model_state_dict
-
-        tensors = {**dict(head.named_parameters()), **dict(head.named_buffers())}
-        expected = {f'task_head.{name}' for name in tensors}
-        legacy = {f'task_head.{name}' for name, _ in head.named_parameters()}
-        if set(state) not in (expected, legacy):
-            raise ValueError(
-                f'task_head checkpoint keys {sorted(state)} do not match the head it restores: '
-                f'expected {sorted(expected)}.')
-        for key, value in state.items():
-            tensor = tensors[key[len('task_head.'):]]
-            if value.shape != tensor.shape:
-                raise ValueError(f'task-head shape mismatch for {key}: {value.shape} != {tensor.shape}')
-        persistent = set(head.state_dict())
-        model_state = {key[len('task_head.'):]: value for key, value in state.items()
-                       if key[len('task_head.'):] in persistent}
-        # Parameter-only checkpoints keep the head's current calibration; strict loading still needs its keys.
-        for name, buffer in head.named_buffers():
-            if name in persistent:
-                model_state.setdefault(name, buffer)
-        set_model_state_dict(
-            head, model_state, options=self._prepare_optimizer_state_dict_options(for_load=True))
-        with torch.no_grad():
-            for key, value in state.items():
-                name = key[len('task_head.'):]
-                if name not in persistent:
-                    tensor = tensors[name]
-                    tensor.copy_(value.to(device=tensor.device, dtype=tensor.dtype))
-        return True
 
     def needs_wrapped_optimizer_state(self) -> bool:
         return self.device_mesh is not None

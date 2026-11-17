@@ -7,7 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Type, Union
 
-from twinkle import Platform, remote_function
+from twinkle import Platform, remote_function, torch_util
 from twinkle.data_format import InputFeature, ModelOutput
 from twinkle.hub import HubOperation
 from twinkle.loss.base import Loss
@@ -397,7 +397,7 @@ class TrainableModel(ABC):
         head = self._attached_head(adapter_name)
         if head is None:
             return {}
-        return {f'task_head.{name}': tensor.detach().clone().cpu()
+        return {f'task_head.{name}': torch_util.to_local_tensor(tensor).detach().clone().cpu()
                 for name, tensor in chain(head.named_parameters(), head.named_buffers())}
 
     def _task_head_carries_on_this_rank(self) -> bool:
@@ -411,7 +411,6 @@ class TrainableModel(ABC):
         this with their slot-pool import. An empty snapshot passes -- every host checks
         the OTHER side's emptiness, never its own (a rank without slots skips, a
         checkpoint written head-less stays head-less)."""
-        import torch
         head = self._attached_head(adapter_name)
         if head is None:
             if state and self._task_head_carries_on_this_rank():
@@ -431,11 +430,8 @@ class TrainableModel(ABC):
             tensor = tensors[key[len('task_head.'):]]
             if value.shape != tensor.shape:
                 raise ValueError(f'task-head shape mismatch for {key}: {value.shape} != {tensor.shape}')
-        with torch.no_grad():
-            for key, value in state.items():
-                param = tensors[key[len('task_head.'):]]
-                value = value.to(device=param.device, dtype=param.dtype)
-                param.data.copy_(value)
+        for key, value in state.items():
+            torch_util.copy_tensor_(tensors[key[len('task_head.'):]], value)
 
     def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
         """Write the adapter's attached head to its own task_head.safetensors.

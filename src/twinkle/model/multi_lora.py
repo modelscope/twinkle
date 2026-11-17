@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from itertools import chain
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Embedding, Linear, LoraLayer
-from torch.distributed.tensor import distribute_tensor
 from types import MethodType
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -190,38 +189,12 @@ class MultiLora:
         return torch_util.to_local_tensor(parameter)
 
     @staticmethod
-    def _is_distributed_param(parameter):
-        return hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements')
-
-    @staticmethod
     def _is_target_parameter_lora_name(name: str) -> bool:
         return '._twinkle_lora_' in name
 
     def _write_param_tensor(self, parameter, value):
-        if value is None:
-            return
-        value = value.detach().to(dtype=parameter.dtype)
-        if self._is_distributed_param(parameter):
-            if self._is_distributed_param(value):
-                parameter.data.copy_(value.to(parameter.device))
-                return
-
-            local_param = parameter.to_local() if hasattr(parameter, 'to_local') else None
-            parameter_shape = tuple(parameter.shape)
-            value_shape = tuple(value.shape)
-            if local_param is not None:
-                local_shape = tuple(local_param.shape)
-                if value_shape == local_shape and value_shape != parameter_shape:
-                    local_param.copy_(value.to(local_param.device))
-                    return
-                if value_shape != parameter_shape:
-                    raise ValueError(
-                        f'Cannot write tensor with shape {value_shape} to distributed parameter with global shape '
-                        f'{parameter_shape} and local shape {local_shape}')
-            value = distribute_tensor(value.to(parameter.device), parameter.device_mesh, parameter.placements)
-        else:
-            value = value.to(parameter.device)
-        parameter.data.copy_(value)
+        if value is not None:
+            torch_util.copy_tensor_(parameter, value)
 
     @staticmethod
     def _slice_rank_tensor(name: str, tensor, rank: int):
