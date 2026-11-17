@@ -639,6 +639,38 @@ class Template:
             decoded.append({**tool_call, "function": {**fn, "arguments": value}})
         return {**message, "tool_calls": decoded}
 
+    @staticmethod
+    def _collapse_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge every system message into one leading message (blank-line-joined).
+
+        The OpenAI protocol allows several system messages, but most model chat
+        templates accept exactly one at the beginning -- Qwen3.5's even raises
+        "System message must be at the beginning" on a second one, which the
+        sampler surfaced as a silent empty stream. A lone non-leading system
+        message moves up for the same reason. Non-system messages keep their
+        relative order; content blocks (multimodal) concatenate as-is.
+        """
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        if not system_msgs:
+            return messages
+        if len(system_msgs) == 1 and messages[0] is system_msgs[0]:
+            return messages
+        contents = [m.get("content") for m in system_msgs]
+        if all(isinstance(c, str) for c in contents):
+            merged_content = "\n\n".join(c for c in contents if c)
+        else:
+            blocks: list[dict[str, Any]] = []
+            for c in contents:
+                if isinstance(c, str):
+                    blocks.append({"type": "text", "text": c})
+                elif isinstance(c, list):
+                    blocks.extend(b for b in c if isinstance(b, dict))
+            merged_content = blocks
+        merged = dict(system_msgs[0])
+        merged["content"] = merged_content
+        rest = [m for m in messages if m.get("role") != "system"]
+        return [merged, *rest]
+
     def render_delta(
         self,
         messages_before: list[dict[str, Any]],
@@ -654,6 +686,7 @@ class Template:
         appended = [self.decode_tool_calls(message) for message in appended]
 
         def render(messages: list[dict[str, Any]], add_generation_prompt: bool) -> list[int]:
+            messages = self._collapse_system_messages(messages)
             text = self.tokenizer.apply_chat_template(
                 messages,
                 tools=tools or None,
@@ -674,6 +707,7 @@ class Template:
 
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
         messages = [dict(message) for message in trajectory["messages"]]
+        messages = self._collapse_system_messages(messages)
         # Arrow serialization may pad content blocks with null keys (e.g. 'image': None
         # on text-only blocks). Jinja checks `'image' in item` on dict keys, so these
         # phantom keys cause wrong token counts. Strip them here.
