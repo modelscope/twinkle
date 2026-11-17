@@ -29,7 +29,32 @@ from typing import ClassVar, Optional
 
 from twinkle.processor.tasks import TASKS, TaskSpec as TaskRow
 
-__all__ = ['TaskSpec', 'get_task_spec_obj', 'TASK_SPECS']
+__all__ = ['TaskSpec', 'get_task_spec_obj', 'TASK_SPECS', 'HEAD_MODULE_NAMES', 'head_state_prefixes']
+
+#: The two attribute names a readout head is mounted under. ``task_head`` is the name
+#: the forward-pass readout dispatch reads; ``scoring_head`` is the legacy name still
+#: read by checkpoint / callback / metrics code. It is one shared module mounted under
+#: both names, and ``state_dict()`` emits a key under each mount (unlike
+#: ``named_parameters``, which deduplicates shared modules, ``state_dict`` does not) --
+#: so stripping head keys from a full-model state dict must filter on this whole
+#: tuple, never a single prefix.
+HEAD_MODULE_NAMES = ('task_head', 'scoring_head')
+
+
+def head_state_prefixes(model) -> tuple:
+    """Which of ``HEAD_MODULE_NAMES`` this model actually mounts a head under: a
+    legacy single-mount checkpoint reports ``('scoring_head',)``, a headless model
+    reports ``()``. Use this (not a hardcoded prefix) when stripping head keys from
+    a merged / exported state dict. If ``model`` is a list of Megatron chunks, the
+    per-chunk results are unioned."""
+    if isinstance(model, (list, tuple)):
+        seen = []
+        for chunk in model:
+            for name in head_state_prefixes(chunk):
+                if name not in seen:
+                    seen.append(name)
+        return tuple(seen)
+    return tuple(name for name in HEAD_MODULE_NAMES if getattr(model, name, None) is not None)
 
 
 class TaskSpec:
@@ -122,11 +147,12 @@ class TaskSpec:
 
     def attach_transformers(self, model, head) -> None:
         """Attach the head for the forward-layer readout dispatch -- no forward patching.
-        Dual names: ``task_head`` drives the readout; ``scoring_head`` is the legacy attribute
-        the checkpoint / callback / metrics ecosystem reads."""
+        Dual names (``HEAD_MODULE_NAMES``): ``task_head`` drives the readout;
+        ``scoring_head`` is the legacy attribute the checkpoint / callback / metrics
+        ecosystem reads."""
         head = self.align_head(model, head)
-        model.task_head = head
-        model.scoring_head = head
+        for name in HEAD_MODULE_NAMES:
+            setattr(model, name, head)
         if getattr(head, 'needs_output_embeddings', False):
             head.set_output_embeddings(model.get_output_embeddings())
 
@@ -154,16 +180,18 @@ class TaskSpec:
         core = chunk
         while hasattr(core, 'module'):  # down to the mcore model, past DDP / Float16Module
             core = core.module
-        core.task_head = head
-        core.scoring_head = head
+        for name in HEAD_MODULE_NAMES:  # the same dual mount as the transformers backend
+            setattr(core, name, head)
 
     def reactivate(self, model) -> None:
         """Re-enable the head after a peft wrap froze it: peft's mark-only-adapters sweep
         covers the module the head rides on, so an adapter run would otherwise train around
-        a frozen head. fp16 storage upcasts to fp32 (bf16 rides -- the readout upcasts)."""
+        a frozen head. fp16 storage upcasts to fp32 (bf16 rides -- the readout upcasts).
+        Matches every mount name: ``named_parameters`` deduplicates the dual-mounted head
+        by identity, so its params surface under the FIRST mounted name only."""
         import torch
         for name, param in model.named_parameters():
-            if 'scoring_head' not in name:
+            if not any(head_name in name for head_name in HEAD_MODULE_NAMES):
                 continue
             if not param.requires_grad:
                 param.requires_grad_(True)
