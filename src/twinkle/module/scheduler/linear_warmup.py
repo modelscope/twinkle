@@ -2,8 +2,10 @@
 # Some code borrowed from transformers
 from torch.optim.lr_scheduler import LambdaLR
 
+from ._base import ScheduleShapeGuardMixin
 
-class LinearWarmupScheduler(LambdaLR):
+
+class LinearWarmupScheduler(ScheduleShapeGuardMixin, LambdaLR):
 
     def __init__(self, optimizer, num_warmup_steps: int, num_training_steps: int, last_epoch: int = -1):
         self.num_warmup_steps = num_warmup_steps

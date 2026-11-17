@@ -261,3 +261,81 @@ class TestApplyParamGroupsSpec:
         with pytest.raises(ValueError, match='param_names'):
             apply_param_groups_spec([{'params': list(model.parameters())}], spec, model=model,
                                     tower_prefixes={'vision_tower': [], 'aligner': [], 'language_model': []})
+
+
+def _step_through(sched, steps):
+    out = {}
+    for s in steps:
+        sched.optimizer.step()
+        sched.step()
+        out[s] = sched.optimizer.param_groups[0]['lr']
+    return out
+
+
+class TestResumeHorizon:
+    """defect69: a resume rebuilt with a new max_steps must keep its own horizon, not be clobbered
+    by the checkpoint's old one (ScheduleShapeGuardMixin). Same-horizon resume stays bit-identical."""
+
+    @pytest.mark.parametrize('cls', [CosineWarmupScheduler, LinearWarmupScheduler])
+    def test_state_dict_excludes_shape(self, cls):
+        s = cls(_opt(), num_warmup_steps=3, num_training_steps=30)
+        sd = s.state_dict()
+        assert 'num_training_steps' not in sd
+        assert 'num_warmup_steps' not in sd
+
+    def test_cosine_resume_rebases_to_new_horizon(self):
+        def opt():
+            return torch.optim.SGD([nn.Parameter(torch.zeros(1))], lr=1e-5)
+        old = CosineWarmupScheduler(opt(), num_warmup_steps=3, num_training_steps=30)
+        _step_through(old, range(1, 16))
+        new = CosineWarmupScheduler(opt(), num_warmup_steps=3, num_training_steps=40)
+        new.load_state_dict(old.state_dict())
+        assert new.num_training_steps == 40
+        lr = _step_through(new, range(16, 41))
+        assert lr[16] == pytest.approx(7.251019e-06, abs=1e-9)
+        assert lr[40] == 0.0
+        assert lr[31] > 0.0  # decays toward the NEW horizon, no resurrection past the old one
+
+    def test_cosine_same_horizon_resume_bitwise(self):
+        old = CosineWarmupScheduler(_opt(), num_warmup_steps=3, num_training_steps=30)
+        _step_through(old, range(1, 16))
+        resume = CosineWarmupScheduler(_opt(), num_warmup_steps=3, num_training_steps=30)
+        resume.load_state_dict(old.state_dict())
+        rlr = _step_through(resume, range(16, 31))
+        fresh = CosineWarmupScheduler(_opt(), num_warmup_steps=3, num_training_steps=30)
+        flr = _step_through(fresh, range(1, 31))
+        for s in range(16, 31):
+            assert rlr[s] == pytest.approx(flr[s], abs=1e-12)
+
+    def test_linear_resume_rebases_and_clamps(self):
+        old = LinearWarmupScheduler(_opt(), num_warmup_steps=3, num_training_steps=30)
+        _step_through(old, range(1, 16))
+        new = LinearWarmupScheduler(_opt(), num_warmup_steps=3, num_training_steps=40)
+        new.load_state_dict(old.state_dict())
+        assert new.num_training_steps == 40
+        lr = _step_through(new, range(16, 41))
+        assert lr[40] == 0.0
+
+    def test_reverse_unguarded_clobbers(self):
+        # Sensitivity: without the guard the old horizon clobbers the new one and cosine resurrects.
+        from torch.optim.lr_scheduler import LambdaLR
+
+        class Unguarded(LambdaLR):
+            def __init__(self, optimizer, num_warmup_steps, num_training_steps):
+                self.num_warmup_steps = num_warmup_steps
+                self.num_training_steps = num_training_steps
+                super().__init__(optimizer, lr_lambda=self._lam)
+
+            def _lam(self, cur):
+                if cur < self.num_warmup_steps:
+                    return cur / max(1, self.num_warmup_steps)
+                p = (cur - self.num_warmup_steps) / max(1, self.num_training_steps - self.num_warmup_steps)
+                return max(0.0, 0.5 * (1 + math.cos(math.pi * p)))
+
+        old = Unguarded(_opt(), 3, 30)
+        _step_through(old, range(1, 16))
+        new = Unguarded(_opt(), 3, 40)
+        new.load_state_dict(old.state_dict())
+        assert new.num_training_steps == 30  # clobbered
+        lr = _step_through(new, range(16, 41))
+        assert lr[40] > 0.0  # resurrected

@@ -3,8 +3,10 @@
 import math
 from torch.optim.lr_scheduler import LambdaLR
 
+from ._base import ScheduleShapeGuardMixin
 
-class CosineWarmupScheduler(LambdaLR):
+
+class CosineWarmupScheduler(ScheduleShapeGuardMixin, LambdaLR):
 
     def __init__(self,
                  optimizer,
