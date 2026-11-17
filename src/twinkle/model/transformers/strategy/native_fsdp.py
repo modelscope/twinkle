@@ -304,7 +304,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             options=self._prepare_optimizer_state_dict_options(for_load=False),
         )
         if Platform.is_master():
-            # DCP requires an entry for every trainable parameter; Adam leaves unused parameters uninitialized.
+            # DCP requires an entry for every optimizer parameter; Adam leaves unused parameters uninitialized.
             for group in optim_state['param_groups']:
                 for name in group['params']:
                     optim_state['state'].setdefault(name, {})

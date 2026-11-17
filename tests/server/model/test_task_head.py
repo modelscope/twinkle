@@ -136,18 +136,22 @@ def test_full_persisted_head_does_not_forward_num_labels_to_hf(monkeypatch):
 
 
 def test_full_model_attaches_head_and_preserves_device_mesh(monkeypatch):
+    import inspect
+
+    from twinkle import DeviceMesh
     from twinkle.infra.dispatch import _get_device_mesh_param_name
     from twinkle.server.model.backends import transformers_model
 
-    mesh = SimpleNamespace(fsdp_size=2)
+    mesh = DeviceMesh.from_sizes(dp_size=2, device_type='cpu')
     received = {}
     monkeypatch.setattr(transformers_model.TransformersModel, '__init__',
                         lambda self, **kwargs: received.update(kwargs))
     attached = []
     monkeypatch.setattr(transformers_model.TransformersModel, '_add_task_head',
                         lambda self, *args: attached.append(args))
-    transformers_model.TwinkleCompatFullTransformersModel(
-        model_id='causal-backbone', device_mesh=mesh, task='seq_cls', num_labels=3)
+    model_class = transformers_model.TwinkleCompatFullTransformersModel
+    inspect.unwrap(model_class.__init__)(
+        object.__new__(model_class), model_id='causal-backbone', device_mesh=mesh, task='seq_cls', num_labels=3)
     assert attached == [('', 'seq_cls', None, 3)]
     assert received['device_mesh'] is mesh
     assert _get_device_mesh_param_name(

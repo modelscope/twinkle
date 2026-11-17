@@ -17,7 +17,6 @@ from twinkle import DeviceGroup, remote_class
 from twinkle.model.base import TrainableModel
 from twinkle.server.config.backend_dispatch import BackendSelector
 from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.config.training import validate_native_st_model
 from twinkle.server.deployment import bind_deployment, build_deployment_app
 from twinkle.server.runtime import init_twinkle_runtime
 from twinkle.server.state import ServerState, get_server_state
@@ -62,11 +61,15 @@ def _validate_model_task(kw: dict[str, Any]) -> None:
         kw['task'] = 'decision'
         kw['task_head_loader'] = head_factory()
         return
+    from pathlib import Path
     from transformers import AutoConfig
     from twinkle.hub import HubOperation
 
     path = HubOperation.download_model(kw['model_id'])
-    validate_native_st_model(path, task_type, kw.get('model_cls'))
+    if task_type == 'embedding' and kw.get('model_cls') is None and (Path(path) / 'modules.json').is_file():
+        raise ValueError(
+            'native sentence-transformers checkpoint requires model_cls; '
+            'the generic embedding wrapper cannot preserve its module pipeline')
     loader = kw.get('model_loader')
     config = (loader.process_config(loader.build_config(path)) if loader is not None else
               AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code()))
@@ -77,7 +80,6 @@ def _validate_model_task(kw: dict[str, Any]) -> None:
         if classification:
             if num_labels is None or getattr(config, 'num_labels', None) != num_labels:
                 raise ValueError('num_labels does not match the persisted classification head')
-            from pathlib import Path
             from safetensors import safe_open
             head_found = False
             for file in Path(path).glob('model*.safetensors'):
@@ -138,15 +140,12 @@ def _make_transformers_model(kw: dict[str, Any]) -> Any:
         from .backends.transformers_model import TwinkleCompatFullTransformersModel
         for key in _LORA_ONLY_CTOR_KWARGS:
             kw.pop(key, None)
-        num_labels = kw.pop('num_labels', None)
-        task = kw.pop('task', None)
-        if task == 'decision' and getattr(kw.get('model_loader'), 'task_type', None) == 'decision':
+        if kw.get('task') == 'decision' and getattr(kw.get('model_loader'), 'task_type', None) == 'decision':
             # The family loader attaches its single head while constructing the full model.
+            kw.pop('task')
             kw.pop('task_head_loader', None)
-        elif task is not None:
-            kw['task'] = task
-            if num_labels is not None:
-                kw['num_labels'] = num_labels
+        if kw.get('task') is None:
+            kw.pop('num_labels', None)
         if model_cls_spec is not None:
             return _make_model_class(_resolve_model_cls(model_cls_spec))(**kw)
         return TwinkleCompatFullTransformersModel(**kw)

@@ -96,7 +96,6 @@ def test_lazy_wrapping_rebinds_each_tenants_optimizer_without_other_parameters(t
                               _model_wrapped=False, _enable_expert_parallel=False, sp_strategy=None,
                               _maybe_apply_expert_parallel=lambda: None, _ensure_sp_strategy=lambda: None,
                               _ensure_gdn_padding_free_patch=lambda: None,
-                              _apply_deterministic_model_kernels=lambda: None,
                               _rebind_lr_scheduler=TransformersModel._rebind_lr_scheduler,
                               register_mm_forward_hook=lambda group: None)
     with patch.object(original, 'to', return_value=replacement), patch(

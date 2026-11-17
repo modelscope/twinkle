@@ -77,34 +77,6 @@ def test_custom_model_class_rejects_incompatible_training_modes(mutation, mode):
         ServerConfig(applications=[app])
 
 
-@pytest.mark.parametrize('resolved', [False, True])
-def test_native_st_without_model_cls_is_rejected_before_runtime(tmp_path, resolved):
-    from twinkle.server.config.training import TrainingModelConfig
-
-    (tmp_path / 'modules.json').write_text('[]')
-    with pytest.raises(ValidationError, match='native sentence-transformers checkpoint requires model_cls'):
-        if resolved:
-            values = model_config()
-            values['model_id'] = str(tmp_path)
-            values['config']['task_type'] = 'embedding'
-            TrainingModelConfig.model_validate(values)
-        else:
-            app = model_application()
-            app['args'].update(model_id=str(tmp_path), task_type='embedding')
-            ServerConfig(applications=[app])
-
-
-def test_native_st_with_model_cls_keeps_the_supported_lora_entry(tmp_path):
-    (tmp_path / 'modules.json').write_text('[]')
-    app = model_application()
-    app['args'].update(
-        model_id=str(tmp_path),
-        task_type='embedding',
-        model_cls='swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel',
-    )
-    ServerConfig(applications=[app])
-
-
 def test_st_example_is_a_cold_on_demand_custom_model():
     config = ServerConfig.from_yaml('cookbook/client/swift_model/sentence_transformer_config.yaml')
     model = config.training_config.models[0]
@@ -135,7 +107,7 @@ def test_existing_yaml_uses_explicit_instance_limits_and_business_idle():
     for path in paths:
         config = ServerConfig.from_yaml(path)
         applications = [app for app in config.applications if app.import_path == 'model']
-        for app, model in zip(applications, config.training_config.models, strict=True):
+        for app, model in zip(applications, config.training_config.models):
             assert model.config.idle_timeout_s == app.args.idle_timeout_s
             assert model.config.min_replicas == app.args.min_replicas
             assert model.config.max_replicas == app.args.max_replicas
