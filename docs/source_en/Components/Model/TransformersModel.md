@@ -16,6 +16,7 @@ class TransformersModel:
                  fsdp_config: Dict[str, Any] = None,
                  grad_scaler_config: Dict[str, Any] = None,
                  memory_efficient_init: bool = False,
+                 dp_balance: bool = True,
                  **kwargs):
         ...
 
@@ -81,3 +82,5 @@ for data in dataloader:
 For full-parameter training, restore model weights by constructing `TransformersModel` with the checkpoint path as `model_id`, for example `TransformersModel(model_id='./output/fsdp2/last-checkpoint')`, and then call `resume_from_checkpoint(...)` to restore optimizer state and training progress.
 
 For end-to-end resume logic, including dataloader skipping, refer to `cookbook/transformers/fsdp2.py`.
+
+DP workload balancing is enabled by default through TrainableModel (`dp_balance=True`); see [the shared design and supported configurations](DPBalance.md).

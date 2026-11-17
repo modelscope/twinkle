@@ -2,8 +2,8 @@
 set -eu
 
 # GRPO on GSM8K with DP workload balancing across the model DP ranks.
-# Thinking completions vary a lot in length; --balance-batch evens out the work per rank before each
-# optimizer step. Defaults: Qwen3.5-4B, FSDP2 on 2 devices (2 data ranks) plus 2 vLLM devices, padded
+# Thinking completions vary a lot in length; TransformersModel evens out the work per rank before each
+# optimizer step (on by default, --no-balance-batch turns it off). Defaults: Qwen3.5-4B, FSDP2 on 2 devices (2 data ranks) plus 2 vLLM devices, padded
 # inputs, dynamic batching with at most 16 rows and 8192 tokens per micro-batch.
 # Override at invocation, e.g.:
 #   sh dp_balance_grpo.sh --padding-free            # packed inputs

@@ -47,3 +47,5 @@ for data in dataloader:
 > 1. Megatron models do not support using AdamW's original optimizer, only support configuring `MegatronDistributedOptimizer`, you can pass `MegatronDistributedOptimizer`, `default` to use it
 > 2. Megatron models do not support using other lr_schedulers, only support using `OptimizerParamScheduler`, you can pass `OptimizerParamScheduler`, `default` to use it
 > 3. You need to pass tp/cp/dp/ep/pp/sequence_parallel configurations into the device_mesh parameter to facilitate twinkle to manage data distribution. These parameters will be passed by device_mesh to the megatron initialization process
+
+DP workload balancing is enabled by default through TrainableModel (`dp_balance=True`); see [the shared design and supported configurations](DPBalance.md).

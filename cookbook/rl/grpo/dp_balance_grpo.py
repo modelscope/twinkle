@@ -1,14 +1,16 @@
-"""GRPO on GSM8K with DP workload balancing (`--balance-batch`).
+"""GRPO on GSM8K with DP workload balancing.
 
 `forward_backward` dispatches every mini-batch with `slice_dp`: each model DP rank trains on a contiguous
 slice, and the step waits for the slowest rank. Thinking completions vary a lot in length, so those
-slices are often uneven. `plan_dp_balance` reorders the mini-batch before dispatch so every rank keeps its
-sample count but gets a similar workload. It estimates each rank's cost by running the model's own
-micro-batch planner on that rank's slice, so it follows both the input layout (padded or packed) and the
-micro-batch options (fixed or dynamic). With `GRPOLoss` (a per-sequence mean) the update does not change;
-only the waiting shrinks. Training metrics gain `dp_balance/*` entries: the workload imbalance (busiest
-rank over the mean), per-rank tokens, micro-batches per rank and, for padded inputs, the padding ratio,
-before and after balancing.
+slices are often uneven. `TransformersModel` balances them by default: before dispatch it reorders the
+mini-batch, together with every per-sample argument such as `old_logps` and `advantages`, so every rank
+keeps its sample count but gets a similar workload, and it returns the outputs in the caller's order. It
+estimates each rank's cost by running the model's own micro-batch planner on that rank's slice, so it
+follows both the input layout (padded or packed) and the micro-batch options (fixed or dynamic). With
+`GRPOLoss` (a per-sequence mean) the update does not change; only the waiting shrinks. Training metrics
+gain `dp_balance/*` entries: the workload imbalance (busiest rank over the mean), per-rank tokens,
+micro-batches per rank and, for padded inputs, the padding ratio, before and after balancing.
+`--no-balance-batch` builds the model with `dp_balance=False`.
 
 Packed inputs (`--padding-free`) of linear-attention models such as Qwen3.5 need flash-linear-attention:
 the native GatedDeltaNet does not reset its state between packed sequences. On NPU that means
@@ -21,7 +23,6 @@ Usage:
     sh dp_balance_grpo.sh --no-balance-batch      # the same run without balancing, for comparison
 """
 import argparse
-from functools import partial
 from typing import Any, Dict, List
 
 from peft import LoraConfig
@@ -36,8 +37,7 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.hub import HubOperation
 from twinkle.metric import CompletionRewardMetric
-from twinkle.model import MicroBatchConfig, TransformersModel, plan_dp_balance
-from twinkle.model.dp_balance import estimate_workload
+from twinkle.model import TransformersModel
 from twinkle.patch import Patch
 from twinkle.preprocessor.llm import GSM8KProcessor
 from twinkle.processor import InputProcessor
@@ -108,24 +108,24 @@ def main():
     # slice_dp splits by data_world_size (dp x fsdp), not dp_size: FSDP2 alone still has fsdp_size data ranks.
     dp_size = model_mesh.data_world_size
 
-    # Must match what forward_backward receives: the plan simulates the model's own micro-batch planner.
     micro_batch_kwargs = {
         'micro_batch_size': args.micro_batch_size,
         'dynamic_batching': args.dynamic_batching,
         'max_tokens_per_micro_batch': args.max_tokens_per_micro_batch if args.dynamic_batching else None,
         'packing_algorithm': 'ffd',
     }
-    micro_batch_config = MicroBatchConfig(**micro_batch_kwargs)
-    # The linear term of the workload estimate grows with the hidden size.
-    hidden_size = (getattr(hf_config, 'text_config', None) or hf_config).hidden_size
-    workload_fn = partial(estimate_workload, hidden_size=hidden_size)
 
     model_kwargs = {'attn_implementation': args.attn_implementation} if args.attn_implementation else {}
     if is_qwen35:
         from transformers import Qwen3_5ForConditionalGeneration
         model_kwargs['model_cls'] = Qwen3_5ForConditionalGeneration
     model = TransformersModel(
-        model_id=args.model_id, device_mesh=model_mesh, remote_group='model', strategy=args.strategy, **model_kwargs)
+        model_id=args.model_id,
+        device_mesh=model_mesh,
+        remote_group='model',
+        strategy=args.strategy,
+        dp_balance=args.balance_batch,
+        **model_kwargs)
     if device_type == 'NPU' and args.padding_free:
         model.apply_patch(NPULinearAttentionKernel)
     # Language-model projections only (full and linear attention, MLP); 'all-linear' would add the vision tower.
@@ -210,25 +210,10 @@ def main():
         metrics.accumulate(completion_lengths=completion_lengths, rewards={'accuracy': rewards})
         advantages = advantage_fn(rewards, num_generations=args.num_generations, scale='group').tolist()
 
-        balance_metrics: Dict[str, List[float]] = {}
         for mb_start in range(0, len(all_inputs), args.mini_batch_size):
             mb_inputs = all_inputs[mb_start:mb_start + args.mini_batch_size]
             mb_old_logps = all_old_logps[mb_start:mb_start + args.mini_batch_size]
             mb_advantages = advantages[mb_start:mb_start + args.mini_batch_size]
-            if args.balance_batch:
-                plan = plan_dp_balance(
-                    mb_inputs,
-                    dp_size,
-                    padding_free=args.padding_free,
-                    micro_batch_config=micro_batch_config,
-                    workload_fn=workload_fn,
-                )
-                # Every per-sample list is reordered with the same plan so they stay aligned.
-                mb_inputs, mb_old_logps, mb_advantages = (
-                    plan.apply(values) for values in (mb_inputs, mb_old_logps, mb_advantages))
-                for key, value in plan.metrics.items():
-                    balance_metrics.setdefault(key, []).append(value)
-
             model.forward_backward(
                 inputs=mb_inputs, old_logps=mb_old_logps, advantages=mb_advantages, **micro_batch_kwargs)
             model.clip_grad_and_step()
@@ -238,7 +223,6 @@ def main():
 
         log_dict = metrics.calculate()
         log_dict.update(model.calculate_metric(is_training=True))
-        log_dict.update({key: sum(values) / len(values) for key, values in balance_metrics.items()})
         logger.info(f'[Step {optim_step}/{args.max_steps}] {log_dict}')
 
     logger.info(f'Training completed. optim_steps={optim_step}')

@@ -481,6 +481,7 @@ def test_forward_only_micro_batches_restore_order_and_slice_masks(algorithm, mic
 
 def test_forward_only_without_micro_batches_prepares_inputs_once():
     class ModelHarness:
+
         # Collaborators of the borrowed ``TransformersModel`` methods. Each is a ``staticmethod`` on
         # ``TrainableModel``; a bare assignment would rebind it as an instance method and hand ``self``
         # to its first parameter. Borrowed uniformly because which subset a given entry point reaches
@@ -491,7 +492,7 @@ def test_forward_only_without_micro_batches_prepares_inputs_once():
         # The loop drives the update here rather than an engine, which is the path under test.
         strategy = SimpleNamespace(owns_update_step=lambda: False)
 
-        optimizer_group = {'adapter': object()}
+        optimizer_group = {'adapter': SimpleNamespace()}
 
         def _get_default_group(self):
             return 'adapter'

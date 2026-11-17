@@ -131,6 +131,10 @@ class ChunkedCrossEntropyLoss(Loss):
         self.reduction = reduction
         self.dft = dft
 
+    @property
+    def dp_balance_group_size(self):
+        return 1 if self.reduction == 'sum' else None
+
     def micro_batch_scale(self, inputs, indices):
         if self.reduction == 'sum':
             return 1.0

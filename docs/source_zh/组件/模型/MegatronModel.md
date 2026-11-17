@@ -47,3 +47,5 @@ for data in dataloader:
 > 1. megatron模型不支持使用AdamW的原始optimizer，仅支持配置`MegatronDistributedOptimizer`, 你可以传递`MegatronDistributedOptimizer`, `default`来使用它
 > 2. megatron模型不支持使用其他lr_scheduler，仅支持使用`OptimizerParamScheduler`，你可以传递`OptimizerParamScheduler`, `default`来使用它
 > 3. 你需要将tp/cp/dp/ep/pp/sequence_parallel配置传入device_mesh参数中，以方便twinkle管理数据分配。这些参数会由device_mesh代为传递到megatron初始化流程中
+
+DP 负载均衡由 TrainableModel 统一实现，默认 `dp_balance=True`；详见[公共设计与适用条件](DPBalance.md)。

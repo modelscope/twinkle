@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from typing import Optional
+
 from twinkle.data_format import InputFeature, LossOutput, ModelOutput
 
 
@@ -8,6 +10,11 @@ class Loss:
     require_entropy = False
     require_logps = True
     require_values = False
+    # Consecutive samples that must stay together, in order, on one DP rank when the model reorders a
+    # batch to balance DP workloads (2 for interleaved chosen/rejected pairs). Opt in only when
+    # moving whole groups between equally sized ranks preserves the objective's gradient weights.
+    # Rank-local token means and batch-dependent statistics do not satisfy that contract.
+    dp_balance_group_size: int | None = None
 
     def __call__(self, inputs: InputFeature, outputs: ModelOutput, **kwargs) -> LossOutput:
         ...
@@ -35,3 +42,10 @@ class Loss:
     def batch_normalizer(self, inputs: list[InputFeature]):
         """Return this batch's additive reduction denominator, or ``None`` for mean-reduced losses."""
         return None
+
+
+def dp_balance_group_size(loss) -> Optional[int]:
+    """The ``dp_balance_group_size`` of ``loss``; a plain callable may depend on order, so it gets None."""
+    if loss is None:
+        return 1
+    return loss.dp_balance_group_size if isinstance(loss, Loss) else None
