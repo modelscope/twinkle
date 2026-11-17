@@ -19,7 +19,6 @@ def init_twinkle_runtime(
     device_mesh_dict: dict[str, Any],
     *,
     ncpu_proc_per_node: int | None = None,
-    extra_torch_kwargs: dict[str, Any] | None = None,
 ) -> Any | None:
     """Initialize the Twinkle distributed runtime and build a DeviceMesh.
 
@@ -44,7 +43,6 @@ def init_twinkle_runtime(
         'nproc_per_node': nproc_per_node,
         'groups': [device_group],
         'lazy_collect': False,
-        'extra_torch_kwargs': extra_torch_kwargs,
     }
     if ncpu_proc_per_node is not None:
         init_kwargs['ncpu_proc_per_node'] = ncpu_proc_per_node

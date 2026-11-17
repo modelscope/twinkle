@@ -668,19 +668,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 break
         fill(int(micro_batch_size), int(ga or 1))
 
-    def _apply_deterministic_model_kernels(self):
-        if not torch.are_deterministic_algorithms_enabled():
-            return
-        from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
-
-        for module in self.model.modules():
-            if type(module).__name__ == 'Qwen3_5GatedDeltaNet':
-                module.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
-                module.causal_conv1d_fn = None
-
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
-            self._apply_deterministic_model_kernels()
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
             self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=self._enable_expert_parallel)
             self._maybe_apply_expert_parallel()

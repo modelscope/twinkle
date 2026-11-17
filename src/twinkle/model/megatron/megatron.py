@@ -448,20 +448,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             _device_mesh=self.device_mesh,
         )
 
-    def _apply_deterministic_model_kernels(self):
-        if not torch.are_deterministic_algorithms_enabled():
-            return
-        from transformers.models.qwen3_next.modeling_qwen3_next import torch_chunk_gated_delta_rule
-
-        for model in self.model:
-            for module in model.modules():
-                if type(module).__name__ == 'Qwen3NextGatedDeltaNet':
-                    module.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
-                    module.causal_conv1d_fn = None
-
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
-            self._apply_deterministic_model_kernels()
             self.model = self.strategy.wrap_model(self.model)
             self._model_wrapped = True
 

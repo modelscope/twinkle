@@ -154,21 +154,6 @@ def test_full_model_attaches_head_and_preserves_device_mesh(monkeypatch):
         transformers_model.TwinkleCompatFullTransformersModel.__init__) == 'device_mesh'
 
 
-def test_server_forwards_full_determinism_to_workers(monkeypatch):
-    import twinkle
-    from twinkle.server.runtime import init_twinkle_runtime
-
-    received = {}
-    monkeypatch.setattr(twinkle, 'initialize', lambda **kwargs: received.update(kwargs))
-    mesh = SimpleNamespace(world_size=2)
-    monkeypatch.setattr(twinkle.DeviceMesh, 'from_sizes', lambda **kwargs: mesh)
-    result = init_twinkle_runtime(
-        is_mock=False, nproc_per_node=2, device_group=SimpleNamespace(name='model'),
-        device_mesh_dict={'fsdp_size': 2}, extra_torch_kwargs={'full_determinism': True})
-    assert result is mesh
-    assert received['extra_torch_kwargs'] == {'full_determinism': True}
-
-
 def test_full_custom_model_class_uses_compat_dispatch(monkeypatch):
     from twinkle.server.model import app
 

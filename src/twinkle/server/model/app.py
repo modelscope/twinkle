@@ -266,7 +266,6 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
             nproc_per_node=nproc_per_node,
             device_group=self.device_group,
             device_mesh_dict=device_mesh,
-            extra_torch_kwargs=kwargs.pop('extra_torch_kwargs', None),
         )
         self.replica_id = self.training_context.instance_id
         self.max_loras = kwargs.get('max_loras', 5)

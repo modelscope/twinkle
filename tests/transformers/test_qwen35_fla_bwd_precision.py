@@ -124,19 +124,6 @@ def _force_fla_off(model: torch.nn.Module) -> None:
             delattr(la, '_twinkle_npu_patched')
 
 
-def test_full_determinism_disables_nondeterministic_sdp(monkeypatch):
-    from twinkle.utils.platforms.gpu import GPU
-
-    calls = []
-    monkeypatch.setattr(torch.backends.cuda, 'enable_mem_efficient_sdp', calls.append)
-    monkeypatch.setattr(torch.backends.cudnn, 'deterministic', False)
-    monkeypatch.setattr(torch.backends.cudnn, 'benchmark', True)
-    GPU.apply_determinism()
-    assert calls == [False]
-    assert torch.backends.cudnn.deterministic
-    assert not torch.backends.cudnn.benchmark
-
-
 def _force_fla_on(model: torch.nn.Module) -> int:
     import importlib
     import twinkle.kernel.ops.fla.npu as fla_mod
@@ -311,45 +298,3 @@ if __name__ == '__main__':
     _compare_models('dense', ['linear_attention', 'linear_attention'], 2024, 256)
     _compare_models('moe', ['linear_attention', 'linear_attention'], 1234, 128)
     print('\nAll comparisons finished.')
-
-
-@pytest.mark.parametrize('multi', [False, True])
-@pytest.mark.parametrize('deterministic', [False, True])
-def test_gdn_kernel_policy_applies_once_before_both_model_wrappers(tmp_path, monkeypatch, multi, deterministic):
-    from tokenizers import Tokenizer
-    from tokenizers.models import WordPiece
-    from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast
-    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
-    from twinkle import Platform
-    import twinkle.infra as infra
-    from twinkle.model.transformers.transformers import TransformersModel
-    from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
-
-    monkeypatch.setenv('ACCELERATE_USE_CPU', 'true')
-    monkeypatch.setattr(Platform, 'get_local_device', lambda *args, **kwargs: 'cpu')
-    monkeypatch.setattr(infra, '_mode', 'local')
-    monkeypatch.setattr(infra, '_device_group', None)
-    monkeypatch.setattr(infra, '_device_mesh', None)
-    config = Qwen3_5TextConfig(**_common_config_kwargs(['linear_attention', 'linear_attention']))
-    Qwen3_5ForCausalLM(config).save_pretrained(tmp_path)
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=Tokenizer(WordPiece({'[PAD]': 0, '[UNK]': 1}, unk_token='[UNK]')),
-        pad_token='[PAD]', unk_token='[UNK]')
-    tokenizer.save_pretrained(tmp_path)
-    cls = MultiLoraTransformersModel if multi else TransformersModel
-    wrapper = cls(model_id=str(tmp_path), model_cls=AutoModelForCausalLM, config=config, mixed_precision='no',
-                  gradient_checkpointing=False,
-                  **({'max_loras': 2, 'max_r': 4, 'target_modules': ['out_proj']} if multi else {}))
-    gdn = next(module for module in wrapper.model.modules()
-               if type(module).__name__ == 'Qwen3_5GatedDeltaNet')
-    fast_kernel = lambda *args, **kwargs: None
-    gdn.chunk_gated_delta_rule = fast_kernel
-    gdn.causal_conv1d_fn = fast_kernel
-    monkeypatch.setattr(torch, 'are_deterministic_algorithms_enabled', lambda: deterministic)
-    wrapper._lazy_wrap_model()
-    assert gdn.chunk_gated_delta_rule is (torch_chunk_gated_delta_rule if deterministic else fast_kernel)
-    assert gdn.causal_conv1d_fn is (None if deterministic else fast_kernel)
-    # Re-entering an already wrapped model must not repeat the initialization policy.
-    gdn.chunk_gated_delta_rule = fast_kernel
-    wrapper._lazy_wrap_model()
-    assert gdn.chunk_gated_delta_rule is fast_kernel

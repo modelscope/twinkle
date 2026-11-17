@@ -170,7 +170,6 @@ class MultiLoraMegatronModel(MegatronModel):
         if self.task_head_slots is not None:
             self._validate_task_head_config()
             self._build_task_head_slots()
-        self._apply_deterministic_model_kernels()
         self.model = self.strategy.wrap_model(self.model)
         self.strategy.finish_param_config(self.model, None)
         self.multi_adapter.save_initial_weights()

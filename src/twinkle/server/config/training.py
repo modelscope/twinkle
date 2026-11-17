@@ -66,22 +66,11 @@ class TrainingArguments(BaseModel):
     model_loader: str | None = None
     gradient_checkpointing: bool | None = Field(default=None, strict=True)
     mixed_precision: Literal["no", "fp8", "fp16", "bf16"] | None = None
-    extra_torch_kwargs: dict[str, Any] | None = None
     # The readout family names the head task this deployment serves (see
     # ``twinkle/model/tasks.py``); ``causal_lm`` carries no head.
     task_type: Literal["causal_lm", "embedding", "seq_cls", "reranker", "value", "decision"] | None = None
     num_labels: int | None = Field(default=None, gt=0, strict=True)
     language_model_only: bool | None = Field(default=None, strict=True)
-
-    @field_validator('extra_torch_kwargs')
-    @classmethod
-    def _validate_torch_kwargs(cls, value):
-        if value is not None:
-            allowed = {'seed', 'full_determinism', 'tf32'}
-            unknown = set(value) - allowed
-            if unknown:
-                raise ValueError(f'unsupported extra_torch_kwargs keys {sorted(unknown)}; expected {sorted(allowed)}')
-        return value
 
     @model_validator(mode="after")
     def _validate_head(self):
