@@ -356,7 +356,9 @@ class VLLMWeightSender:
                 shm.close()
                 shm.unlink()
                 del shm
-            if not direct_large_tensors:
+            # Device buckets are reused; collecting the whole Python heap on every
+            # publication delays the next rollout without releasing this buffer.
+            if (use_shm or lora_mode) and not direct_large_tensors:
                 gc.collect()
 
         elapsed = time.time() - start_time
