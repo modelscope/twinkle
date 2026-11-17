@@ -785,6 +785,14 @@ class Template:
 
     def _encode_messages(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
         """Encode a single trajectory's messages into InputFeature."""
+        # Normalize multiple system messages into one leading message BEFORE labeling:
+        # TokenizeByRound locates assistant boundaries by prefix-encode LENGTH -- if the
+        # full encode merges a trailing system into the head while the prefix slices do
+        # not contain it, every boundary shifts and labels silently mark system tokens
+        # trainable. Collapsing here (idempotent) keeps full and prefix encodes on the
+        # same message sequence; key_rounds indices count the normalized rounds. The
+        # render entries collapse again for direct inference callers -- idempotent.
+        trajectory["messages"] = self._collapse_system_messages(trajectory["messages"])
         labels = None
         input_ids = None
         # key-round selective training
