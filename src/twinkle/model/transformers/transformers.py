@@ -814,7 +814,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return RouterReplay(action=None)
         self._maybe_apply_router_replay()
         return RouterReplay(
-            action,
+            action=action,
             routed_experts=routed_experts,
             batch_size=batch_size,
             manual_cleanup=manual_cleanup,
