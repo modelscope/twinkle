@@ -20,7 +20,8 @@ class CheckpointWriterRankTest(unittest.TestCase):
                     wrapper.strategy = Mock()
                     wrapper.strategy.unwrap_model.return_value = model
                     wrapper.strategy.get_full_state_dict.return_value = state
-                    wrapper.optimizer_group = {'': SimpleNamespace(cur_step=3)}
+                    wrapper.optimizer_group = {'': SimpleNamespace(
+                        cur_step=3, gradient_accumulation_steps=1, optimizer=None, require_finalized=Mock())}
                     wrapper._save_training_state = Mock()
                     wrapper._save_tokenizer = Mock()
                     wrapper._save_task_head_checkpoint = Mock()
@@ -47,6 +48,19 @@ class CheckpointWriterRankTest(unittest.TestCase):
                                 safe_serialization=True, max_shard_size='5GB')
                         else:
                             model.save_pretrained.assert_not_called()
+
+    def test_partial_accumulation_is_rejected_before_weight_collection(self):
+        wrapper = object.__new__(TransformersModel)
+        wrapper.strategy = Mock()
+        wrapper.optimizer_group = {'': SimpleNamespace(
+            cur_step=3, gradient_accumulation_steps=2, optimizer=None, require_finalized=Mock())}
+
+        with self.assertRaisesRegex(ValueError, 'complete gradient accumulation window'):
+            inspect.unwrap(TransformersModel.save)(
+                wrapper, name='partial', output_dir='/unused', save_optimizer=True)
+
+        wrapper.strategy.get_full_state_dict.assert_not_called()
+        wrapper.strategy.unwrap_model.assert_not_called()
 
 
 if __name__ == '__main__':

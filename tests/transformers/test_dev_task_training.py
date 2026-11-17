@@ -101,6 +101,16 @@ def test_head_lora_tenants_and_cold_optimizer_resume(tmp_path, monkeypatch, task
     initial, peer = read(model, 'a'), read(model, 'b')
     for _ in range(3):
         step(model, 'a')
+    with pytest.raises(ValueError, match='complete gradient accumulation window'):
+        model.save('partial', output_dir=str(tmp_path), adapter_name='a', save_optimizer=True)
+    assert not (tmp_path / 'partial' / 'trainer_state.json').exists()
+    model.save('weights-only', output_dir=str(tmp_path), adapter_name='a')
+    assert (tmp_path / 'weights-only' / 'adapter_model.safetensors').exists()
+    # A complete backward window still needs its optimizer step and zero_grad.
+    model.forward_backward(inputs=copy.deepcopy(batch), task=task, adapter_name='a')
+    with pytest.raises(ValueError, match='zero_grad'):
+        model.save('before-step', output_dir=str(tmp_path), adapter_name='a', save_optimizer=True)
+    model.clip_grad_and_step(adapter_name='a')
     trained = read(model, 'a')
     assert not torch.equal(initial, trained)
     torch.testing.assert_close(read(model, 'b'), peer, rtol=0, atol=0)
@@ -109,7 +119,7 @@ def test_head_lora_tenants_and_cold_optimizer_resume(tmp_path, monkeypatch, task
             assert not parameter.requires_grad
             torch.testing.assert_close(parameter, base[key], rtol=0, atol=0)
     saved = model.save('trained', output_dir=str(tmp_path), adapter_name='a',
-                       save_optimizer=True, consumed_train_samples=3 * len(batch))
+                       save_optimizer=True, consumed_train_samples=4 * len(batch))
     if task != 'embedding':
         head = {k: v for k, v in load_file(saved + '/adapter_model.safetensors').items() if 'score.' in k}
         assert head and any(torch.count_nonzero(v) for k, v in head.items() if 'lora_B' in k)
@@ -128,7 +138,7 @@ def test_head_lora_tenants_and_cold_optimizer_resume(tmp_path, monkeypatch, task
     cold = build()
     add(cold, 'a')
     progress = cold.resume_from_checkpoint(saved, adapter_name='a')
-    assert progress['cur_step'] == 3
+    assert progress['cur_step'] == 4
     step(cold, 'a')
     step(cold, 'a')
     torch.testing.assert_close(read(cold, 'a'), continued, rtol=0, atol=1e-6)
