@@ -367,11 +367,11 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             optimizer,
             options=self._prepare_optimizer_state_dict_options(for_load=False),
         )
-        # DCP requires an entry for every trainable parameter; Adam leaves unused parameters uninitialized.
-        for group in optim_state['param_groups']:
-            for name in group['params']:
-                optim_state['state'].setdefault(name, {})
         if Platform.is_master():
+            # DCP requires an entry for every trainable parameter; Adam leaves unused parameters uninitialized.
+            for group in optim_state['param_groups']:
+                for name in group['params']:
+                    optim_state['state'].setdefault(name, {})
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
             torch.save(optim_state, output_path)
 

@@ -159,6 +159,20 @@ def test_attached_standard_head_is_sharded_independently(preallocated):
     assert all(head._twinkle_independent_fsdp for head in model.task_heads.values())
 
 
+def test_nonmaster_save_ignores_empty_gathered_optimizer_state(tmp_path):
+    strategy = NativeFSDPStrategy(device_mesh=MagicMock(), enable_ep=False)
+    model = torch.nn.Linear(3, 3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    with patch('twinkle.model.transformers.strategy.native_fsdp.Platform.is_master', return_value=False), \
+            patch('torch.distributed.checkpoint.state_dict.get_optimizer_state_dict', return_value={}) as get_state, \
+            patch('torch.save') as save:
+        strategy.save_optimizer_checkpoint(model, optimizer, str(tmp_path / 'optimizer.pt'))
+
+    get_state.assert_called_once()
+    save.assert_not_called()
+
+
 def test_optimizer_restore_accepts_lazy_state_for_unused_parameters(tmp_path):
     strategy = NativeFSDPStrategy(device_mesh=MagicMock(), enable_ep=False)
     model = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 1))
@@ -191,7 +205,7 @@ def test_optimizer_restore_accepts_lazy_state_for_unused_parameters(tmp_path):
     torch.save(corrupted, tmp_path / 'corrupted.pt')
     with patch.object(strategy, '_prepare_optimizer_state_dict_options', side_effect=cpu_options), \
             patch('twinkle.model.transformers.strategy.native_fsdp.Platform.is_master', return_value=True), \
-            pytest.raises(KeyError):
+            pytest.raises((KeyError, RuntimeError), match='0.weight'):
         strategy.load_optimizer_checkpoint(cold, cold_optimizer, str(tmp_path / 'corrupted.pt'))
 
 
