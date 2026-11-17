@@ -104,12 +104,13 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         else:
             from transformers import AutoConfig
             self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        if model_cls is None and hasattr(self.hf_config, 'architectures'):
-            model_cls = self.hf_config.architectures[0]
-        if model_cls is None:
-            model_cls = AutoModelForCausalLM
-        if isinstance(model_cls, str):
-            model_cls = getattr(transformers, model_cls)
+        if model_loader is None or model_id is None:
+            if model_cls is None and getattr(self.hf_config, 'architectures', None):
+                model_cls = self.hf_config.architectures[0]
+            if model_cls is None:
+                model_cls = AutoModelForCausalLM
+            if isinstance(model_cls, str):
+                model_cls = getattr(transformers, model_cls)
         if model_loader is not None and model_id is not None:
             processor = model_loader.process_tokenizer(model_loader.build_processor(model_id, self.hf_config))
             self._default_tokenizer = processor
@@ -358,6 +359,12 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         config = self._copy_lora_config(config_or_dir)
         if config.modules_to_save:
             raise ValueError('modules_to_save is not supported for a multi-tenant LoRA adapter.')
+        self._expand_multimodal_lora_target(
+            config,
+            self.strategy.unwrap_model(self.model),
+            freeze_llm=kwargs.pop('freeze_llm', False),
+            freeze_vit=kwargs.pop('freeze_vit', True),
+            freeze_aligner=kwargs.pop('freeze_aligner', True))
         self.multi_adapter.validate_tenant_target_modules(config.target_modules,
                                                           getattr(config, 'target_parameters', None))
         self._register_adapter(adapter_name, config, **kwargs)

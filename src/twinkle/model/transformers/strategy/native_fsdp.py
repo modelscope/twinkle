@@ -24,6 +24,15 @@ PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
 
+def _shard_fp32_modules(model, *, mesh, reshard_after_forward):
+    # FSDP parameter groups require one storage dtype; keep FP32 modules separate from the BF16 group.
+    for module in model.modules():
+        if (not getattr(module, 'keep_fp32', False) or isinstance(module, FSDPModule)
+                or next(module.parameters(), None) is None):
+            continue
+        fully_shard(module, mesh=mesh, reshard_after_forward=reshard_after_forward, mp_policy=_build_mp_policy('no'))
+
+
 class NativeFSDPStrategy(TransformerStrategyBase):
 
     def __init__(self,
@@ -193,6 +202,8 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             world_size = self.device_mesh.world_size
             ep_fsdp_mesh_1d = self.ep_fsdp_device_mesh['ep_fsdp'] if ep_enabled else None
 
+            _shard_fp32_modules(model, mesh=fsdp_mesh, reshard_after_forward=reshard_after_forward)
+
             for layer_mod, experts_mod in layer_pairs:
                 layer_mod._fsdp_modules = []
 
@@ -293,6 +304,10 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             options=self._prepare_optimizer_state_dict_options(for_load=False),
         )
         if Platform.is_master():
+            # DCP requires an entry for every optimizer parameter; Adam leaves unused parameters uninitialized.
+            for group in optim_state['param_groups']:
+                for name in group['params']:
+                    optim_state['state'].setdefault(name, {})
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
             torch.save(optim_state, output_path)
 
@@ -311,15 +326,25 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
         optim_state = {}
+        empty_states = None
         if Platform.is_master():
             optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
+            empty_states = {name for name, value in optim_state['state'].items() if not value}
+        if dist.is_initialized():
+            payload = [empty_states]
+            dist.broadcast_object_list(payload, src=0)
+            empty_states = payload[0]
         set_optimizer_state_dict(
             model,
             optimizer,
             optim_state,
             options=self._prepare_optimizer_state_dict_options(for_load=True),
         )
+        # DCP initializes every Adam slot before loading; explicitly empty snapshots remain lazy.
+        parameters = dict(model.named_parameters())
+        for name in empty_states:
+            optimizer.state.pop(parameters[name], None)
 
     def get_ep_clip_kwargs(self, model) -> Dict[str, Any]:
         """Return EP-aware kwargs for normalize_and_clip_grad_norm."""

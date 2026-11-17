@@ -53,10 +53,23 @@ def _validate_model_task(kw: dict[str, Any]) -> None:
     task_type = kw.pop('task_type', None)
     if task_type is None:
         return
+    if task_type == 'decision':
+        loader = kw.get('model_loader')
+        head_factory = getattr(loader, 'task_head_loader', None)
+        if getattr(loader, 'task_type', None) != 'decision' or not callable(head_factory):
+            raise ValueError('decision requires a family model_loader with task_head_loader()')
+        kw['task'] = 'decision'
+        kw['task_head_loader'] = head_factory()
+        return
+    from pathlib import Path
     from transformers import AutoConfig
     from twinkle.hub import HubOperation
 
     path = HubOperation.download_model(kw['model_id'])
+    if task_type == 'embedding' and kw.get('model_cls') is None and (Path(path) / 'modules.json').is_file():
+        raise ValueError(
+            'native sentence-transformers checkpoint requires model_cls; '
+            'the generic embedding wrapper cannot preserve its module pipeline')
     loader = kw.get('model_loader')
     config = (loader.process_config(loader.build_config(path)) if loader is not None else
               AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code()))
@@ -67,7 +80,6 @@ def _validate_model_task(kw: dict[str, Any]) -> None:
         if classification:
             if num_labels is None or getattr(config, 'num_labels', None) != num_labels:
                 raise ValueError('num_labels does not match the persisted classification head')
-            from pathlib import Path
             from safetensors import safe_open
             head_found = False
             for file in Path(path).glob('model*.safetensors'):
@@ -112,19 +124,30 @@ def _make_model_class(base: type) -> type:
 
 def _make_transformers_model(kw: dict[str, Any]) -> Any:
     train_mode = kw.pop('train_mode', 'lora')
+    # Family-owned module paths keep all-linear LoRA on the language-model side
+    # of a multimodal backbone, as on the loader's native training path.
+    arch = getattr(kw.get('model_loader'), 'model_arch', None)
+    if arch is not None:
+        kw['model_arch'] = {name: getattr(arch, name) for name in
+                            ('language_model', 'vision_tower', 'aligner', 'lm_head')
+                            if getattr(arch, name, None)}
     # ``model_cls`` arrives as plain data and is resolved here, so the class object never reaches the
     # constructor -- it would either be rejected by the remote-class layer in safe mode
-    # (``TWINKLE_TRUST_REMOTE_CODE=0``) or leak into every worker's constructor kwargs. The schema only
-    # allows it for a LoRA-mode transformers deployment.
+    # (``TWINKLE_TRUST_REMOTE_CODE=0``) or leak into every worker's constructor kwargs. The schema
+    # allows it for non-hybrid transformers deployments.
     model_cls_spec = kw.pop('model_cls', None)
     if train_mode == 'full':
         from .backends.transformers_model import TwinkleCompatFullTransformersModel
         for key in _LORA_ONLY_CTOR_KWARGS:
             kw.pop(key, None)
-        # The plain TransformersModel attaches heads at add_adapter time -- a full-mode
-        # deployment has no adapter, so an attached-head task_type has nothing to ride on.
-        if kw.pop('task', None) is not None:
-            raise ValueError('the transformers full-mode backend serves no task head; use train_mode: lora')
+        if kw.get('task') == 'decision' and getattr(kw.get('model_loader'), 'task_type', None) == 'decision':
+            # The family loader attaches its single head while constructing the full model.
+            kw.pop('task')
+            kw.pop('task_head_loader', None)
+        if kw.get('task') is None:
+            kw.pop('num_labels', None)
+        if model_cls_spec is not None:
+            return _make_model_class(_resolve_model_cls(model_cls_spec))(**kw)
         return TwinkleCompatFullTransformersModel(**kw)
     from .backends.transformers_model import (TwinkleCompatSpectralHybridTransformersModel,
                                               TwinkleCompatTransformersModel)

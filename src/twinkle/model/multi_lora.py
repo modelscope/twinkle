@@ -3,9 +3,9 @@ import torch
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
+from itertools import chain
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora import Embedding, Linear, LoraLayer
-from torch.distributed.tensor import distribute_tensor
 from types import MethodType
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -56,7 +56,8 @@ class MultiLoraTaskHeadSlots:
             head = build_head()
             setattr(host, f'task_head_slot_{slot}', head)
             self._initial_weights[slot] = {
-                name: parameter.detach().clone().cpu() for name, parameter in head.named_parameters()}
+                name: tensor.detach().clone().cpu()
+                for name, tensor in chain(head.named_parameters(), head.named_buffers())}
         host.task_heads = {}
 
     def bind(self, adapter_name: str, host: torch.nn.Module) -> None:
@@ -93,7 +94,9 @@ class MultiLoraTaskHeadSlots:
         if head is None:
             return
         with torch.no_grad():
-            for name, parameter in head.named_parameters():
+            # Calibration buffers can be nonpersistent in the family head. They still
+            # belong to this tenant and must not leak when the physical slot is reused.
+            for name, parameter in chain(head.named_parameters(), head.named_buffers()):
                 saved = self._initial_weights.get(slot, {}).get(name)
                 if saved is not None:
                     write_param(parameter, saved)
@@ -118,7 +121,7 @@ class MultiLoraTaskHeadSlots:
             return {}
         return {
             f'task_head.{name}': read_param(parameter).detach().clone().cpu()
-            for name, parameter in head.named_parameters()
+            for name, parameter in chain(head.named_parameters(), head.named_buffers())
         }
 
     def import_state(self, adapter_name: str, host: torch.nn.Module, state: Dict[str, torch.Tensor],
@@ -142,16 +145,25 @@ class MultiLoraTaskHeadSlots:
             # lives on the last stage; every rank binds the same slot index.
             return
         parameters = dict(head.named_parameters())
+        tensors = {**parameters, **dict(head.named_buffers())}
         covered = {key[len(prefix):] for key in head_keys}
-        if covered != set(parameters):
+        # Parameter-only checkpoints predate calibration snapshots; keep them loadable.
+        if covered not in (set(parameters), set(tensors)):
             raise ValueError(
                 f'checkpoint task-head keys {sorted(covered)} do not match the bound head\'s '
-                f'parameters {sorted(parameters)}: the head architecture changed since the '
+                f'tensors {sorted(tensors)}: the head architecture changed since the '
                 'checkpoint was written.')
+        for key in head_keys:
+            tensor = tensors[key[len(prefix):]]
+            shapes = {tensor.shape}
+            if hasattr(tensor, 'to_local'):
+                shapes.add(tensor.to_local().shape)
+            if state[key].shape not in shapes:
+                raise ValueError(f'task-head shape mismatch for {key}: {state[key].shape} != {tensor.shape}')
         with torch.no_grad():
             for key in head_keys:
                 name = key[len(prefix):]
-                parameter = parameters[name]
+                parameter = tensors[name]
                 write_param(parameter, state[key])
 
 
@@ -177,38 +189,12 @@ class MultiLora:
         return torch_util.to_local_tensor(parameter)
 
     @staticmethod
-    def _is_distributed_param(parameter):
-        return hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements')
-
-    @staticmethod
     def _is_target_parameter_lora_name(name: str) -> bool:
         return '._twinkle_lora_' in name
 
     def _write_param_tensor(self, parameter, value):
-        if value is None:
-            return
-        value = value.detach().to(dtype=parameter.dtype)
-        if self._is_distributed_param(parameter):
-            if self._is_distributed_param(value):
-                parameter.data.copy_(value.to(parameter.device))
-                return
-
-            local_param = parameter.to_local() if hasattr(parameter, 'to_local') else None
-            parameter_shape = tuple(parameter.shape)
-            value_shape = tuple(value.shape)
-            if local_param is not None:
-                local_shape = tuple(local_param.shape)
-                if value_shape == local_shape and value_shape != parameter_shape:
-                    local_param.copy_(value.to(local_param.device))
-                    return
-                if value_shape != parameter_shape:
-                    raise ValueError(
-                        f'Cannot write tensor with shape {value_shape} to distributed parameter with global shape '
-                        f'{parameter_shape} and local shape {local_shape}')
-            value = distribute_tensor(value.to(parameter.device), parameter.device_mesh, parameter.placements)
-        else:
-            value = value.to(parameter.device)
-        parameter.data.copy_(value)
+        if value is not None:
+            torch_util.copy_tensor_(parameter, value)
 
     @staticmethod
     def _slice_rank_tensor(name: str, tensor, rank: int):
@@ -492,9 +478,9 @@ class MultiLora:
         # Strip LoRA-specific suffixes (e.g. ".lora_A.default.weight") so that
         # a full parameter name like "model.layers.0.attn.proj.lora_A.default.weight"
         # can be matched against target_modules like ["attn.proj"].
-        cleaned = module_name
-        if '.lora_' in module_name:
-            cleaned = re.sub(r'\.lora_\w+(\.[\w-]+)*$', '', module_name)
+        cleaned = module_name.removeprefix('base_model.model.')
+        if '.lora_' in cleaned:
+            cleaned = re.sub(r'\.lora_\w+(\.[\w-]+)*$', '', cleaned)
 
         if isinstance(target_modules, str):
             return re.fullmatch(target_modules, cleaned) is not None
@@ -676,6 +662,14 @@ class MultiLora:
         low_cpu_mem_usage = module_device.type == 'meta'
 
         base_config = kwargs.get('lora_config', None)
+        megatron_targets = None
+        if isinstance(module, list):
+            requested = base_config.target_modules if base_config is not None else target_modules
+            if requested:
+                from .megatron import MegatronModel
+                requested = [requested] if isinstance(requested, str) else list(requested)
+                # Resolve each pristine chunk once; adding a slot changes its module tree.
+                megatron_targets = [MegatronModel.get_target_modules(chunk, requested) for chunk in module]
         for i in range(self.max_loras):
             config = deepcopy(base_config) if base_config is not None else None
             if config is None:
@@ -703,22 +697,14 @@ class MultiLora:
                         self._patch_lora_forward(name, submodule)
                 return _module
 
-            def _patch_megatron(_module):
-                # Expand target_modules (e.g., 'all-linear' -> actual module names)
+            def _patch_megatron(_module, targets):
                 _config = deepcopy(config)
+                if targets is not None:
+                    _config.target_modules = targets
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, _config, low_cpu_mem_usage=low_cpu_mem_usage)
                     self._autocast_adapter_dtype(_module, lora_tenant.adapter_name)
                 else:
-                    # TODO first wrap needs parse target_modules, need to fix later
-                    if _config.target_modules:
-                        if isinstance(_config.target_modules, str):
-                            target_modules = [_config.target_modules]
-                        else:
-                            target_modules = list(_config.target_modules)
-
-                        from .megatron import MegatronModel
-                        _config.target_modules = MegatronModel.get_target_modules(_module, target_modules)
                     _module = get_peft_model(
                         _module, _config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
 
@@ -728,7 +714,8 @@ class MultiLora:
                 return _module
 
             if isinstance(module, list):
-                module = [_patch_megatron(_m) for _m in module]
+                module = [_patch_megatron(chunk, megatron_targets[index] if megatron_targets is not None else None)
+                          for index, chunk in enumerate(module)]
             else:
                 module = _patch_peft(module)
 

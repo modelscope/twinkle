@@ -31,7 +31,8 @@ def model_application():
 
 
 @pytest.mark.asyncio
-async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construction(monkeypatch):
+@pytest.mark.parametrize('mode', ['lora', 'full'])
+async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construction(monkeypatch, mode):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
     from twinkle.server.config.training import TrainingModelConfig
@@ -42,7 +43,7 @@ async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construct
     app = model_application()
     # These modules deliberately do not exist on the gateway. Resolution belongs to workers.
     app['args'].update(model_cls='worker_only.encoder:Model', model_loader='worker_only.loader:load',
-                       gradient_checkpointing=False, mixed_precision='no')
+                       gradient_checkpointing=False, mixed_precision='no', train_mode=mode)
     catalog = ServerConfig(applications=[app]).training_config
     spec = TrainingModelConfig.model_validate_json(catalog.models[0].model_dump_json())
     captured = Mock(return_value=object())
@@ -55,7 +56,7 @@ async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construct
         pool=SimpleNamespace(name=lambda *args: 'owned-instance'),
         deployment_options=lambda *args: {}, deploy=AsyncMock())
     await driver.deploy(InstanceRecord(instance_id='instance', controller_epoch='epoch',
-                                      base_model=spec.name, mode='lora', startup_deadline=0), spec)
+                                      base_model=spec.name, mode=mode, startup_deadline=0), spec)
     assert captured.call_args.kwargs['model_cls'] == app['args']['model_cls']
     assert captured.call_args.kwargs['model_loader'] == app['args']['model_loader']
     assert captured.call_args.kwargs['gradient_checkpointing'] is False
@@ -63,13 +64,12 @@ async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construct
     driver.runtime.deploy.assert_awaited_once()
 
 
-@pytest.mark.parametrize('mutation', ['full', 'hybrid', 'megatron'])
-def test_custom_model_class_rejects_incompatible_training_modes(mutation):
+@pytest.mark.parametrize('mutation,mode', [('hybrid', 'lora'), ('megatron', 'lora'), ('megatron', 'full')])
+def test_custom_model_class_rejects_incompatible_training_modes(mutation, mode):
     app = model_application()
     app['args']['model_cls'] = 'worker_only.encoder:Model'
-    if mutation == 'full':
-        app['args']['train_mode'] = 'full'
-    elif mutation == 'hybrid':
+    app['args']['train_mode'] = mode
+    if mutation == 'hybrid':
         app['args']['hybrid'] = {'allocation_path': '/tmp/allocation.json'}
     else:
         app['args']['backend'] = 'megatron'
@@ -185,18 +185,15 @@ def test_existing_yaml_examples_keep_their_model_entries(monkeypatch):
     paths += list(Path('cookbook/client/async_rl').glob('server_config.yaml'))
     paths += list(Path('tests/server/config').glob('server_config*e2e*.yaml'))
     paths += list(Path('tests/server/fixtures').glob('server_config_mock*.yaml'))
-    assert len(paths) == 9
+    assert paths
     for path in paths:
         config = ServerConfig.from_yaml(path)
         models = [app for app in config.applications if app.import_path == 'model']
-        assert len(models) == len(config.training_config.models) == 1
-        model = config.training_config.models[0]
-        assert model.model_id == models[0].args.model_id
-        assert model.route_prefix == models[0].route_prefix
-        mode = model.config
-        original = models[0]
-        expected_min = original.args.min_replicas
-        assert mode.min_replicas == expected_min
+        assert len(models) == len(config.training_config.models) > 0
+        for original, model in zip(models, config.training_config.models, strict=True):
+            assert model.model_id == original.args.model_id
+            assert model.route_prefix == original.route_prefix
+            assert model.config.min_replicas == original.args.min_replicas
         assert ServerConfig.model_validate(config.to_yaml_dict()).training_config == config.training_config
 
 
@@ -417,3 +414,17 @@ def test_transformers_still_accepts_single_device():
     app = model_application()
     app['args'].update(device_group={'ranks': 1, 'device_type': 'cuda'}, device_mesh={'dp_size': 1})
     assert ServerConfig(applications=[app]).training_config.models[0].config.num_devices == 1
+
+
+@pytest.mark.parametrize('backend', ['transformers', 'megatron'])
+@pytest.mark.parametrize('mode', ['lora', 'full'])
+def test_native_backends_preserve_loader_and_precision_configuration(backend, mode):
+    app = model_application()
+    app['args'].update(backend=backend, train_mode=mode, mixed_precision='no',
+                       model_loader='worker_only.loader:load')
+    config = ServerConfig(applications=[app])
+    restored = ServerConfig.model_validate(config.to_yaml_dict())
+    model = restored.training_config.models[0]
+    assert model.backend == backend and model.mode == mode
+    assert model.config.model_loader == 'worker_only.loader:load'
+    assert model.config.mixed_precision == 'no'

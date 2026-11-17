@@ -110,9 +110,18 @@ def validate(base_url, controller, args):
         initial_weights = weights(save(a, 'initial', 0))
         for _ in range(3):
             step(a)
+        if args.backend == 'transformers':
+            from twinkle_client.exceptions import TaskFailedError
+            try:
+                save(a, 'partial', 3 * len(batch))
+            except TaskFailedError as error:
+                assert 'complete gradient accumulation window' in str(error)
+            else:
+                raise AssertionError('An optimizer checkpoint with pending gradients was accepted')
+        step(a)
         trained = read(a)
         np.testing.assert_allclose(read(b), peer, rtol=0, atol=0)
-        snapshot = save(a, 'trained', 3 * len(batch))
+        snapshot = save(a, 'trained', 4 * len(batch))
         changed = weights(snapshot)
         assert changed.keys() == initial_weights.keys()
         updates = [key for key in changed if not np.array_equal(changed[key].float().numpy(),
@@ -130,7 +139,7 @@ def validate(base_url, controller, args):
         assert fresh_state['cur_step'] == 0
         np.testing.assert_allclose(read(c), initial, rtol=0, atol=2e-5)
         progress = c.resume_from_checkpoint(snapshot.twinkle_path)
-        assert progress['cur_step'] == 3 and progress['consumed_train_samples'] == 3 * len(batch)
+        assert progress['cur_step'] == 4 and progress['consumed_train_samples'] == 4 * len(batch)
         np.testing.assert_allclose(read(c), trained, rtol=0, atol=2e-5)
         step(c)
         step(c)

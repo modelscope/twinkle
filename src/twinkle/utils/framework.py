@@ -179,6 +179,35 @@ class Torch(Framework):
         return tensor
 
     @staticmethod
+    def copy_tensor_(tensor: 'torch.Tensor', value: 'torch.Tensor') -> None:
+        """Copy a full tensor or a saved local shard in place, preserving the target layout."""
+        import torch
+
+        with torch.no_grad():
+            value = value.detach().to(dtype=tensor.dtype)
+            if hasattr(tensor, 'device_mesh') and hasattr(tensor, 'placements'):
+                if hasattr(value, 'device_mesh') and hasattr(value, 'placements'):
+                    tensor.copy_(value.to(tensor.device))
+                    return
+                local = tensor.to_local() if hasattr(tensor, 'to_local') else None
+                global_shape, value_shape = tuple(tensor.shape), tuple(value.shape)
+                if local is not None:
+                    local_shape = tuple(local.shape)
+                    if value_shape == local_shape and value_shape != global_shape:
+                        local.copy_(value.to(local.device))
+                        return
+                    if value_shape != global_shape:
+                        raise ValueError(
+                            f'Cannot write tensor with shape {value_shape} to distributed parameter with global shape '
+                            f'{global_shape} and local shape {local_shape}')
+                from torch.distributed.tensor import distribute_tensor
+
+                value = distribute_tensor(value.to(tensor.device), tensor.device_mesh, tensor.placements)
+            else:
+                value = value.to(tensor.device)
+            tensor.copy_(value)
+
+    @staticmethod
     def synchronize(device=None):
         """Wait for all queued work on ``device``, defaulting to the LOCAL_RANK device.
 

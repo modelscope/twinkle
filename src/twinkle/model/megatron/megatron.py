@@ -36,7 +36,7 @@ from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpo
 from twinkle.model.micro_batch import (MicroBatchConfig, agree_micro_batch_count,
                                        plan_micro_batches_contiguous, sequence_length)
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
-from twinkle.model.tasks import get_task_spec_obj
+from twinkle.model.tasks import _generative_reranker_score, get_task_spec_obj
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
@@ -57,6 +57,26 @@ def _first_optimizer_lr(optimizer) -> float:
     """The learning rate of any megatron optimizer: a ChainedOptimizer fans out per model chunk."""
     chained = getattr(optimizer, 'chained_optimizers', None) or [optimizer]
     return chained[0].config.lr
+
+
+def _align_distributed_optimizer_param_order(optimizer) -> None:
+    """Match checkpoint indices to MCore's FP32-first main-parameter order.
+
+    Some MCore versions index mixed groups in gradient-buffer order, then put
+    FP32 parameters before low-precision master parameters in the inner optimizer.
+    A decision head kept in FP32 exposes this mismatch during checkpoint save/load.
+    """
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    for part in getattr(optimizer, 'chained_optimizers', None) or [optimizer]:
+        if not isinstance(part, DistributedOptimizer):
+            continue
+        fp32_groups = getattr(part, 'model_fp32_groups', ())
+        low_groups = getattr(part, 'model_float16_groups', ())
+        for group_index, (fp32, low) in enumerate(zip(fp32_groups, low_groups, strict=True)):
+            if fp32 and low:
+                for param_index, param in enumerate([*fp32, *low]):
+                    part.model_param_group_index_map[param] = (group_index, param_index)
 
 
 def _gather_vocab_parallel(tensor):
@@ -989,6 +1009,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         else:
                             # Packed: one row [1, total, C]; each segment ends at its last token.
                             unpacked_logits = output_tensor[0, _last_idx]
+                        if task == 'generative_reranker':
+                            unpacked_logits = _gather_vocab_parallel(unpacked_logits)
+                            unpacked_logits = _generative_reranker_score(
+                                unpacked_logits, self.optimizer_group[adapter_name].template)
                 elif task == 'value':
                     # Legacy path -- PPO critic over the bridge-built head: keep its per-token
                     # V(s_t) riding the logits channel ([b, s]); PPOValueLoss masks to response
@@ -1530,6 +1554,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             model_chunks=model_chunks,
             config_overrides=config_overrides,
         )
+        _align_distributed_optimizer_param_order(optimizer)
         return optimizer
 
     def _create_megatron_scheduler(self, optimizer, lr_decay_steps, max_lr=1e-4, **kwargs):
@@ -1929,8 +1954,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         synchronous path."""
         from megatron.core import dist_checkpointing
         from megatron.core import parallel_state as mpu
-        from megatron.core.dist_checkpointing.serialization import TorchDistSaveShardedStrategy
         from megatron.core.dist_checkpointing.strategies.fully_parallel import FullyParallelSaveStrategyWrapper
+        from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 
         iteration = optimizer_config.cur_step
         iter_dir = os.path.join(checkpoint_dir, f'iter_{iteration:07d}')
@@ -1960,7 +1985,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # megatron-core < 0.19 exposed get_default_save_sharded_strategy(); 0.19 made
         # save(sharded_strategy=None) default to TorchDistSaveShardedStrategy itself -- build that
         # explicitly, the thread_count tweak and the wrapper below need a concrete instance.
-        save_strategy = TorchDistSaveShardedStrategy()
+        save_strategy = TorchDistSaveShardedStrategy(backend='torch_dist', version=1)
         if hasattr(save_strategy, 'thread_count'):
             save_strategy.thread_count = thread_count
         if mpu.get_data_parallel_world_size(with_context_parallel=True) > 1:
@@ -1972,17 +1997,20 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # Async staging is only sound under an initialized process group (the metadata finalize
         # holds a barrier); a single-process run has no skew to hide anyway.
         async_save = kwargs.pop('async_save', False) and dist.is_initialized()
+        save_parameters = inspect.signature(dist_checkpointing.save).parameters
+        save_options = {}
+        if 'async_strategy' in save_parameters:
+            # Avoid the optional nvidia-resiliency-ext queue on newer MCore.
+            save_options['async_strategy'] = 'mcore'
+        if 'content_metadata' in save_parameters:
+            save_options['content_metadata'] = sharded_sd_metadata
         async_request = dist_checkpointing.save(
             state_dict,
             iter_dir,
             save_strategy,
             async_sharded_save=async_save,
-            # mcore's default 'nvrx' strategy needs the nvidia-resiliency-ext package, which is
-            # not a twinkle dependency; the built-in 'mcore' strategy drives the SAME
-            # AsyncCallsQueue the consumption path below schedules into.
-            async_strategy='mcore',
             validate_access_integrity=True,
-            content_metadata=sharded_sd_metadata,
+            **save_options,
         )
         if async_request is not None:
             # The strategy already staged the tensors to host memory; the queue's worker performs
