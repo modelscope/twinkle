@@ -24,34 +24,22 @@ PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
 
-def _shard_attached_task_heads(model, *, mesh, reshard_after_forward, mp_policy):
+def _shard_task_heads(model, *, mesh, reshard_after_forward, mp_policy):
     # The head wrapper owns unsharding for the readout backward instead of the root wrapper.
     heads = list((getattr(model, 'task_heads', None) or {}).values())
     # Future tenants can bind any preallocated slot after the root is already sharded.
     heads.extend(module for name, module in model.named_children() if name.startswith('task_head_slot_'))
+    heads = [head for head in heads if not getattr(head, 'keep_fp32', False)]
+    heads.extend(module for module in model.modules() if getattr(module, 'keep_fp32', False)
+                 and not getattr(module, '_twinkle_independent_fsdp', False))
     seen = set()
     for head in heads:
-        if (head is None or id(head) in seen or getattr(head, 'keep_fp32', False)
-                or next(head.parameters(), None) is None):
+        if head is None or id(head) in seen or next(head.parameters(), None) is None:
             continue
         seen.add(id(head))
-        fully_shard(head, mesh=mesh, reshard_after_forward=reshard_after_forward, mp_policy=mp_policy)
+        policy = _build_mp_policy('no') if getattr(head, 'keep_fp32', False) else mp_policy
+        fully_shard(head, mesh=mesh, reshard_after_forward=reshard_after_forward, mp_policy=policy)
         head._twinkle_independent_fsdp = True
-
-
-def _shard_fp32_task_heads(model, *, mesh, reshard_after_forward):
-    # Independent FSDP wrappers unshard these externally-called heads and keep per-group dtypes uniform.
-    for module in model.modules():
-        if (getattr(module, '_twinkle_independent_fsdp', False)
-                or not getattr(module, 'keep_fp32', False) or next(module.parameters(), None) is None):
-            continue
-        fully_shard(
-            module,
-            mesh=mesh,
-            reshard_after_forward=reshard_after_forward,
-            mp_policy=_build_mp_policy('no'),
-        )
-        module._twinkle_independent_fsdp = True
 
 
 class NativeFSDPStrategy(TransformerStrategyBase):
@@ -223,10 +211,8 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             world_size = self.device_mesh.world_size
             ep_fsdp_mesh_1d = self.ep_fsdp_device_mesh['ep_fsdp'] if ep_enabled else None
 
-            _shard_attached_task_heads(
+            _shard_task_heads(
                 model, mesh=fsdp_mesh, reshard_after_forward=reshard_after_forward, mp_policy=mp_policy)
-            _shard_fp32_task_heads(
-                model, mesh=fsdp_mesh, reshard_after_forward=reshard_after_forward)
 
             for layer_mod, experts_mod in layer_pairs:
                 layer_mod._fsdp_modules = []
@@ -304,7 +290,6 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             full_state_dict=True,
             cpu_offload=not for_load,
             broadcast_from_rank0=for_load,
-            strict=True,
         )
 
     def get_independent_task_head_state(self, head):

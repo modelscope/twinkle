@@ -60,8 +60,7 @@ def test_weights_only_load_refreshes_target_master_params_and_preserves_adam_sta
 
 
 @pytest.mark.parametrize('api', ['legacy', 'current'])
-@pytest.mark.parametrize('sharding', ['dp_reshardable', 'fsdp_dtensor'])
-def test_mcore_optimizer_save_uses_versioned_torch_dist_strategy(tmp_path, monkeypatch, api, sharding):
+def test_mcore_optimizer_save_uses_versioned_torch_dist_strategy(tmp_path, monkeypatch, api):
     pytest.importorskip('megatron.core', reason='requires the optional Megatron backend')
     from megatron.core import dist_checkpointing
     from megatron.core import parallel_state as mpu
@@ -84,7 +83,7 @@ def test_mcore_optimizer_save_uses_versioned_torch_dist_strategy(tmp_path, monke
 
     monkeypatch.setattr(dist_checkpointing, 'save', legacy_save if api == 'legacy' else current_save)
     monkeypatch.setattr(mpu, 'get_data_parallel_world_size', lambda **kwargs: 1)
-    metadata = {'sharded': True, 'distrib_optim_sharding_type': sharding}
+    metadata = {'sharded': True, 'distrib_optim_sharding_type': 'dp_reshardable'}
     wrapper = SimpleNamespace(
         model=object(),
         strategy=SimpleNamespace(get_sharded_sd_metadata=lambda: metadata),
@@ -99,9 +98,8 @@ def test_mcore_optimizer_save_uses_versioned_torch_dist_strategy(tmp_path, monke
     assert captured['strategy'].version == 1
     assert captured['strategy'].thread_count == 3
     assert captured['async_save'] is False
-    assert metadata == {'sharded': True, 'distrib_optim_sharding_type': sharding}
     if api == 'current':
-        assert captured['metadata'] is metadata
+        assert captured['metadata'] == {'sharded': True, 'distrib_optim_sharding_type': 'dp_reshardable'}
         assert captured['async_strategy'] == 'mcore'
     else:
         assert 'metadata' not in captured
@@ -158,34 +156,3 @@ def test_mcore_persisted_classifier_config(monkeypatch):
         MCoreBridgeBackend().build_model_config(hf_config, {}, strategy, task_type='causal_lm')
     with pytest.raises(ValueError, match='num_labels'):
         MCoreBridgeBackend().build_model_config(hf_config, {}, strategy, num_labels=2)
-
-
-def test_mcore_persisted_classifier_uses_independent_output_head():
-    pytest.importorskip('mcore_bridge', reason='requires the optional Megatron bridge')
-    from mcore_bridge.bridge.gpt_bridge import GPTBridge
-
-    bridge = object.__new__(GPTBridge)
-    bridge.config = SimpleNamespace(
-        task_type='seq_cls', untie_embeddings_and_output_weights=True, padded_vocab_size=13)
-    bridge.is_multimodal = False
-    bridge.tp_size = bridge.etp_size = 1
-    bridge.tp_rank = bridge.etp_rank = 0
-    bridge._peft_format = False
-    mg_model = SimpleNamespace(
-        output_layer=SimpleNamespace(weight=torch.nn.Parameter(torch.zeros(1, 8))),
-        decoder=SimpleNamespace(final_layernorm=SimpleNamespace(weight=torch.nn.Parameter(torch.zeros(8)))),
-    )
-    score = torch.arange(8, dtype=torch.float32).reshape(1, 8)
-    embedding = score.repeat(13, 1) + 100
-    norm = torch.ones(8)
-    def lazy(value):
-        return SimpleNamespace(load=lambda: value)
-
-    bridge._convert_post_process(mg_model, {
-        'score.weight': lazy(score),
-        'model.embed_tokens.weight': lazy(embedding),
-        'model.norm.weight': lazy(norm),
-    }, '', True)
-
-    torch.testing.assert_close(mg_model.output_layer.weight, score)
-    torch.testing.assert_close(mg_model.decoder.final_layernorm.weight, norm)

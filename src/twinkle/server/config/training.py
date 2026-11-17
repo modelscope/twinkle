@@ -99,6 +99,24 @@ class TrainingArguments(BaseModel):
             raise ValueError("min_replicas must not exceed max_replicas")
         return self
 
+    def validate_backend(self, backend: str, *, mode: str, hybrid=None) -> None:
+        if self.strategy is not None and backend != "transformers":
+            raise ValueError("strategy requires the transformers backend")
+        if self.gradient_checkpointing is not None and backend != "transformers":
+            raise ValueError("gradient_checkpointing requires the transformers backend")
+        if self.mixed_precision is not None and backend == "mock":
+            raise ValueError("mixed_precision requires the transformers or megatron backend")
+        if hybrid is not None:
+            if backend != "transformers":
+                raise ValueError("hybrid requires the transformers backend")
+            if mode == "full":
+                raise ValueError('hybrid is not supported with train_mode="full"')
+        if self.model_cls is not None and (backend != "transformers" or mode not in ("lora", "full")
+                                           or hybrid is not None):
+            raise ValueError("model_cls requires a transformers LoRA/full deployment")
+        if self.model_loader is not None and backend == "mock":
+            raise ValueError("model_loader requires the transformers or megatron backend")
+
 
 class LoraArguments(BaseModel):
     """LoRA parameters shared by YAML and LoRA instance configuration."""
@@ -129,23 +147,7 @@ class ModelArgs(TrainingArguments, LoraArguments):
     @model_validator(mode="after")
     def _validate_spectral_backend(self):
         validate_native_st_model(self.model_id, self.task_type, self.model_cls)
-        if self.strategy is not None and self.backend != "transformers":
-            raise ValueError("strategy is only supported by the transformers backend")
-        if self.gradient_checkpointing is not None and self.backend != "transformers":
-            raise ValueError("gradient_checkpointing requires the transformers backend")
-        if self.mixed_precision is not None and self.backend == "mock":
-            raise ValueError("mixed_precision requires the transformers or megatron backend")
-        if self.hybrid is not None:
-            if self.backend != "transformers":
-                raise ValueError("hybrid is only supported by the transformers backend")
-            if self.train_mode == "full":
-                raise ValueError('hybrid is not supported with train_mode="full"')
-        if self.model_cls is not None:
-            if (self.backend != "transformers" or self.train_mode not in ("lora", "full")
-                    or self.hybrid is not None):
-                raise ValueError("model_cls requires a transformers LoRA/full deployment")
-        if self.model_loader is not None and self.backend == "mock":
-            raise ValueError("model_loader requires the transformers or megatron backend")
+        self.validate_backend(self.backend, mode=self.train_mode, hybrid=self.hybrid)
         if self.language_model_only is not None and self.backend != "megatron":
             raise ValueError("language_model_only requires the megatron backend")
         return self
@@ -230,20 +232,7 @@ class TrainingModelConfig(BaseModel):
             raise ValueError("megatron training instances require at least 2 devices")
         if self.config.device_mesh.device_type not in (None, self.device_type):
             raise ValueError("device_mesh.device_type must match device_type")
-        if self.config.strategy is not None and self.backend != "transformers":
-            raise ValueError("strategy requires the transformers backend")
-        if self.config.gradient_checkpointing is not None and self.backend != "transformers":
-            raise ValueError("gradient_checkpointing requires the transformers backend")
-        if self.config.mixed_precision is not None and self.backend == "mock":
-            raise ValueError("mixed_precision requires the transformers or megatron backend")
-        if isinstance(self.config, LoraTrainingConfig) and self.config.hybrid and self.backend != "transformers":
-            raise ValueError("hybrid requires the transformers backend")
-        if self.config.model_cls is not None:
-            if (self.backend != "transformers" or self.mode not in ("lora", "full")
-                    or getattr(self.config, "hybrid", None) is not None):
-                raise ValueError("model_cls requires a transformers LoRA/full deployment")
-        if self.config.model_loader is not None and self.backend == "mock":
-            raise ValueError("model_loader requires the transformers or megatron backend")
+        self.config.validate_backend(self.backend, mode=self.mode, hybrid=getattr(self.config, "hybrid", None))
         return self
 
     @property

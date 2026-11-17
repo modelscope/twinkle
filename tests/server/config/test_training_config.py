@@ -31,7 +31,8 @@ def model_application():
 
 
 @pytest.mark.asyncio
-async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construction(monkeypatch):
+@pytest.mark.parametrize('mode', ['lora', 'full'])
+async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construction(monkeypatch, mode):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
     from twinkle.server.config.training import TrainingModelConfig
@@ -42,7 +43,7 @@ async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construct
     app = model_application()
     # These modules deliberately do not exist on the gateway. Resolution belongs to workers.
     app['args'].update(model_cls='worker_only.encoder:Model', model_loader='worker_only.loader:load',
-                       gradient_checkpointing=False, mixed_precision='no')
+                       gradient_checkpointing=False, mixed_precision='no', train_mode=mode)
     catalog = ServerConfig(applications=[app]).training_config
     spec = TrainingModelConfig.model_validate_json(catalog.models[0].model_dump_json())
     captured = Mock(return_value=object())
@@ -55,7 +56,7 @@ async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construct
         pool=SimpleNamespace(name=lambda *args: 'owned-instance'),
         deployment_options=lambda *args: {}, deploy=AsyncMock())
     await driver.deploy(InstanceRecord(instance_id='instance', controller_epoch='epoch',
-                                      base_model=spec.name, mode='lora', startup_deadline=0), spec)
+                                      base_model=spec.name, mode=mode, startup_deadline=0), spec)
     assert captured.call_args.kwargs['model_cls'] == app['args']['model_cls']
     assert captured.call_args.kwargs['model_loader'] == app['args']['model_loader']
     assert captured.call_args.kwargs['gradient_checkpointing'] is False
@@ -63,10 +64,11 @@ async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construct
     driver.runtime.deploy.assert_awaited_once()
 
 
-@pytest.mark.parametrize('mutation', ['hybrid', 'megatron'])
-def test_custom_model_class_rejects_incompatible_training_modes(mutation):
+@pytest.mark.parametrize('mutation,mode', [('hybrid', 'lora'), ('megatron', 'lora'), ('megatron', 'full')])
+def test_custom_model_class_rejects_incompatible_training_modes(mutation, mode):
     app = model_application()
     app['args']['model_cls'] = 'worker_only.encoder:Model'
+    app['args']['train_mode'] = mode
     if mutation == 'hybrid':
         app['args']['hybrid'] = {'allocation_path': '/tmp/allocation.json'}
     else:
@@ -75,18 +77,21 @@ def test_custom_model_class_rejects_incompatible_training_modes(mutation):
         ServerConfig(applications=[app])
 
 
-@pytest.mark.parametrize('backend,train_mode', [
-    ('transformers', 'lora'),
-    ('transformers', 'full'),
-    ('megatron', 'lora'),
-    ('megatron', 'full'),
-])
-def test_native_st_without_model_cls_is_rejected_before_runtime(tmp_path, backend, train_mode):
+@pytest.mark.parametrize('resolved', [False, True])
+def test_native_st_without_model_cls_is_rejected_before_runtime(tmp_path, resolved):
+    from twinkle.server.config.training import TrainingModelConfig
+
     (tmp_path / 'modules.json').write_text('[]')
-    app = model_application()
-    app['args'].update(model_id=str(tmp_path), task_type='embedding', backend=backend, train_mode=train_mode)
     with pytest.raises(ValidationError, match='native sentence-transformers checkpoint requires model_cls'):
-        ServerConfig(applications=[app])
+        if resolved:
+            values = model_config()
+            values['model_id'] = str(tmp_path)
+            values['config']['task_type'] = 'embedding'
+            TrainingModelConfig.model_validate(values)
+        else:
+            app = model_application()
+            app['args'].update(model_id=str(tmp_path), task_type='embedding')
+            ServerConfig(applications=[app])
 
 
 def test_native_st_with_model_cls_keeps_the_supported_lora_entry(tmp_path):
@@ -459,16 +464,3 @@ def test_extra_torch_kwargs_rejects_unknown_keys():
     app['args']['extra_torch_kwargs'] = {'full_determinism': True, 'deterministic': True}
     with pytest.raises(ValidationError, match='unsupported extra_torch_kwargs'):
         ServerConfig(applications=[app])
-
-
-@pytest.mark.parametrize('backend', ['transformers', 'megatron'])
-@pytest.mark.parametrize('mode', ['lora', 'full'])
-def test_resolved_native_st_without_model_cls_is_rejected(tmp_path, backend, mode):
-    from twinkle.server.config.training import TrainingModelConfig
-
-    (tmp_path / 'modules.json').write_text('[]')
-    values = model_config(mode)
-    values.update(model_id=str(tmp_path), backend=backend)
-    values['config']['task_type'] = 'embedding'
-    with pytest.raises(ValidationError, match='native sentence-transformers checkpoint requires model_cls'):
-        TrainingModelConfig.model_validate(values)

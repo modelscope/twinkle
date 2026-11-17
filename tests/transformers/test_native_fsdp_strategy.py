@@ -114,16 +114,21 @@ def test_lazy_wrapping_rebinds_each_tenants_optimizer_without_other_parameters(t
         torch.testing.assert_close(replacement['b'], torch.ones(2))
 
 
-def test_builtin_score_head_remains_in_root_fsdp_group():
-    model = torch.nn.Module()
-    model.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
-    model.score = torch.nn.Linear(4, 2).to(torch.bfloat16)
+@pytest.fixture
+def head_sharding():
     strategy = NativeFSDPStrategy(device_mesh=MagicMock(), mixed_precision='bf16', enable_ep=False)
-
     with patch('twinkle.model.transformers.strategy.native_fsdp._build_fsdp_mesh',
                return_value=MagicMock()), \
          patch('twinkle.model.transformers.strategy.native_fsdp.fully_shard') as fully_shard:
-        strategy.wrap_model(model)
+        yield strategy, fully_shard
+
+
+def test_builtin_score_head_remains_in_root_fsdp_group(head_sharding):
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
+    model.score = torch.nn.Linear(4, 2).to(torch.bfloat16)
+    strategy, fully_shard = head_sharding
+    strategy.wrap_model(model)
 
     fully_shard.assert_called_once()
     assert fully_shard.call_args.args[0] is model
@@ -132,7 +137,7 @@ def test_builtin_score_head_remains_in_root_fsdp_group():
 
 
 @pytest.mark.parametrize('preallocated', [False, True])
-def test_attached_standard_head_is_sharded_independently(preallocated):
+def test_attached_standard_head_is_sharded_independently(preallocated, head_sharding):
     model = torch.nn.Module()
     model.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
     if preallocated:
@@ -143,12 +148,8 @@ def test_attached_standard_head_is_sharded_independently(preallocated):
         slots.bind('a', model)
     else:
         model.task_heads = {'': torch.nn.Linear(4, 1).to(torch.bfloat16)}
-    strategy = NativeFSDPStrategy(device_mesh=MagicMock(), mixed_precision='bf16', enable_ep=False)
-
-    with patch('twinkle.model.transformers.strategy.native_fsdp._build_fsdp_mesh',
-               return_value=MagicMock()), \
-         patch('twinkle.model.transformers.strategy.native_fsdp.fully_shard') as fully_shard:
-        strategy.wrap_model(model)
+    strategy, fully_shard = head_sharding
+    strategy.wrap_model(model)
 
     assert fully_shard.call_count == (3 if preallocated else 2)
     if preallocated:
@@ -233,20 +234,21 @@ def test_nonmaster_restores_lazy_slots_from_broadcast_metadata():
     assert not optimizer.state[model[1].weight]
 
 
-def test_fp32_task_head_is_sharded_as_separate_precision_group():
-    strategy = NativeFSDPStrategy(device_mesh=MagicMock(), mixed_precision='bf16', enable_ep=False)
+def test_fp32_task_head_is_sharded_as_separate_precision_group(head_sharding):
     model = torch.nn.Module()
     model.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
     model.task_head = torch.nn.Linear(4, 1)
     model.task_head.keep_fp32 = True
     model.scoring_head = model.task_head
-    with patch('twinkle.model.transformers.strategy.native_fsdp._build_fsdp_mesh',
-               return_value=MagicMock()), \
-         patch('twinkle.model.transformers.strategy.native_fsdp.fully_shard') as fully_shard:
-        strategy.wrap_model(model)
+    model.standard_head = torch.nn.Linear(4, 1).to(torch.bfloat16)
+    model.task_heads = {'': model.standard_head}
+    strategy, fully_shard = head_sharding
+    strategy.wrap_model(model)
 
-    assert fully_shard.call_count == 2
-    head_call, model_call = fully_shard.call_args_list
+    assert fully_shard.call_count == 3
+    standard_call, head_call, model_call = fully_shard.call_args_list
+    assert standard_call.args[0] is model.standard_head
+    assert standard_call.kwargs['mp_policy'].param_dtype is torch.bfloat16
     assert head_call.args[0] is model.task_head
     assert head_call.kwargs['mp_policy'].param_dtype is None
     assert head_call.kwargs['mp_policy'].reduce_dtype is None
