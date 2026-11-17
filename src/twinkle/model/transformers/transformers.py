@@ -83,13 +83,21 @@ def _no_sync_context(model, should_sync):
 @contextlib.contextmanager
 def _fsdp2_no_sync_context(model):
     # Preserve every FSDP unit's flags across nested forward/backward contexts.
-    # torch's set_requires_gradient_sync walks ``state._fsdp_param_groups`` (a list; the singular
-    # property raises on multi-group HSDP states), so save/restore must walk the same list.
+    # save/restore must walk exactly what ``set_requires_gradient_sync`` walks. That attribute is
+    # version-dependent: torch 2.11's FSDPState carries a single ``_fsdp_param_group`` (the public
+    # setter reads it with a walrus and skips None), while older torch exposed a ``_fsdp_param_groups``
+    # list. Prefer the list when present, otherwise wrap the singular group, so the flags we restore
+    # are the same ones the setter flipped on every torch version.
     from torch.distributed.fsdp import FSDPModule
     previous = []
     for module in model.modules():
         if isinstance(module, FSDPModule):
-            for group in module._get_fsdp_state()._fsdp_param_groups:
+            state = module._get_fsdp_state()
+            groups = getattr(state, '_fsdp_param_groups', None)
+            if groups is None:
+                group = state._fsdp_param_group
+                groups = (group,) if group is not None else ()
+            for group in groups:
                 previous.append((group, group.reduce_grads, group.all_reduce_grads))
     try:
         model.set_requires_gradient_sync(False)
