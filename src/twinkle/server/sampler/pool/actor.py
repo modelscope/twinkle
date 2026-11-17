@@ -5,7 +5,10 @@ import asyncio
 from copy import deepcopy
 
 from twinkle.server.config.application_spec import SamplerArgs
+from twinkle.utils.logger import get_logger
 from .controller import SamplerController
+
+logger = get_logger()
 
 
 def create_controller_actor():
@@ -78,5 +81,13 @@ def stop_sampler_controller(namespace, route_prefix, *, timeout_s=60):
         ray.get(controller.shutdown.remote(), timeout=timeout_s)
     except ray.exceptions.ActorDiedError:
         pass  # already dead; the kill below is then just name bookkeeping
+    except ray.exceptions.GetTimeoutError:
+        # shutdown stuck (the case where cleanup matters most): kill anyway so
+        # --stop converges -- aborting here would leave BOTH the controller and
+        # the router app behind. A half-done shutdown may leave engine
+        # deployments / placement groups alive; say so loudly for manual check.
+        logger.warning(f'sampler controller {name!r} shutdown timed out after {timeout_s}s; '
+                       'killing it anyway -- engine deployments / placement groups may survive, '
+                       'check `ray list actors` / serve status if devices stay occupied.')
     ray.kill(controller, no_restart=True)
     return True

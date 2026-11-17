@@ -4,7 +4,6 @@
 from __future__ import annotations
 import asyncio
 import hashlib
-import logging
 import math
 import time
 import uuid
@@ -22,8 +21,9 @@ from twinkle.server.config.resources import ResourceOptions
 from twinkle.server.exceptions import ResourceExhaustedError
 from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.sampler.concurrency import SamplerConcurrency
+from twinkle.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 _CONTROL_ENDPOINTS = frozenset(
     {"twinkle/set_template", "twinkle/add_adapter_to_sampler", "twinkle/apply_patch", "twinkle/unload_adapter_paths"}
 )

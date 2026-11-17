@@ -32,9 +32,10 @@ BACKEND_TIMEOUT_EXCEPTIONS = (TimeoutError, GetTimeoutError)
 class BackendGate:
     """Owns the two executors, the admission lock, and the poison event.
 
-    Construction must happen inside a running event loop: ``asyncio.Lock()`` and
-    ``asyncio.Event()`` bind to the loop that creates them. This holds today because
-    ``_init_task_queue`` is called from Ray Serve's ``async def __init__``.
+    ``_init_task_queue`` runs in the deployment's SYNCHRONOUS constructor (Ray
+    Serve's ingress wrapper never awaits an async ``__init__``). On Python 3.10+
+    ``asyncio.Lock()`` / ``asyncio.Event()`` bind to the running loop lazily at
+    first use, so constructing them outside a loop is safe.
     """
 
     def __init__(self, *, enable_admission_gate: bool = False) -> None:
