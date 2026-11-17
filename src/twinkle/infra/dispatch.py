@@ -526,6 +526,39 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
             Perf.disable_process(getattr(self, '_profiler', None))
             self._profiler = None
 
+        def close(self):
+            """Terminate THIS handle's remote workers: the constructor's counterpart.
+
+            Driver-side, idempotent, best-effort (never raises). Without it a
+            dropped handle leaves its named workers behind, and the next
+            construction at the same call site dies with 'actor already taken'.
+            Pool handles also deregister their replicas so the registry keeps
+            no stale ACTIVE entries. Local mode holds no workers: a no-op."""
+            actors = getattr(self, '_actors', None)
+            if not actors:
+                return
+            import ray
+            from ._ray import RayHelper
+            for actor in actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:  # noqa
+                    pass
+            try:
+                RayHelper._created_actors[:] = [a for a in RayHelper._created_actors
+                                                if a not in actors]
+            except Exception:  # noqa
+                pass
+            if RayHelper._registry is not None:
+                try:
+                    from .continuous_work import worker_id_of
+
+                    ray.get(RayHelper._registry.remove_actors.remote(
+                        [worker_id_of(actor) for actor in actors]))
+                except Exception:  # noqa
+                    pass
+            self._actors = []
+
         if not hasattr(cls, 'perf_on'):
             cls.perf_on = remote_function(dispatch='all', execute=execute, collect='none',
                                           lazy_collect=False)(perf_on)
@@ -537,6 +570,10 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
         if not hasattr(cls, 'perf_off'):
             cls.perf_off = remote_function(dispatch='all', execute=execute, collect='none',
                                            lazy_collect=False)(perf_off)
+        # close must NOT go through remote_function: it kills the driver-side
+        # handle's own workers, so it runs HERE, on the handle, not on a worker.
+        if not hasattr(cls, 'close'):
+            cls.close = close
 
         cls.__init__ = new_init
         return cls

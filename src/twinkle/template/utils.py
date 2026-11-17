@@ -239,6 +239,11 @@ class TokenizeByRound:
 
     For assistant messages, uses add_generation_prompt=True to exclude the assistant
     prefix (e.g., '<|im_start|>assistant\n') from training labels.
+
+    Boundaries are prefix-encode LENGTHS, so the caller must hand in a normalized
+    message list (multiple system messages already collapsed into one leading
+    message, see Template._encode_messages): otherwise the full encode and the
+    prefix slices disagree on where the head ends and labels silently shift.
     """
 
     @staticmethod

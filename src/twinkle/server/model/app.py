@@ -221,17 +221,35 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
     - Twinkle training operations via /twinkle/* endpoints (synchronous)
     - Worker-local gradient state is keyed by the controller-issued training handle.
     - Per-user rate limiting via TaskQueueMixin
+
+    ``__init__`` must stay synchronous: Ray Serve's FastAPI ingress wrapper calls the
+    user constructor synchronously (ASGIIngressWrapper in ray/serve/api.py) -- an async
+    ``__init__``'s coroutine is never awaited, so none of its body runs and the first
+    request dies on a missing attribute. The startup body needs awaits throughout
+    (runtime registration, model validation, worker readiness), so it lives in
+    :meth:`_complete_startup`, completed once from :meth:`check_health` -- the first
+    instance method Ray Serve awaits. Failing there still fails the deployment loudly,
+    matching the old async-init semantics.
     """
 
-    async def __init__(self,
-                       model_id: str,
-                       nproc_per_node: int,
-                       device_group: dict[str, Any],
-                       device_mesh: dict[str, Any],
-                       backend: str,
-                       queue_config: TaskQueueConfig | None = None,
-                       data_plane_url: str | None = None,
-                       **kwargs):
+    def __init__(self,
+                 model_id: str,
+                 nproc_per_node: int,
+                 device_group: dict[str, Any],
+                 device_mesh: dict[str, Any],
+                 backend: str,
+                 queue_config: TaskQueueConfig | None = None,
+                 data_plane_url: str | None = None,
+                 **kwargs):
+        self._startup_args = (model_id, nproc_per_node, device_group, device_mesh, backend,
+                              queue_config, data_plane_url)
+        self._startup_kwargs = kwargs
+        self._startup_async_done = False
+
+    async def _complete_startup(self) -> None:
+        """The constructor's startup body (see the class docstring for why it lives here)."""
+        model_id, nproc_per_node, device_group, device_mesh, backend, queue_config, data_plane_url = self._startup_args
+        kwargs = self._startup_kwargs
         self.backend = backend
         self.device_group = DeviceGroup(**device_group)
         self.training_context = TrainingRuntimeContext.model_validate(kwargs.pop('training_context'))
@@ -308,13 +326,25 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
             await self.state.touch_replica_last_seen(self.replica_id)
             self._replica_registered = True
 
+    async def check_health(self) -> None:
+        # First awaited instance method after the synchronous constructor: complete the
+        # startup body once. A failure here fails the deployment loudly, exactly like
+        # the old async-init semantics.
+        if not self._startup_async_done:
+            self._startup_async_done = True
+            await self._complete_startup()
+
     async def _on_request_start(self, request: Request) -> str:
         return await self.training_request_start(request)
 
     async def shutdown(self) -> None:
         """Explicit async cleanup — called via FastAPI shutdown event."""
-        await self.shutdown_task_queue()
-        await self.data_plane.close()
+        # Startup may have failed in _complete_startup before these existed;
+        # guard so teardown does not mask the original startup error.
+        if getattr(self, '_backend_gate', None) is not None:
+            await self.shutdown_task_queue()
+        if getattr(self, 'data_plane', None) is not None:
+            await self.data_plane.close()
 
     async def _run_model_health_probe(self) -> dict:
         try:
