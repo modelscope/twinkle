@@ -230,7 +230,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # ``_attach_task_head``.
         task_head_loader = kwargs.pop('task_head_loader', None)
         task = kwargs.pop('task', None)
-        num_labels = kwargs.pop('num_labels', None)
+        # Non-destructive: num_labels must stay in kwargs to reach ModelConfig for the seq_cls head
+        # (popping it left num_labels=None and crashed OutputLayerLinear; defect68).
+        num_labels = kwargs.get('num_labels', None)
         if config is not None:
             self.hf_config = config
         elif model_loader is not None:
