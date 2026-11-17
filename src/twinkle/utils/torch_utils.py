@@ -62,6 +62,33 @@ def pad_sequence_to_length(
 _CHUNKED_SELECTIVE_LOG_SOFTMAX = None
 
 
+def _npu_cross_entropy_log_probs(logits, index):
+    """Return ``log_softmax(logits) -> gather(index)`` with the Ascend CE op."""
+    try:
+        import torch_npu
+    except ImportError:
+        return None
+
+    cross_entropy = getattr(torch_npu, 'npu_cross_entropy_loss', None)
+    if cross_entropy is None:
+        return None
+
+    try:
+        losses, _, _, _ = cross_entropy(
+            logits,
+            index,
+            None,
+            'none',
+            -100,
+            0.0,
+        )
+    except (RuntimeError, TypeError):
+        # Older torch_npu releases may expose a different signature. Preserve
+        # correctness by falling back to Twinkle's autograd implementation.
+        return None
+    return -losses
+
+
 def _chunked_selective_log_softmax_function():
     """Lazily build the autograd function used by :func:`selective_log_softmax`.
 
@@ -74,52 +101,74 @@ def _chunked_selective_log_softmax_function():
     import torch
 
     class ChunkedSelectiveLogSoftmax(torch.autograd.Function):
-        """One chunk of ``selective_log_softmax`` that recomputes in backward.
+        """Chunk the wide softmax while assembling one compact gradient buffer.
 
         The wide FP32 upcast is a forward-only temporary: only the original
-        dtype chunk and its labels are saved, so no full-vocab FP32 copy of the
-        activation stays resident until the backward pass.
+        dtype logits and their labels are saved. Keeping the chunk loop inside
+        one autograd node avoids one full-sized ``SliceBackward`` allocation
+        and accumulation per chunk.
         """
 
         @staticmethod
-        def forward(ctx, logits, labels, compute_dtype, return_entropy):
-            chunk = logits.to(compute_dtype)
-            logsumexp = torch.logsumexp(chunk, dim=-1)
-            selected = torch.gather(chunk, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-            logps = selected - logsumexp
+        def forward(ctx, logits, labels, compute_dtype, return_entropy, chunk_rows):
+            logps = []
+            entropies = []
+            for start in range(0, logits.shape[0], chunk_rows):
+                stop = min(start + chunk_rows, logits.shape[0])
+                chunk = logits[start:stop].to(compute_dtype)
+                chunk_labels = labels[start:stop]
+                logsumexp = torch.logsumexp(chunk, dim=-1)
+                selected = torch.gather(chunk, dim=-1, index=chunk_labels.unsqueeze(-1)).squeeze(-1)
+                logps.append(selected - logsumexp)
+                if return_entropy:
+                    probabilities = torch.softmax(chunk, dim=-1)
+                    entropies.append(logsumexp - (probabilities * chunk).sum(dim=-1))
             ctx.save_for_backward(logits, labels)
             ctx.compute_dtype = compute_dtype
             ctx.return_entropy = return_entropy
+            ctx.chunk_rows = chunk_rows
             if not return_entropy:
-                return logps
-            probabilities = torch.softmax(chunk, dim=-1)
-            return logps, logsumexp - (probabilities * chunk).sum(dim=-1)
+                return torch.cat(logps)
+            return torch.cat(logps), torch.cat(entropies)
 
         @staticmethod
-        def backward(ctx, *grad_outputs):
+        def backward(ctx, grad_logps=None, grad_entropies=None):
             logits, labels = ctx.saved_tensors
             compute_dtype = ctx.compute_dtype
-            chunk = logits.to(compute_dtype)
-            probabilities = torch.softmax(chunk, dim=-1)
-            grad_logits = torch.zeros_like(chunk)
+            single_chunk = logits.shape[0] <= ctx.chunk_rows
+            grad_logits = None if single_chunk else torch.empty(
+                logits.shape,
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            if grad_logps is None:
+                grad_logps = torch.zeros(labels.shape, dtype=compute_dtype, device=logits.device)
+            if ctx.return_entropy and grad_entropies is None:
+                grad_entropies = torch.zeros(labels.shape, dtype=compute_dtype, device=logits.device)
 
-            grad_logps = grad_outputs[0]
-            if grad_logps is not None:
-                grad_logps = grad_logps.to(compute_dtype).unsqueeze(-1)
-                # d/dz (z[label] - logsumexp(z)) = onehot(label) - softmax(z)
-                grad_logits.scatter_add_(dim=-1, index=labels.unsqueeze(-1), src=grad_logps)
-                grad_logits.sub_(probabilities * grad_logps)
+            for start in range(0, logits.shape[0], ctx.chunk_rows):
+                stop = min(start + ctx.chunk_rows, logits.shape[0])
+                chunk = logits[start:stop].to(compute_dtype)
+                chunk_labels = labels[start:stop]
+                chunk_grad_logps = grad_logps[start:stop].to(compute_dtype).unsqueeze(-1)
+                probabilities = torch.softmax(chunk, dim=-1)
 
-            if ctx.return_entropy:
-                grad_entropy = grad_outputs[1]
-                if grad_entropy is not None:
-                    grad_entropy = grad_entropy.to(compute_dtype).unsqueeze(-1)
-                    # H(z) = logsumexp(z) - sum(softmax(z) * z)
-                    # dH/dz = softmax(z) * (E_p[z] - z)
+                # Start from the common -p * dlogp term instead of allocating and
+                # then clearing a full zeros buffer before scatter-add.
+                grad_chunk = probabilities * (-chunk_grad_logps)
+                grad_chunk.scatter_add_(dim=-1, index=chunk_labels.unsqueeze(-1), src=chunk_grad_logps)
+
+                if ctx.return_entropy:
+                    chunk_grad_entropies = grad_entropies[start:stop].to(compute_dtype).unsqueeze(-1)
                     expected = (probabilities * chunk).sum(dim=-1, keepdim=True)
-                    grad_logits.add_(probabilities * (grad_entropy * (expected - chunk)))
+                    grad_chunk.add_(probabilities * (chunk_grad_entropies * (expected - chunk)))
 
-            return grad_logits.to(logits.dtype), None, None, None
+                if single_chunk:
+                    grad_logits = grad_chunk.to(logits.dtype)
+                else:
+                    grad_logits[start:stop].copy_(grad_chunk.to(logits.dtype))
+
+            return grad_logits, None, None, None, None
 
     _CHUNKED_SELECTIVE_LOG_SOFTMAX = ChunkedSelectiveLogSoftmax
     return _CHUNKED_SELECTIVE_LOG_SOFTMAX
@@ -170,33 +219,34 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
 
     vocab_size = logits.shape[-1]
     flat_logits = logits.reshape(-1, vocab_size)
-    flat_index = index.reshape(-1)
+    flat_index = index.reshape(-1).long()
+    if (not return_entropy and flat_logits.device.type == 'npu' and flat_logits.dtype == torch.float32
+            and flat_logits.numel() <= 2_147_483_647):
+        fused_logps = _npu_cross_entropy_log_probs(flat_logits, flat_index)
+        if fused_logps is not None:
+            return fused_logps.reshape(index.shape)
     compute_dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
     element_size = torch.empty((), dtype=compute_dtype).element_size()
     temporary_bytes = 32 << 20 if return_entropy else 64 << 20
     chunk_rows = max(1, temporary_bytes // (vocab_size * element_size))
+    if not return_entropy and compute_dtype == logits.dtype:
+        # No wide upcast is needed for FP32/FP64 logp-only. Use one chunk so
+        # the custom backward can return its gradient directly instead of
+        # paying Python loop, copy, and accumulation overhead.
+        chunk_rows = flat_logits.shape[0]
     chunk_function = _chunked_selective_log_softmax_function()
 
-    logps = []
-    entropies = []
-    for start in range(0, flat_logits.shape[0], chunk_rows):
-        stop = min(start + chunk_rows, flat_logits.shape[0])
-        result = chunk_function.apply(
-            flat_logits[start:stop],
-            flat_index[start:stop],
-            compute_dtype,
-            return_entropy,
-        )
-        if return_entropy:
-            chunk_logps, chunk_entropies = result
-            logps.append(chunk_logps)
-            entropies.append(chunk_entropies)
-        else:
-            logps.append(result)
-    per_token_logps = torch.cat(logps).reshape(index.shape)
+    result = chunk_function.apply(
+        flat_logits,
+        flat_index,
+        compute_dtype,
+        return_entropy,
+        chunk_rows,
+    )
     if return_entropy:
-        return per_token_logps, torch.cat(entropies).reshape(index.shape)
-    return per_token_logps
+        logps, entropies = result
+        return logps.reshape(index.shape), entropies.reshape(index.shape)
+    return result.reshape(index.shape)
 
 
 @dataclass(frozen=True)
