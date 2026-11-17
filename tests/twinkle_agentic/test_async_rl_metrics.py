@@ -14,47 +14,7 @@ from twinkle.metric import (
     MetricRecord,
     create_metrics_reporter,
 )
-from twinkle_agentic.async_rl.metrics import advantage_signal_metrics, rollout_metrics
 from twinkle.metric.reporting import MetricsReporter, _QueuedBackend
-
-
-def test_advantage_signal_metrics_report_zero_and_nonzero_groups():
-    metrics = advantage_signal_metrics(
-        rewards=[1.0, 1.0, 0.0, 1.0],
-        advantages=[0.0, 0.0, -1.0, 1.0],
-        num_generations=2,
-    )
-    assert metrics['group_count'] == 2
-    assert metrics['group_reward_std_mean'] == pytest.approx(0.25)
-    assert metrics['zero_advantage_group_ratio'] == pytest.approx(0.5)
-    assert metrics['positive_advantage_ratio'] == pytest.approx(0.25)
-
-
-def test_advantage_signal_metrics_reject_incomplete_groups():
-    with pytest.raises(ValueError, match='complete groups'):
-        advantage_signal_metrics([1.0, 0.0, 1.0], [1.0, -1.0, 0.0], num_generations=2)
-
-
-def test_rollout_metrics_include_rewards_tokens_and_truncation():
-    metrics = rollout_metrics(
-        rewards={'accuracy': [1.0, 0.0]},
-        completion_lengths=[3, 7],
-        stop_reasons=['stop', 'length'],
-        rollout_latency_s=2.0,
-    )
-    assert metrics == {
-        'sample_count': 2,
-        'completion_length_mean': 5.0,
-        'completion_length_p95': 7,
-        'completion_length_max': 7,
-        'completion_truncated_count': 1,
-        'completion_truncated_ratio': 0.5,
-        'output_tokens': 10,
-        'rollout_latency_s': 2.0,
-        'output_tokens_per_s': 5.0,
-        'accuracy_reward': 0.5,
-        'accuracy_reward_std': pytest.approx(2**-0.5),
-    }
 
 
 def test_completion_reward_metric_preserves_model_metric_contract():

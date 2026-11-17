@@ -4,9 +4,11 @@ import threading
 import uuid
 from typing import List
 
-from twinkle import Platform, remote_function
+from twinkle import Platform, get_logger, remote_function
 from twinkle.checkpoint_engine.base import CheckpointEngine
 from twinkle.perf import timed
+
+logger = get_logger()
 
 
 class CheckpointEngineMixin:
@@ -119,6 +121,10 @@ class CheckpointEngineMixin:
             assert len(master_metadata) == 1
             master_metadata = master_metadata[0]
         engine = self._get_or_create_checkpoint_engine()
+        # The group init ends in a barrier broadcast, so a participant that never arrives leaves the
+        # source blocked with nothing on the console to say who was missing. Record each arrival.
+        logger.info(f'init_checkpoint_process_group: {type(self).__name__} rank={rank} '
+                    f'world_size={world_size} engine={type(engine).__name__}')
         engine.init_process_group(
             rank=rank,
             world_size=world_size,
@@ -233,6 +239,20 @@ class CheckpointEngineMixin:
         if errors:
             raise errors[0]
 
+    @staticmethod
+    def _fingerprint_published(pairs, tag: str = ''):
+        """Record each weight's exact fingerprint as it enters the transport, if the probe is on.
+
+        Wrapping the stream here rather than inside an engine is what makes one record cover every
+        transport: NCCL, IPC, HCCL and XPU engines all consume the generator this returns, so the
+        published side of a reconciliation is instrumented once. Laziness is preserved -- the engine
+        still pulls one tensor at a time and peak memory stays at one bucket.
+        """
+        from twinkle.checkpoint_engine.weight_keys import record_weight_fingerprint
+        for seq, (name, tensor) in enumerate(pairs):
+            record_weight_fingerprint('engine', 'send', seq, name, tensor, tag=tag)
+            yield name, tensor
+
     @remote_function(dispatch='all', lazy_collect=True)
     def send_weights(
         self,
@@ -254,6 +274,8 @@ class CheckpointEngineMixin:
                 model_keys=model_keys,
                 **kwargs,
             )
+        weight_generator = self._fingerprint_published(
+            weight_generator, tag=f'{type(engine).__name__}.rank{engine.rank}')
 
         # In local (paired EMA) mode every rank is a sender in its own 2-rank group.
         # In broadcast mode only engine rank 0 actually sends; others consume silently

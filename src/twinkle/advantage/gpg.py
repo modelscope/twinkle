@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, Literal, Union
 from twinkle import remote_class, remote_function
 
 from .base import Advantage
-from ._utils import apply_kl_in_reward, reduce_rewards
+from ._utils import apply_kl_in_reward, nanstd, reduce_rewards
 
 if TYPE_CHECKING:
     import torch
@@ -57,9 +57,9 @@ class GPGAdvantage(Advantage):
         f_norm = float(kwargs.get('f_norm', 1.0))
 
         rewards = reduce_rewards(rewards, kwargs.get('reward_weights'))
-        # An unscored row (nan out of reduce_rewards) records 0 here, exactly as the legacy
-        # weighted-nansum fold did -- nan-aware group exclusion is grpo/rloo/passk's contract.
-        rewards = torch.nan_to_num(rewards, nan=0.0)
+        # A never-scored row stays NaN through the KL fold and is kept out of the group mean.
+        # Imputing 0 shifts every scored row in the group and leaves the unscored row at
+        # -alpha*mean, a signal with none of its own evidence behind it.
         rewards = apply_kl_in_reward(
             rewards,
             kl_in_reward=kwargs.get('kl_in_reward', False),
@@ -73,16 +73,18 @@ class GPGAdvantage(Advantage):
         K = num_generations
         bsz = rewards.numel()
 
-        # Dynamic alpha: batch_size / count_nonzero(scores), clamped to avoid div-by-zero
-        m = torch.count_nonzero(rewards)
+        # Dynamic alpha: batch_size / count_nonzero(scores), clamped to avoid div-by-zero.
+        # count_nonzero treats NaN as non-zero, so the never-scored rows are folded to 0 for this
+        # count only -- they are not scores, and counting them would inflate alpha for the whole batch.
+        m = torch.count_nonzero(torch.nan_to_num(rewards, nan=0.0))
         alpha = bsz / m.clamp(min=1).to(rewards.dtype)
 
         grouped = rewards.view(-1, K)
-        group_mean = grouped.mean(dim=1, keepdim=True)
+        group_mean = grouped.nanmean(dim=1, keepdim=True)
         advantages = alpha * (grouped - group_mean) / f_norm
 
         if scale == 'batch':
-            std = advantages.std() if advantages.numel() > 1 else torch.ones(1, device=advantages.device)
+            std = nanstd(advantages) if advantages.numel() > 1 else torch.ones(1, device=advantages.device)
             advantages = advantages / (std + 1e-8)
 
-        return advantages.view(-1)
+        return torch.nan_to_num(advantages, nan=0.0).view(-1)

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, Literal, Union
 from twinkle import remote_class, remote_function
 
 from .base import Advantage
-from ._utils import apply_kl_in_reward, reduce_rewards
+from ._utils import apply_kl_in_reward, nanstd, reduce_rewards
 
 if TYPE_CHECKING:
     import torch
@@ -57,9 +57,10 @@ class OPOAdvantage(Advantage):
             response_lengths = torch.tensor(response_lengths, dtype=rewards.dtype, device=rewards.device)
 
         rewards = reduce_rewards(rewards, kwargs.get('reward_weights'))
-        # An unscored row (nan out of reduce_rewards) records 0 here, exactly as the legacy
-        # weighted-nansum fold did -- nan-aware group exclusion is grpo/rloo/passk's contract.
-        rewards = torch.nan_to_num(rewards, nan=0.0)
+        # A never-scored row stays NaN through the KL fold and is kept out of the length-weighted
+        # baseline. Imputing 0 is worse here than a plain mean: the fake score adds nothing to the
+        # numerator but the row's LENGTH still lands in the denominator, diluting the baseline that
+        # every scored row in the group is measured against.
         rewards = apply_kl_in_reward(
             rewards,
             kl_in_reward=kwargs.get('kl_in_reward', False),
@@ -74,14 +75,15 @@ class OPOAdvantage(Advantage):
         grouped_rewards = rewards.view(-1, K)
         grouped_lengths = response_lengths.view(-1, K).to(rewards.dtype)
 
-        # Length-weighted baseline per group: sum(len_i * score_i) / sum(len_i)
-        len_sum = grouped_lengths.sum(dim=1, keepdim=True).clamp(min=1e-8)
-        baseline = (grouped_lengths * grouped_rewards).sum(dim=1, keepdim=True) / len_sum
+        # Length-weighted baseline per group: sum(len_i * score_i) / sum(len_i), over scored members only.
+        scored = (~torch.isnan(grouped_rewards)).to(grouped_lengths.dtype)
+        len_sum = (grouped_lengths * scored).sum(dim=1, keepdim=True).clamp(min=1e-8)
+        baseline = (grouped_lengths * grouped_rewards).nansum(dim=1, keepdim=True) / len_sum
 
         advantages = grouped_rewards - baseline
 
         if scale == 'batch':
-            std = advantages.std() if advantages.numel() > 1 else torch.ones(1, device=advantages.device)
+            std = nanstd(advantages) if advantages.numel() > 1 else torch.ones(1, device=advantages.device)
             advantages = advantages / (std + 1e-8)
 
-        return advantages.view(-1)
+        return torch.nan_to_num(advantages, nan=0.0).view(-1)

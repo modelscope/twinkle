@@ -31,18 +31,24 @@ def nanstd(tensor: torch.Tensor, dim: Optional[int] = None, keepdim: bool = Fals
 def reduce_rewards(rewards: torch.Tensor, reward_weights: Optional[Sequence[float]]) -> torch.Tensor:
     """Collapse a ``[N, n_funcs]`` per-function reward matrix to ``[N]``.
 
-    With no weights this is the plain sum the estimators used before (so existing single-reward and
-    unweighted multi-reward behavior is unchanged). With weights it is the weighted ``nansum`` used by
-    the legacy rl_core path, so a NaN from a skipped reward function drops out instead of poisoning the
-    row. A row where every function is NaN folds back to NaN, though: that sample was never scored,
-    and a fake 0 would quietly join the group statistics as a real score.
+    A NaN from a skipped reward function drops out instead of poisoning the row, whether or not
+    weights were given: no weights means equal weights, so the two spellings must fold identically.
+    A row where EVERY function is NaN folds back to NaN, though -- that sample was never scored, and
+    a fake 0 would quietly join the group statistics as a real score.
+
+    The unweighted branch used to be a plain ``sum``, which made one failed scorer discard the valid
+    scores beside it. That contradicted the metric side (``run_grpo._record_reward_metric`` builds
+    all-ones weights and folds with ``nansum``), so the same partially scored row was reported as a
+    real reward in ``train/*_reward`` while training treated it as never scored -- and passing explicit
+    equal weights, semantically the same as the default, changed the numerics.
     """
     if rewards.dim() <= 1:
         return rewards
     if reward_weights is None:
-        return rewards.sum(dim=-1)
-    weights = torch.as_tensor(reward_weights, dtype=rewards.dtype, device=rewards.device)
-    folded = (rewards * weights.unsqueeze(0)).nansum(dim=1)
+        folded = rewards.nansum(dim=-1)
+    else:
+        weights = torch.as_tensor(reward_weights, dtype=rewards.dtype, device=rewards.device)
+        folded = (rewards * weights.unsqueeze(0)).nansum(dim=1)
     return folded.masked_fill(torch.isnan(rewards).all(dim=-1), float('nan'))
 
 

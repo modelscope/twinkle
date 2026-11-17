@@ -18,6 +18,11 @@ class TrainingHarness:
     _forward_backward_micro_batches = TransformersModel._forward_backward_micro_batches
     _build_micro_batch_plan = TransformersModel._build_micro_batch_plan
     _global_loss_normalizer = TransformersModel._global_loss_normalizer
+    # ``forward_backward`` splits a rollout's trajectory into model features and the loss's columns
+    # before it reaches the micro-batch plan, so a harness that borrows the method has to borrow that
+    # collaborator too. It is a ``staticmethod`` on ``TrainableModel``, and a bare assignment would
+    # rebind it as an instance method and hand ``self`` to the ``inputs`` parameter.
+    _rollout_features = staticmethod(TransformersModel._rollout_features)
     _not_encoded = staticmethod(lambda _: False)
 
     def __init__(self, loss):
@@ -32,6 +37,11 @@ class TrainingHarness:
         self.sync_enabled = True
         self.calls = []
         self.model = SimpleNamespace(no_sync=self.no_sync, training=True)
+        # The loop drives the update here rather than an engine, which is the path these tests
+        # measure: the harness supplies ``model.no_sync`` and records ``sync_enabled`` to assert
+        # where synchronization happened. A strategy that owned the step would route backward
+        # through ``engine_backward`` and bypass both.
+        self.strategy = SimpleNamespace(owns_update_step=lambda: False)
         self.calculate_loss = MethodType(TransformersModel.calculate_loss.__wrapped__, self)
         self.backward = MethodType(TransformersModel.backward.__wrapped__, self)
 

@@ -311,10 +311,17 @@ class NCCLCheckpointEngine(CheckpointEngine):
             self.rank = rank
             self.world_size = world_size
             self._group_initialized = True
+            logger.info(f'init_process_group: rank={rank} not participating, no group joined')
             return
 
         # Fast path: group already initialized, skip all setup
         if self._group_initialized and not self.rebuild_group:
+            # _nccl_store_port is set only in prepare() by the master (rank 0); every rank
+            # receives it through master_metadata instead, so log it from there -- a non-master
+            # rank never touches the master-only attribute, keeping the diagnostic line from
+            # being able to fail the very call it reports.
+            logger.info(f'init_process_group: rank={rank} reusing the existing group '
+                        f'(world_size={self.world_size}, store_port={master_metadata.nccl_store_port})')
             return
 
         if self._pg is None:
@@ -351,6 +358,13 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         # Barrier via broadcast to ensure all workers are ready
         barrier_tensor = torch.zeros(1, dtype=torch.int32, device='cuda')
+        # The barrier is the one place a missing participant turns into an infinite wait, so record
+        # the arrival with the store it is rendezvousing against. A sampler actor spanning several
+        # GPUs has an ambiguous ambient device, so record which one the tensor landed on.
+        logger.info(f'init_process_group: rank={rank} entering the barrier broadcast '
+                    f'(world_size={world_size}, store={master_metadata.nccl_store_host}:'
+                    f'{master_metadata.nccl_store_port}, current_device={torch.cuda.current_device()}, '
+                    f'device_count={torch.cuda.device_count()}, tensor_device={barrier_tensor.device})')
         _pg_broadcast(self._pg, barrier_tensor, src=0)
         torch.cuda.synchronize()
 

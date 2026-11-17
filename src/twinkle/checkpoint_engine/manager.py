@@ -3,7 +3,7 @@
 import os
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import replace as _replace
 from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional
@@ -29,21 +29,23 @@ def _together(*calls) -> List[Any]:
     """Run the calls side by side and wait for all of them.
 
     Rendezvous pairs (a process-group init whose master blocks until every peer connects, a send
-    and its receive) must not run one after the other; the first failure is raised after every call
-    has ended.
+    and its receive) must not run one after the other.
+
+    A failure is raised as soon as one call has failed, without waiting for the others: the survivor
+    of a broken rendezvous blocks forever inside the collective, so waiting for every call to end
+    first turned a diagnosable one-sided error into an unbounded hang with nothing on the console.
+    The blocked sibling is left behind deliberately -- its actor is torn down by the caller.
     """
-    with ThreadPoolExecutor(len(calls)) as pool:
-        futures = [pool.submit(lambda call=call: _wait(call())) for call in calls]
-    results, error = [], None
-    for future in futures:
-        try:
-            results.append(future.result())
-        except BaseException as failure:  # noqa
-            error = error or failure
-            results.append(None)
-    if error is not None:
-        raise error
-    return results
+    pool = ThreadPoolExecutor(len(calls))
+    futures = [pool.submit(lambda call=call: _wait(call())) for call in calls]
+    done, _not_done = wait(futures, return_when=FIRST_EXCEPTION)
+    for future in done:
+        exception = future.exception()
+        if exception is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise exception
+    pool.shutdown(wait=False)
+    return [future.result() for future in futures]
 
 
 @remote_class(execute='first', max_concurrency=3)
@@ -314,6 +316,29 @@ class CheckpointEngineManager:
         self.model.offload_to_cpu(**self.offload_kwargs)
         self._wake_sampler(['kv_cache'])
 
+    def _abandon_channel(self) -> None:
+        """Mark the channel unusable and reset the peers without waiting for them.
+
+        Failure path only. A rendezvous one side never reached leaves the other blocked inside a
+        collective, and a Ray call to a blocked actor never returns, so a synchronous teardown here
+        would swallow the original error forever. It would also re-enter this actor through Ray
+        (:meth:`close` is a remote method) and wait on ``_sync_lock``, which the failing
+        :meth:`sync_weights` already holds. The reset is therefore dispatched on a daemon thread: it
+        lands when the peer can serve it and dies with the process when it cannot. Clearing
+        ``_members`` is what makes the next sync rebuild rather than reuse the broken transport.
+        """
+        self._members = None
+        self.base_sync_done = False
+
+        def reset():
+            try:
+                self._close_checkpoint_channel()
+            except Exception:
+                logger.warning('Failed to reset checkpoint channel %s after a sync failure.', self.channel,
+                               exc_info=True)
+
+        threading.Thread(target=reset, name='checkpoint-channel-reset', daemon=True).start()
+
     def _sync_channel(self, merge_and_sync):
         """Checkpoint-engine sync over the manager's channel, rebuilt when the replicas changed."""
         try:
@@ -329,15 +354,9 @@ class CheckpointEngineManager:
             self._transfer(self.sampler, len(self._members), merge_and_sync, self.base_sync_done)
         except BaseException:
             # A failed sync can leave the transport half-torn -- a NCCL group in error state, a
-            # dead socket. Close here so the next attempt rebuilds the channel instead of reusing
-            # the broken one.
-            try:
-                self.close()
-            except Exception:
-                # A failing close (e.g. the remote actor already died) must not replace the
-                # original sync failure -- warn and re-raise the root cause.
-                logger.warning('Failed to fully close checkpoint channel %s after sync failure.',
-                               self.channel, exc_info=True)
+            # dead socket. Abandon it rather than closing it synchronously, so the original error
+            # reaches the driver and the next attempt rebuilds instead of reusing the broken one.
+            self._abandon_channel()
             raise
         if not self.base_sync_done:
             self.base_sync_done = True

@@ -454,11 +454,14 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
             from twinkle.model.state_dict_utils import with_tied_weight_aliases
+            aligned = with_tied_weight_aliases(self.unwrap_model(model), state_dict)
+            self._probe_load_precision(model, state_dict, after=False)
             set_model_state_dict(
                 model,
-                with_tied_weight_aliases(self.unwrap_model(model), state_dict),
+                aligned,
                 options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
             )
+            self._probe_load_precision(model, state_dict, after=True)
             return
         unwrapped = self.unwrap_model(model)
         unwrapped.load_state_dict(state_dict, strict=False)

@@ -2,13 +2,7 @@
 from typing import Any, List, Optional, Sequence, Tuple
 
 from twinkle import remote_class, remote_function
-from .base import Advantage, _mean, weighted_score
-
-
-def _check_unit(name: str, value: float) -> float:
-    if not 0.0 <= value <= 1.0:
-        raise ValueError(f'{name} must be in [0, 1]')
-    return value
+from .base import Advantage, _absmean, _check_unit, _mean, _zero_row_fraction, weighted_score
 
 
 @remote_class(execute='first')
@@ -55,6 +49,8 @@ class GAEAdvantage(Advantage):
                                              'old_logps': old_logps, 'old_values': old_values})
         return new_trajs, {'estimator': type(self).__name__, 'num_rows': len(trajs),
                            'mean_advantage': _mean(advantages), 'mean_return': _mean(returns),
+                           'absmean_advantage': _absmean(advantages),
+                           'zero_advantage_rows': _zero_row_fraction(advantages),
                            'reward_totals': [float(sum(row)) for row in token_rewards]}
 
     @remote_function(dispatch='all', collect='first', lazy_collect=True)

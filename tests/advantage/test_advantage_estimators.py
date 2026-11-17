@@ -19,26 +19,26 @@ class TestGPGAdvantage:
 
     def test_dynamic_alpha_hand_computed(self):
         # rewards [1,0,0,0], K=4: nonzero count=1 -> alpha=4; group mean=0.25.
-        adv = GPGAdvantage()([1.0, 0.0, 0.0, 0.0], num_generations=4)
+        adv = GPGAdvantage()._per_sequence([1.0, 0.0, 0.0, 0.0], num_generations=4)
         torch.testing.assert_close(adv, torch.tensor([3.0, -1.0, -1.0, -1.0]), atol=ATOL, rtol=0)
 
     def test_f_norm_divides(self):
-        adv = GPGAdvantage()([1.0, 0.0, 0.0, 0.0], num_generations=4, f_norm=2.0)
+        adv = GPGAdvantage()._per_sequence([1.0, 0.0, 0.0, 0.0], num_generations=4, f_norm=2.0)
         torch.testing.assert_close(adv, torch.tensor([1.5, -0.5, -0.5, -0.5]), atol=ATOL, rtol=0)
 
     def test_two_groups_centered_per_group(self):
         # [2,0 | 4,2], K=2: alpha=4/3; means=[1,3] -> 4/3 * [1,-1,1,-1].
-        adv = GPGAdvantage()([2.0, 0.0, 4.0, 2.0], num_generations=2)
+        adv = GPGAdvantage()._per_sequence([2.0, 0.0, 4.0, 2.0], num_generations=2)
         torch.testing.assert_close(adv, torch.tensor([4 / 3, -4 / 3, 4 / 3, -4 / 3]), atol=ATOL, rtol=0)
 
     def test_all_zero_rewards_clamped_not_nan(self):
         # count_nonzero=0 -> clamp(min=1) -> alpha=N; centered zeros stay zeros.
-        adv = GPGAdvantage()([0.0, 0.0, 0.0, 0.0], num_generations=2)
+        adv = GPGAdvantage()._per_sequence([0.0, 0.0, 0.0, 0.0], num_generations=2)
         torch.testing.assert_close(adv, torch.zeros(4), atol=ATOL, rtol=0)
 
     def test_indivisible_raises(self):
         with pytest.raises(ValueError):
-            GPGAdvantage()([1.0, 2.0, 3.0], num_generations=2)
+            GPGAdvantage()._per_sequence([1.0, 2.0, 3.0], num_generations=2)
 
 
 class TestOPOAdvantage:
@@ -46,16 +46,16 @@ class TestOPOAdvantage:
 
     def test_length_weighted_baseline_hand_computed(self):
         # lens=[1,3], scores=[2,4] -> baseline=(1*2+3*4)/4=3.5 -> adv=[-1.5, 0.5].
-        adv = OPOAdvantage()([2.0, 4.0], num_generations=2, response_lengths=[1, 3])
+        adv = OPOAdvantage()._per_sequence([2.0, 4.0], num_generations=2, response_lengths=[1, 3])
         torch.testing.assert_close(adv, torch.tensor([-1.5, 0.5]), atol=ATOL, rtol=0)
 
     def test_missing_response_lengths_raises(self):
         with pytest.raises(ValueError, match='response_lengths'):
-            OPOAdvantage()([2.0, 4.0], num_generations=2)
+            OPOAdvantage()._per_sequence([2.0, 4.0], num_generations=2)
 
     def test_indivisible_raises(self):
         with pytest.raises(ValueError):
-            OPOAdvantage()([1.0, 2.0, 3.0], num_generations=2, response_lengths=[1, 1, 1])
+            OPOAdvantage()._per_sequence([1.0, 2.0, 3.0], num_generations=2, response_lengths=[1, 1, 1])
 
 
 class TestGRPOPassKAdvantage:
@@ -63,23 +63,23 @@ class TestGRPOPassKAdvantage:
 
     def test_only_best_sample_nonzero(self):
         # [1,3,2]: best is 3 at idx 1, gap to second-best (2) is 1.
-        adv = GRPOPassKAdvantage()([1.0, 3.0, 2.0], num_generations=3, scale='none')
+        adv = GRPOPassKAdvantage()._per_sequence([1.0, 3.0, 2.0], num_generations=3, scale='none')
         torch.testing.assert_close(adv, torch.tensor([0.0, 1.0, 0.0]), atol=ATOL, rtol=0)
 
     def test_norm_by_group_std(self):
         # std([1,3,2]) unbiased = 1.0 -> gap 1 / (1 + eps).
-        adv = GRPOPassKAdvantage()([1.0, 3.0, 2.0], num_generations=3, scale='group')
+        adv = GRPOPassKAdvantage()._per_sequence([1.0, 3.0, 2.0], num_generations=3, scale='group')
         expected = 1.0 / (1.0 + 1e-6)
         torch.testing.assert_close(adv[1], torch.tensor(expected), atol=ATOL, rtol=0)
         assert adv[0] == 0.0 and adv[2] == 0.0
 
     def test_k_below_two_raises(self):
         with pytest.raises(ValueError, match='>= 2'):
-            GRPOPassKAdvantage()([1.0, 2.0], num_generations=1)
+            GRPOPassKAdvantage()._per_sequence([1.0, 2.0], num_generations=1)
 
     def test_tied_top_two_gives_zero_advantage(self):
         # r_max == r_second_max -> the winner's advantage is exactly zero.
-        adv = GRPOPassKAdvantage()([5.0, 5.0, 1.0], num_generations=3, scale='none')
+        adv = GRPOPassKAdvantage()._per_sequence([5.0, 5.0, 1.0], num_generations=3, scale='none')
         torch.testing.assert_close(adv, torch.zeros(3), atol=ATOL, rtol=0)
 
 
@@ -89,9 +89,9 @@ class TestReinforcePlusPlus:
     def test_normalizer_differs_from_grpo_at_batch_scale(self):
         rewards = [0.0, 1.0, 10.0, 11.0]
         kwargs = dict(num_generations=2, scale='batch')
-        rpp = ReinforcePlusPlusAdvantage()(rewards, **kwargs)
+        rpp = ReinforcePlusPlusAdvantage()._per_sequence(rewards, **kwargs)
         from twinkle.advantage import GRPOAdvantage
-        grpo = GRPOAdvantage()(rewards, **kwargs)
+        grpo = GRPOAdvantage()._per_sequence(rewards, **kwargs)
         # centered = [-.5,.5,-.5,.5]: R++ divides by the unbiased ADVANTAGE std (sqrt(1/3))
         # -> +-0.866; GRPO divides by the raw REWARD std (~5.80) -> much smaller values.
         rpp_expected = 0.5 / math.sqrt(1.0 / 3.0)
@@ -100,11 +100,11 @@ class TestReinforcePlusPlus:
 
     def test_gdpo_scale_is_no_op(self):
         # scale='gdpo' leaves the centered advantage unscaled.
-        adv = ReinforcePlusPlusAdvantage()([1.0, 3.0], num_generations=2, scale='gdpo')
+        adv = ReinforcePlusPlusAdvantage()._per_sequence([1.0, 3.0], num_generations=2, scale='gdpo')
         torch.testing.assert_close(adv, torch.tensor([-1.0, 1.0]), atol=ATOL, rtol=0)
 
     def test_k_equals_one_stays_zero_not_nan(self):
-        adv = ReinforcePlusPlusAdvantage()([5.0], num_generations=1, scale='group')
+        adv = ReinforcePlusPlusAdvantage()._per_sequence([5.0], num_generations=1, scale='group')
         torch.testing.assert_close(adv, torch.zeros(1), atol=ATOL, rtol=0)
 
 
@@ -114,12 +114,12 @@ class TestReinforcePPBaseline:
     def test_whitening_hand_computed(self):
         # [1,2 | 3,4], K=2 -> centered [-.5,.5,-.5,.5]; mean 0; var_unbiased = 4*.25/3 = 1/3.
         # masked_whiten = (x - mean) * rsqrt(var_unbiased + 1e-8) -> +-0.5*sqrt(3).
-        adv = ReinforcePPBaselineAdvantage()([1.0, 2.0, 3.0, 4.0], num_generations=2, scale='batch')
+        adv = ReinforcePPBaselineAdvantage()._per_sequence([1.0, 2.0, 3.0, 4.0], num_generations=2, scale='batch')
         scale = 0.5 * math.sqrt(3.0)
         torch.testing.assert_close(adv.abs(), torch.full((4,), scale), atol=1e-4, rtol=0)
 
     def test_scale_none_keeps_centered(self):
-        adv = ReinforcePPBaselineAdvantage()([1.0, 3.0], num_generations=2, scale='none')
+        adv = ReinforcePPBaselineAdvantage()._per_sequence([1.0, 3.0], num_generations=2, scale='none')
         torch.testing.assert_close(adv, torch.tensor([-1.0, 1.0]), atol=ATOL, rtol=0)
 
 
@@ -128,21 +128,21 @@ class TestReMaxAdvantage:
 
     def test_missing_baselines_raises(self):
         with pytest.raises(ValueError, match='reward_baselines'):
-            ReMaxAdvantage()([1.0, 2.0])
+            ReMaxAdvantage()._per_sequence([1.0, 2.0])
 
     def test_subtracts_baseline(self):
-        adv = ReMaxAdvantage()([3.0, 5.0], reward_baselines=[2.0, 4.0])
+        adv = ReMaxAdvantage()._per_sequence([3.0, 5.0], reward_baselines=[2.0, 4.0])
         torch.testing.assert_close(adv, torch.tensor([1.0, 1.0]), atol=ATOL, rtol=0)
 
     def test_batch_scale_hand_computed(self):
         # adv [1,3]: std = sqrt(2); normalized [1/sqrt(2), 3/sqrt(2)].
-        adv = ReMaxAdvantage()([1.0, 3.0], reward_baselines=[0.0, 0.0], scale='batch')
+        adv = ReMaxAdvantage()._per_sequence([1.0, 3.0], reward_baselines=[0.0, 0.0], scale='batch')
         expected = torch.tensor([1.0, 3.0]) / (math.sqrt(2.0) + 1e-8)
         torch.testing.assert_close(adv, expected, atol=1e-4, rtol=0)
 
     def test_num_generations_ignored(self):
-        once = ReMaxAdvantage()([3.0, 5.0], reward_baselines=[2.0, 4.0], num_generations=1)
-        twice = ReMaxAdvantage()([3.0, 5.0], reward_baselines=[2.0, 4.0], num_generations=4)
+        once = ReMaxAdvantage()._per_sequence([3.0, 5.0], reward_baselines=[2.0, 4.0], num_generations=1)
+        twice = ReMaxAdvantage()._per_sequence([3.0, 5.0], reward_baselines=[2.0, 4.0], num_generations=4)
         torch.testing.assert_close(once, twice, atol=0, rtol=0)
 
 
@@ -164,8 +164,8 @@ class TestListInputParity:
         if estimator is ReMaxAdvantage:
             values = [3.0, 5.0]
             kwargs['reward_baselines'] = [2.0, 4.0]
-        from_list = estimator()(values, **kwargs)
-        from_tensor = estimator()(torch.tensor(values, dtype=torch.float32), **kwargs)
+        from_list = estimator()._per_sequence(values, **kwargs)
+        from_tensor = estimator()._per_sequence(torch.tensor(values, dtype=torch.float32), **kwargs)
         torch.testing.assert_close(from_list, from_tensor, atol=0, rtol=0)
 
 

@@ -10,6 +10,7 @@ caller drops it from its view and resubmits the request elsewhere, so correctnes
 how fresh the cache is.
 """
 import functools
+import inspect
 import os
 import threading
 import time
@@ -46,7 +47,8 @@ _CW_SESSION_IDLE_TIMEOUT = 30 * 60
 _CW_SESSION_CACHE_SIZE = 10_000
 # How long a process trusts its cached membership before re-reading the registry.
 _POOL_TTL = 1.0
-# How many times one request is resubmitted after its replica drained or died.
+# How many times a FAILED PART is resubmitted after its replica drained or died: the budget
+# is shared by the whole call (every part draws from these 8, not 8 per part).
 _CW_MAX_RETRIES = 8
 
 # Prefix of the awaitable companion generated for a continuous-work method. The
@@ -110,6 +112,31 @@ def _make_worker_async_companion(func, wrapper):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(_worker_executor(self), functools.partial(wrapper, self, *args, **kwargs))
 
+    # functools.wraps pins __wrapped__, and inspect.signature follows it -- so Ray would validate
+    # a call against the original method's parameters instead of this companion's (self, *args,
+    # **kwargs) and reject the _dispatch_context that _submit adds when the arguments carry refs.
+    # A pinned __signature__ outranks __wrapped__ in inspect.signature, so Ray still sees the
+    # var-args form while __wrapped__ stays available for reaching the undecorated body.
+    #
+    # The pin must declare ``self``. Ray extracts an actor method's signature with
+    # ``extract_signature(func, ignore_first=True)``, which drops the first parameter unconditionally
+    # on the assumption that it is ``self``. A pin of just (*args, **kwargs) therefore loses ``args``
+    # and every positional argument is then refused with "too many positional arguments".
+    companion.__signature__ = inspect.Signature(parameters=[
+        inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        inspect.Parameter('args', inspect.Parameter.VAR_POSITIONAL),
+        inspect.Parameter('kwargs', inspect.Parameter.VAR_KEYWORD),
+    ])
+    # The pin alone is not enough on THIS object. Ray resolves an actor method's signature by
+    # walking __wrapped__ back to the undecorated function and injecting its own _ray_trace_ctx
+    # there, so a companion that keeps the chain hands Ray the original method's named parameters
+    # and the _dispatch_context that _submit adds is refused as an unexpected keyword -- measured:
+    # inspect.signature(companion) reports (self, *args, **kwargs) while Ray's ActorMethod captured
+    # (items, tag, _ray_trace_ctx). Dropping the chain here is safe because the companion is only
+    # ever reached through the actor handle; the caller-side wrapper keeps its own __wrapped__,
+    # which is how the test suite reaches the undecorated body.
+    if hasattr(companion, '__wrapped__'):
+        del companion.__wrapped__
     companion.__name__ = _WORKER_ASYNC_PREFIX + func.__name__
     return companion
 
@@ -258,14 +285,25 @@ class _PoolView:
         with self.lock:
             return list(self.members.values())
 
-    def evict(self, worker_id: str):
-        """Forget a replica that answered draining or died, so the next pick avoids it."""
+    def evict(self, worker_id: str, *, dead: bool = False):
+        """Forget a replica that answered draining or died, so the next pick avoids it.
+
+        ``dead`` (a RayActorError) also removes it from the registry pool: a dead replica never
+        comes back, and the next refresh would re-add it straight from the registry (load 0,
+        first pick) until the call's retries burn out on it while healthy replicas idle. A
+        draining replica stays -- its removal is the remove_workers flow's to make, and a
+        refresh only reads back members whose state is ACTIVE.
+        """
         with self.lock:
             self.members.pop(worker_id, None)
             for key in [key for key, binding in self.bindings.items() if binding[0] == worker_id]:
                 self.bindings.pop(key)
             if self.key is not None:
                 self.refreshed = 0.0
+                if dead:
+                    from ._ray import RayHelper
+
+                    RayHelper.pool_remove(self.key, [worker_id])
 
     def assign(self, count: int, sticky_value=None) -> List[Tuple[str, Any, List[int]]]:
         """Split ``count`` requests over members: the sticky owner if bound, else least loaded first."""
@@ -317,7 +355,13 @@ _POOL_VIEWS: Dict[str, _PoolView] = {}
 
 
 def _pool_view(handle) -> _PoolView:
-    """The view a handle routes through: its registry pool, or the fixed actor set it holds."""
+    """The view a handle routes through: its registry pool, or the fixed actor set it holds.
+
+    A warmup sub-handle (``_pool_key=None``, only the new replicas) keys its entry by that
+    actor set; such views accumulate one per add_workers call and are never dropped -- a
+    bounded, known leak, kept rather than weak-ref complexity for entries that live for the
+    process anyway.
+    """
     key = handle.__dict__.get('_pool_key')
     if key is None:
         key = 'fixed:' + ','.join(worker_id_of(actor) for actor in handle._actors)
@@ -419,7 +463,9 @@ class _ContinuousCall:
     def _on_part(self, worker_id, part, value, exc):
         self.view.release(worker_id, len(part))
         if exc is not None and _is_retryable(exc) and self.retries < _CW_MAX_RETRIES:
-            self.view.evict(worker_id)
+            import ray
+
+            self.view.evict(worker_id, dead=isinstance(exc, ray.exceptions.RayActorError))
             with self.lock:
                 self.retries += 1
             _retry_executor().submit(self._submit, part, True)

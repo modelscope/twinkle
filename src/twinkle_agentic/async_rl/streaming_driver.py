@@ -30,19 +30,19 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import user_data_get
 from twinkle.utils import get_logger
-from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutSample
+from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutStatus
 
 logger = get_logger()
 
 __all__ = ['StreamingDriver', 'PRM_SEGMENT_TURNS']
 
-#: The ``RolloutSample.extra`` key recording each PRM segment's end: the episode's ``turns`` when the
+#: The ``RolloutStatus.extra`` key recording each PRM segment's end: the episode's ``turns`` when the
 #: segment closed, one per column of ``prm_rewards``.
 PRM_SEGMENT_TURNS = 'prm_segment_turns'
 
@@ -65,7 +65,7 @@ def _role_of(traj: Any) -> str:
     return str(role or '')
 
 
-def _sample_facts(samples: Sequence[RolloutSample], scores: Sequence[Dict[str, Any]],
+def _sample_facts(samples: Sequence[RolloutStatus], scores: Sequence[Dict[str, Any]],
                    version_spans: Sequence[int]) -> Dict[str, Any]:
     """The delivery facts of one batch, off the samples -- never the trajectories.
 
@@ -121,7 +121,7 @@ class _Episode:
     role: str
     version: int
     traj: Any = None
-    sample: Optional[RolloutSample] = None
+    sample: Optional[RolloutStatus] = None
     done: bool = False
     #: Set once the episode has no further work: scored (``finished``) or given up (``lost``).
     finished: bool = False
@@ -133,6 +133,9 @@ class _Episode:
     prm_pending: int = 0
     #: The PRM segment the episode waits for before its next step (only with ``on_step``).
     held: Optional[int] = None
+    #: The episode's training rows as the last step returned them (one, or one per collected
+    #: segment); an unfinished episode holds none.
+    deliver: List[Any] = field(default_factory=list)
 
 
 @remote_class(execute='first', max_concurrency=8)
@@ -159,8 +162,12 @@ class StreamingDriver:
         prms: process scorers, run on the trajectory so far at every closed segment.
         prm_names: each PRM's name in the handed-out ``prm_segments['scores']``; ``None`` names
             them by position (``prm_0`` ...).
-        prm_segment: ``prm_segment(sample) -> bool``, whether the step just finished closes a PRM
-            segment (default: every step; the last step always does).
+        prm_segment: ``prm_segment(sample, traj) -> bool``, whether the step just finished closes a
+            PRM segment (default: every step; the last step always does). ``traj`` is the
+            trajectory as the driver holds it -- the in-process dict on local direct calls, the
+            stashed object reference under ray (the driver never materializes it itself; a
+            content-based segmentation resolves it at its own cost, e.g. one ``ray.get`` per
+            step).
         on_step: ``on_step(sample, prm_scores) -> bool``, called with a closed segment's scores;
             ``False`` stops the episode (it is dropped like a failed one).
         on_sample: ``on_sample(sample) -> Optional[bool]``, called on every scored episode;
@@ -171,7 +178,7 @@ class StreamingDriver:
             marks a baseline). Returning non-baseline trajectories replaces the group with them (the
             new group is offered to ``on_group`` again); once replacing is no longer allowed, or when
             only baselines are returned, the baselines run and their ORM rows are attached to the
-            group's samples (``RolloutSample.baseline``) once they are scored.
+            group's samples (``RolloutStatus.baseline``) once they are scored.
         max_group_regenerations: how many times a group may be replaced (by ``on_group`` or to make
             up for missing members) before it is accepted as is, or dropped if incomplete.
         cluster_adapter: rebalances replicas after each version change (``adjust``), lends the
@@ -184,6 +191,9 @@ class StreamingDriver:
     #: ... or when more than ``MAX_FAILURE_RATE`` of the last ``FAILURE_WINDOW`` episodes failed.
     FAILURE_WINDOW = 256
     MAX_FAILURE_RATE = 0.5
+    #: One ``adjust`` call still running past this many seconds is reported as stuck: it hung
+    #: inside the adapter holding its lock, so rebalancing is down until the call returns.
+    ADJUST_STUCK_TIMEOUT = 300.0
 
     def __init__(self,
                  dataloader: Any,
@@ -200,10 +210,10 @@ class StreamingDriver:
                  orm_names: Optional[Sequence[str]] = None,
                  prms: Sequence[Any] = (),
                  prm_names: Optional[Sequence[str]] = None,
-                 prm_segment: Optional[Callable[[RolloutSample], bool]] = None,
-                 on_step: Optional[Callable[[RolloutSample, List[Any]], bool]] = None,
-                 on_sample: Optional[Callable[[RolloutSample], Optional[bool]]] = None,
-                 on_group: Optional[Callable[[Any, List[RolloutSample], int], List[Any]]] = None,
+                 prm_segment: Optional[Callable[[RolloutStatus, Any], bool]] = None,
+                 on_step: Optional[Callable[[RolloutStatus, List[Any]], bool]] = None,
+                 on_sample: Optional[Callable[[RolloutStatus], Optional[bool]]] = None,
+                 on_group: Optional[Callable[[Any, List[RolloutStatus], int], List[Any]]] = None,
                  max_group_regenerations: int = 0,
                  cluster_adapter: Any = None):
         if num_generations < 1 or batch_size < 1 or batch_size % num_generations:
@@ -264,7 +274,16 @@ class StreamingDriver:
             'stopped': 0, 'regenerated': 0
         }
         self._adjusting = False
+        #: monotonic stamps: when the running ``adjust`` started, and when its being stuck was last reported.
+        self._adjust_started = 0.0
+        self._adjust_reported = 0.0
         self._wait_time = 0.0
+        #: the last batch's wait share spent joining the lend thread and reclaiming (excluded from
+        #: ``_idle_ratio`` so the machinery's own cost never reads as a sampler bottleneck)
+        self._reclaim_cost = 0.0
+        #: the lend->reclaim cycle now in flight (the thread, until the reclaim in ``_next_batch``'s
+        #: finally completes): while it runs the adapter's lock is legitimately held
+        self._lending = None
         self._returned_at: Optional[float] = None
         self._idle_ratio = 0.0
         self._iter_started = False
@@ -296,9 +315,12 @@ class StreamingDriver:
         """
         self._start()
         started = time.monotonic()
+        waited = 0.0
         if self._returned_at is not None:
             busy = started - self._returned_at
-            self._idle_ratio = self._wait_time / max(self._wait_time + busy, 1e-9)
+            # only the sampler-caused wait counts: the machinery's own reclaim is not a reason to lend
+            waited = max(self._wait_time - self._reclaim_cost, 0.0)
+            self._idle_ratio = waited / max(waited + busy, 1e-9)
         # the trainer may have synced just before asking: judge staleness against that version
         version = self._read_version()
         with self._lock:
@@ -307,8 +329,11 @@ class StreamingDriver:
         # the trainer waits from here on: its devices may be lent until the batch is ready
         lending = None
         if self.cluster_adapter is not None and short:
-            lending = threading.Thread(target=self._lend, name='twinkle-cluster-lend', daemon=True)
+            lending = threading.Thread(target=self._lend, args=(waited,), name='twinkle-cluster-lend', daemon=True)
             lending.start()
+        #: mirrors ``lending`` from its start until the reclaim below completes -- an ``adjust``
+        #: queued behind that cycle is not stuck, so the watchdog stays quiet while it runs
+        self._lending = lending
         try:
             with self._lock:
                 while True:
@@ -324,28 +349,52 @@ class StreamingDriver:
                     self._lock.wait(0.5)
         finally:
             if self.cluster_adapter is not None:
+                settle = time.monotonic()
                 if lending is not None:
                     lending.join()
                 self.cluster_adapter.reclaim()
+                self._reclaim_cost = time.monotonic() - settle
+                self._lending = None
         # ONE locked section: collect the batch and build its light facts. The rows are handed
         # out exactly as they travel (a reference under ray, a dict in-process) -- the driver
         # never opens one; the score columns ride the facts instead, aligned row for row, and
-        # the identity fields were stamped on the rows at admission. Nothing here scales with
+        # the identity fields were stamped on the rows at admission. An episode delivered as
+        # several rows (collected segments) contributes each of them: its episode-level sample
+        # and score entry repeat per row, aligned. Nothing here scales with
         # the tokens, so the event thread is never held up; collecting and counting move
         # together, so the batch is never half-published.
         with self._lock:
             self._drop_stale()
             trajs: List[Any] = []
-            samples: List[RolloutSample] = []
+            samples: List[RolloutStatus] = []
             scores: List[Dict[str, Any]] = []
             version_spans: List[int] = []
             while len(trajs) < self.batch_size and self._ready:
                 for episode in self._ready.popleft():
                     episode.sample.version_span = self._version - episode.sample.policy_version
-                    trajs.append(episode.traj)
-                    samples.append(episode.sample)
-                    scores.append(self._score_update(episode))
-                    version_spans.append(episode.sample.version_span)
+                    score = self._score_update(episode)
+                    lengths = (episode.sample.extra or {}).get('row_token_lengths')
+                    if len(episode.deliver) == 1 or not lengths:
+                        # The identity path: one row carries the episode's own facts verbatim.
+                        row_samples = [episode.sample] * len(episode.deliver)
+                    else:
+                        if len(lengths) != len(episode.deliver):
+                            raise RuntimeError(
+                                f'episode {episode.sample.episode_id!r}: {len(episode.deliver)} delivered rows '
+                                f'but {len(lengths)} row lengths on its status.')
+                        # A collected episode's rows carry their own length facts: the episode
+                        # totals would repeat on every row and weigh the metrics by row count.
+                        extra = {key: value for key, value in (episode.sample.extra or {}).items()
+                                 if key != 'row_token_lengths'}
+                        row_samples = [
+                            replace(episode.sample, token_lengths=tuple(map(int, pair)),
+                                    extra=dict(extra, segment_index=index))
+                            for index, pair in enumerate(lengths)]
+                    for row, row_sample in zip(episode.deliver, row_samples):
+                        trajs.append(row)
+                        samples.append(row_sample)
+                        scores.append(score)
+                        version_spans.append(row_sample.version_span)
             self._ready_rows -= len(trajs)
             self._handed += 1
             self._lock.notify_all()
@@ -397,7 +446,8 @@ class StreamingDriver:
         kept = deque()
         for members in self._ready:
             if self._version - min(episode.version for episode in members) > self.max_staleness:
-                self._ready_rows -= len(members)
+                rows = sum(len(episode.deliver) for episode in members)
+                self._ready_rows -= rows
                 self._live -= len(members)
                 self._counters['dropped_stale'] += len(members)
             else:
@@ -490,10 +540,29 @@ class StreamingDriver:
         return self._handed // self.sync_interval
 
     def _maybe_adjust(self) -> None:
-        """Hand ``adjust`` to a thread of its own; skipped while the previous one still runs."""
-        if self.cluster_adapter is None or self._adjusting:
+        """Hand ``adjust`` to a thread of its own; skipped while the previous one still runs.
+
+        One still running past ``ADJUST_STUCK_TIMEOUT`` is only reported, not replaced: it holds
+        the adapter's lock (hung, or warming a large set of weights), so a new call would just
+        queue behind it; if it ever returns, the ``finally`` below re-arms the next version
+        change. A lend->reclaim cycle in flight holds the same lock legitimately -- an ``adjust``
+        queued behind one is not reported.
+        """
+        if self.cluster_adapter is None:
+            return
+        if self._adjusting:
+            if self._lending is not None:
+                return  # a lend->reclaim cycle legitimately holds the adapter lock: queueing is not stuck
+            now = time.monotonic()
+            stuck = now - self._adjust_started
+            if stuck >= self.ADJUST_STUCK_TIMEOUT and now - self._adjust_reported >= self.ADJUST_STUCK_TIMEOUT:
+                self._adjust_reported = now
+                logger.warning(f'cluster adapter adjust has been running for {stuck:.0f}s '
+                               '(a large weight warm takes this long too and a stuck RPC looks '
+                               'the same); rebalancing is paused until it returns')
             return
         self._adjusting = True
+        self._adjust_started = time.monotonic()
 
         def _adjust():
             try:
@@ -505,10 +574,10 @@ class StreamingDriver:
 
         threading.Thread(target=_adjust, name='twinkle-cluster-adjust', daemon=True).start()
 
-    def _lend(self) -> None:
+    def _lend(self, waited: float) -> None:
         """Run ``lend`` while the trainer waits; ``reclaim`` joins this thread before undoing it."""
         try:
-            self.cluster_adapter.lend(self._idle_ratio)
+            self.cluster_adapter.lend(self._idle_ratio, waited=waited)
         except Exception as exc:  # noqa: BLE001 -- lending is an optimisation, never fatal
             logger.warning(f'cluster adapter lend failed: {type(exc).__name__}: {exc}')
 
@@ -590,7 +659,7 @@ class StreamingDriver:
             if episode.lost:
                 if kind == 'step' and exc is None and not future.result()[1].done:
                     # dropped while this step ran: release its rollout state now
-                    self.rollout.stop(future.result()[0], episode_id=episode.episode_id)
+                    self.rollout.stop(future.result()[0][0], episode_id=episode.episode_id)
                 return
             if exc is not None and not (kind == 'step' and _is_episode_error(exc)):
                 raise exc
@@ -613,12 +682,14 @@ class StreamingDriver:
                 self._maybe_finish(episode)
             self._lock.notify_all()
 
-    def _on_step(self, episode: _Episode, traj: Any, sample: RolloutSample) -> None:
-        episode.traj = traj
+    def _on_step(self, episode: _Episode, trajs: Any, sample: RolloutStatus) -> None:
+        episode.traj = trajs[0]
         episode.sample = sample
         episode.done = bool(sample.done)
+        if episode.done:
+            episode.deliver = list(trajs)
         if self.prms and episode.role != _BASELINE and (episode.done or self.prm_segment is None
-                                                         or self.prm_segment(sample)):
+                                                         or self.prm_segment(sample, trajs[0])):
             segment = self._score_prm(episode)
             if self.on_step is not None and not episode.done:
                 episode.held = segment
@@ -628,7 +699,7 @@ class StreamingDriver:
             self._failures.append(False)
             self._score_orm(episode)
         else:
-            self._step(episode, traj)
+            self._step(episode, trajs[0])
 
     def _score_prm(self, episode: _Episode) -> int:
         if episode.prm is None:
@@ -763,7 +834,7 @@ class StreamingDriver:
     def _accept(self, group: _Group) -> None:
         del self._groups[group.key]
         self._ready.append(list(group.members))
-        self._ready_rows += len(group.members)
+        self._ready_rows += sum(len(episode.deliver) for episode in group.members)
 
     def _drop_group(self, group: _Group) -> None:
         """Give the group up: its counted rows leave the bound, its unfinished episodes stop (under the lock)."""

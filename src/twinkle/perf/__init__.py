@@ -11,15 +11,17 @@ Four independent, low-intrusion parts:
   (:func:`chrome_trace` / :func:`dag_report`).
 * :class:`CounterRegistry` -- always-live monotonic counters, the metrics half
   complementing the span (trace) half above: ``add`` accumulates, ``snapshot``
-  reads window deltas, never reset, no enable gate. For control loops that read
-  a delta at every step -- spans are windowed and gated, counters are neither.
+  reads window deltas, never reset, no enable gate. Kept as a primitive for a
+  per-step control loop; no such consumer is wired today (the real control loop
+  reads ``phase_totals`` off the recorder), so treat it as reserved until one is.
 * :class:`ModuleProfiler` -- a forward-hook profiler that gates by step, selects
   target modules, and leaves *what to measure* open via a list of collector
   functions (built-ins: :func:`activation_stats` / :func:`param_stats`). Attaches
   to any ``nn.Module`` subclass.
 * :mod:`twinkle.perf.timeline` -- stateless transforms of that event stream:
-  Chrome Trace rendering and a text DAG / lane report. Consumed by whoever holds
-  the window's events; the recorder itself only appends.
+  Chrome Trace rendering and a text DAG / lane report. Not wired to any dump
+  path today (nothing writes the chrome trace out); it stays a debugging tool
+  to drive by hand from a recorder's ``trace_events``.
 
 The recorder and profiler are disabled/no-op by default, so importing perf never
 changes existing behaviour; the counter registry is always live by design (a few

@@ -317,9 +317,10 @@ class TrainableModel(ABC):
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def memory_stats(self, *, synchronize: bool = False) -> dict[str, int]:
         """Raw per-rank allocator peaks and host RAM in bytes; no cross-rank reduction."""
+        from twinkle import Platform
         from twinkle.perf.stats import memory_stats
 
-        return memory_stats(synchronize=synchronize)
+        return memory_stats(synchronize=synchronize, device_prefix=Platform.device_prefix())
 
     @abstractmethod
     def calculate_metric(self, is_training: bool, **kwargs) -> Dict[str, Any]:

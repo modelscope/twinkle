@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import statistics
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -19,9 +20,12 @@ _ALLOWED_OVERRIDE_KEYS = frozenset({
     'sampler_replicas',
     'shared_sampler',
     'flex_gpus',
-    'max_num_batched_tokens',
     'max_num_seqs',
 })
+#: The lend gate's cost stands on the rolling average of the last so many measured lend cycles.
+_SWITCH_COST_WINDOW = 3
+#: Stand-in cycle cost (seconds) until a first lend->reclaim cycle has been measured.
+_SWITCH_COST_FALLBACK_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -57,7 +61,6 @@ class RLResourcePlan:
     auxiliaries: Tuple[RolePlacement, ...] = ()
     shared_sampler: Optional[RolePlacement] = None
     flex_ranks: Tuple[int, ...] = ()
-    max_num_batched_tokens: Optional[int] = None
     max_num_seqs: Optional[int] = None
     explanation: Tuple[str, ...] = ()
 
@@ -304,20 +307,13 @@ class RLResourceEstimator:
         kv_budget = budget - memory.weight_bytes - memory.runtime_reserve_bytes - memory.graph_reserve_bytes
         if kv_budget <= 0:
             raise ValueError('sampler KV budget is non-positive after weights and runtime reserves.')
-        # Tokens the KV cache can hold. The scheduler chunk is separate: one forward
-        # should cover a full max_model_len prefill, not the entire cache. Writing the
-        # cache size into max_num_batched_tokens also becomes vLLM's vision-encoder
-        # budget and profiles dozens of max-size images.
+        # Tokens the KV cache can hold -- the cap on live sequences. The per-step scheduler
+        # budget (max_num_batched_tokens) is NOT derived here: it is a throughput knob with no
+        # memory-physics behind it (chunked prefill splits long prompts on its own), so the
+        # engine default stands unless the user sets it in the engine kwargs.
         kv_tokens = max(1, math.floor(0.95 * kv_budget / max(1, memory.kv_bytes_per_token)))
-        context_limit = int(engine_context or 0)
-        if context_limit <= 0:
-            context_limit = int(getattr(hf_config, 'max_position_embeddings', 0) or 0)
         configured_seqs = getattr(rollout_config, 'vllm_max_num_seqs', None) if backend == 'vllm' else None
-        if 'max_num_batched_tokens' in overrides:
-            seq_budget = int(overrides['max_num_batched_tokens'])
-        else:
-            seq_budget = kv_tokens
-        max_seqs = max(1, seq_budget // max(1, total_p95))
+        max_seqs = max(1, kv_tokens // max(1, total_p95))
         if configured_seqs is not None:
             max_seqs = min(max_seqs, configured_seqs)
         max_seqs = int(overrides.get('max_num_seqs', max_seqs))
@@ -326,18 +322,6 @@ class RLResourceEstimator:
         if configured_seqs is not None and max_seqs > configured_seqs:
             raise ValueError(f'max_num_seqs override {max_seqs} exceeds the configured engine limit '
                              f'{configured_seqs}.')
-        if 'max_num_batched_tokens' in overrides:
-            max_batched = int(overrides['max_num_batched_tokens'])
-        else:
-            # One prefill step may be as long as the context window. Also keep room for
-            # one decode token from every live sequence, which vLLM requires.
-            chunk = kv_tokens if context_limit <= 0 else min(kv_tokens, context_limit)
-            max_batched = min(kv_tokens, max(chunk, max_seqs))
-        if max_batched < 1:
-            raise ValueError('max_num_batched_tokens must be positive.')
-        if max_batched < max_seqs:
-            raise ValueError(f'max_num_batched_tokens={max_batched} is smaller than max_num_seqs={max_seqs}; '
-                             'one scheduler step must hold a decode token from every live sequence.')
 
         sampler_replicas = int(overrides.get('sampler_replicas', 1))
         if sampler_replicas < 1:
@@ -345,6 +329,18 @@ class RLResourceEstimator:
         flex_gpus = int(overrides.get('flex_gpus', getattr(rollout_config, 'resource_flex_gpus', 0)))
         if flex_gpus < 0:
             raise ValueError('flex_gpus must be non-negative.')
+        total_cap = getattr(rollout_config, 'resource_total_gpus', None)
+        auto_filled = False
+        if total_cap is not None and 'sampler_replicas' not in overrides:
+            # An explicit cap asks the plan to USE the GPUs: beyond the fixed roles (trainer,
+            # auxiliaries, the flex reservation) and the default one sampler replica, every whole
+            # replica the remaining cards can hold becomes a real sampler replica instead of idling.
+            # An explicit sampler_replicas override wins over the fill; leftover cards below one
+            # replica's width stay unused and the cap check below still rejects a too-small cap.
+            fixed = trainer_gpus + flex_gpus + sum(int(width) for _, width in auxiliary_widths.items())
+            extra = max(0, total_cap - fixed - sampler_width) // sampler_width
+            sampler_replicas += extra
+            auto_filled = extra > 0
         next_rank = trainer_gpus
         trainer = RolePlacement('trainer', trainer_width, trainer_gpus // trainer_width,
                                 tuple(range(trainer_gpus)), trainer_width)
@@ -364,7 +360,6 @@ class RLResourceEstimator:
                 and flex_gpus < sampler_width:
             raise ValueError(f'resource_flex_gpus={flex_gpus} cannot hold one complete sampler replica of '
                              f'width {sampler_width}. Increase the flex reservation or set it to zero.')
-        total_cap = getattr(rollout_config, 'resource_total_gpus', None)
         if total_cap is not None and next_rank > total_cap:
             raise ValueError(f'resource plan needs {next_rank} GPUs but resource_total_gpus={total_cap}.')
         enable_shared = bool(overrides.get('shared_sampler',
@@ -381,11 +376,12 @@ class RLResourceEstimator:
             auxiliaries=tuple(auxiliaries),
             shared_sampler=shared,
             flex_ranks=flex_ranks,
-            max_num_batched_tokens=max_batched,
             max_num_seqs=max_seqs,
             explanation=(
                 f'prompt p50/p95/p99/max={lengths["p50"]}/{lengths["p95"]}/{lengths["p99"]}/{lengths["max"]}',
                 f'sampler KV budget={kv_budget / _GIB:.2f} GiB per card',
+                *(() if not auto_filled else
+                  (f'sampler replicas auto-filled to {sampler_replicas} from resource_total_gpus={total_cap}',)),
             ))
 
 
@@ -472,9 +468,8 @@ def apply_plan(plan: RLResourcePlan, *, distributed_config: Any, rollout_config:
         rollout_config.vllm_pipeline_parallel_size = 1
         rollout_config.vllm_data_parallel_size = sampler.replica_count
         rollout_config.vllm_max_num_seqs = plan.max_num_seqs
-        engine_kwargs = dict(rollout_config.vllm_engine_kwargs or {})
-        engine_kwargs['max_num_batched_tokens'] = plan.max_num_batched_tokens
-        rollout_config.vllm_engine_kwargs = engine_kwargs
+        # max_num_batched_tokens is deliberately NOT written: it is a throughput knob the
+        # engine defaults (or the user's engine kwargs) own, not a memory-planning output.
     else:
         rollout_config.sglang_tp_size = sampler.model_parallel_width
         rollout_config.sglang_pp_size = 1
@@ -507,13 +502,26 @@ class ClusterAdapter:
       calls apart, until the ratio falls under ``ratio_down``.
     * :meth:`lend` while the trainer waits for a batch: when it spent more than ``lend_idle_ratio``
       of the last step waiting, ``model`` is offloaded and the busiest role grows onto
-      ``lend_ranks``.
+      ``lend_ranks`` -- but only when that wait also outruns the measured cost of a lend cycle
+      (the rolling average of the last few cycles; 10 s stand-in until one is measured).
     * :meth:`reclaim` before the batch is handed out retires the replicas on ``lend_ranks`` (their
       requests are resubmitted to the other replicas) and reloads ``model``.
 
     A new replica is passed to ``warmups[role]`` before it takes requests (the sampler's
     ``checkpoint_manager.warm`` loads the current weights into it). ``widths[role]`` is the device
     count of one replica of that role (default 1).
+
+    Known gap (TODO): ``adjust``'s move does not weigh its own cost, the way :meth:`lend` weighs
+    a lend cycle against its measured seconds. Retiring the idlest role's replica aborts its
+    in-flight requests (each resubmits elsewhere -- at-least-once re-execution of paid work) and
+    the grown role pays a warmup weight sync before the new replica serves; the decision sees
+    only the pressure ratio and a blind ``cooldown`` between moves. Nor is the re-execution
+    visible anywhere: resubmitted requests are counted only inside the continuous-work retry
+    budget. First steps when this is picked up: surface the resubmission count as a metric, time
+    each move the way ``_switch_overheads`` times lend cycles, and gate moves on measured cost
+    vs. expected benefit instead of the flat cooldown. Neither signal here answers whether a
+    role sits on the iteration's critical path (parallel roles can be busy without deciding the
+    wall time) -- that needs the offline timeline (chrome trace) on a real run, driven by hand.
     """
 
     def __init__(self,
@@ -558,6 +566,10 @@ class ClusterAdapter:
         self._cooldown = 0
         #: the role holding replicas on ``lend_ranks``, until ``reclaim``
         self._lent: Optional[str] = None
+        #: measured seconds of each lend->reclaim cycle (grow leg + retire/reload leg), most recent last
+        self._switch_overheads: List[float] = []
+        #: the grow leg's seconds of the cycle now running; ``reclaim`` folds it into the history
+        self._lend_duration = 0.0
         self._lock = threading.Lock()
 
     def adjust(self) -> None:
@@ -578,10 +590,18 @@ class ClusterAdapter:
             if self._engaged and self._move(hot, cold):
                 self._cooldown = self.cooldown
 
-    def lend(self, train_idle_ratio: float) -> None:
-        """Offload the trainer and grow the busiest role onto ``lend_ranks``; only while it waits."""
+    def lend(self, train_idle_ratio: float, waited: Optional[float] = None) -> None:
+        """Offload the trainer and grow the busiest role onto ``lend_ranks``; only while it waits.
+
+        ``waited`` is the last wait's sampler-caused seconds (the trainer's whole wait minus the
+        machinery's own reclaim cost): lending costs one grow leg plus one reclaim leg, so it is
+        skipped unless that wait would have outrun the cycles' measured cost (``None`` leaves the
+        decision to ``train_idle_ratio`` alone).
+        """
         with self._lock:
             if not self.lend_ranks or self._lent is not None or train_idle_ratio <= self.lend_idle_ratio:
+                return
+            if waited is not None and waited <= self._switch_cost():
                 return
             pressures = {name: float(handle.pressure()) for name, handle in self.roles.items()}
             name = max(pressures, key=pressures.get)
@@ -589,6 +609,7 @@ class ClusterAdapter:
             count = len(self.lend_ranks) // width
             if count == 0:
                 return
+            started = time.monotonic()
             self.model.offload_to_cpu()
             try:
                 self.roles[name].add_workers(
@@ -596,6 +617,7 @@ class ClusterAdapter:
             except BaseException:
                 self.model.reload_to_gpu()
                 raise
+            self._lend_duration = time.monotonic() - started
             self._lent = name
             logger.info(f'ClusterAdapter: lent trainer ranks {list(self.lend_ranks[:count * width])} to {name}.')
 
@@ -605,10 +627,18 @@ class ClusterAdapter:
             if self._lent is None:
                 return
             name, self._lent = self._lent, None
+            started = time.monotonic()
             try:
                 self.roles[name].remove_workers(ranks=list(self.lend_ranks))
             finally:
                 self.model.reload_to_gpu()
+            self._switch_overheads.append(self._lend_duration + (time.monotonic() - started))
+            self._lend_duration = 0.0
+
+    def _switch_cost(self) -> float:
+        """The rolling-average seconds of one lend->reclaim cycle; a stand-in value until one is measured."""
+        recent = self._switch_overheads[-_SWITCH_COST_WINDOW:]
+        return sum(recent) / len(recent) if recent else _SWITCH_COST_FALLBACK_S
 
     def _move(self, hot: str, cold: Optional[str]) -> bool:
         """One replica's devices to ``hot``: spare ranks first, else a replica retired from ``cold``."""

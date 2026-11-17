@@ -14,17 +14,17 @@ class TestGRPOAdvantage:
 
     def test_output_shape_matches_input(self):
         rewards = torch.tensor([1.0, 2.0, 3.0, 4.0])
-        result = self.grpo(rewards, num_generations=4)
+        result = self.grpo._per_sequence(rewards, num_generations=4)
         assert result.shape == rewards.shape
 
     def test_output_is_float32(self):
         rewards = [1, 2, 3, 4]
-        result = self.grpo(rewards, num_generations=4)
+        result = self.grpo._per_sequence(rewards, num_generations=4)
         assert result.dtype == torch.float32
 
     def test_accepts_list_input(self):
         rewards = [0.0, 1.0, 0.0, 1.0]
-        result = self.grpo(rewards, num_generations=4)
+        result = self.grpo._per_sequence(rewards, num_generations=4)
         assert result.shape == (4,)
 
     # --- scale='none' ---
@@ -32,14 +32,14 @@ class TestGRPOAdvantage:
     def test_scale_none_subtracts_group_mean(self):
         # Group [0, 1, 0, 1]: mean=0.5, advantages = [-0.5, 0.5, -0.5, 0.5]
         rewards = torch.tensor([0.0, 1.0, 0.0, 1.0])
-        result = self.grpo(rewards, num_generations=4, scale='none')
+        result = self.grpo._per_sequence(rewards, num_generations=4, scale='none')
         expected = torch.tensor([-0.5, 0.5, -0.5, 0.5])
         assert torch.allclose(result, expected, atol=1e-6)
 
     def test_scale_none_two_groups(self):
         # 2 prompts, 4 generations each
         rewards = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
-        result = self.grpo(rewards, num_generations=4, scale='none')
+        result = self.grpo._per_sequence(rewards, num_generations=4, scale='none')
         # Group 1: [0,1,2,3] mean=1.5 → [-1.5, -0.5, 0.5, 1.5]
         # Group 2: [4,5,6,7] mean=5.5 → [-1.5, -0.5, 0.5, 1.5]
         expected = torch.tensor([-1.5, -0.5, 0.5, 1.5, -1.5, -0.5, 0.5, 1.5])
@@ -49,7 +49,7 @@ class TestGRPOAdvantage:
 
     def test_scale_group_divides_by_group_std(self):
         rewards = torch.tensor([0.0, 2.0, 0.0, 2.0])
-        result = self.grpo(rewards, num_generations=4, scale='group')
+        result = self.grpo._per_sequence(rewards, num_generations=4, scale='group')
         # Group mean=1.0, std≈1.1547
         # advantages_raw = [-1, 1, -1, 1]
         # normalized = [-1, 1, -1, 1] / 1.1547
@@ -58,7 +58,7 @@ class TestGRPOAdvantage:
     def test_scale_group_zero_std_handled(self):
         # All same reward → std=0, division by eps=1e-8
         rewards = torch.tensor([5.0, 5.0, 5.0, 5.0])
-        result = self.grpo(rewards, num_generations=4, scale='group')
+        result = self.grpo._per_sequence(rewards, num_generations=4, scale='group')
         # advantages_raw = [0,0,0,0], still 0 after division
         assert torch.allclose(result, torch.zeros(4), atol=1e-5)
 
@@ -66,7 +66,7 @@ class TestGRPOAdvantage:
 
     def test_scale_batch_uses_batch_std(self):
         rewards = torch.tensor([0.0, 2.0, 4.0, 6.0])
-        result = self.grpo(rewards, num_generations=4, scale='batch')
+        result = self.grpo._per_sequence(rewards, num_generations=4, scale='batch')
         assert result.shape == (4,)
 
     # --- num_generations=1 ---
@@ -79,13 +79,13 @@ class TestGRPOAdvantage:
     def test_num_generations_1_scale_none(self):
         rewards = torch.tensor([1.0, 3.0, 5.0])
         with pytest.warns(UserWarning, match='num_generations == 1'):
-            result = self.grpo(rewards, num_generations=1, scale='none')
+            result = self.grpo._per_sequence(rewards, num_generations=1, scale='none')
         assert torch.allclose(result, torch.zeros(3), atol=1e-6)
 
     def test_num_generations_1_scale_batch(self):
         rewards = torch.tensor([1.0, 3.0, 5.0])
         with pytest.warns(UserWarning, match='num_generations == 1'):
-            result = self.grpo(rewards, num_generations=1, scale='batch')
+            result = self.grpo._per_sequence(rewards, num_generations=1, scale='batch')
         assert result.shape == (3,)
         assert torch.allclose(result, torch.zeros(3), atol=1e-6)
 
@@ -93,14 +93,14 @@ class TestGRPOAdvantage:
         """Default scale for num_generations=1: group-relative advantages are identically zero."""
         rewards = torch.tensor([1.0, 2.0, 3.0])
         with pytest.warns(UserWarning, match='num_generations == 1'):
-            result = self.grpo(rewards, num_generations=1)
+            result = self.grpo._per_sequence(rewards, num_generations=1)
         assert torch.allclose(result, torch.zeros(3), atol=1e-6)
 
     # --- multi-dim rewards ---
 
     def test_multi_dim_rewards_summed(self):
         rewards = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
-        result = self.grpo(rewards, num_generations=4, scale='none')
+        result = self.grpo._per_sequence(rewards, num_generations=4, scale='none')
         # summed: [3, 7, 11, 15], mean=9, advantages = [-6, -2, 2, 6]
         expected = torch.tensor([-6.0, -2.0, 2.0, 6.0])
         assert torch.allclose(result, expected, atol=1e-6)
@@ -109,15 +109,15 @@ class TestGRPOAdvantage:
 
     def test_invalid_num_generations_zero(self):
         with pytest.raises(ValueError):
-            self.grpo(torch.tensor([1.0, 2.0]), num_generations=0)
+            self.grpo._per_sequence(torch.tensor([1.0, 2.0]), num_generations=0)
 
     def test_invalid_num_generations_mismatch(self):
         with pytest.raises(ValueError):
-            self.grpo(torch.tensor([1.0, 2.0, 3.0]), num_generations=2)
+            self.grpo._per_sequence(torch.tensor([1.0, 2.0, 3.0]), num_generations=2)
 
     def test_single_element_with_num_gen_1(self):
         with pytest.warns(UserWarning, match='num_generations == 1'):
-            result = self.grpo(torch.tensor([5.0]), num_generations=1)
+            result = self.grpo._per_sequence(torch.tensor([5.0]), num_generations=1)
         assert torch.allclose(result, torch.tensor([0.0]))
 
 
@@ -130,12 +130,12 @@ class TestRLOOAdvantage:
 
     def test_output_shape_matches_input(self):
         rewards = torch.tensor([1.0, 2.0, 3.0, 4.0])
-        result = self.rloo(rewards, num_generations=4)
+        result = self.rloo._per_sequence(rewards, num_generations=4)
         assert result.shape == rewards.shape
 
     def test_accepts_list_input(self):
         rewards = [1.0, 2.0, 3.0, 4.0]
-        result = self.rloo(rewards, num_generations=4)
+        result = self.rloo._per_sequence(rewards, num_generations=4)
         assert result.shape == (4,)
 
     # --- RLOO formula ---
@@ -145,19 +145,19 @@ class TestRLOOAdvantage:
         # For reward=0: baseline = 1/3 ≈ 0.333, advantage ≈ -0.333
         # For reward=1: baseline = 0/3 = 0,     advantage = 1
         rewards = torch.tensor([0.0, 0.0, 0.0, 1.0])
-        result = self.rloo(rewards, num_generations=4, scale='none')
+        result = self.rloo._per_sequence(rewards, num_generations=4, scale='none')
         assert torch.allclose(result[0], torch.tensor(-1.0 / 3), atol=1e-5)
         assert torch.allclose(result[3], torch.tensor(1.0), atol=1e-5)
 
     def test_rloo_all_same_rewards(self):
         rewards = torch.tensor([5.0, 5.0, 5.0, 5.0])
-        result = self.rloo(rewards, num_generations=4, scale='none')
+        result = self.rloo._per_sequence(rewards, num_generations=4, scale='none')
         # All advantages should be 0
         assert torch.allclose(result, torch.zeros(4), atol=1e-5)
 
     def test_rloo_two_groups(self):
         rewards = torch.tensor([1.0, 3.0, 5.0, 7.0])
-        result = self.rloo(rewards, num_generations=2, scale='none')
+        result = self.rloo._per_sequence(rewards, num_generations=2, scale='none')
         # Group1 [1,3]: baseline_1=3, adv_1=-2; baseline_2=1, adv_2=2
         # Group2 [5,7]: baseline_1=7, adv_1=-2; baseline_2=5, adv_2=2
         expected = torch.tensor([-2.0, 2.0, -2.0, 2.0])
@@ -167,34 +167,96 @@ class TestRLOOAdvantage:
 
     def test_scale_group(self):
         rewards = torch.tensor([0.0, 1.0, 2.0, 3.0])
-        result = self.rloo(rewards, num_generations=4, scale='group')
+        result = self.rloo._per_sequence(rewards, num_generations=4, scale='group')
         assert result.shape == (4,)
 
     def test_scale_batch(self):
         rewards = torch.tensor([0.0, 1.0, 2.0, 3.0])
-        result = self.rloo(rewards, num_generations=4, scale='batch')
+        result = self.rloo._per_sequence(rewards, num_generations=4, scale='batch')
         assert result.shape == (4,)
 
     # --- error handling ---
 
     def test_invalid_num_generations_one(self):
         with pytest.raises(ValueError):
-            self.rloo(torch.tensor([1.0, 2.0]), num_generations=1)
+            self.rloo._per_sequence(torch.tensor([1.0, 2.0]), num_generations=1)
 
     def test_invalid_num_generations_zero(self):
         with pytest.raises(ValueError):
-            self.rloo(torch.tensor([1.0, 2.0]), num_generations=0)
+            self.rloo._per_sequence(torch.tensor([1.0, 2.0]), num_generations=0)
 
     def test_invalid_num_generations_mismatch(self):
         with pytest.raises(ValueError):
-            self.rloo(torch.tensor([1.0, 2.0, 3.0]), num_generations=2)
+            self.rloo._per_sequence(torch.tensor([1.0, 2.0, 3.0]), num_generations=2)
 
     # --- multi-dim ---
 
     def test_multi_dim_rewards_summed(self):
         rewards = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
-        result = self.rloo(rewards, num_generations=4, scale='none')
+        result = self.rloo._per_sequence(rewards, num_generations=4, scale='none')
         # summed: [3, 7, 11, 15], sum=36
         # adv_3 = 3 - (36-3)/3 = 3 - 11 = -8
         # adv_15 = 15 - (36-15)/3 = 15 - 7 = 8
         assert result.shape == (4,)
+
+
+class TestAdvantageDegeneracyReport:
+    """The summary quantities that separate "this batch learned nothing" from "it trained normally".
+
+    A GRPO group whose members all scored the same is centered to exactly zero, so it contributes no
+    gradient: the step's loss and grad_norm are both zero by arithmetic, not by failure. ``mean`` cannot
+    report which happened, because centering drives it to zero in both cases.
+
+    PLAN
+    | # | case | input | expected | failure it kills |
+    |---|------|-------|----------|------------------|
+    | 1 | mean is blind to degeneracy | degenerate vs differentiated | both 0.0 | keeping mean as the only reported signal |
+    | 2 | absmean separates them | same | 0.0 vs > 0 | a magnitude that cancels signed values |
+    | 3 | zero-row fraction counts all-zero rows | degenerate / differentiated / half-and-half | 1.0 / 0.0 / 0.5 | miscounting how much of the batch trained |
+    | 4 | negative advantages | ``[[-2.0, 2.0]]`` | absmean 2.0 | a signed mean reading 0.0 over a healthy batch |
+    | 5 | negative zero | ``[[-0.0, 0.0]]`` | zero_rows 1.0 | ``-0.0`` read as nonzero, under-reporting degeneracy |
+    | 6 | empty batch | ``[]`` | 0.0 and 0.0 | a division by zero on an empty batch |
+    | 7 | a row with no tokens | ``[[]]`` | absmean 0.0, zero_rows 1.0 | a tokenless row counted as differentiated |
+    | 8 | NaN advantage | ``[[nan]]`` | zero_rows 0.0 | NaN folded into the degenerate count |
+    """
+
+    DEGENERATE = [[0.0, 0.0], [0.0, 0.0]]
+    DIFFERENTIATED = [[1.0, -1.0], [-1.0, 1.0]]
+
+    def test_mean_cannot_tell_a_degenerate_batch_from_a_trained_one(self):
+        from twinkle.advantage.base import _mean
+        assert _mean(self.DEGENERATE) == _mean(self.DIFFERENTIATED) == 0.0
+
+    def test_absmean_separates_them(self):
+        from twinkle.advantage.base import _absmean
+        assert _absmean(self.DEGENERATE) == 0.0
+        assert _absmean(self.DIFFERENTIATED) == 1.0
+
+    def test_zero_row_fraction_counts_the_rows_that_trained_nothing(self):
+        from twinkle.advantage.base import _zero_row_fraction
+        assert _zero_row_fraction(self.DEGENERATE) == 1.0
+        assert _zero_row_fraction(self.DIFFERENTIATED) == 0.0
+        assert _zero_row_fraction(self.DEGENERATE[:1] + self.DIFFERENTIATED[:1]) == 0.5
+
+    def test_negative_advantages_are_measured_by_magnitude(self):
+        from twinkle.advantage.base import _absmean, _mean
+        assert _mean([[-2.0, 2.0]]) == 0.0
+        assert _absmean([[-2.0, 2.0]]) == 2.0
+
+    def test_negative_zero_counts_as_a_zero_advantage(self):
+        from twinkle.advantage.base import _zero_row_fraction
+        assert _zero_row_fraction([[-0.0, 0.0]]) == 1.0
+
+    def test_an_empty_batch_reports_zeros_not_an_error(self):
+        from twinkle.advantage.base import _absmean, _zero_row_fraction
+        assert _absmean([]) == 0.0
+        assert _zero_row_fraction([]) == 0.0
+
+    def test_a_row_with_no_tokens_contributed_nothing(self):
+        from twinkle.advantage.base import _absmean, _zero_row_fraction
+        assert _absmean([[]]) == 0.0
+        assert _zero_row_fraction([[]]) == 1.0
+
+    def test_a_nan_advantage_is_not_counted_as_degenerate(self):
+        from twinkle.advantage.base import _zero_row_fraction
+        assert _zero_row_fraction([[float('nan')]]) == 0.0

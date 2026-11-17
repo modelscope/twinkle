@@ -80,6 +80,11 @@ class DataLoader:
         self.dataloader = None
         self.max_retries = kwargs.pop('max_retries', 20)
         self.min_batch_size = min_batch_size
+        if self.min_batch_size is None and device_mesh is not None:
+            # The default the infra used to inject by sniffing the class name at construction
+            # time: a batch the sampler may shard must never come back narrower than the data
+            # world it feeds (the same rule ``ShardedBatchSampler`` itself falls back to).
+            self.min_batch_size = device_mesh.data_world_size
         if device_mesh is not None:
             assert batch_size >= device_mesh.data_world_size and batch_size % device_mesh.data_world_size == 0
         self.batch_size = batch_size

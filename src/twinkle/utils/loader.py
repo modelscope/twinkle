@@ -25,6 +25,11 @@ _LOADED_MODULES: dict[str, ModuleType] = {}
 #: and its ``@register`` side effects re-run -- in every worker.
 WORKER_SETUP_HOOK_ENV = "TWINKLE_WORKER_SETUP_HOOK"
 
+#: The import path Ray needs to reach :func:`run_worker_setup_hook`. A string rather than the
+#: function itself, because Ray serialises ``runtime_env`` to JSON and rejects a callable there
+#: ("Object of type function is not JSON serializable").
+WORKER_SETUP_HOOK = f"{__name__}.run_worker_setup_hook"
+
 
 def run_worker_setup_hook() -> None:
     """Ray ``worker_process_setup_hook``: invoke the driver-registered setup hook, if any.
@@ -95,14 +100,15 @@ def _load_local(path: Path) -> ModuleType:
 
 def _load_hub(plugin_id: str, **kwargs) -> ModuleType:
     """Download a ``hf://`` / ``ms://`` plugin and import it. Refused in safe mode."""
-    from ..hub import HFHub, MSHub
+    from ..hub import HubOperation
 
     if not trust_remote_code():
         raise ValueError("Twinkle does not support plugin in safe mode.")
-    if plugin_id.startswith("hf://"):
-        plugin_dir = HFHub.download_model(plugin_id[len("hf://") :], **kwargs)
-    elif plugin_id.startswith("ms://"):
-        plugin_dir = MSHub.download_model(plugin_id[len("ms://") :], **kwargs)
+    if plugin_id.startswith(("hf://", "ms://")):
+        # The one download entry, so the FORBID_HF gate and the per-rank download lock apply to
+        # plugins exactly as to models (bypassing them here would send plugin traffic straight to
+        # the hub TWINKLE_FORBID_HF exists to stop).
+        plugin_dir = HubOperation.download_model(plugin_id, **kwargs)
     else:
         raise ValueError(f"Unknown plugin id {plugin_id}, please use hf:// or ms://")
     return _load_local(Path(plugin_dir))

@@ -234,18 +234,17 @@ class RayHelper:
                 for worker_id in worker_ids:
                     pool.pop(worker_id, None)
 
+            def remove_actors(self, worker_ids: List[str]):
+                """Drop these replicas from every pool (a shutdown only ever removes its own)."""
+                for pool in self.pools.values():
+                    for worker_id in worker_ids:
+                        pool.pop(worker_id, None)
+
             def occupied(self) -> List[Tuple[str, Any, Tuple[int, ...]]]:
                 """``(group, slot, ranks)`` of every replica of every pool."""
                 return [(member['group'], member.get('slot'), tuple(member.get('ranks') or ()))
                         for pool in self.pools.values() for member in pool.values()]
-
-            def all_actors(self) -> List[Any]:
-                return [member['actor'] for pool in self.pools.values() for member in pool.values()]
-
-            def clear(self):
-                self.config.clear()
-                self.pools.clear()
-
+        
         registry_name = os.environ.get('TWINKLE_RAY_REGISTRY_NAME', 'config_registry')
         registry_namespace = os.environ.get('TWINKLE_RAY_NAMESPACE')
         try:
@@ -285,7 +284,19 @@ class RayHelper:
             num_gpus = None
             if resources:
                 num_gpus = int(resources.pop('GPU')) if 'GPU' in resources else None
-            ray.init(ignore_reinit_error=True, resources=resources or None, num_gpus=num_gpus)
+            # The worker setup hook has to be installed here, at the job level, and not on each
+            # actor's runtime_env: Ray 2.56 accepts ``worker_process_setup_hook`` in a per-actor
+            # ``RuntimeEnv`` and then silently never calls it. Measured with a three-arm probe on this
+            # Ray -- per-actor only: the hook never ran; job level only: it ran; job level plus a
+            # per-actor ``RuntimeEnv`` carrying ``env_vars`` (the shape ``create_workers`` builds): it
+            # ran, in the same worker process that hosted the actor, and the per-actor ``env_vars``
+            # still applied. Nothing warned in the first arm, so a plugin the driver imported reached
+            # every actor as a module name no worker could import.
+            from twinkle.utils.loader import WORKER_SETUP_HOOK
+            ray.init(ignore_reinit_error=True,
+                     resources=resources or None,
+                     num_gpus=num_gpus,
+                     runtime_env={'worker_process_setup_hook': WORKER_SETUP_HOOK})
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.
@@ -304,28 +315,38 @@ class RayHelper:
 
     @staticmethod
     def shutdown():
-        """Terminate every actor this run created, release the placement groups and stop Ray."""
+        """Terminate the actors this process created, release the placement groups, stop Ray.
+
+        Only this process's own actors die: a shared namespace's other runs keep theirs and their
+        pool entries (killing through the registry would take out every replica of every pool in
+        the namespace). The registry itself is still killed and rebuilt by the next
+        ``initialize``; a peer holding a stale handle fails loudly rather than losing its
+        replicas. A crashed run leaves its dead replicas listed until freed by hand --
+        ``_free_placements`` then reports their slots as occupied.
+        """
         import ray
         if not RayHelper.ray_inited():
             return
         actors = list(RayHelper._created_actors)
-        if RayHelper._registry is not None:
-            try:
-                actors.extend(ray.get(RayHelper._registry.all_actors.remote()))
-            except Exception:  # noqa
-                pass
         for actor in actors:
             try:
                 ray.kill(actor, no_restart=True)
             except Exception:  # noqa
                 pass
         RayHelper._created_actors.clear()
+        if RayHelper._registry is not None:
+            try:
+                from ..continuous_work import worker_id_of
+
+                ray.get(RayHelper._registry.remove_actors.remote(
+                    [worker_id_of(actor) for actor in actors]))
+            except Exception:  # noqa
+                pass
         if RayHelper.resource_manager is not None:
             RayHelper.resource_manager.destroy_placement_group()
             RayHelper.resource_manager = None
         if RayHelper._registry is not None:
             try:
-                ray.get(RayHelper._registry.clear.remote())
                 ray.kill(RayHelper._registry)
             except Exception:  # noqa
                 pass
@@ -581,8 +602,12 @@ class RayHelper:
             placements = list(info['placements'])
         if not placements:
             return []
+        # The class name must be read before ``_get_remote_component`` wraps it: afterwards it is
+        # Ray's ActorClass, every actor would be named ``group-ActorClass-...`` and two handles
+        # built from the same line would collide on the same name.
+        class_name = worker_cls.__name__
         worker_cls = RayHelper._get_remote_component(worker_cls)
-        key = f'{group}-{worker_cls.__class__.__name__}-{instance_id}'
+        key = f'{group}-{class_name}-{instance_id}'
         if execute == 'peer':
             placements = placements[Platform.get_peer_index(len(placements))]
             ip, port = RayHelper.get_master_id_port(placements[0]['placement_group'])
@@ -621,10 +646,11 @@ class RayHelper:
                 # blocking continuous-work methods off the actor's event loop.
                 env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-            # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
-            # ("Object of type function is not JSON serializable"). Pass the import path instead.
-            runtime_env = RuntimeEnv(
-                env_vars=env_vars, worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
+            # No ``worker_process_setup_hook`` here: Ray ignores that field in a per-actor runtime_env
+            # and honours it only at the job level, where ``initialize`` installs it. This env_vars is
+            # merged with the job-level runtime_env rather than replacing it, so the hook still runs in
+            # these workers while each gets its own RANK / WORLD_SIZE / visible-device values.
+            runtime_env = RuntimeEnv(env_vars=env_vars)
             # The placement group already reserves a worker's full accelerator allocation and the
             # visible-device env pins the actor to its ranks, so no fractional accelerator is requested:
             # Ray would translate the bundle's device id through the already narrowed visible list.

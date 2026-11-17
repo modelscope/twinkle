@@ -49,7 +49,7 @@ def _tag_exc(exc: BaseException, caller: Optional[str]) -> None:
         pass
 
 
-def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp', 'last_pp_first',
+def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'first', 'last_pp_first',
                                         'tensor_dict', 'dp_flatten'], Callable],
                   result: List[Any],
                   device_mesh: DeviceMesh = None):
@@ -60,20 +60,18 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
             none: Return as is.
             flatten: Flat the nested results.
             mean: Average the results.
-            sum: Sum the results.
             first: Only return the first result.
-            last_pp: Only return the results of the last pp rank.
             tensor_dict: Merge per-worker output dicts, stacking tensors (deduplicated by data rank).
             dp_flatten: Deduplicate per-worker lists by data rank, then flatten in input order.
         result: The results returned by workers.
-        device_mesh: The device_mesh, needed by `last_pp`
+        device_mesh: The device_mesh, needed by `last_pp_first`
     Returns:
         The collected results.
     """
     if not result:
         return result
 
-    if isinstance(result[0], tuple):
+    if isinstance(result[0], tuple) and method != 'none':
         output = []
         # if each result of a worker is a tuple
         for i in range(len(result[0])):
@@ -82,6 +80,8 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
             output.append(_collect_func(method, _single_result, device_mesh=device_mesh))
         return output
     if method == 'none':
+        # As-is: a single worker's tuple stays a tuple (never a positional list) -- the return
+        # type must not drift between local and ray deployments.
         if isinstance(result, list) and len(result) == 1:
             # unwrap the result
             return result[0]
@@ -104,13 +104,8 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first
                     output[key] = vals
             return output
         return np.mean(result)
-    elif method == 'sum':
-        return np.sum(result)
     elif method == 'first':
         return result[0]
-    elif method == 'last_pp':
-        assert device_mesh is not None
-        return [r for i, r in enumerate(result) if i in device_mesh.get_pp_last_ranks()]
     elif method == 'last_pp_first':
         # Return the first result from the last PP stage workers.
         # Falls back to result[0] when PP = 1 (all workers are the last stage).
@@ -342,6 +337,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                 # -- plain HF classes reject the unknown keyword inside
                 # from_pretrained kwargs.
                 kwargs.pop('remote_group', None)
+                # instance_id disambiguates ray actor names for handles built from one call site.
+                # It is infra bookkeeping, so local mode drops it for the same reason: a component
+                # constructor must not receive it, or the same call site would work under --mode ray
+                # and raise TypeError under --mode local.
+                kwargs.pop('instance_id', None)
                 self._max_concurrency = concurrency
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
@@ -352,9 +352,6 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         kwargs[device_mesh_name] = infra._device_mesh
                     assert len(infra._device_group) == 1  # only one device group is allowed
                     infra._device_group[0]._device_mesh[self.__class__.__name__] = device_mesh
-                    if self.__class__.__name__ == 'DataLoader' and 'min_batch_size' not in kwargs:
-                        # TODO An ugly special setting for dataloader to set the min batch size
-                        kwargs['min_batch_size'] = device_mesh.data_world_size
                     init_method(self, *args, **kwargs)
                 else:
                     if device_mesh is not None:
@@ -390,10 +387,6 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         device_mesh = DeviceMesh.from_sizes(dp_size=1)
                         kwargs[device_mesh_name] = device_mesh
 
-                    if self.__class__.__name__ == 'DataLoader' and 'min_batch_size' not in kwargs:
-                        # TODO An ugly special setting for dataloader to set the min batch size
-                        kwargs['min_batch_size'] = kwargs['batch_size']
-
                     if remote_group:
                         if device_mesh is None:
                             if infra._device_mesh is not None:
@@ -408,7 +401,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         device_group = [dg for dg in infra._device_group if dg.name == remote_group][0]
                         device_group._device_mesh[self.__class__.__name__] = device_mesh
 
-                iter_stash = getattr(getattr(cls, '__iter__', None), '_stash', None)
+                # ``__iter_origin__`` (set once, below) is the user-declared iterator: without it,
+                # a second instantiation of the same class would read the stash off our own
+                # first-round wrapper, whose ``_stash`` is None.
+                iter_origin = getattr(cls, '__iter_origin__', None) or getattr(cls, '__iter__', None)
+                iter_stash = getattr(iter_origin, '_stash', None)
 
                 # This will solve the iterator cannot be passed through ray.
                 def __iter__(_self):
@@ -459,7 +456,13 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         _collect = self.__iter__._collect
                         _lazy = self.__iter__._lazy_collect
                         import ray
-                        cls.__iter_origin__ = cls.__iter__
+                        # The user's original iterator is recorded ONCE: a later instantiation of
+                        # the same class must not overwrite it with our own wrapper, whose body
+                        # calls ``__iter_origin__`` back -- a chain of such wrappers would recurse
+                        # forever if Ray ever re-serialised the current class instead of its
+                        # cached snapshot.
+                        if not hasattr(cls, '__iter_origin__'):
+                            cls.__iter_origin__ = cls.__iter__
                         cls.__iter__ = __iter__
                         # Return 2 object refs to enable get the stop flag in driver
                         cls.__next__ = ray.method(num_returns=2)(__next__)
@@ -634,7 +637,7 @@ def _collect_in_input_order(collect, plan):
 
 def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
-                    collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp', 'last_pp_first',
+                    collect: Union[Literal['none', 'flatten', 'mean', 'first', 'last_pp_first',
                                            'tensor_dict', 'dp_flatten'], Callable] = 'none',
                     sync: bool = False,
                     lazy_collect: Optional[bool] = None,
@@ -659,10 +662,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             'none': Return as-is
             'flatten': Return a flattened list
             'mean': Return the mean value of all processes
-            'sum': Return the sum value of all processes
             'first': Return the first worker's result but executed in each process, usually
                 works for scenarios of all-gather (e.g., get length).
-            'last_pp': Return the last pp's result.
             'tensor_dict': Merge per-worker output dicts (model forward outputs).
             'dp_flatten': Deduplicate per-worker lists by data rank, then flatten.
             Callable: A callable that handles the collection
@@ -680,7 +681,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             resubmitted elsewhere. Without ``lazy_collect=True`` the call returns the results; with it,
             a ``concurrent.futures.Future`` -- in local mode too, where the call runs on the
             instance's thread pool (sized by ``max_concurrency``). Requires the class to be declared
-            with ``max_concurrency`` above 1 to reach the worker's engine concurrently.
+            with ``max_concurrency`` above 1 to reach the worker's engine concurrently. A
+            resubmission is at-least-once: a request whose replica drained after finishing it
+            (or halfway through it) runs again elsewhere, so the method must tolerate being
+            called twice on the same request.
         sticky_key: Pin calls sharing a key to one replica (session affinity): a ``param.field.path``
             string read off the bound arguments, or a callable taking ``(args, kwargs)``. The binding
             lives in the caller's process (LRU, idle expiry); a vanished replica is rebound.
@@ -764,9 +768,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                 # A worker method may hand back a plain Future (an engine-side async submission);
                 # waiting here makes the caller's reference come ready only when the work finishes.
                 result = result.result()
-            if stash is not None and stash is not False:
+            if stash is not None and stash is not False and func.__name__ != '__iter__':
                 # Partial collect: lift the declared heavy channels to refs here, at the value's
                 # birthplace, so the caller's collect materialises only the light half.
+                # ``__iter__`` is exempt: it hands back the generator, not a batch, and the stash
+                # declared on it is applied per yielded value by the ``__next__`` wrapper.
                 result = _stash_channels(result, stash)
             return result
 
@@ -783,7 +789,31 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                        _resolve_sticky_key(sticky_key, func, args, kwargs),
                                        RayHelper.has_ref(args, kwargs))
                 future = call.start()
-                return future if lazy_collect is True else future.result(timeout=_rgt)
+                if lazy_collect is True:
+                    return future
+                try:
+                    return future.result(timeout=_rgt)
+                except TimeoutError as exc:
+                    # ``future.result`` raises ``TimeoutError`` for two different failures, and only one of
+                    # them is a timeout of this call. The wait expiring leaves the future unfinished; the
+                    # callee raising its own ``TimeoutError`` leaves it finished and carrying that
+                    # exception. Rewrapping both destroyed the second one's only diagnosis: an ``Env.reset``
+                    # that ran out of session slots says "no free session within 600s (8 in use)", which
+                    # reached the caller as "reset: no result within Nones" -- a pool that is exhausted
+                    # reading as a call that was slow, with the timeout that was never even set named as
+                    # the cause. Re-raise the callee's exception untouched and wrap only a real wait.
+                    #
+                    # Every other path here waits through ``ray.get``, whose timeout is a
+                    # ``ray.exceptions.GetTimeoutError``. A continuous-work call instead waits on a
+                    # ``concurrent.futures.Future``, whose native timeout is a plain ``TimeoutError``,
+                    # so a caller catching the infra's one timeout type would silently miss these.
+                    # ``GetTimeoutError`` subclasses ``TimeoutError``, so narrowing the type here
+                    # unifies the two paths without breaking anyone catching the builtin.
+                    if future.done():
+                        raise
+                    import ray
+                    raise ray.exceptions.GetTimeoutError(
+                        f'{func.__name__}: no result within {_rgt}s') from exc
 
             execute_method = RayHelper.execute_all_async if not sync else functools.partial(
                 RayHelper.execute_all_sync, timeout=_rgt)
@@ -817,6 +847,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             # This is a result future, call it to get the actual result
             result_func = RayHelper.do_get_and_collect_func(_collect_func, _call_collect, result, _mesh, timeout=_rgt)
             if func.__name__ == '__iter__':
+                # The replica's __iter__ stores the iterator on itself and __next__ reads it back
+                # there, so the two calls are ordered by state rather than by argument. Waiting here
+                # is what makes that order hold: without it the first __next__ can reach the replica
+                # before the iterator exists.
+                import ray
+                for _res in result:
+                    ray.get(_res, timeout=_rgt)
                 return self
 
             if func.__name__ == '__len__':
@@ -857,19 +894,23 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             try:
                 dispatch_context = kwargs.pop('_dispatch_context', None)
                 if infra._mode == 'local':
+                    # The same entry the ray path runs: Future resolution, the drain check and
+                    # stash all apply here too, or a component method handing back a plain engine
+                    # Future would return it nested in local mode and materialised in ray.
+                    # (stash is a no-op outside a worker -- ``_stash_value`` passes through.)
                     if continuous_lazy:
-                        return _local_executor(self).submit(func, self, *args, **kwargs)
+                        return _local_executor(self).submit(_run_here, self, args, kwargs, None)
                     balance_local = getattr(self, '_dp_balance_local', None) if balance_enabled else None
                     if (balance_local is not None and dispatch == 'slice_dp'
                             and not getattr(self, '_dp_balance_running', False)):
                         self._dp_balance_running = True
                         try:
-                            return balance_local(functools.partial(func, self), args, kwargs)
+                            return balance_local(
+                                lambda *call_args, **call_kwargs: _run_here(self, call_args, call_kwargs, None),
+                                args, kwargs)
                         finally:
                             self._dp_balance_running = False
-                    if balance_enabled:
-                        kwargs.pop('input_lengths', None)
-                    return func(self, *args, **kwargs)
+                    return _run_here(self, args, kwargs, None)
                 elif infra._mode == 'ray':
                     check_unsafe(*args, **kwargs)
                     if hasattr(self, '_actors'):
@@ -894,6 +935,39 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                 with default_recorder.span(func.__qualname__):
                     return _call_impl(self, *args, **kwargs)
             return _call_impl(self, *args, **kwargs)
+
+        # Ray validates an actor call against ``inspect.signature(inspect.unwrap(method))``: it
+        # unwraps first (``ray/actor.py``, ``method = inspect.unwrap(method)``) and only then reads
+        # the signature, so a pin on this wrapper never reaches the validator -- ``functools.wraps``
+        # set ``__wrapped__`` to the undecorated body and unwrap descends straight past the pin to
+        # it. The pin therefore belongs on the body, which is the object Ray ends up holding.
+        # ``__wrapped__`` stays in place: reaching the undecorated body through it is how the test
+        # suite drives these methods at all.
+        #
+        # The declared parameter is metadata only. ``_call_impl`` and ``_worker_entry`` both pop
+        # ``_dispatch_context`` before the body runs, so the body never receives it; declaring it is
+        # what lets the ref-carrying dispatch path put it on the wire. The body's own parameters are
+        # kept in the pin rather than replaced with a var-args form, so ``inspect.signature`` stays
+        # honest for anyone reading the component.
+        _params = list(inspect.signature(func).parameters.values())
+        if not any(_p.name == '_dispatch_context' for _p in _params):
+            _context = inspect.Parameter('_dispatch_context', inspect.Parameter.KEYWORD_ONLY,
+                                         default=None)
+            # A keyword-only parameter may not follow ``**kwargs``, so it goes just before one.
+            _at = next((_i for _i, _p in enumerate(_params)
+                        if _p.kind is inspect.Parameter.VAR_KEYWORD), len(_params))
+            _params.insert(_at, _context)
+        func.__signature__ = inspect.Signature(parameters=_params)
+
+        # ``self`` must be declared here: Ray extracts an actor method's signature with
+        # ``extract_signature(func, ignore_first=True)``, which drops the first parameter on the
+        # assumption that it is ``self``. Without it the pin loses ``args`` and every positional
+        # argument is refused with "too many positional arguments".
+        wrapper.__signature__ = inspect.Signature(parameters=[
+            inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
+            inspect.Parameter('args', inspect.Parameter.VAR_POSITIONAL),
+            inspect.Parameter('kwargs', inspect.Parameter.VAR_KEYWORD),
+        ])
 
         def _worker_entry(self, *args, **kwargs):
             # What the awaitable companion runs on the replica: always the body, never a Future.

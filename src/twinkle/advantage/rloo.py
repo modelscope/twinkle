@@ -54,7 +54,7 @@ class RLOOAdvantage(Advantage):
                 raise ValueError("scale='gdpo' requires a 2D [N, n_funcs] per-function reward matrix.")
             return compute_gdpo_advantages(rewards, kwargs.get('reward_weights'), num_generations)
 
-        # reduce_rewards keeps the original plain-sum behavior when no reward_weights are given;
+        # reduce_rewards folds NaN-aware with or without weights (no weights means equal weights);
         # apply_kl_in_reward is a no-op unless kl_in_reward is requested.
         rewards = reduce_rewards(rewards, kwargs.get('reward_weights'))
         rewards = apply_kl_in_reward(

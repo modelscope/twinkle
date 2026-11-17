@@ -152,7 +152,14 @@ class Challenger(ABC):
         """
         admitted = []
         for group in groups:
-            if not self._has_spread(group):
+            rewards = self._group_rewards(group)
+            if any(value != value for value in rewards):
+                # A member whose judge never scored has no reward, and neither a fabricated 0 nor a
+                # NaN is usable here: 0 would join the group's spread and admission statistics as a
+                # real score, while GroupAdmissionPolicy.evaluate refuses non-finite input outright.
+                rejection_reasons['unscored'] += 1
+                continue
+            if not self._has_spread(rewards):
                 rejection_reasons['exact_dead'] += 1
                 continue
             if self.group_admission_policy is None:
@@ -162,10 +169,7 @@ class Challenger(ABC):
             completions = None
             if self.group_admission_policy.config.max_mean_pairwise_similarity is not None:
                 completions = [assistant_text(member) for member in group]
-            decision = self.group_admission_policy.evaluate(
-                [float(member.get('rewards') or 0.0) for member in group],
-                completions=completions,
-            )
+            decision = self.group_admission_policy.evaluate(rewards, completions=completions)
             if decision.admitted:
                 admitted.append(group)
             else:
@@ -173,16 +177,29 @@ class Challenger(ABC):
         return admitted
 
     @staticmethod
-    def _has_spread(group: List[Trajectory]) -> bool:
+    def _group_rewards(group: List[Trajectory]) -> List[float]:
+        """One group's rewards, with an unscored member as NaN rather than a fake 0.
+
+        ``rewards`` is missing or None when a member's judge never returned a score. NaN is truthy,
+        so the ``x or 0.0`` default does not catch it -- the caller tests for it explicitly.
+        """
+        values = []
+        for member in group:
+            reward = member.get('rewards')
+            value = float('nan') if reward is None else float(reward)
+            values.append(value if value == value else float('nan'))
+        return values
+
+    @staticmethod
+    def _has_spread(rewards: List[float]) -> bool:
         """True when a group's rewards differ.
 
         One reward repeated is one reward minus itself: every advantage in the group
         is zero and the whole group is a forward pass spent on no gradient.
         """
-        if len(group) < 2:
+        if len(rewards) < 2:
             return False
-        first = float(group[0].get('rewards') or 0.0)
-        return any(abs(float(member.get('rewards') or 0.0) - first) > 1e-9 for member in group[1:])
+        return any(abs(value - rewards[0]) > 1e-9 for value in rewards[1:])
 
     def _quotas(self, batch_size: int, solver_ratio: float) -> Tuple[int, int]:
         """Groups per batch on each side, from a trajectory count and a solver share.

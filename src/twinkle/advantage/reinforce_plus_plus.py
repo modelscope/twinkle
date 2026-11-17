@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, Literal, Union
 from twinkle import remote_class, remote_function
 
 from .base import Advantage
-from ._utils import apply_kl_in_reward, reduce_rewards
+from ._utils import apply_kl_in_reward, nanstd, reduce_rewards
 
 if TYPE_CHECKING:
     import torch
@@ -45,9 +45,11 @@ class ReinforcePlusPlusAdvantage(Advantage):
             rewards = torch.tensor(rewards, dtype=torch.float32)
 
         rewards = reduce_rewards(rewards, kwargs.get('reward_weights'))
-        # An unscored row (nan out of reduce_rewards) records 0 here, exactly as the legacy
-        # weighted-nansum fold did -- nan-aware group exclusion is grpo/rloo/passk's contract.
-        rewards = torch.nan_to_num(rewards, nan=0.0)
+        # A never-scored row stays NaN through the KL fold (an elementwise subtraction) and is kept
+        # out of the group mean. Imputing 0 instead does two wrong things at once: it shifts every
+        # scored row's advantage in that group, and it leaves the unscored row at -mean, a signal
+        # built entirely from other rows' evidence. NaN - mean is NaN, so the row lands at exactly
+        # zero below -- where grpo/rloo/passk land it too.
         rewards = apply_kl_in_reward(
             rewards,
             kl_in_reward=kwargs.get('kl_in_reward', False),
@@ -60,14 +62,15 @@ class ReinforcePlusPlusAdvantage(Advantage):
 
         K = num_generations
         grouped = rewards.view(-1, K)
-        group_mean = grouped.mean(dim=1).repeat_interleave(K)
+        group_mean = grouped.nanmean(dim=1).repeat_interleave(K)
         advantages = rewards - group_mean
 
         if scale == 'batch':
-            std = advantages.std().expand_as(advantages) if advantages.numel() > 1 else torch.zeros_like(advantages)
+            std = nanstd(advantages).expand_as(advantages) if advantages.numel() > 1 else torch.zeros_like(advantages)
             advantages = advantages / (std + 1e-8)
         elif scale == 'group':
-            std = (advantages.view(-1, K).std(dim=1).repeat_interleave(K) if K > 1 else torch.zeros_like(advantages))
+            std = (nanstd(advantages.view(-1, K), dim=1).repeat_interleave(K) if K > 1
+                   else torch.zeros_like(advantages))
             advantages = advantages / (std + 1e-8)
 
-        return advantages.view(-1)
+        return torch.nan_to_num(advantages, nan=0.0).view(-1)

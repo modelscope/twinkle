@@ -26,7 +26,9 @@ class EmbeddingMetric(Metric):
         self.neg_count = 0
         self.total_loss = 0.0
         self.total_count = 0
-        self.grad_norm = 0.0
+        # ``None`` = no norm reached this metric; ``0.0`` is a measured value that must still be
+        # reported. See ``LossMetric`` for why the two may not collapse into one rendering.
+        self.grad_norm = None
 
     def accumulate(self, inputs: Union[InputFeature, List[InputFeature]], outputs: ModelOutput, **kwargs):
         import torch
@@ -113,7 +115,7 @@ class EmbeddingMetric(Metric):
             results['neg_sim'] = f'{self.neg_sim_sum / self.neg_count:.4f}'
         if self.total_count > 0:
             results['loss'] = f'{self.total_loss / self.total_count:.4f}'
-        if self.grad_norm > 0:
+        if self.grad_norm is not None:
             results['grad_norm'] = f'{self.grad_norm:.6f}'
         self.reset()
         return results

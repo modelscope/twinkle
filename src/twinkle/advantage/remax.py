@@ -58,8 +58,11 @@ class ReMaxAdvantage(Advantage):
             reward_baselines = torch.tensor(reward_baselines, dtype=rewards.dtype, device=rewards.device)
 
         rewards = reduce_rewards(rewards, kwargs.get('reward_weights'))
-        # An unscored row (nan out of reduce_rewards) records 0 here, exactly as the legacy
-        # weighted-nansum fold did -- nan-aware group exclusion is grpo/rloo/passk's contract.
+        # A row whose every scorer failed is NaN out of the fold and must contribute no training
+        # signal. Zeroing the reward alone does not achieve that: subtracting the baseline would
+        # leave -baseline behind, a fabricated advantage on a row that was never scored. The mask
+        # is taken here because nan_to_num below destroys the only record of which rows failed.
+        unscored = torch.isnan(rewards)
         rewards = torch.nan_to_num(rewards, nan=0.0)
         rewards = apply_kl_in_reward(
             rewards,
@@ -68,10 +71,13 @@ class ReMaxAdvantage(Advantage):
             kl_values=kwargs.get('kl_values'),
         )
 
-        advantages = rewards - reward_baselines
+        advantages = (rewards - reward_baselines).masked_fill(unscored, 0.0)
 
         if scale == 'batch':
-            std = advantages.std() if advantages.numel() > 1 else torch.ones(1, device=advantages.device)
+            # Unscored rows stay out of the scale as well, so a batch's normalization is set by the
+            # rows that actually carry signal -- the same exclusion grpo/rloo apply to their std.
+            scored = advantages[~unscored]
+            std = scored.std() if scored.numel() > 1 else torch.ones(1, device=advantages.device)
             advantages = advantages / (std + 1e-8)
 
         return advantages.view(-1)

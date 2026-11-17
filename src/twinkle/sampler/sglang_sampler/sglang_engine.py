@@ -89,10 +89,42 @@ class SGLangEngine(BaseSamplerEngine):
             tp_size=tensor_parallel_size,
             dp_size=data_parallel_size,
             enable_memory_saver=enable_memory_saver,
-            **engine_kwargs,
+            **self._accepted_engine_kwargs(engine_kwargs),
         )
         logger.info(f'Creating sglang Engine: tp_size={tensor_parallel_size}, dp_size={data_parallel_size}')
         self.engine = sgl.Engine(**kwargs)
+
+    @staticmethod
+    def _accepted_engine_kwargs(engine_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """The caller's passthrough args minus the ones the installed sglang does not have.
+
+        sglang retires and renames engine knobs across releases -- ``enable_ep_moe`` is gone from
+        0.5.x, which spells expert parallelism ``ep_size`` -- and ``Engine`` accepts ``**kwargs``
+        only to reject unknown names at startup. A caller therefore cannot forward a config block
+        wholesale: one retired knob, even left at its default, stops the engine before it starts.
+        Dropping is reported by name rather than silent, so a knob the caller did set on purpose is
+        still visible; the four arguments this class passes explicitly are its own business and are
+        never filtered here.
+        """
+        try:
+            from sglang.srt.server_args import ServerArgs
+        except Exception:
+            return dict(engine_kwargs)
+        accepted = set(getattr(ServerArgs, '__annotations__', {}) or {})
+        try:
+            accepted |= set(inspect.signature(ServerArgs).parameters)
+        except (TypeError, ValueError):
+            pass
+        if not accepted:
+            return dict(engine_kwargs)
+        unknown = sorted(key for key in engine_kwargs if key not in accepted)
+        if unknown:
+            import sglang
+            logger.warning(
+                f'sglang {getattr(sglang, "__version__", "?")} does not accept engine argument(s) '
+                f'{unknown}; dropping them. These are retired or renamed knobs, and one left at its '
+                'config default must not stop the engine from starting.')
+        return {key: value for key, value in engine_kwargs.items() if key not in unknown}
 
     @property
     def _manager(self):
@@ -500,30 +532,55 @@ class SGLangEngine(BaseSamplerEngine):
             logger.info('delta round carried no flushes: the rollout weights are unchanged')
 
     async def _flush_bucket(self, bucket: List[Tuple[str, torch.Tensor]], flush_cache: bool,
-                           load_format: Optional[str] = None) -> None:
+                            load_format: Optional[str] = None) -> None:
         """Hand one bucket to sglang, which forwards it to the TP workers as CUDA IPC handles.
 
         ``monkey_patch_torch_reductions`` swaps the device index inside each handle for the physical
         device UUID (the flow sglang's own weight sync and verl's integration use): a TP worker whose
         CUDA enumeration differs from this process's then maps the handle onto its own card instead
         of whatever carries the same index here. Idempotent, so calling it per flush is free.
+
+        The load runs inside a begin/end weight-update session, which sglang requires and which
+        brackets exactly one bucket: the session restores the in-place-packed weights before the
+        load and finalizes them after, so leaving one open across buckets would keep the runners in
+        the restored state while a later bucket lands.
         """
-        from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+        from sglang.srt.managers.io_struct import (
+            BeginWeightUpdateReqInput,
+            EndWeightUpdateReqInput,
+            UpdateWeightsFromTensorReqInput,
+        )
         from sglang.srt.utils import MultiprocessingSerializer
         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
         monkey_patch_torch_reductions()
+        # Every tensor must be in device memory before it is serialized: the payload each TP worker
+        # receives is a CUDA IPC handle, and a host tensor's reduction tuple carries no device index
+        # at all, which sglang's patched reducer indexes unconditionally. The collect transport
+        # returns its flush stream on the host, so stage it here -- the same reason the vLLM lane
+        # stages host tensors into its device bucket instead of switching the wire format.
+        device = torch.device('cuda', torch.cuda.current_device())
+        staged = [(name, tensor.detach().to(device)) for name, tensor in bucket]
         request = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[
-                MultiprocessingSerializer.serialize([(name, tensor.detach()) for name, tensor in bucket])
-                for _ in range(self.tensor_parallel_size)
-            ],
+            serialized_named_tensors=[MultiprocessingSerializer.serialize(staged)
+                                      for _ in range(self.tensor_parallel_size)],
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        success, message = await self._manager.update_weights_from_tensor(request, None)
+        # sglang requires the load to run inside a weight-update session: begin restores the
+        # in-place-packed weights so new ones can land, end finalizes the runners it opened. The
+        # selector defaults to 'all', which covers the draft runner too when one is attached.
+        opened, begin_message = await self._manager.begin_weight_update(BeginWeightUpdateReqInput(), None)
+        if not opened:
+            raise RuntimeError(f'sglang refused to open a weight-update session: {begin_message}')
+        try:
+            success, message = await self._manager.update_weights_from_tensor(request, None)
+        finally:
+            closed, end_message = await self._manager.end_weight_update(EndWeightUpdateReqInput(), None)
         if not success:
             raise RuntimeError(f'sglang rejected a weight update bucket of {len(bucket)} tensors: {message}')
+        if not closed:
+            raise RuntimeError(f'sglang refused to close a weight-update session: {end_message}')
 
     @staticmethod
     async def _as_async_iter(weights):

@@ -2,7 +2,7 @@
 """The rollout: one episode advanced one step at a time.
 
 ``step(traj)`` takes an episode one generation further -- with its tool round, or with one
-request of an agent program -- and returns ``(traj, RolloutSample)``. The first step of an
+request of an agent program -- and returns ``(traj, RolloutStatus)``. The first step of an
 episode opens it (its env session, its tools, its agent); the step that ends it returns the
 merged, trainable trajectory and releases everything. A caller that drives many episodes (the
 streaming driver) interleaves their steps; a caller that wants whole episodes uses ``__call__``.
@@ -47,6 +47,27 @@ MAX_FOLLOWUPS = 20
 #: ceiling only: how many episodes are in flight is the driver's admission, not this.
 ROLLOUT_MAX_CONCURRENCY = 1024
 
+def _record_dispatch_probe(event: str, episode_id: str, **fields: Any) -> None:
+    """Append one dispatch event per call when ``TWINKLE_DISPATCH_PROBE`` names a directory.
+
+    A deadlock can show eight env sessions held by live agents while no thread is inside
+    ``_harness_step`` answering them. Stacks say where everything is blocked, not the dispatch
+    order that got it there, so this records each step entry, each session open, and each harness
+    wait/item/serve per episode. Env-gated: unset, it does nothing.
+    """
+    import json
+    import os
+
+    root = os.environ.get('TWINKLE_DISPATCH_PROBE')
+    if not root:
+        return
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f'dispatch.{os.getpid()}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps({'t': time.monotonic(), 'event': event, 'episode_id': episode_id,
+                                 **fields}, default=str) + '\n')
+
+
 #: Put on an episode's request queue when its agent program exits.
 _AGENT_EXITED = object()
 #: Seconds past the agent's own timeout before a step stops waiting for it.
@@ -90,7 +111,7 @@ class StreamDone:
 
 
 @dataclass
-class RolloutSample:
+class RolloutStatus:
     """The light half of one step: what the driver and the recipe read, never the tokens.
 
     The trajectory itself travels apart (by reference under ray). The rollout fills the episode
@@ -284,6 +305,10 @@ class _Episode:
         self.ledger = None
         self.tool_manager: Optional[ToolManager] = None
         self.env_open = False
+        #: Set by ``_discard``. ``_open`` blocks in ``env.reset`` while every session slot is taken, and
+        #: the episode can be discarded meanwhile, so the call that returns afterwards has to be able to
+        #: tell that nobody owns its session any more. See ``MultiTurnRollout._open``.
+        self.discarded = False
         self.touched = time.monotonic()
         self.busy = False
         # The tool loop: see ``MultiTurnRollout._tool_step``.
@@ -305,6 +330,12 @@ class _Episode:
         self.segments = 0
         self.sent: list[tuple] = []
         self.tools_key: Optional[str] = None
+        #: The last served reply, for resubmitted requests (an agent HTTP client that timed out
+        #: and retried sends the same payload verbatim: it is answered verbatim, not re-served).
+        self.last_reply: Optional[dict] = None
+        #: Under segment_policy='collect': the rows of segments a compaction boundary already
+        #: froze, oldest first; the final segment's row joins them when the episode ends.
+        self.closed_rows: list = []
 
 
 @remote_class(max_concurrency=ROLLOUT_MAX_CONCURRENCY)
@@ -356,7 +387,7 @@ class MultiTurnRollout:
             the sampler call (e.g. to route some turns to another backend).
         followup_fn: ``(trajectory, n_followups) -> text | (text, SamplingParams) | None``.
         on_episode_end: ``(trajectory, env, episode_id) -> value``, run before the env session
-            closes (a check that reads the workspace); a dict lands in ``RolloutSample.extra``.
+            closes (a check that reads the workspace); a dict lands in ``RolloutStatus.extra``.
         stop_after_stuck_turns: stuck tool turns in a row that end the episode; 0 never.
         max_malformed_retries: replies with unparsable tool markup told so and retried.
         adapter_path / use_base_model: which weights every generation uses.
@@ -385,6 +416,7 @@ class MultiTurnRollout:
         adapter_path: str | None = None,
         use_base_model: bool = False,
         concurrency: int | None = None,
+        segment_policy: str = 'drop',
     ):
         if sampler is None and response_callback is None:
             raise ValueError('MultiTurnRollout requires a sampler or a response_callback.')
@@ -422,6 +454,12 @@ class MultiTurnRollout:
         # the repeat rule stops 3 of 12 and saves 63 calls.
         if stop_after_stuck_turns < 0:
             raise ValueError(f'stop_after_stuck_turns must be >= 0, got {stop_after_stuck_turns}')
+        # How a compaction boundary treats the segment it writes out: 'drop' (the default) keeps
+        # only the final segment trainable -- the episode trains as one row; 'collect' freezes
+        # each written-out segment into its own row, and the episode is delivered as several
+        # independently-coded rows that share one identity and one outcome reward.
+        if segment_policy not in ('drop', 'collect'):
+            raise ValueError(f"segment_policy must be 'drop' or 'collect', got {segment_policy!r}.")
         # How many replies in a row may carry tool-call markup that does not parse
         # before the episode is given up. Such a reply asked for a tool and had the
         # markup rejected, so it gets the parser's reason back and another turn.
@@ -454,6 +492,7 @@ class MultiTurnRollout:
             self._adapter_kwargs['use_base_model'] = True
         self.adapter_path = adapter_path
         self.concurrency = concurrency
+        self.segment_policy = segment_policy
         self._template_backend = getattr(type(sampler), 'template_backend', 'vllm') if sampler is not None else 'vllm'
         self.sampling_params = self._params(sampling_params or SamplingParams())
         self._episodes: dict[str, _Episode] = {}
@@ -465,12 +504,16 @@ class MultiTurnRollout:
     # ------------------------------------------------------------------ entries
 
     @remote_function(enable_continous_work=True, sticky_key=_episode_key, stash=(0,), lazy_collect=True)
-    def step(self, traj: Trajectory, episode_id: str | None = None) -> tuple[Trajectory, RolloutSample]:
-        """Advance the episode one generation; ``(traj, sample)`` with ``sample.done`` on the last.
+    def step(self, traj: Trajectory, episode_id: str | None = None) -> tuple[list, RolloutStatus]:
+        """Advance the episode one generation; ``(rows, sample)`` with ``sample.done`` on the last.
 
-        The first call of an episode opens it from ``traj``; later calls pass the ``traj`` the
-        previous one returned (only its episode id is read). Raises :class:`EpisodeError` for an
-        episode that cannot produce a sample; it is released either way.
+        The first call of an episode opens it from ``traj``; later calls pass the first ``row``
+        of what the previous one returned (only its episode id is read). An unfinished episode
+        returns one row, its message view; the last step returns the episode's training rows:
+        one under the default ``segment_policy='drop'`` (or an episode that never compacted),
+        one per collected segment otherwise -- independently coded, sharing one identity and
+        one outcome. Raises :class:`EpisodeError` for an episode that cannot produce a sample;
+        it is released either way.
         """
         return self._step(traj, episode_id)
 
@@ -484,7 +527,9 @@ class MultiTurnRollout:
         """Run every trajectory to its end; the results in the input order.
 
         An episode that raised :class:`EpisodeError` comes back as its input with
-        ``stop_reason='generation_error'`` and the reason in ``error``.
+        ``stop_reason='generation_error'`` and the reason in ``error``. Under
+        ``segment_policy='collect'`` an episode that compacted yields one row per
+        collected segment, so the flattened output may hold more rows than inputs.
         """
         if isinstance(trajectories, dict):
             raise TypeError(f'{type(self).__name__}.__call__ expects a List[Trajectory]; '
@@ -493,25 +538,26 @@ class MultiTurnRollout:
         if not trajectories:
             return []
 
-        def run(trajectory: Trajectory) -> Trajectory:
+        def run(trajectory: Trajectory) -> list[Trajectory]:
             episode_id = _episode_id_of(trajectory) or uuid.uuid4().hex
             current = trajectory
             try:
                 while True:
-                    current, sample = self._step(current, episode_id)
+                    rows, sample = self._step(current, episode_id)
+                    current = rows[0]
                     if sample.done:
-                        return current
+                        return rows
             except EpisodeError as error:
                 out = dict(trajectory)
                 out['stop_reason'] = STOP_GENERATION_ERROR
                 out['error'] = str(error)
-                return out
+                return [out]
 
         workers = min(len(trajectories), self.concurrency or len(trajectories))
         if workers == 1:
-            return [run(trajectory) for trajectory in trajectories]
+            return [row for trajectory in trajectories for row in run(trajectory)]
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(run, trajectories))
+            return [row for rows in pool.map(run, trajectories) for row in rows]
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def close(self) -> None:
@@ -559,7 +605,7 @@ class MultiTurnRollout:
 
     # ------------------------------------------------------------------ episode
 
-    def _step(self, traj: Trajectory, episode_id: str | None) -> tuple[Trajectory, RolloutSample]:
+    def _step(self, traj: Trajectory, episode_id: str | None) -> tuple[list, RolloutStatus]:
         episode_id = episode_id or _episode_id_of(traj)
         if not episode_id:
             raise ValueError('step needs an episode id: pass episode_id= or set user_data.episode_id.')
@@ -577,6 +623,7 @@ class MultiTurnRollout:
             elif 'turns' not in traj:
                 raise ValueError(f'episode {episode_id!r} is already running; every episode needs its own id.')
             ep.busy = True
+        _record_dispatch_probe('step_entry', episode_id, opening=opening)
         try:
             if opening:
                 self._open(ep)
@@ -592,11 +639,29 @@ class MultiTurnRollout:
 
     def _open(self, ep: _Episode) -> None:
         if self.env is not None:
+            _record_dispatch_probe('reset_start', ep.episode_id)
             result = self.env.reset(ep.episode_id, ep.trajectory)
+            _record_dispatch_probe('reset_returned', ep.episode_id, discarded=ep.discarded)
+            if ep.discarded:
+                # ``env.reset`` waits for a free session slot, and the episode can be discarded while it
+                # waits -- an idle release, or another step's failure calling ``_discard`` for this id.
+                # The session this call has just created then belongs to nobody: ``_discard`` already ran
+                # and closed an env session that did not exist yet, and the episode is out of
+                # ``_episodes``, so no later ``_finish`` will ever close it. Close it here instead. A
+                # permit that is not returned is not reused, so leaking one per discarded opening
+                # exhausts the pool even when the pool is larger than the admission bound.
+                try:
+                    self.env.close(ep.episode_id)
+                except Exception:  # noqa
+                    logger.warning(f'closing the env session opened for discarded episode '
+                                   f'{ep.episode_id!r} failed.', exc_info=True)
+                raise EpisodeError(f'episode {ep.episode_id!r} was discarded while its env session was '
+                                   'waiting to open.')
             ep.env_open = True
             ep.trajectory = self._with_observation(ep.trajectory, result)
         if self.harness is not None:
             self._start_agent(ep)
+            _record_dispatch_probe('agent_started', ep.episode_id)
             return
         ep.tool_manager = self._episode_tools(ep.episode_id)
         ep.ledger = self._new_ledger(ep.episode_id)
@@ -608,10 +673,16 @@ class MultiTurnRollout:
         ep.ledger.open(ep.trajectory, tools=opening_tools)
         ep.budget = self.max_turns
 
-    def _finish(self, ep: _Episode, **fields: Any) -> tuple[Trajectory, RolloutSample]:
-        """Merge the trajectory, run ``on_episode_end``, close the session, release the episode."""
+    def _finish(self, ep: _Episode, **fields: Any) -> tuple[list, RolloutStatus]:
+        """Merge the trajectory, run ``on_episode_end``, close the session, release the episode.
+
+        Under ``segment_policy='collect'`` the rows the compaction boundaries froze join the
+        final segment's row, in the order they happened: one episode, several independently-
+        coded training rows sharing one identity and one outcome.
+        """
         traj = ep.ledger.merge(
-            ep.trajectory, turns=ep.ledger.turns, stop_reason=ep.stop_reason, truncated=ep.truncated, **fields)
+            ep.trajectory, turns=ep.ledger.turns, stop_reason=ep.stop_reason, truncated=ep.truncated,
+            segment_index=len(ep.closed_rows), **fields)
         if ep.error is not None:
             traj['error'] = ep.error
         episode_end = None
@@ -627,6 +698,11 @@ class MultiTurnRollout:
         traj['rewards'] = dict(traj.get('rewards') or {}, env=env_reward)
         if episode_end is not None:
             traj['episode_end'] = episode_end
+        for row in ep.closed_rows:
+            # The frozen rows carry the episode's env reward too: the reward key belongs to
+            # the episode, and every row of it carries the same one.
+            row['rewards'] = dict(row.get('rewards') or {}, env=env_reward)
+        rows = list(ep.closed_rows) + [traj]
         extra = {
             key: traj[key]
             for key in ('stuck_stop', 'tool_stop', 'followups', 'segments', 'agent_exit_code', 'error') if key in traj
@@ -635,24 +711,39 @@ class MultiTurnRollout:
             extra.update(episode_end)
         elif episode_end is not None:
             extra['episode_end'] = episode_end
-        input_ids = traj.get('input_ids') or []
-        response = traj.get('response_token_ids') or []
-        sample = RolloutSample(
+        prompt_tokens = response_tokens = 0
+        coded = False
+        row_lengths: list = []
+        for row in rows:
+            input_ids = row.get('input_ids') or []
+            response = row.get('response_token_ids') or []
+            coded = coded or bool(input_ids)
+            prompt_tokens += len(input_ids) - len(response)
+            response_tokens += len(response)
+            row_lengths.append((len(input_ids) - len(response), len(response)))
+        if coded:
+            # The per-row lengths ride the status so the driver can hand each delivered row its
+            # own facts: the episode totals would repeat on every row and weigh the batch's
+            # metrics by its row count.
+            extra['row_token_lengths'] = row_lengths
+        sample = RolloutStatus(
             episode_id=ep.episode_id,
-            turns=int(traj.get('turns') or 0),
+            # The episode's turns, not the last segment's: every row carries its own segment's
+            # banked turns, and the episode is the unit that ran.
+            turns=sum(int(row.get('turns') or 0) for row in rows),
             done=True,
             stop_reason=ep.stop_reason,
             truncated=bool(ep.truncated),
-            token_lengths=(len(input_ids) - len(response), len(response)) if input_ids else None,
+            token_lengths=(prompt_tokens, response_tokens) if coded else None,
             routing_exported=traj.get('routed_experts') is not None,
             env_reward=env_reward,
             extra=extra,
         )
-        return traj, sample
+        return rows, sample
 
-    def _continue(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
-        """The episode goes on: return its message view."""
-        return self._view(ep), RolloutSample(
+    def _continue(self, ep: _Episode) -> tuple[list, RolloutStatus]:
+        """The episode goes on: return its message view as the one row of an unfinished step."""
+        return [self._view(ep)], RolloutStatus(
             episode_id=ep.episode_id, turns=ep.ledger.turns, stop_reason=ep.stop_reason)
 
     def _view(self, ep: _Episode) -> Trajectory:
@@ -672,12 +763,19 @@ class MultiTurnRollout:
             ep = self._episodes.pop(episode_id, None)
         if ep is None:
             return
+        # Set before anything that can block: ``_open`` may be inside ``env.reset`` at this moment and has
+        # to see the flag the instant that call returns.
+        ep.discarded = True
         if ep.requests is not None and self._policy_endpoint is not None:
             self._policy_endpoint.close(episode_id)
-        if self.env is not None and ep.env_open:
+        if self.env is not None:
             ep.env_open = False
             try:
-                # Kills whatever the session still runs, the agent program included.
+                # Kills whatever the session still runs, the agent program included. Not gated on
+                # ``env_open``: that flag is only set once ``env.reset`` returns, so gating it skipped the
+                # close for exactly the episodes discarded while their reset was still waiting for a slot.
+                # ``Env.close`` is idempotent -- no session under this id, no effect -- so an unconditional
+                # close costs nothing and covers the window the flag cannot.
                 self.env.close(episode_id)
             except Exception:  # noqa
                 logger.warning(f'closing the env session of episode {episode_id!r} failed.', exc_info=True)
@@ -778,7 +876,7 @@ class MultiTurnRollout:
 
     # ---------------------------------------------------------------- tool loop
 
-    def _tool_step(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _tool_step(self, ep: _Episode) -> tuple[list, RolloutStatus]:
         """One generation and, when it called tools, their round."""
         ledger = ep.ledger
         ep.spent += 1
@@ -885,13 +983,13 @@ class MultiTurnRollout:
             return self._finish_tool_episode(ep)
         return self._next_turn(ep)
 
-    def _next_turn(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _next_turn(self, ep: _Episode) -> tuple[list, RolloutStatus]:
         """Another generation is due -- unless the budget is spent, which ends the episode here."""
         if ep.spent >= ep.budget:
             return self._finish_tool_episode(ep)
         return self._continue(ep)
 
-    def _finish_tool_episode(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _finish_tool_episode(self, ep: _Episode) -> tuple[list, RolloutStatus]:
         # ``truncated`` says something was cut off; these say what ended the tool-calling
         # part -- an episode can run out of turns, be handed a follow-up, and finish it.
         return self._finish(ep, stuck_stop=ep.stuck_stop, tool_stop=ep.tool_stop, followups=ep.followups)
@@ -957,23 +1055,31 @@ class MultiTurnRollout:
 
         threading.Thread(target=run, name=f'agent-{ep.episode_id[:8]}', daemon=True).start()
 
-    def _harness_step(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _harness_step(self, ep: _Episode) -> tuple[list, RolloutStatus]:
         """Answer the agent's next request, or end the episode when the program exited."""
+        wait = max(ep.deadline - time.monotonic(), 0.0)
+        _record_dispatch_probe('harness_wait', ep.episode_id, wait=wait)
         try:
-            item = ep.requests.get(timeout=max(ep.deadline - time.monotonic(), 0.0))
+            item = ep.requests.get(timeout=wait)
         except queue.Empty:
+            _record_dispatch_probe('harness_timeout', ep.episode_id)
             raise EpisodeError(f'episode {ep.episode_id!r}: the agent did not finish within '
                                f'{self.harness.timeout:.0f}s.') from None
+        _record_dispatch_probe('harness_item', ep.episode_id, exited=item is _AGENT_EXITED)
         if item is _AGENT_EXITED:
             return self._agent_exited(ep)
         try:
-            return self._serve(ep, item)
+            result = self._serve(ep, item)
+            _record_dispatch_probe('harness_served', ep.episode_id)
+            return result
         except BaseException as error:
+            _record_dispatch_probe('harness_serve_error', ep.episode_id,
+                                   error=f'{type(error).__name__}: {error}')
             if not item.reply.done():
                 item.reply.set_exception(error)
             raise
 
-    def _agent_exited(self, ep: _Episode) -> tuple[Trajectory, RolloutSample]:
+    def _agent_exited(self, ep: _Episode) -> tuple[list, RolloutStatus]:
         code, output = ep.exit or (None, '')
         tail = (output or '')[-_OUTPUT_TAIL:]
         if ep.ledger is None:
@@ -985,14 +1091,63 @@ class MultiTurnRollout:
         ep.stop_reason = STOP_NO_TOOL
         return self._finish(ep, segments=ep.segments, agent_exit_code=code)
 
-    def _serve(self, ep: _Episode, request: EndpointRequest) -> tuple[Trajectory, RolloutSample]:
+    def _open_segment(self, ep: _Episode, request: EndpointRequest):
+        """Start a fresh segment from what the agent sent: freeze the old one under collect.
+
+        A history the agent rewrote (compacted, dropped a turn) or a tool change admits no
+        append, so the recorded segment is over whatever the rewrite left it at.
+        """
+        if self.segment_policy == 'collect' and ep.ledger is not None:
+            # The written-out segment freezes here: its account never changes again, so it
+            # merges into its own row now (identity on it already, from admission); the
+            # episode's other rows join it when the episode ends.
+            ep.closed_rows.append(ep.ledger.merge(
+                ep.trajectory, turns=ep.ledger.turns, truncated=False,
+                segment_index=len(ep.closed_rows)))
+        ledger = self._new_ledger(f'{ep.episode_id}#{ep.segments}')
+        ledger.open({'messages': list(request.messages)}, tools=list(request.tools))
+        return ledger
+
+    def _serve(self, ep: _Episode, request: EndpointRequest) -> tuple[list, RolloutStatus]:
         """Sample one reply to the agent's request, record it, and answer the request."""
         canonical = [_canonical(message) for message in request.messages]
         tools_key = json.dumps(request.tools, sort_keys=True, ensure_ascii=False)
         ledger = ep.ledger
+        if (ep.last_reply is not None and tools_key == ep.tools_key and canonical
+                and canonical == ep.sent[:-1]):
+            # The same request a retry re-sends: answer with the reply it never saw, without
+            # sampling, recording or starting a segment (the no-new-content history would
+            # otherwise read as a rewrite and needlessly swap the ledger).
+            request.reply.set_result(dict(ep.last_reply))
+            return self._continue(ep)
+        noise = None
+        if self.harness is not None:
+            noise = self.harness.noise_reply(request.messages, request.tools, request.params)
         extends = (
             ledger is not None and tools_key == ep.tools_key and len(canonical) > len(ep.sent)
             and canonical[:len(ep.sent)] == ep.sent)
+        if noise is not None:
+            # Housekeeping traffic the agent program does not expect a generation for: the
+            # harness's reply answers it verbatim, costs no sampling, and rides the account
+            # masked (the pair keeps the conversation prefix aligned, the reply is not trained).
+            message = noise.get('message') or {'role': 'assistant', 'content': ''}
+            if extends:
+                if not ledger.observe(request.messages[len(ep.sent):] + [message]):
+                    return self._end_agent_truncated(ep, request)
+            else:
+                # A compaction or tool change the harness's own filter caught: swap the segment
+                # exactly as a generation request would and record the reply onto the fresh
+                # segment, so the account never drifts from the agent's real history.
+                ledger = self._open_segment(ep, request)
+                ep.ledger = ledger
+                ep.segments += 1
+                if not ledger.observe([message]):
+                    return self._end_agent_truncated(ep, request)
+            ep.sent = canonical + [_canonical(message)]
+            ep.tools_key = tools_key
+            ep.last_reply = noise
+            request.reply.set_result(dict(noise))
+            return self._continue(ep)
         if extends:
             # Token-in: what the agent added since our last reply (tool results, its own
             # notes) is the environment's, appended masked.
@@ -1001,8 +1156,7 @@ class MultiTurnRollout:
         else:
             # The first request, or a history the agent rewrote (compacted, dropped a
             # turn): no append expresses it, so a fresh segment starts from what it sent.
-            ledger = self._new_ledger(f'{ep.episode_id}#{ep.segments}')
-            ledger.open({'messages': list(request.messages)}, tools=list(request.tools))
+            ledger = self._open_segment(ep, request)
 
         # Same length rule as the tool loop: a segment with turns banked ends truncated, a
         # fresh one gets its first budget capped to the room left.
@@ -1034,20 +1188,21 @@ class MultiTurnRollout:
         message = assistant_message(text, parsed, self.template.clean_tool_call(text) if parsed else text)
         ep.sent = canonical + [_canonical(message)]
         ep.tools_key = tools_key
-        request.reply.set_result({
+        ep.last_reply = {
             'message': message,
             'finish_reason': 'tool_calls' if parsed else ('length' if seq.stop_reason == 'length' else 'stop'),
             'usage': {
                 'prompt_tokens': prompt_tokens,
                 'completion_tokens': len(seq.tokens or []),
             },
-        })
+        }
+        request.reply.set_result(dict(ep.last_reply))
         if ledger.full():
             ep.truncated = True
             return self._finish(ep, segments=ep.segments)
         return self._continue(ep)
 
-    def _end_agent_truncated(self, ep: _Episode, request: EndpointRequest) -> tuple[Trajectory, RolloutSample]:
+    def _end_agent_truncated(self, ep: _Episode, request: EndpointRequest) -> tuple[list, RolloutStatus]:
         """No room for the request: end on what is recorded (closing the session ends the agent)."""
         request.reply.set_exception(RuntimeError(f'episode {ep.episode_id!r} reached its length limit'))
         ep.truncated = True
@@ -1110,6 +1265,6 @@ class MultiTurnRollout:
 
 
 __all__ = [
-    'EpisodeError', 'MAX_FOLLOWUPS', 'MultiTurnRollout', 'RolloutSample', 'STOP_GENERATION_ERROR', 'STOP_LENGTH',
+    'EpisodeError', 'MAX_FOLLOWUPS', 'MultiTurnRollout', 'RolloutStatus', 'STOP_GENERATION_ERROR', 'STOP_LENGTH',
     'STOP_MAX_TURNS', 'STOP_NO_TOOL', 'StreamDelta', 'StreamDone', 'StreamToolCall', 'is_error_observation'
 ]

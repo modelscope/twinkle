@@ -44,12 +44,23 @@ class _Sampler:
         self.loaded = []
         self.fail = fail
         self._checkpoint_engine = None
+        # One timeline for the gate and the transfer, so "weights are swapped while generation is held"
+        # is assertable as an ordering rather than implied by two separate lists happening to be
+        # non-empty. The manager's contract is pause -> transfer -> resume.
+        self.gate = []
 
     def get_state_keys(self):
         return ['q_proj.weight']
 
+    def pause_generation(self) -> None:
+        self.gate.append('pause')
+
+    def resume_generation(self) -> None:
+        self.gate.append('resume')
+
     def receive_weights(self, **kwargs):
         self.calls.append(kwargs)
+        self.gate.append('receive')
         if self.fail is not None:
             raise self.fail
         self.loaded.append(list(kwargs['weights']))
@@ -68,6 +79,9 @@ def test_local_sync_streams_generator_without_checkpoint_engine(requested_mode):
     assert manager.backend_cls is None
     assert manager.base_sync_done is True
     assert sampler.loaded == [[('q_proj.weight', 'base')]]
+    # Generation is held across the transfer and released after, so requests in flight continue on the
+    # fresh weights rather than being torn down by the swap.
+    assert sampler.gate == ['pause', 'receive', 'resume']
     assert model._checkpoint_engine is None
     assert sampler._checkpoint_engine is None
     assert model.generator_calls == [{
@@ -230,6 +244,8 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
     events = []
 
     class _Backend:
+        # The manager reads this off the backend class to sign which engine the channel runs on.
+        backend_name = 'nccl'
 
         @classmethod
         def build_topology(cls, trainer_world_size, rollout_world_size, metadata):
@@ -251,6 +267,9 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
             events.append(('model_init_submitted', kwargs))
             return lambda: events.append(('model_init_waited', kwargs))
 
+        def activate_checkpoint_engine(self, backend, channel, auth_key=None):
+            pass
+
         def send_weights(self, **kwargs):
             events.append(('send_submitted', kwargs))
             return lambda: events.append(('send_waited', kwargs))
@@ -270,6 +289,12 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
         def init_checkpoint_process_group(self, **kwargs):
             events.append(('sampler_init_submitted', kwargs))
             return lambda: events.append(('sampler_init_waited', kwargs))
+
+        def activate_checkpoint_engine(self, backend, channel, auth_key=None):
+            # The receiver half reports the replicas the channel was opened for. Not recorded in
+            # ``events``: this case is about the standalone prepare/init/receive/finalize lifecycle, and
+            # which engine the actors were configured with is what the colocate case asserts.
+            return ['member']
 
         def receive_weights(self, **kwargs):
             events.append(('receive_submitted', kwargs))
@@ -292,21 +317,32 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
 
     assert manager.requested_mode == 'auto'
     assert manager.mode == 'standalone'
-    assert [event if isinstance(event, str) else event[0] for event in events] == [
-        'model_prepare',
-        'sampler_prepare',
-        'build_topology',
-        'model_init_submitted',
-        'sampler_init_submitted',
-        'model_init_waited',
-        'sampler_init_waited',
-        'send_submitted',
-        'receive_submitted',
-        'send_waited',
-        'receive_waited',
-        'model_finalize',
-        'sampler_finalize',
-    ]
+    assert manager.backend == 'nccl'
+    # The two rendezvous pairs run on their own threads through ``_together``, which submits both
+    # calls before waiting on either -- but nothing orders the two threads against each other, so one
+    # may submit and finish waiting before the other submits at all. What the product guarantees is
+    # which events exist, the order of the calls it makes serially, and that each half of a rendezvous
+    # is submitted before it is waited on. Asserting a total order over the concurrent pairs asserted
+    # one interleaving out of several legal ones, and failed whenever the pool scheduled the other.
+    names = [event if isinstance(event, str) else event[0] for event in events]
+    assert sorted(names) == sorted([
+        'model_prepare', 'sampler_prepare', 'build_topology',
+        'model_init_submitted', 'sampler_init_submitted',
+        'model_init_waited', 'sampler_init_waited',
+        'send_submitted', 'receive_submitted', 'send_waited', 'receive_waited',
+        'model_finalize', 'sampler_finalize',
+    ])
+    position = {name: index for index, name in enumerate(names)}
+    # Serial in the product: both sides prepare, then the topology is built, then the rendezvous begin.
+    assert position['model_prepare'] < position['sampler_prepare'] < position['build_topology']
+    for half in ('model_init', 'sampler_init', 'send', 'receive'):
+        assert position[f'{half}_submitted'] < position[f'{half}_waited']
+    assert position['build_topology'] < min(position['model_init_submitted'],
+                                           position['sampler_init_submitted'])
+    assert max(position['model_init_waited'], position['sampler_init_waited']) < min(
+        position['send_submitted'], position['receive_submitted'])
+    assert max(position['send_waited'], position['receive_waited']) < position['model_finalize']
+    assert position['model_finalize'] < position['sampler_finalize']
     receive_kwargs = next(
         event[1]
         for event in events
@@ -318,13 +354,18 @@ def test_auto_ray_actor_sync_keeps_standalone_checkpoint_engine_lifecycle(monkey
 
 def test_colocate_mode_configures_actor_backends(monkeypatch):
     configured = []
-    backend = object()
+    # A class rather than a bare sentinel: the manager reads ``backend_cls.backend_name`` to record
+    # which engine the channel runs on, and the assertions below still need the identity preserved.
+    backend = type('backend', (), {'backend_name': 'ipc'})
 
     class _ActorRole:
         _actors = [object()]
 
-        def set_checkpoint_engine_backend(self, name):
-            configured.append(name)
+        def activate_checkpoint_engine(self, backend, channel, auth_key=None):
+            # This is how the manager tells each actor which engine its channel runs on; the model side
+            # ignores the return, the receiver side reports the replicas the channel was opened for.
+            configured.append(backend)
+            return ['member']
 
     def decide_backend(platform=None, mode='standalone'):
         assert platform == 'GPU'
@@ -337,4 +378,5 @@ def test_colocate_mode_configures_actor_backends(monkeypatch):
 
     assert manager.mode == 'colocate'
     assert manager.backend_cls is backend
+    assert manager.backend == 'ipc'
     assert configured == ['ipc', 'ipc']

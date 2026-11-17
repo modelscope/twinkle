@@ -10,9 +10,12 @@ job, and keeping the two apart is what lets a new agent be added without reading
 any of it.
 """
 from abc import ABC, abstractmethod
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from twinkle.data_format import Trajectory
+
+if TYPE_CHECKING:
+    from typing import Any, Dict, List, Optional
 
 
 def default_task_text(trajectory: Trajectory) -> str:
@@ -53,6 +56,26 @@ class CliAgent(ABC):
     def task(self, trajectory: Trajectory) -> str:
         """The text handed to the agent; defaults to :func:`default_task_text`."""
         return default_task_text(trajectory)
+
+    def noise_reply(self, messages: 'List[Dict[str, Any]]', tools: 'List[Dict[str, Any]]',
+                    params: 'Dict[str, Any]') -> 'Optional[Dict[str, Any]]':
+        """One request this program sends that is not a generation to train on, answered verbatim.
+
+        An agent sometimes talks to its endpoint for bookkeeping -- a keep-alive ping, a
+        handshake, a probe it expects a particular shape back from. Serving those as
+        generations spends a sampling call on traffic the policy is not supposed to learn
+        from. This is the ONE place such knowledge lives: a subclass that knows its agent's
+        housekeeping traffic returns the complete reply dict here (``message`` /
+        ``finish_reason`` / ``usage`` -- the same shape a served turn answers with); ``None``,
+        the default, serves the request as a generation. The answer is recorded masked (the
+        conversation prefix is kept, the reply is never trained on) and costs no sampling.
+
+        Args:
+            messages: the request's messages, chat shape.
+            tools: the request's tool declarations.
+            params: the request's decoding overrides.
+        """
+        return None
 
     @abstractmethod
     def command(self, *, task: str, base_url: str, api_key: str, workspace: str) -> str:

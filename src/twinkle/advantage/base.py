@@ -50,6 +50,89 @@ def _mean(rows: Sequence[Sequence[float]]) -> float:
     return sum(flat) / len(flat) if flat else 0.0
 
 
+def _absmean(rows: Sequence[Sequence[float]]) -> float:
+    flat = [abs(float(value)) for row in rows for value in row]
+    return sum(flat) / len(flat) if flat else 0.0
+
+
+def _zero_row_fraction(rows: Sequence[Sequence[float]]) -> float:
+    """The fraction of rows whose advantage is zero on every token.
+
+    A group whose members all scored the same is centered to exactly zero, so it contributes no
+    gradient at all. ``mean_advantage`` cannot report this: centering makes it near zero whether
+    every group is degenerate or none is, which is why a run that learned nothing and a run that
+    learned normally look the same on that number.
+    """
+    if not rows:
+        return 0.0
+    zero = sum(1 for row in rows if not any(float(value) != 0.0 for value in row))
+    return zero / len(rows)
+
+
+def _check_unit(name: str, value: float) -> float:
+    """Reject a discount / trace-decay knob outside [0, 1], where the recursion stops converging.
+
+    Both the constructor and a per-call override go through this, so one range rule covers the two
+    ways a caller can set the knob. Validating only the override would let ``gamma=1.1`` in at
+    construction and silently produce advantages that grow instead of decay.
+    """
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f'{name} must be in [0, 1]')
+    return value
+
+
+def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: List[Dict[str, Any]],
+                            new_trajs: List[Trajectory]) -> None:
+    """Append one row per trajectory carrying the scores it was estimated from and the targets it got.
+
+    Set ``TWINKLE_ADVANTAGE_PROBE`` to a directory to enable it. The bad-score contract is per row --
+    an unscored member must land at exactly zero advantage while the group statistics stay computed
+    over the scored members only -- and the run's printed ``adv=``/``zero_adv=`` are batch aggregates
+    that a polluted group mean can still reproduce. Pairing each row's landed target against its own
+    score row is what distinguishes those two cases.
+
+    Only the columns the estimator ADDED are recorded, so the probe reports the training targets
+    rather than echoing the whole trajectory. A token-level target is summarized by its length, sum
+    and largest absolute element: a per-token list would spend the file on one row, and the sum alone
+    cannot prove a row is all zeros (equal positive and negative entries cancel), which is exactly
+    what the unscored-row contract asserts.
+    """
+    import json
+    import os
+
+    root = os.environ.get('TWINKLE_ADVANTAGE_PROBE')
+    if not root:
+        return
+    from twinkle.data_format import ground_truth
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f'advantage.{os.getpid()}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        for index, (before, after) in enumerate(zip(trajs, new_trajs)):
+            added = {}
+            for field, value in after.items():
+                if field in before:
+                    continue
+                if isinstance(value, torch.Tensor):
+                    added[field] = {'len': value.numel(), 'sum': float(value.sum()),
+                                    'absmax': float(value.abs().max()) if value.numel() else 0.0}
+                elif isinstance(value, (list, tuple)):
+                    added[field] = {'len': len(value), 'sum': float(sum(value)),
+                                    'absmax': max((abs(v) for v in value), default=0.0)}
+                else:
+                    added[field] = value
+            src_idx = ground_truth(before, 'src_idx')
+            if src_idx is None:
+                src_idx = before.get('src_idx')
+            handle.write(json.dumps({
+                'global_step': global_step,
+                'row': index,
+                'episode_id': before.get('episode_id'),
+                'src_idx': src_idx,
+                'orm': (scores[index].get('rewards') or {}).get('orm') or {},
+                'targets': added,
+            }, default=str) + '\n')
+
+
 class Advantage:
     """The model-free advantage estimation step: one call per rollout batch, before training.
 
@@ -94,7 +177,8 @@ class Advantage:
                  gamma: float = 1.0,
                  gae_lambda: float = 0.95,
                  normalize: bool = True,
-                 kl_coef: float = 0.0) -> None:
+                 kl_coef: float = 0.0,
+                 segment_discount: float = 1.0) -> None:
         """GRPO-family knobs: ``num_generations`` / ``scale_rewards`` / ``beta`` / ``kl_in_reward``
         / ``kl_kind`` (the k3 per-row mean folds into the reward), ``reward_weights`` (the ORM
         fold), ``use_prm`` + ``prm_orm_mix`` + ``prm_weights`` (PRM fusion), ``teacher_reweight``
@@ -126,14 +210,24 @@ class Advantage:
                       ('rlsd_reweight_clip_range', rlsd_reweight_clip_range != 5.0),
                       ('rlsd_negative_only', rlsd_negative_only),
                       ('rollout_importance_sampling_mode', rollout_importance_sampling_mode),
-                      ('log_rollout_offpolicy_metrics', log_rollout_offpolicy_metrics)]
-            if not kl_in_reward:
-                unused.append(('kl_kind', kl_kind != 'k1'))
+                      ('log_rollout_offpolicy_metrics', log_rollout_offpolicy_metrics),
+                      # the group-relative half this base runs is scalar-only; a token-level
+                      # estimator has no episode fold to discount.
+                      ('segment_discount', segment_discount != 1.0)]
+            if kl_coef == 0.0:
+                # kl_kind reaches the token-reward fold only through kl_coef, so with kl_coef at 0
+                # nothing reads it. Two values are still legitimate: 'k3' is this constructor's own
+                # default, i.e. the caller never set it, and 'k1' is what the PPO assembly always
+                # passes alongside kl_coef=beta -- a beta=0 run leaves it unread by choice, not by a
+                # wiring mistake. Any other kind was set on purpose and will be silently ignored.
+                unused.append(('kl_kind', kl_kind not in ('k1', 'k3')))
         else:
             unused = [('gamma', gamma != 1.0), ('gae_lambda', gae_lambda != 0.95),
                       ('normalize', not normalize), ('kl_coef', kl_coef != 0.0)]
-            if kl_coef == 0.0:
-                unused.append(('kl_kind', kl_kind != 'k1'))
+            if not kl_in_reward:
+                # kl_kind is read only by the kl_in_reward fold in __call__, and 'k3' is this
+                # family's own constructor default, so it is what "not set" means here.
+                unused.append(('kl_kind', kl_kind != 'k3'))
             if teacher_reweight != 'expand':
                 unused.append(('teacher_kl_coef', teacher_kl_coef != 0.0))
             if teacher_reweight != 'rlsd':
@@ -171,8 +265,13 @@ class Advantage:
         self.rlsd_negative_only = rlsd_negative_only
         self.teacher_kl_coef = teacher_kl_coef
         self.kl_coef = kl_coef
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
+        self.gamma = _check_unit('gamma', float(gamma))
+        self.gae_lambda = _check_unit('gae_lambda', float(gae_lambda))
+        # An episode delivered as several rows (collected segments) shares one advantage; this
+        # discounts an earlier row's share by the trainable tokens its episode still generates
+        # after it (CompactionRL's trajectory-position correction, gamma-only): 1.0 -- the
+        # default -- is the uniform broadcast.
+        self.segment_discount = _check_unit('segment_discount', float(segment_discount))
         self.normalize = normalize
         # Pure math, instantiated locally: the subclass is the remote boundary, these run in it.
         self._kl = KLEstimator()
@@ -218,8 +317,10 @@ class Advantage:
                 raise ValueError(f'trajectory {traj.get("episode_id")!r} has no rollout_logps; the '
                                  'importance-ratio math needs the sampler log-probs lane.')
             rollout_logps.append(lane)
-        return self._estimate(trajs, rollout_logps, scores, ref_out=ref_out, teacher_out=teacher_out,
-                              old_out=old_out, value_out=value_out, global_step=global_step)
+        result = self._estimate(trajs, rollout_logps, scores, ref_out=ref_out, teacher_out=teacher_out,
+                                old_out=old_out, value_out=value_out, global_step=global_step)
+        _record_advantage_probe(global_step, trajs, scores, result[0])
+        return result
 
     def _estimate(self, trajs: List[Trajectory], rollout_logps: List[List[float]],
                   scores: List[Dict[str, Any]], *,
@@ -282,11 +383,46 @@ class Advantage:
             raise ValueError(f'the trajectories carry different ORM scorer counts {sorted(widths)}; every row '
                              'of a batch is scored by the same scorer set (a missing score is None, not a '
                              'shorter row).')
-        reward_matrix = torch.tensor(matrix_rows, dtype=torch.float32)
+        # An episode delivered as several rows (collected segments) counts ONCE in the group
+        # statistics -- its reward entering the mean per row would weight compacted episodes by
+        # their segment count -- and the per-episode advantage is broadcast back to every row.
+        folded, owner = self._episode_fold(trajs, matrix_rows)
+        if folded is None:
+            reward_matrix = torch.tensor(matrix_rows, dtype=torch.float32)
+            response_lengths = [len(traj['response_token_ids']) for traj in trajs]
+        else:
+            if self.use_prm:
+                raise ValueError('use_prm does not read a batch of segment rows: PRM segment alignment '
+                                 'across collected segments is not implemented (drop the PRM fusion or '
+                                 "run with segment_policy='drop').")
+            episode_response = {}
+            for index, traj in enumerate(trajs):
+                episode_response[owner[index]] = episode_response.get(owner[index], 0) + \
+                    len(traj['response_token_ids'])
+            reward_matrix = torch.tensor([matrix_rows[index] for index in folded], dtype=torch.float32)
+            response_lengths = [episode_response[episode] for episode in range(len(folded))]
         self._check_groups(trajs)
         baseline_rows = [list(((score.get('rewards') or {}).get('baseline') or {}).values()) for score in scores]
         baselines = ([weighted_score(row, self.reward_weights) for row in baseline_rows]
                      if any(baseline_rows) else None)
+        if folded is not None:
+            # The KL lane and the remax baselines are per-row while the folded reward matrix is
+            # per-episode: fold them along the same owner map, or the per-row inputs would not
+            # carry the episode count compute_advantages sees. The KL folds as the response-token
+            # weighted mean (each row's value is its per-token mean, so the episode's is the mean
+            # over all its tokens); a baseline is stamped on every row of the episode, so its
+            # first row carries it.
+            if kl_values is not None:
+                totals = [0.0] * len(folded)
+                weights = [0] * len(folded)
+                for index, traj in enumerate(trajs):
+                    episode = owner[index]
+                    weight = len(traj['response_token_ids'])
+                    totals[episode] += kl_values[index] * weight
+                    weights[episode] += weight
+                kl_values = [total / max(1, weights[episode]) for episode, total in enumerate(totals)]
+            if baselines is not None:
+                baselines = [baselines[index] for index in folded]
         advantages = compute_advantages(
             reward_matrix,
             self.num_generations,
@@ -296,9 +432,14 @@ class Advantage:
             kl_in_reward=self.kl_in_reward,
             beta=float(self.beta or 0.0),
             kl_values=kl_values,
-            response_lengths=[len(traj['response_token_ids']) for traj in trajs],
+            response_lengths=response_lengths,
             f_norm=float(self.f_norm),
             reward_baselines=baselines)
+        if folded is not None:
+            # The per-episode advantage broadcast onto the episode's rows, each earlier row
+            # optionally discounted by the trainable tokens its episode still generates after it.
+            scale = self._segment_scale(trajs, owner)
+            advantages = [float(advantages[owner[index]]) * scale[index] for index in range(len(trajs))]
         if self.use_prm:
             # advantage = mix * process + (1 - mix) * orm_advantage on every response token: mix=0
             # is standard GRPO, mix=1 pure PRM. The scalar ORM lane broadcasts over the token rows.
@@ -329,12 +470,66 @@ class Advantage:
             columns['teacher_logps'] = teacher_logps
         new_trajs = self._write_back(trajs, columns)
         summary: Dict[str, Any] = {'estimator': type(self).__name__, 'num_rows': len(trajs),
-                                   'mean_advantage': _mean(advantages)}
+                                   'mean_advantage': _mean(advantages),
+                                   'absmean_advantage': _absmean(advantages),
+                                   'zero_advantage_rows': _zero_row_fraction(advantages)}
         if self.log_rollout_offpolicy_metrics:
             summary['rollout_correction'] = self._correction(old_logps, rollout_logps)
         return new_trajs, summary
 
     # ---------------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _episode_fold(trajs: List[Trajectory], matrix_rows: List[List[float]]) -> Tuple[Optional[List[int]], List[int]]:
+        """Fold the batch's rows to one per episode: ``(folded, owner)``.
+
+        An episode delivered as several rows (collected segments under
+        ``segment_policy='collect'``) is ONE unit of training: its reward counts once in the
+        group statistics and once in every length-based correction. ``owner[i]`` is the folded
+        row index the i-th trajectory belongs to; ``folded`` lists the index of each distinct
+        episode's first row, or is ``None`` when every episode is one row (the identity path,
+        byte-for-byte the batch as it arrived). Rows of one episode must arrive consecutively.
+        """
+        owner: List[int] = []
+        index_of: Dict[Any, int] = {}
+        folded: List[int] = []
+        previous = None
+        for index, traj in enumerate(trajs):
+            key = traj.get('episode_id')
+            if key is None:
+                raise ValueError(f'trajectory at row {index} has no episode_id; folding segment rows '
+                                 'needs it.')
+            if key in index_of:
+                if index_of[key] != previous:
+                    raise ValueError(f"episode {key!r}'s rows are not consecutive: every episode's rows "
+                                     'arrive as one block.')
+            else:
+                index_of[key] = len(folded)
+                folded.append(index)
+            previous = index_of[key]
+            owner.append(index_of[key])
+        if len(folded) == len(trajs):
+            return None, owner
+        return folded, owner
+
+    def _segment_scale(self, trajs: List[Trajectory], owner: List[int]) -> List[float]:
+        """One row's broadcast multiplier: gamma ** (trainable tokens after it, same episode).
+
+        With ``segment_discount=1`` -- the default -- every row of an episode carries the
+        episode's advantage verbatim (the uniform broadcast). Below 1, a row is discounted by
+        the tokens its episode still generates after it, so the outcome reaches earlier
+        segments weakened the further away it happened to end (CompactionRL's
+        trajectory-position correction, gamma-only).
+        """
+        if self.segment_discount >= 1.0:
+            return [1.0] * len(trajs)
+        after = [0.0] * len(trajs)
+        tail: Dict[int, float] = {}
+        for index in range(len(trajs) - 1, -1, -1):
+            episode = owner[index]
+            after[index] = tail.get(episode, 0.0)
+            tail[episode] = after[index] + len(trajs[index].get('response_token_ids') or [])
+        return [self.segment_discount ** tokens for tokens in after]
 
     def _write_back(self, trajs: List[Trajectory], columns: Dict[str, List[Any]]) -> List[Trajectory]:
         """Write whole-batch columns onto copies of the trajectories; the caller replaces references."""
@@ -376,8 +571,8 @@ class Advantage:
         ``prm_segments`` is ``{'end_turns': [...], 'scores': {scorer: [per-segment float | None]}}``:
         ``end_turns[k]`` is the cumulative count of assistant turns closed by segment ``k``, and
         segment ``k``'s ``prm_weights``-folded score covers the response tokens of its turns
-        (``turn_token_spans`` of the trajectory). Same math as the driver's
-        ``ProcessReward``, reading the score row instead of the sample record.
+        (``turn_token_spans`` of the trajectory). Reads the score row the driver stamped
+        (``prm_segments``), never the sample record.
         """
         segments = score.get('prm_segments')
         if not segments:
@@ -404,24 +599,36 @@ class Advantage:
         return per_token
 
     def _check_groups(self, trajs: List[Trajectory]) -> None:
-        """Every prompt group arrives as one consecutive block of exactly ``num_generations`` rows."""
+        """Every prompt group arrives as one consecutive block of exactly ``num_generations``
+        episodes -- an episode delivered as several rows (collected segments) counts once."""
         if self.num_generations <= 1:
             return
-        blocks: List[Tuple[Any, List[Trajectory]]] = []
+        blocks: List[Tuple[Any, int]] = []
+        seen: Dict[Any, int] = {}
+        folded_keys: List[Any] = []
         for traj in trajs:
             key = traj.get('group_key')
             if key is None:
                 raise ValueError(f'trajectory {traj.get("episode_id")!r} has no group_key; grouped estimation '
                                  'needs it.')
+            episode = traj.get('episode_id')
+            position = seen.get(episode)
+            if position is None:
+                position = len(folded_keys)
+                seen[episode] = position
+                folded_keys.append(key)
+            elif folded_keys[position] != key:
+                raise ValueError(f'episode {episode!r} carries two group keys; one episode, one group.')
+        for index, key in enumerate(folded_keys):
             if not blocks or blocks[-1][0] != key:
-                blocks.append((key, [traj]))
+                blocks.append((key, 1))
             else:
-                blocks[-1][1].append(traj)
+                blocks[-1] = (key, blocks[-1][1] + 1)
         keys = [key for key, _ in blocks]
         if len(set(keys)) != len(keys):
             raise ValueError('group_key blocks are not contiguous: every prompt group must arrive as one '
-                             'consecutive block of rows.')
-        for key, rows in blocks:
-            if len(rows) != self.num_generations:
-                raise ValueError(f'group {key!r} carries {len(rows)} rows; num_generations='
+                             'consecutive block of episodes.')
+        for key, count in blocks:
+            if count != self.num_generations:
+                raise ValueError(f'group {key!r} carries {count} episodes; num_generations='
                                  f'{self.num_generations} requires complete groups.')

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, Literal, Union
 from twinkle import remote_class, remote_function
 
 from .base import Advantage
-from ._utils import apply_kl_in_reward, reduce_rewards
+from ._utils import apply_kl_in_reward, nanstd, reduce_rewards
 
 if TYPE_CHECKING:
     import torch
@@ -57,9 +57,9 @@ class ReinforcePPBaselineAdvantage(Advantage):
             rewards = torch.tensor(rewards, dtype=torch.float32)
 
         rewards = reduce_rewards(rewards, kwargs.get('reward_weights'))
-        # An unscored row (nan out of reduce_rewards) records 0 here, exactly as the legacy
-        # weighted-nansum fold did -- nan-aware group exclusion is grpo/rloo/passk's contract.
-        rewards = torch.nan_to_num(rewards, nan=0.0)
+        # A never-scored row stays NaN through the KL fold and is kept out of the group mean and the
+        # whitening statistics. Imputing 0 shifts every scored row in the group and leaves the
+        # unscored row at -mean, a signal with none of its own evidence behind it.
         rewards = apply_kl_in_reward(
             rewards,
             kl_in_reward=kwargs.get('kl_in_reward', False),
@@ -75,15 +75,15 @@ class ReinforcePPBaselineAdvantage(Advantage):
         # Group-mean subtraction (verl uses a zero baseline for a size-1 group; K>=2 is the real GRPO case)
         if K > 1:
             grouped = rewards.view(-1, K)
-            group_mean = grouped.mean(dim=1, keepdim=True)
+            group_mean = grouped.nanmean(dim=1, keepdim=True)
             centered = (grouped - group_mean).view(-1)
         else:
             centered = rewards.clone()
 
         # Global whitening: verl's masked_whiten = (x - mean) * rsqrt(var_unbiased + 1e-8)
         if scale == 'batch' and centered.numel() > 1:
-            mean = centered.mean()
-            var = centered.var(unbiased=True)
+            mean = torch.nanmean(centered)
+            var = nanstd(centered)**2
             centered = (centered - mean) * torch.rsqrt(var + 1e-8)
 
-        return centered.view(-1)
+        return torch.nan_to_num(centered, nan=0.0).view(-1)

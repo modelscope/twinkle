@@ -1,9 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .endpoint import ChatEndpoint, PolicyEndpoint, ResponsesEndpoint
 from .ledger import turn_token_spans
-from .multi_turn import EpisodeError, MultiTurnRollout, StreamDelta, StreamDone, StreamToolCall
+from .multi_turn import (
+    EpisodeError,
+    MultiTurnRollout,
+    RolloutStatus,
+    StreamDelta,
+    StreamDone,
+    StreamToolCall,
+)
 
 __all__ = [
     'ChatEndpoint', 'EpisodeError', 'MultiTurnRollout', 'PolicyEndpoint', 'ResponsesEndpoint',
-    'StreamDelta', 'StreamDone', 'StreamToolCall', 'turn_token_spans',
+    'RolloutStatus', 'StreamDelta', 'StreamDone', 'StreamToolCall', 'turn_token_spans',
 ]
