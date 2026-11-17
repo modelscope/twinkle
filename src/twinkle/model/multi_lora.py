@@ -505,9 +505,9 @@ class MultiLora:
         # Strip LoRA-specific suffixes (e.g. ".lora_A.default.weight") so that
         # a full parameter name like "model.layers.0.attn.proj.lora_A.default.weight"
         # can be matched against target_modules like ["attn.proj"].
-        cleaned = module_name
-        if '.lora_' in module_name:
-            cleaned = re.sub(r'\.lora_\w+(\.[\w-]+)*$', '', module_name)
+        cleaned = module_name.removeprefix('base_model.model.')
+        if '.lora_' in cleaned:
+            cleaned = re.sub(r'\.lora_\w+(\.[\w-]+)*$', '', cleaned)
 
         if isinstance(target_modules, str):
             return re.fullmatch(target_modules, cleaned) is not None
@@ -689,6 +689,14 @@ class MultiLora:
         low_cpu_mem_usage = module_device.type == 'meta'
 
         base_config = kwargs.get('lora_config', None)
+        megatron_targets = None
+        if isinstance(module, list):
+            requested = base_config.target_modules if base_config is not None else target_modules
+            if requested:
+                from .megatron import MegatronModel
+                requested = [requested] if isinstance(requested, str) else list(requested)
+                # Resolve each pristine chunk once; adding a slot changes its module tree.
+                megatron_targets = [MegatronModel.get_target_modules(chunk, requested) for chunk in module]
         for i in range(self.max_loras):
             config = deepcopy(base_config) if base_config is not None else None
             if config is None:
@@ -716,22 +724,14 @@ class MultiLora:
                         self._patch_lora_forward(name, submodule)
                 return _module
 
-            def _patch_megatron(_module):
-                # Expand target_modules (e.g., 'all-linear' -> actual module names)
+            def _patch_megatron(_module, targets):
                 _config = deepcopy(config)
+                if targets is not None:
+                    _config.target_modules = targets
                 if isinstance(_module, PeftModel):
                     _module.add_adapter(lora_tenant.adapter_name, _config, low_cpu_mem_usage=low_cpu_mem_usage)
                     self._autocast_adapter_dtype(_module, lora_tenant.adapter_name)
                 else:
-                    # TODO first wrap needs parse target_modules, need to fix later
-                    if _config.target_modules:
-                        if isinstance(_config.target_modules, str):
-                            target_modules = [_config.target_modules]
-                        else:
-                            target_modules = list(_config.target_modules)
-
-                        from .megatron import MegatronModel
-                        _config.target_modules = MegatronModel.get_target_modules(_module, target_modules)
                     _module = get_peft_model(
                         _module, _config, lora_tenant.adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
 
@@ -741,7 +741,8 @@ class MultiLora:
                 return _module
 
             if isinstance(module, list):
-                module = [_patch_megatron(_m) for _m in module]
+                module = [_patch_megatron(chunk, megatron_targets[index] if megatron_targets is not None else None)
+                          for index, chunk in enumerate(module)]
             else:
                 module = _patch_peft(module)
 

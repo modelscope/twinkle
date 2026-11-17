@@ -359,6 +359,12 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         config = self._copy_lora_config(config_or_dir)
         if config.modules_to_save:
             raise ValueError('modules_to_save is not supported for a multi-tenant LoRA adapter.')
+        self._expand_multimodal_lora_target(
+            config,
+            self.strategy.unwrap_model(self.model),
+            freeze_llm=kwargs.pop('freeze_llm', False),
+            freeze_vit=kwargs.pop('freeze_vit', True),
+            freeze_aligner=kwargs.pop('freeze_aligner', True))
         self.multi_adapter.validate_tenant_target_modules(config.target_modules,
                                                           getattr(config, 'target_parameters', None))
         self._register_adapter(adapter_name, config, **kwargs)
