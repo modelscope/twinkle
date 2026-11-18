@@ -131,13 +131,16 @@ class TestCopyCheckpointArgs:
 
 class TestShouldBindDeviceId:
 
-    @pytest.mark.parametrize('backend, expected', [
-        ('nccl', True),
-        ('hccl', True),
-        ('gloo', False),
-        ('cpu', False),
-        ('', False),
-    ])
-    def test_backend_predicate(self, backend, expected):
-        # The method uses only its backend argument, so it is exercised unbound.
-        assert TrainableModel._should_bind_device_id_for_process_group(None, backend) is expected
+    @pytest.mark.parametrize('backend', ['nccl', 'hccl', 'gloo', 'cpu', ''])
+    @pytest.mark.parametrize('binds', [True, False])
+    def test_delegates_to_platform_hook(self, backend, binds, monkeypatch):
+        # 53f46a1e moved the decision to the platform hook (CUDA/NPU bind lazily-built
+        # communicators to the device; XPU's BKCL breaks on a bound id in subgroup
+        # splits). The backend argument is no longer consulted: every backend must
+        # follow the platform's answer, in both directions.
+        import types
+
+        import twinkle
+        stub = types.SimpleNamespace(binds_device_id_to_process_group=lambda: binds)
+        monkeypatch.setattr(twinkle.Platform, 'get_platform', lambda: stub)
+        assert TrainableModel._should_bind_device_id_for_process_group(None, backend) is binds
