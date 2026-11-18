@@ -655,7 +655,15 @@ class MultiTurnRollout:
         """Open the episode's env session and first turn. Returns True only on a no-slot sentinel."""
         if self.env is not None:
             _record_dispatch_probe('reset_start', ep.episode_id)
-            result = self.env.reset(ep.episode_id, ep.trajectory, wait=session_wait)
+            try:
+                result = self.env.reset(ep.episode_id, ep.trajectory, wait=session_wait)
+            except TimeoutError as exc:
+                # A waiting reset that exhausts its slot deadline raises a bare TimeoutError. The batch
+                # driver's __call__ catches only EpisodeError, so without this wrap a full pool crashes
+                # the whole batch instead of recording one generation_error row. Discard the registration
+                # (no session opened) and surface it as an episode failure, preserving the real cause.
+                self._discard(ep.episode_id)
+                raise EpisodeError(f'episode {ep.episode_id!r} could not open an env session: {exc}') from exc
             _record_dispatch_probe('reset_returned', ep.episode_id, discarded=ep.discarded)
             if isinstance(result, NoSlot):
                 # The pool is full and this call was asked not to wait. Drop the registration we just
