@@ -9,8 +9,10 @@ from twinkle.infra import remote_class, remote_function
 from twinkle.template.base import Template
 from twinkle_agentic.protocol.api_sampler import APIGenerationError, APISampler
 from twinkle_agentic.protocol.base import API
+from twinkle_agentic.tools.base import ToolExecutionResult
 from twinkle_agentic.tools.tool_manager import ToolManager
 from .base import MAX_FOLLOWUPS, STOP_GENERATION_ERROR, Rollout
+from .credit import make_tool_events, qualified_state_key, state_from_tool_infos
 from .ledger import TurnLedger
 from .trace import TraceWriter
 
@@ -179,6 +181,7 @@ class MultiTurnRollout(Rollout):
         use_base_model: bool = False,
         stop_after_stuck_turns: int = 0,
         max_malformed_retries: int = 2,
+        track_turn_credits: bool = False,
         followup_fn: Optional[Callable[[Trajectory, int], Any]] = None,
         api: Optional[API] = None,
         response_callback: Optional[ResponseCallback] = None,
@@ -279,6 +282,7 @@ class MultiTurnRollout(Rollout):
             raise ValueError(f'max_malformed_retries must be >= 0, got '
                              f'{max_malformed_retries}')
         self.max_malformed_retries = max_malformed_retries
+        self.track_turn_credits = track_turn_credits
         # Called with (trajectory, how many follow-ups it has had already) at the
         # moment an episode would end: because the model stopped calling tools,
         # because it used up ``max_turns``, or because it was stopped for being
@@ -335,6 +339,10 @@ class MultiTurnRollout(Rollout):
             'tool_managers': self._broadcast(kwargs.get('tool_manager', self.tool_manager), n, name='tool_manager'),
             'followup_fn': kwargs.get('followup_fn', self.followup_fn),
             'harnesses': self._resolve_harness(kwargs.get('harness', self.harness), n),
+            'track_turn_credits': bool(kwargs.get('track_turn_credits', self.track_turn_credits)),
+            'environment_ids': self._broadcast(kwargs.get('environment_id'), n, name='environment_id'),
+            'task_ids': self._broadcast(kwargs.get('task_id'), n, name='task_id'),
+            'policy_versions': self._broadcast(kwargs.get('policy_version'), n, name='policy_version'),
         }
 
     def _resolve_harness(self, harness, n: int) -> List[Any]:
@@ -362,11 +370,30 @@ class MultiTurnRollout(Rollout):
         followup_fn = ctx['followup_fn']
         adapter_kwargs: Dict[str, Any] = ctx['adapter_kwargs']
         response_callback: ResponseCallback = ctx['response_callback']
+        track_turn_credits = ctx['track_turn_credits']
+        requested_environment_id = ctx['environment_ids'][index]
+        requested_task_id = ctx['task_ids'][index]
+        requested_policy_version = ctx['policy_versions'][index]
+        environment_id = (
+            requested_environment_id if requested_environment_id is not None else trajectory.get('environment_id'))
+        task_id = requested_task_id if requested_task_id is not None else trajectory.get('task_id')
+        policy_version = (
+            requested_policy_version if requested_policy_version is not None else trajectory.get('policy_version'))
 
         # The token account for this episode. Every id the trajectory ends up
         # trained on passes through it; what stays in this function is the policy
         # that decides when to add one. See ``ledger.py``.
-        ledger = TurnLedger(self.template, label=f'trajectory {index}', max_tokens=self.max_trajectory_tokens)
+        initial_state_key = (
+            qualified_state_key(environment_id, task_id, self._current_state_key(tool_manager))
+            if track_turn_credits else None)
+        ledger = TurnLedger(
+            self.template,
+            label=f'trajectory {index}',
+            max_tokens=self.max_trajectory_tokens,
+            track_turn_credits=track_turn_credits,
+            initial_state_key=initial_state_key,
+            policy_version=policy_version,
+        )
         # A trajectory that named no tools advertises the manager's, so the prompt
         # lists what can actually be dispatched.
         # A harness may shape the opening (system prompt, tool schema) before
@@ -528,6 +555,7 @@ class MultiTurnRollout(Rollout):
                 parse_errors = ([] if followups else self.template.tool_call_errors(seq.decoded or ''))
                 if parse_errors and malformed_turns < self.max_malformed_retries:
                     malformed_turns += 1
+                    ledger.abort_credit_turn()
                     if not ledger.observe([_malformed_tool_message(parse_errors)]):
                         truncated = True
                         break
@@ -537,6 +565,7 @@ class MultiTurnRollout(Rollout):
                 # why this is not a second rollout.
                 if grant_followup():
                     continue
+                ledger.abort_credit_turn()
                 break
 
             if ledger.turns >= self.max_turns:
@@ -554,7 +583,30 @@ class MultiTurnRollout(Rollout):
             #    messages the model did not write.
             if tool_manager is None:
                 raise ValueError('the model emitted tool_calls but this trajectory has no ToolManager')
-            observations = self._run_tools(tool_manager, tool_calls)
+            tool_results = self._run_tools_results(tool_manager, tool_calls)
+            observations = [result.observation for result in tool_results]
+            terminal_success = None
+            state_error = None
+            post_state_key = None
+            if track_turn_credits:
+                try:
+                    local_post_state, terminal_success, state_error = state_from_tool_infos(
+                        [result.info for result in tool_results])
+                except (TypeError, ValueError):
+                    local_post_state, terminal_success, state_error = None, None, 'state_key_invalid'
+                current_state = self._current_state_key(tool_manager)
+                explicit_post_state = qualified_state_key(environment_id, task_id, local_post_state)
+                current_post_state = qualified_state_key(environment_id, task_id, current_state)
+                if explicit_post_state is not None and current_post_state is not None:
+                    post_state_key = explicit_post_state
+                    if explicit_post_state != current_post_state:
+                        state_error = 'state_conflict'
+                else:
+                    post_state_key = explicit_post_state or current_post_state
+                if state_error is not None:
+                    ledger.abort_credit_turn(state_error)
+                elif post_state_key is None:
+                    ledger.abort_credit_turn('state_key_missing')
             if self.stop_after_stuck_turns:
                 keys = [_call_key(tc) for tc in tool_calls]
                 all_repeats = bool(keys) and all(k in seen_calls for k in keys)
@@ -570,7 +622,19 @@ class MultiTurnRollout(Rollout):
             else:
                 tool_messages = _default_tool_messages(tool_calls, observations)
             overflowed = not ledger.observe(tool_messages)
+            if track_turn_credits and not overflowed and state_error is None and post_state_key is not None:
+                try:
+                    tool_events = make_tool_events(tool_calls, tool_results, turn_id=ledger.turns)
+                except (TypeError, ValueError):
+                    ledger.abort_credit_turn('tool_event_invalid')
+                else:
+                    ledger.complete_credit_turn(
+                        post_state_key=post_state_key,
+                        tool_events=tool_events,
+                        terminal_success=terminal_success,
+                    )
             if overflowed:
+                ledger.abort_credit_turn('observation_overflow')
                 # Trajectory exceeded max_length.
                 truncated = True
             else:
@@ -641,6 +705,29 @@ class MultiTurnRollout(Rollout):
         return tail or _default_tool_messages(tool_calls, observations)
 
     @staticmethod
+    def _current_state_key(tool_manager: Optional[ToolManager]) -> Optional[str]:
+        return None if tool_manager is None else tool_manager.current_state_key()
+
+    @staticmethod
+    def _run_tools_results(
+        tool_manager: ToolManager,
+        tool_calls: List[Dict[str, Any]],
+    ) -> List[ToolExecutionResult]:
+        if hasattr(tool_manager, 'call_many_results'):
+            results = list(tool_manager.call_many_results(tool_calls))
+        else:
+            contents = tool_manager.call_many(tool_calls) if hasattr(
+                tool_manager, 'call_many') else [tool_manager(tool_call) for tool_call in tool_calls]
+            results = [ToolExecutionResult(observation='' if content is None else str(content)) for content in contents]
+        if len(results) < len(tool_calls):
+            failure = ToolExecutionResult(
+                observation=f'the tool manager returned {len(results)} results for {len(tool_calls)} calls',
+                info={'error': 'tool_result_count_mismatch'},
+            )
+            results.extend([failure] * (len(tool_calls) - len(results)))
+        return results[:len(tool_calls)]
+
+    @staticmethod
     def _run_tools(tool_manager: ToolManager, tool_calls: List[Dict[str, Any]]) -> List[str]:
         """Run one turn's calls, through ``call_many`` when the manager has it.
 
@@ -652,11 +739,4 @@ class MultiTurnRollout(Rollout):
         A manager that answers with fewer results than calls leaves the rest
         empty rather than shifting them onto the wrong call.
         """
-        if hasattr(tool_manager, 'call_many'):
-            contents = tool_manager.call_many(tool_calls)
-        else:
-            contents = [tool_manager(tc) for tc in tool_calls]
-        obs = [''] * len(tool_calls)
-        for i, content in enumerate(contents[:len(tool_calls)]):
-            obs[i] = '' if content is None else str(content)
-        return obs
+        return [result.observation for result in MultiTurnRollout._run_tools_results(tool_manager, tool_calls)]

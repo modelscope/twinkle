@@ -159,6 +159,15 @@ class Env(ABC):
     def reset(self, trajectory: Optional[Trajectory] = None) -> StepResult:
         return StepResult()
 
+    def state_key(self) -> Optional[str]:
+        """Return an opaque key for the current task state, when supported.
+
+        The key must describe task state, not the transcript. Environments that
+        cannot provide a stable identifier keep the default ``None`` and are
+        excluded from state-conditioned credit assignment.
+        """
+        return None
+
     @abstractmethod
     def step(self, tool_name: str, arguments: Dict[str, Any]) -> StepResult:
         raise NotImplementedError

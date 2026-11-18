@@ -3,6 +3,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle.data_format.message import Tool as ToolInfo
+from twinkle_agentic.tools.base import ToolExecutionResult
 from .base import Env, StepResult
 
 
@@ -21,16 +22,26 @@ class EnvTool:
         self.last_result: Optional[StepResult] = None
 
     def __call__(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        return self.call_result(tool_name, arguments).observation
+
+    def call_result(self, tool_name: str, arguments: Dict[str, Any]) -> ToolExecutionResult:
         result = self._env.step(tool_name, arguments)
         self.last_result = result
-        return result.observation
+        return ToolExecutionResult(observation=result.observation, info=dict(result.info or {}))
 
     def call_many(self, calls: List[Tuple[str, Dict[str, Any]]]) -> List[str]:
         """Batch through ``Env.step_batch``."""
+        return [result.observation for result in self.call_many_results(calls)]
+
+    def call_many_results(self, calls: List[Tuple[str, Dict[str, Any]]]) -> List[ToolExecutionResult]:
+        """Batch through ``Env.step_batch`` while preserving per-call info."""
         results = self._env.step_batch(calls)
         if results:
             self.last_result = results[-1]
-        return [r.observation for r in results]
+        return [ToolExecutionResult(observation=r.observation, info=dict(r.info or {})) for r in results]
+
+    def current_state_key(self) -> Optional[str]:
+        return self._env.state_key()
 
     def tool_info(self) -> ToolInfo:
         return {

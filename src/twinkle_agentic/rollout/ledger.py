@@ -32,6 +32,7 @@ from twinkle.data_format import Trajectory
 from twinkle.data_format.sampling import SampledSequence
 from twinkle.template.base import Template
 from twinkle_agentic.utils.token_utils import _to_plain, append_ids, extend_with_bridge
+from .credit import ObservationSpan, ToolEvent, TurnActionSpan, TurnCreditRecord, TurnCreditState
 
 
 class TurnLedger:
@@ -55,7 +56,16 @@ class TurnLedger:
     which rebuilt them.
     """
 
-    def __init__(self, template: Template, *, label: str = 'trajectory', max_tokens: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        template: Template,
+        *,
+        label: str = 'trajectory',
+        max_tokens: Optional[int] = None,
+        track_turn_credits: bool = False,
+        initial_state_key: Optional[str] = None,
+        policy_version: Optional[int | str] = None,
+    ) -> None:
         """
         Args:
             template: encodes the opening turn and every bridge after it. One
@@ -70,9 +80,22 @@ class TurnLedger:
         self.template = template
         self.label = label
         self.max_tokens = max_tokens
+        if policy_version is not None and (isinstance(policy_version, bool)
+                                           or not isinstance(policy_version, (int, str))):
+            raise TypeError('policy_version must be an int, string, or None')
         self._pif: Dict[str, Any] = {}
         self._logprobs: List[Any] = []
         self._turns = 0
+        self._track_turn_credits = track_turn_credits
+        self._initial_state_key = initial_state_key
+        self._current_state_key = initial_state_key
+        self._policy_version = policy_version
+        self._turn_credits: List[TurnCreditRecord] = []
+        self._turn_credit_state = self._initial_credit_state()
+        self._pending_turn_id: Optional[int] = None
+        self._pending_pre_state_key: Optional[str] = None
+        self._pending_action_span: Optional[TurnActionSpan] = None
+        self._last_observation_span: Optional[ObservationSpan] = None
 
     # ---------------------------------------------------------------- reading
 
@@ -95,11 +118,28 @@ class TurnLedger:
         """Generations banked. Not turns *attempted*: a failed call is not here."""
         return self._turns
 
+    @property
+    def turn_credits(self) -> List[TurnCreditRecord]:
+        return list(self._turn_credits)
+
+    @property
+    def turn_credit_state(self) -> TurnCreditState:
+        return self._turn_credit_state
+
     def full(self) -> bool:
         """Has the episode reached :attr:`max_tokens`? Never true without one."""
         if self.max_tokens is None:
             return False
         return len(self._pif.get('input_ids') or []) >= self.max_tokens
+
+    def _initial_credit_state(self) -> TurnCreditState:
+        if not self._track_turn_credits:
+            return TurnCreditState(available=False)
+        if self._initial_state_key is None:
+            return TurnCreditState(available=False, fallback_reason='state_key_missing')
+        if self._policy_version is None:
+            return TurnCreditState(available=False, fallback_reason='policy_version_missing')
+        return TurnCreditState(available=True)
 
     # ---------------------------------------------------------------- writing
 
@@ -123,8 +163,15 @@ class TurnLedger:
         self._pif = pif
         self._logprobs = []
         self._turns = 0
+        self._turn_credits = []
+        self._current_state_key = self._initial_state_key
+        self._turn_credit_state = self._initial_credit_state()
+        self._pending_turn_id = None
+        self._pending_pre_state_key = None
+        self._pending_action_span = None
+        self._last_observation_span = None
 
-    def record(self, seq: SampledSequence) -> None:
+    def record(self, seq: SampledSequence) -> Optional[TurnActionSpan]:
         """Bank one generation, taking its ids from the sampler.
 
         ``new_input_feature`` is the prompt plus what was just sampled, already
@@ -138,9 +185,37 @@ class TurnLedger:
             raise RuntimeError(f'sampler returned a SampledSequence without '
                                f'new_input_feature.input_ids for {self.label}; '
                                f'cannot continue multi-turn.')
+        old_ids = list(self._pif.get('input_ids') or [])
         self._pif = _to_plain(dict(seq.new_input_feature))
         self._turns += 1
         self._extend_logprobs(seq)
+        if not self._track_turn_credits:
+            return None
+        return self._begin_credit_turn(seq, old_ids)
+
+    def _begin_credit_turn(self, seq: SampledSequence, old_ids: Sequence[Any]) -> Optional[TurnActionSpan]:
+        old_length = len(old_ids)
+        new_ids = list(self._pif.get('input_ids') or [])
+        new_length = len(self._pif.get('input_ids') or [])
+        labels = self._pif.get('labels') or []
+        completion_mask = self._pif.get('completion_mask')
+        start, end = old_length - 1, new_length - 1
+        valid = (
+            old_length > 0 and new_length - old_length == len(seq.tokens) and new_ids[:old_length] == list(old_ids)
+            and new_ids[old_length:] == list(seq.tokens) and 0 <= start < end <= len(labels)
+            and (completion_mask is None or
+                 (len(completion_mask) == len(labels) and all(completion_mask[pos] for pos in range(start, end)))))
+        if not valid:
+            self._turn_credit_state = TurnCreditState(False, 'action_span_invalid')
+            return None
+        span = TurnActionSpan(start=start, end=end)
+        self._pending_turn_id = self._turns
+        self._pending_pre_state_key = self._current_state_key
+        self._pending_action_span = span
+        self._last_observation_span = None
+        if self._pending_pre_state_key is None:
+            self._turn_credit_state = TurnCreditState(False, 'state_key_missing')
+        return span
 
     def _extend_logprobs(self, seq: SampledSequence) -> None:
         """Append one generation's logprobs -- one per sampled token, or raise.
@@ -164,11 +239,59 @@ class TurnLedger:
         words, and training on them teaches the model to predict its own
         observations. False means the append did not fit.
         """
+        before_length = len(self._pif.get('input_ids') or [])
         extended = extend_with_bridge(self._pif, list(messages), self.template)
         if extended is None:
             return False
         self._pif = extended
+        after_length = len(self._pif.get('input_ids') or [])
+        if after_length > before_length:
+            self._last_observation_span = ObservationSpan(start=max(0, before_length - 1), end=after_length - 1)
         return True
+
+    def complete_credit_turn(
+        self,
+        *,
+        post_state_key: Optional[str],
+        tool_events: Sequence[ToolEvent],
+        terminal_success: Optional[bool],
+    ) -> None:
+        if not self._track_turn_credits or self._pending_action_span is None:
+            return
+        if not self._turn_credit_state.available:
+            self.abort_credit_turn()
+            return
+        if post_state_key is None:
+            self._turn_credit_state = TurnCreditState(False, 'state_key_missing')
+            self.abort_credit_turn()
+            return
+        observation = self._last_observation_span
+        self._turn_credits.append(
+            TurnCreditRecord(
+                turn_id=self._pending_turn_id or self._turns,
+                action_token_start=self._pending_action_span.start,
+                action_token_end=self._pending_action_span.end,
+                observation_token_start=None if observation is None else observation.start,
+                observation_token_end=None if observation is None else observation.end,
+                pre_state_key=self._pending_pre_state_key or '',
+                post_state_key=post_state_key,
+                tool_events=tuple(tool_events),
+                policy_version=self._policy_version,
+                terminal_success=terminal_success,
+            ))
+        self._current_state_key = post_state_key
+        self._pending_turn_id = None
+        self._pending_pre_state_key = None
+        self._pending_action_span = None
+        self._last_observation_span = None
+
+    def abort_credit_turn(self, reason: Optional[str] = None) -> None:
+        if reason and self._turn_credit_state.available:
+            self._turn_credit_state = TurnCreditState(False, reason)
+        self._pending_turn_id = None
+        self._pending_pre_state_key = None
+        self._pending_action_span = None
+        self._last_observation_span = None
 
     def adopt(self, input_feature: Dict[str, Any]) -> None:
         """Take an already-encoded feature as the current state.
@@ -245,6 +368,12 @@ class TurnLedger:
         out.update(self._pif)
         out['messages'] = list(self._pif.get('messages') or trajectory.get('messages') or [])
         out['logprobs'] = self._logprobs if self._logprobs else None
+        if self._track_turn_credits:
+            out['turn_credits'] = [record.to_dict() for record in self._turn_credits]
+            out['turn_credit_status'] = {
+                'available': self._turn_credit_state.available,
+                'fallback_reason': self._turn_credit_state.fallback_reason,
+            }
         out.update(fields)
         return out
 

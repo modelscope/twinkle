@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from twinkle.data_format import ToolCall
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
-from twinkle_agentic.tools.base import Tool
+from twinkle_agentic.tools.base import Tool, ToolExecutionResult
 
 logger = get_logger()
 
@@ -122,26 +122,41 @@ class ToolManager:
         return [t.tool_info() for t in self._tools.values()]
 
     def __call__(self, tool_call: Union[ToolCall, Dict[str, Any]]) -> str:
+        return self.call_result(tool_call).observation
+
+    def call_result(self, tool_call: Union[ToolCall, Dict[str, Any]]) -> ToolExecutionResult:
         name, args, err = _unpack_tool_call(tool_call)
         if err:
-            return err
+            return ToolExecutionResult(observation=err, info={'error': err})
         if (tool := self._tools.get(name)) is None:
             available = ', '.join(sorted(self._tools)) or '(none)'
             hint = ''
             if (suggestion := _suggest(name, self._tools)) is not None:
                 hint = (f' Did you mean {suggestion!r}? Tool names must be given in '
                         f'full, including the part before "---".')
-            return f'Error: unknown tool {name!r}.{hint} Available: {available}.'
+            error = f'Error: unknown tool {name!r}.{hint} Available: {available}.'
+            return ToolExecutionResult(observation=error, info={'error': error})
         try:
-            return str(tool(name, args))
+            if hasattr(tool, 'call_result'):
+                result = tool.call_result(name, args)
+                return ToolExecutionResult(observation=str(result.observation), info=dict(result.info or {}))
+            return ToolExecutionResult(observation=str(tool(name, args)))
         except Exception as e:  # noqa
-            return f'Error: tool {name!r} raised {type(e).__name__}: {e}'
+            error = f'Error: tool {name!r} raised {type(e).__name__}: {e}'
+            return ToolExecutionResult(observation=error, info={'error': error})
 
     def call_many(
         self,
         tool_calls: Iterable[Union[ToolCall, Dict[str, Any]]],
         max_workers: Optional[int] = None,
     ) -> List[str]:
+        return [result.observation for result in self.call_many_results(tool_calls, max_workers=max_workers)]
+
+    def call_many_results(
+        self,
+        tool_calls: Iterable[Union[ToolCall, Dict[str, Any]]],
+        max_workers: Optional[int] = None,
+    ) -> List[ToolExecutionResult]:
         """Execute many tool calls, preserving input order.
 
         ``tool_calls`` are the OpenAI-shaped dicts produced by
@@ -169,18 +184,18 @@ class ToolManager:
         if not calls:
             return []
         if len(calls) == 1:
-            return [self(calls[0])]
+            return [self.call_result(calls[0])]
 
         unpacked = [_unpack_tool_call(tc) for tc in calls]
         env = self._shared_env()
         if env is not None:
-            out: List[Optional[str]] = [None] * len(calls)
+            out: List[Optional[ToolExecutionResult]] = [None] * len(calls)
             batched: List[Tuple[int, str, Dict[str, Any]]] = []
             for i, (name, args, err) in enumerate(unpacked):
                 if err is None and name in self._tools:
                     batched.append((i, name, args))
                 else:
-                    out[i] = self(calls[i])
+                    out[i] = self.call_result(calls[i])
             try:
                 results = env.step_batch([(name, args) for _i, name, args in batched])
             except Exception as e:  # noqa
@@ -194,8 +209,8 @@ class ToolManager:
                                f'{type(e).__name__}: {e}')
                 failure = f'Error: tool batch did not run: {type(e).__name__}: {e}'
                 for i, _name, _args in batched:
-                    out[i] = failure
-                return ['' if x is None else x for x in out]
+                    out[i] = ToolExecutionResult(observation=failure, info={'error': failure})
+                return [ToolExecutionResult() if x is None else x for x in out]
             if len(results) != len(batched):
                 # Same reasoning: a short result list means the calls did not all
                 # run, and pairing them up by position would report one call's
@@ -205,19 +220,27 @@ class ToolManager:
                 failure = (f'Error: tool batch did not run: the environment returned '
                            f'{len(results)} results for {len(batched)} calls.')
                 for i, _name, _args in batched:
-                    out[i] = failure
-                return ['' if x is None else x for x in out]
+                    out[i] = ToolExecutionResult(observation=failure, info={'error': failure})
+                return [ToolExecutionResult() if x is None else x for x in out]
             for (i, _name, _args), r in zip(batched, results):
-                out[i] = r.observation if hasattr(r, 'observation') else str(r)
-            return ['' if x is None else x for x in out]
+                observation = r.observation if hasattr(r, 'observation') else str(r)
+                info = dict(getattr(r, 'info', {}) or {})
+                out[i] = ToolExecutionResult(observation=observation, info=info)
+            return [ToolExecutionResult() if x is None else x for x in out]
 
         workers = max_workers or min(32, len(calls))
-        out = [None] * len(calls)
+        out: List[Optional[ToolExecutionResult]] = [None] * len(calls)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(self, tc): i for i, tc in enumerate(calls)}
+            futs = {pool.submit(self.call_result, tc): i for i, tc in enumerate(calls)}
             for fut in as_completed(futs):
                 out[futs[fut]] = fut.result()
-        return ['' if x is None else x for x in out]
+        return [ToolExecutionResult() if x is None else x for x in out]
+
+    def current_state_key(self) -> Optional[str]:
+        env = self._shared_env()
+        if env is None:
+            return None
+        return env.state_key()
 
     def _shared_env(self):
         """Return the Env shared by every registered EnvTool, else None."""

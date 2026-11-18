@@ -84,17 +84,20 @@ def _normalize_result(result) -> Dict[str, Any]:
             'observation': _format_observation(result.get('observation', '')),
             'reward': float(result.get('reward', 0.0)),
             'done': bool(result.get('done', False)),
+            'info': dict(result.get('info') or {}),
         }
     if hasattr(result, 'observation'):
         return {
             'observation': _format_observation(result.observation),
             'reward': float(getattr(result, 'reward', 0.0) or 0.0),
             'done': bool(getattr(result, 'done', False)),
+            'info': dict(getattr(result, 'info', {}) or {}),
         }
     return {
         'observation': _format_observation(result),
         'reward': float(getattr(result, 'reward', 0.0) or 0.0),
         'done': bool(getattr(result, 'done', False)),
+        'info': {},
     }
 
 
@@ -193,6 +196,7 @@ class OpenEnv(Env):
             observation=normalized['observation'],
             reward=normalized['reward'],
             done=normalized['done'],
+            info=normalized['info'],
         )
 
     def step(self, tool_name: str, arguments: Dict[str, Any] = None) -> StepResult:
@@ -208,6 +212,7 @@ class OpenEnv(Env):
             observation=normalized['observation'],
             reward=normalized['reward'],
             done=normalized['done'],
+            info=normalized['info'],
         )
 
     def close(self) -> None:
@@ -434,10 +439,13 @@ class OpenEnvClient(Env):
         # session (and its WebSocket) is reused across episodes.
         result = self._client.reset(**self.reset_kwargs)
         self._last_result = result
+        info = dict(getattr(result, 'info', {}) or {})
+        info['episode_reward'] = self._episode_reward
         return StepResult(
             observation=_format_client_observation(getattr(result, 'observation', None)),
             reward=float(getattr(result, 'reward', 0.0) or 0.0),
             done=bool(getattr(result, 'done', False)),
+            info=info,
         )
 
     def step(self, tool_name: str, arguments: Dict[str, Any] = None) -> StepResult:
@@ -458,11 +466,13 @@ class OpenEnvClient(Env):
             return StepResult(observation=f'Error: {e}', reward=0.0, done=False, info={'error': str(e)})
         reward = float(getattr(result, 'reward', 0.0) or 0.0)
         self._episode_reward += reward
+        info = dict(getattr(result, 'info', {}) or {})
+        info['episode_reward'] = self._episode_reward
         return StepResult(
             observation=_format_client_observation(getattr(result, 'observation', None)),
             reward=reward,
             done=bool(getattr(result, 'done', False)),
-            info={'episode_reward': self._episode_reward},
+            info=info,
         )
 
     def tools(self) -> List[ToolInfo]:
