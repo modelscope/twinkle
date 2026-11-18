@@ -18,6 +18,7 @@ import platform
 import re
 import signal
 import torch
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from twinkle import get_logger
@@ -231,6 +232,21 @@ class TwinkleWorkerExtension:
         auth_key: str = '',
         independent: bool = False,
     ) -> None:
+        """Receive one complete bucketed sync, including expert layout restoration."""
+        with self._reload_moe_weights(peft_config, base_sync_done):
+            self._receive_weights_from_ipc(
+                peft_config=peft_config, base_sync_done=base_sync_done, use_shm=use_shm,
+                zmq_handle=zmq_handle, auth_key=auth_key, independent=independent)
+
+    def _receive_weights_from_ipc(
+        self,
+        peft_config,
+        base_sync_done,
+        use_shm,
+        zmq_handle,
+        auth_key,
+        independent,
+    ) -> None:
         """Receive and load weights via ZMQ + device IPC/SHM.
 
         Called via ``collective_rpc("update_weights_from_ipc", ...)`` from
@@ -276,7 +292,8 @@ class TwinkleWorkerExtension:
             tp_size = 1
         is_driver = independent or (tp_rank == 0)
         borrow_bucket = (independent and not use_shm and not (peft_config and base_sync_done)
-                         and getattr(self, '_quant_reload_state', None) is None)
+                         and getattr(self, '_quant_reload_state', None) is None
+                         and not getattr(self, '_moe_reload_active', False))
 
         if tp_size > 1:
             # Use vLLM's built-in TP cpu group for object broadcasts.
@@ -402,6 +419,9 @@ class TwinkleWorkerExtension:
                 shape = shape if isinstance(shape, torch.Size) else torch.Size(shape)
                 if meta.get('handle') is not None:
                     tensor = _rebuild_ipc(meta['handle'], self.device.index)
+                    if getattr(self, '_moe_reload_active', False):
+                        # Layerwise loaders may retain this tensor across buckets.
+                        tensor = tensor.clone()
                     weights.append((name, tensor))
                     continue
                 offset = int(meta['offset'])
@@ -558,7 +578,8 @@ class TwinkleWorkerExtension:
             self.device = torch.device(Torch.get_device(getattr(self, 'local_rank', None)))
 
         weight_list = list(weights.items())
-        self._load_weights(weight_list, peft_config=peft_config, base_sync_done=base_sync_done)
+        with self._reload_moe_weights(peft_config, base_sync_done):
+            self._load_weights(weight_list, peft_config=peft_config, base_sync_done=base_sync_done)
 
         gc.collect()
         Torch.empty_cache()
@@ -566,6 +587,43 @@ class TwinkleWorkerExtension:
     # -----------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------
+
+    @contextmanager
+    def _reload_moe_weights(self, peft_config, base_sync_done):
+        """Reload Ascend experts in checkpoint layout, then restore their live kernel storage."""
+        device = getattr(self, 'device', None)
+        device_type = device.type if device is not None else Platform.device_prefix()
+        if (device_type != 'npu' or (peft_config and base_sync_done)
+                or getattr(self, '_quant_reload_state', None) is not None):
+            yield
+            return
+
+        # Ascend transposes even unquantized experts after the initial load. Feeding HF
+        # tensors directly to those parameters makes the TP loader slice the wrong axes.
+        experts = [module for module in self.model_runner.model.modules()
+                   if 'w13_weight' in module._parameters and 'w2_weight' in module._parameters]
+        if not experts:
+            yield
+            return
+
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
+        from vllm.model_executor.model_loader.reload import finalize_layerwise_reload, initialize_layerwise_reload
+
+        experts = [module for module in experts
+                   if isinstance(getattr(module, 'quant_method', None), UnquantizedFusedMoEMethod)]
+        self._moe_reload_active = bool(experts)
+        try:
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                for module in experts:
+                    initialize_layerwise_reload(module)
+                yield
+                for module in experts:
+                    finalize_layerwise_reload(module, self.model_runner.model_config)
+                if experts:
+                    Torch.synchronize(self.device)
+        finally:
+            self._moe_reload_active = False
 
     @staticmethod
     def _convert_peft_to_vllm_lora_name(name: str) -> str:
