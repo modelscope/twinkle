@@ -10,7 +10,10 @@ from twinkle_agentic.envs.base import Env, StepResult
 
 class _Env(Env):
 
-    def step(self, tool_name, arguments):
+    def _open(self, trajectory):
+        return None, StepResult()
+
+    def _step(self, state, tool_name, arguments):
         return StepResult()
 
 
@@ -34,7 +37,7 @@ def _admit(challenger, group):
 
 
 def test_default_keeps_existing_exact_dead_filter():
-    challenger = _Challenger(envs=[_Env()])
+    challenger = _Challenger(env=_Env())
     try:
         admitted, reasons = _admit(
             challenger,
@@ -47,7 +50,7 @@ def test_default_keeps_existing_exact_dead_filter():
 
 
 def test_default_accepts_a_group_with_reward_spread():
-    challenger = _Challenger(envs=[_Env()])
+    challenger = _Challenger(env=_Env())
     group = [_trajectory(0.2), _trajectory(0.4), _trajectory(0.6)]
     try:
         admitted, reasons = _admit(challenger, group)
@@ -59,7 +62,7 @@ def test_default_accepts_a_group_with_reward_spread():
 
 def test_resolution_aware_policy_rejects_near_tie_atomically():
     policy = GroupAdmissionPolicy(GroupAdmissionConfig(min_reward_range=0.02))
-    challenger = _Challenger(envs=[_Env()], group_admission_policy=policy)
+    challenger = _Challenger(env=_Env(), group_admission_policy=policy)
     try:
         admitted, reasons = _admit(
             challenger,
@@ -76,7 +79,7 @@ def test_near_duplicate_gate_reads_assistant_completions():
         GroupAdmissionConfig(max_mean_pairwise_similarity=0.9),
         scorer=lambda left, right: 1.0 if left == right else 0.0,
     )
-    challenger = _Challenger(envs=[_Env()], group_admission_policy=policy)
+    challenger = _Challenger(env=_Env(), group_admission_policy=policy)
     try:
         admitted, reasons = _admit(
             challenger,
