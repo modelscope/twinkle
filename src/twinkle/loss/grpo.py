@@ -1101,7 +1101,7 @@ class REALLoss(GRPOLoss):
             batch_pos_mask = pos_mask[valid_mask]
             batch_neg_mask = neg_mask[valid_mask]
 
-            scaled_scores = batch_scores if self.real_tau == 1.0 else batch_scores / self.real_tau
+            scaled_scores = batch_scores / self.real_tau
             zeros = torch.zeros(batch_scores.size(0), 1, device=batch_scores.device, dtype=batch_scores.dtype)
 
             # Negative loss: log(1 + sum(exp(S_neg)))
