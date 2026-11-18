@@ -3,6 +3,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from twinkle import remote_function
@@ -136,6 +137,22 @@ class NoSlot:
     """
 
 
+class EnvResumeCapability(str, Enum):
+    """How an environment can survive a different Twinkle process."""
+
+    NONE = 'none'
+    LIVE_ATTACH = 'live_attach'
+    DURABLE_CHECKPOINT = 'durable_checkpoint'
+
+
+class UnsupportedEnvResume(NotImplementedError):
+    """The environment has no safe way to resume this episode."""
+
+
+class UnsafeCheckpoint(RuntimeError):
+    """The episode is not at a point where its workspace can be captured."""
+
+
 class _Session:
     __slots__ = ('state', 'reward', 'touched', 'script_inflight')
 
@@ -174,6 +191,10 @@ class Env(ABC):
     ``_close(state)`` and ``_workspace(state)``; plus :meth:`tools`.
     """
 
+    #: Environments default to no recovery.  A backend opts in explicitly and
+    #: the rollout refuses to mutate or retry an episode when this is NONE.
+    resume_capability = EnvResumeCapability.NONE
+
     #: What :meth:`snapshot` shows of the workspace: how many files to name, how
     #: many bytes of each body, how many bytes of bodies in total, and which
     #: directories not to walk into. Class attributes rather than constructor
@@ -200,6 +221,26 @@ class Env(ABC):
         #: override (see :meth:`reset`) takes precedence. Three states: positive = wait up to this
         #: many seconds then raise; None = wait forever; 0 = return :class:`NoSlot` immediately.
         self.session_wait_timeout = session_wait_timeout
+
+    def checkpoint_episode(self, episode_id: str, state_key: str) -> Dict[str, Any]:
+        """Capture one episode at a stable boundary for a later process.
+
+        ``state_key`` is the rollout's internal stable identity, never a random
+        session id.  The returned value must be self-contained metadata that
+        :meth:`restore_episode` accepts after this process exits.
+        """
+        raise UnsupportedEnvResume(f'{type(self).__name__} cannot checkpoint episode {episode_id!r}')
+
+    def restore_episode(self,
+                        episode_id: str,
+                        state_key: str,
+                        state: Dict[str, Any],
+                        trajectory: Optional[Trajectory] = None) -> None:
+        """Rebind a checkpoint to a newly allocated episode session."""
+        raise UnsupportedEnvResume(f'{type(self).__name__} cannot restore episode {episode_id!r}')
+
+    def discard_episode_state(self, state_key: str) -> None:
+        """Remove durable state once the owning group is committed and trained."""
 
     # ------------------------------------------------------------------
     # Hooks

@@ -89,16 +89,24 @@ class ClientCheckpointManager:
         self.sampler = sampler
         self.name_prefix = name_prefix
         self._version = 0
+        self._paths: Dict[int, str] = {}
         self._lock = threading.Lock()
 
     def sync_weights(self) -> None:
         with self._lock:
             saved = self.model.save(f'{self.name_prefix}-{self._version}', save_optimizer=False)
-            self.sampler.adapter_path = saved.twinkle_path
+            path = saved.twinkle_path
+            self._paths[self._version] = path
+            self.sampler.adapter_path = path
             self._version += 1
 
     def version(self) -> int:
         return self._version
+
+    def adapter_path(self, version: int) -> Optional[str]:
+        """The durable adapter a group sampled from, retained for resume."""
+        with self._lock:
+            return self._paths.get(int(version))
 
 
 def _wire_media(media: Any) -> Dict[str, List[str]]:

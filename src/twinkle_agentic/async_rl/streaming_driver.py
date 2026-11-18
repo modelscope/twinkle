@@ -37,6 +37,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 from twinkle import remote_class, remote_function
 from twinkle.data_format import user_data_get
 from twinkle.utils import get_logger
+from twinkle_agentic.async_rl.rollout_resume import JournalEvent, ResumeStore, UnsafeResume
 from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutStatus
 
 logger = get_logger()
@@ -127,6 +128,10 @@ class _Group:
     """One prompt row's episodes: the current attempt's members and the baseline episodes it waits for."""
     key: str
     row: Any
+    #: Fixed for the group's whole lifetime. Recovery and replacement members must use this
+    #: behavior policy, never whichever version happens to be current after a restart.
+    version: int = 0
+    adapter_path: Optional[str] = None
     attempt: int = 0
     #: The current attempt's member trajectories, aligned with ``members`` (a lost one is redone from here).
     source: List[Any] = field(default_factory=list)
@@ -257,7 +262,9 @@ class StreamingDriver:
                  on_group: Optional[Callable[[Any, List[RolloutStatus], int], List[Any]]] = None,
                  max_group_regenerations: int = 0,
                  cluster_adapter: Any = None,
-                 max_no_slot_wait: float = 1800.0):
+                 max_no_slot_wait: float = 1800.0,
+                 resume_store: Optional[ResumeStore] = None,
+                 run_id: Optional[str] = None):
         if num_generations < 1 or batch_size < 1 or batch_size % num_generations:
             raise ValueError(f'batch_size ({batch_size}) must be a positive multiple of num_generations '
                              f'({num_generations}): a batch holds whole groups.')
@@ -291,6 +298,10 @@ class StreamingDriver:
         self.on_group = on_group
         self.max_group_regenerations = max_group_regenerations
         self.cluster_adapter = cluster_adapter
+        self.resume_store = resume_store
+        self.run_id = run_id or (resume_store.run_id if resume_store is not None else uuid.uuid4().hex)
+        if resume_store is not None and run_id is not None and run_id != resume_store.run_id:
+            raise ValueError(f'run_id {run_id!r} does not match resume store run {resume_store.run_id!r}')
         #: Wall-clock ceiling on how long one member may keep retrying a full session pool before its
         #: group is loudly dropped. Scheduling delay is not quality regeneration: it never spends
         #: max_group_regenerations or increments group_attempt, but it must still be bounded.
@@ -317,7 +328,8 @@ class StreamingDriver:
         self._consecutive_failures = 0
         self._counters: Dict[str, int] = {
             'admitted': 0, 'dropped_stale': 0, 'dropped_sample': 0, 'dropped_group': 0, 'episode_errors': 0,
-            'stopped': 0, 'regenerated': 0, 'no_slot': 0, 'no_slot_dropped': 0
+            'stopped': 0, 'regenerated': 0, 'no_slot': 0, 'no_slot_dropped': 0,
+            'resumed_groups': 0, 'resumed_members': 0,
         }
         self._adjusting = False
         #: monotonic stamps: when the running ``adjust`` started, and when its being stuck was last reported.
@@ -333,6 +345,10 @@ class StreamingDriver:
         self._returned_at: Optional[float] = None
         self._idle_ratio = 0.0
         self._iter_started = False
+        #: The one batch whose model update may or may not have committed. It survives a process
+        #: restart and is handed out again until ``commit_batch`` records the model checkpoint.
+        self._lease: Optional[Dict[str, Any]] = None
+        self._lease_returned = False
 
     # ------------------------------------------------------------------ iteration
 
@@ -359,6 +375,18 @@ class StreamingDriver:
         a dict in-process -- never opened here), and the light per-batch facts (row lengths, the
         row-aligned score column, version spans) built in the same locked section.
         """
+        if self._lease is not None:
+            if self.resume_store is None:
+                # Preserve the pre-resume single-process iteration contract: without a store the
+                # previous lease is only useful to a state_dict taken while training is running.
+                self._lease = None
+                self._lease_returned = False
+            elif not self._lease_returned:
+                self._lease_returned = True
+                return self._lease['rows'], self._lease['facts']
+            else:
+                raise UnsafeResume(f'batch lease {self._lease["lease_id"]!r} is still open; '
+                                   'call commit_batch() after the model checkpoint is durable')
         self._start()
         started = time.monotonic()
         waited = 0.0
@@ -427,7 +455,9 @@ class StreamingDriver:
             scores: List[Dict[str, Any]] = []
             version_spans: List[int] = []
             while len(trajs) < self.batch_size and self._ready:
-                for episode in self._ready.popleft():
+                ready_group = self._ready.popleft()
+                self._live -= sum(1 for episode in ready_group if episode.deliver)
+                for episode in ready_group:
                     episode.sample.version_span = self._version - episode.sample.policy_version
                     score = self._score_update(episode)
                     lengths = (episode.sample.extra or {}).get('row_token_lengths')
@@ -453,11 +483,27 @@ class StreamingDriver:
                         scores.append(score)
                         version_spans.append(row_sample.version_span)
             self._ready_rows -= len(trajs)
+            batch_index = self._handed
+            facts = _sample_facts(samples, scores, version_spans)
+            lease_id = f'{self.run_id}/batch/{batch_index}'
+            self._lease = {
+                'lease_id': lease_id,
+                'batch': batch_index,
+                'policy_versions': list(facts['policy_versions']),
+                'rows': trajs,
+                'facts': facts,
+            }
+            self._lease_returned = True
+            if self.resume_store is not None:
+                self.resume_store.save_object('leases', lease_id, self._lease)
+                self.resume_store.journal.append(
+                    JournalEvent.BATCH_LEASED, lease_id,
+                    {'batch': batch_index, 'rows': len(trajs), 'object': lease_id})
             self._handed += 1
             self._lock.notify_all()
         self._returned_at = time.monotonic()
         self._wait_time = self._returned_at - started
-        return trajs, _sample_facts(samples, scores, version_spans)
+        return trajs, facts
 
     def _score_update(self, episode: _Episode) -> Dict[str, Any]:
         """One row's light score entry, off the private bookkeeping -- never written onto the row.
@@ -493,14 +539,11 @@ class StreamingDriver:
         return score
 
     def _drop_stale(self) -> None:
-        """Retire over-age members of ready groups, per member (under the lock).
+        """Retire whole ready groups whose pinned behavior policy is too old (under the lock).
 
-        Without a checkpoint manager the policy never changes, so nothing is stale: the version then
-        only paces admission. A member more than ``max_staleness`` versions behind is lost back into its
-        group's ``missing`` and the group returns to ``_groups`` for ``_settle`` to regenerate exactly
-        those slots -- the fresh members are kept, not buried with the stale ones. ``_accept`` asserts the
-        group's version span stays within ``max_staleness``, the same-window backstop the old whole-group
-        ``min(version)`` drop used to provide.
+        Regenerating only stale members under the current policy would mix behavior distributions
+        inside one GRPO baseline. A ready group is atomic: when any member is outside the
+        staleness window, the whole group is dropped.
         """
         if self.checkpoint_manager is None:
             return
@@ -512,15 +555,26 @@ class StreamingDriver:
                 continue
             group = members[0].group
             self._ready_rows -= sum(len(episode.deliver) for episode in members)
-            self._groups[group.key] = group
-            for episode in stale:
-                episode.lost = True
-                episode.counted_inflight = False
-                group.missing += 1
-                self._live -= 1
-                self._counters['dropped_stale'] += 1
-            self._settle(group)
+            self._retire_stale_group(group)
         self._ready = kept
+
+    def _retire_stale_group(self, group: _Group) -> None:
+        """Drop one group atomically after its pinned policy leaves the staleness window."""
+        self._groups.pop(group.key, None)
+        self._counters['dropped_stale'] += len(group.members)
+        self._counters['dropped_group'] += 1
+        if self.resume_store is not None:
+            state_key = f'{self.run_id}/group/{group.key}'
+            self.resume_store.journal.append(
+                JournalEvent.GROUP_DROPPED, state_key,
+                {'reason': 'stale', 'version': group.version, 'current_version': self._version})
+        for episode in group.members + group.baselines:
+            if episode.lost:
+                continue
+            episode.lost = True
+            episode.counted_inflight = False
+            if episode.role != _BASELINE:
+                self._live -= 1
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
     def stats(self) -> Dict[str, Any]:
@@ -529,17 +583,256 @@ class StreamingDriver:
             return dict(self._counters, version=self._version, handed=self._handed, inflight=self._inflight,
                         live=self._live, ready_rows=self._ready_rows, train_idle_ratio=self._idle_ratio)
 
+    def _loader_state(self) -> Any:
+        getter = getattr(self.dataloader, 'state_dict', None) or getattr(self.dataloader, 'get_state', None)
+        return copy.deepcopy(getter()) if callable(getter) else None
+
+    def _episode_state(self, episode: _Episode) -> Dict[str, Any]:
+        now = time.monotonic()
+        return {
+            'episode_id': episode.episode_id,
+            'group_key': episode.group.key,
+            'role': episode.role,
+            'version': episode.version,
+            'traj': episode.traj,
+            'sample': episode.sample,
+            'done': episode.done,
+            'finished': episode.finished,
+            'lost': episode.lost,
+            'orm': _dump_pending(episode.orm),
+            'orm_pending': episode.orm_pending,
+            'prm': _dump_pending(episode.prm),
+            'prm_turns': list(episode.prm_turns),
+            'prm_pending': episode.prm_pending,
+            'held': episode.held,
+            'deliver': list(episode.deliver),
+            'submit_traj': episode.submit_traj,
+            'no_slot_retry_in': (None if episode.no_slot_retry_at is None
+                                 else max(0.0, episode.no_slot_retry_at - now)),
+            'no_slot_deadline_in': (None if episode.no_slot_deadline is None
+                                    else max(0.0, episode.no_slot_deadline - now)),
+            'no_slot_attempts': episode.no_slot_attempts,
+            'counted_inflight': episode.counted_inflight,
+        }
+
+    def _group_state(self, group: _Group) -> Dict[str, Any]:
+        return {
+            'key': group.key,
+            'row': group.row,
+            'version': group.version,
+            'adapter_path': group.adapter_path,
+            'attempt': group.attempt,
+            'source': list(group.source),
+            'members': [self._episode_state(episode) for episode in group.members],
+            'baselines': [self._episode_state(episode) for episode in group.baselines],
+            'missing': group.missing,
+        }
+
+    def _snapshot(self) -> Dict[str, Any]:
+        return {
+            'format': 'twinkle.streaming-driver.v1',
+            'run_id': self.run_id,
+            'handed': self._handed,
+            'prompts_drawn': self._prompt_seq,
+            'version': self._version,
+            'base_version': self._base_version,
+            'exhausted': self._exhausted,
+            'counters': dict(self._counters),
+            'loader_state': self._loader_state(),
+            'groups': [self._group_state(group) for group in self._groups.values()],
+            'ready': [[self._episode_state(episode) for episode in members] for members in self._ready],
+            'ready_groups': [self._group_state(members[0].group) for members in self._ready if members],
+            'lease': self._lease,
+        }
+
     @remote_function(execute='first', collect='first', lazy_collect=False)
     def state_dict(self) -> Dict[str, Any]:
-        """What a resumed run restores: the batches handed out and the prompt rows drawn.
+        """Snapshot prompts, complete groups, ready groups and the open batch lease.
 
-        TODO: resuming re-reads the dataloader from its own saved position, which is ahead of the rows
-        that were drawn but not yet trained (in flight or buffered); up to one buffer of prompts,
-        ``(max_staleness + 1) * sync_interval * batch_size`` rows, is skipped. Keeping them would mean
-        saving the in-flight episodes, which live in the rollout and env sessions.
+        Live episodes are paired with their last durable rollout turn checkpoint. A checkpoint taken
+        while a generation is running therefore resumes from the preceding turn boundary rather than
+        pretending the in-memory partial response is durable.
         """
         with self._lock:
-            return {'handed': self._handed, 'prompts_drawn': self._prompt_seq}
+            state = self._snapshot()
+        if self.resume_store is not None:
+            self.resume_store.save_object('driver', self.run_id, state)
+        return state
+
+    def _restore_episode(self, state: Dict[str, Any], group: _Group) -> _Episode:
+        episode = _Episode(
+            episode_id=str(state['episode_id']), group=group, role=str(state.get('role') or ''),
+            version=int(state.get('version') or 0))
+        episode.traj = state.get('traj')
+        episode.sample = state.get('sample')
+        episode.done = bool(state.get('done'))
+        episode.finished = bool(state.get('finished'))
+        episode.lost = bool(state.get('lost'))
+        episode.orm = _load_pending(state.get('orm'))
+        episode.orm_pending = int(state.get('orm_pending') or 0)
+        episode.prm = _load_pending(state.get('prm'))
+        episode.prm_turns = list(state.get('prm_turns') or ())
+        episode.prm_pending = int(state.get('prm_pending') or 0)
+        episode.held = state.get('held')
+        episode.deliver = list(state.get('deliver') or ())
+        episode.submit_traj = state.get('submit_traj')
+        now = time.monotonic()
+        if state.get('no_slot_retry_in') is not None:
+            episode.no_slot_retry_at = now + float(state['no_slot_retry_in'])
+        if state.get('no_slot_deadline_in') is not None:
+            episode.no_slot_deadline = now + float(state['no_slot_deadline_in'])
+        episode.no_slot_attempts = int(state.get('no_slot_attempts') or 0)
+        episode.counted_inflight = bool(state.get('counted_inflight'))
+        return episode
+
+    def _restore_group(self, state: Dict[str, Any]) -> _Group:
+        members = state.get('members') or ()
+        member_version = next(
+            (int(item.get('version') or 0) for item in members if item.get('version') is not None), 0)
+        version = int(state.get('version') if state.get('version') is not None else member_version)
+        adapter_path = state.get('adapter_path')
+        if adapter_path is None and self.checkpoint_manager is not None:
+            lookup = getattr(self.checkpoint_manager, 'adapter_path', None)
+            if callable(lookup):
+                adapter_path = lookup(version)
+                if adapter_path is None:
+                    raise UnsafeResume(f'policy version {version} has no resolvable adapter path')
+        group = _Group(
+            key=str(state['key']), row=state.get('row'), version=version, adapter_path=adapter_path,
+            attempt=int(state.get('attempt') or 0),
+            source=list(state.get('source') or ()), missing=int(state.get('missing') or 0))
+        group.members = [self._restore_episode(item, group) for item in state.get('members') or ()]
+        group.baselines = [self._restore_episode(item, group) for item in state.get('baselines') or ()]
+        return group
+
+    def _resume_scores(self, episode: _Episode) -> None:
+        """Reissue only score calls whose result was missing from the snapshot."""
+        for index, value in enumerate(episode.orm or ()):
+            if value is not _PENDING:
+                continue
+            future = self.orms[index]([episode.traj])
+            future.add_done_callback(
+                lambda f, episode=episode, index=index: self._events.put(('orm', episode, index, f)))
+        for scorer, column in enumerate(episode.prm or ()):
+            for segment, value in enumerate(column):
+                if value is not _PENDING:
+                    continue
+                future = self.prms[scorer]([episode.traj])
+                future.add_done_callback(
+                    lambda f, episode=episode, key=(segment, scorer): self._events.put(('prm', episode, key, f)))
+
+    def _resume_live_episode(self, episode: _Episode) -> None:
+        if episode.finished or episode.lost or episode.done:
+            if not episode.finished and not episode.lost:
+                self._resume_scores(episode)
+            return
+        self._counters['resumed_members'] += 1
+        state_key = str((episode.submit_traj or {}).get('state_key') or '')
+        if self.resume_store is not None and state_key and self.resume_store.has_object('episodes', state_key):
+            self.rollout.restore_episode_from_store(state_key)
+            route = dict(episode.traj or episode.submit_traj or {})
+            route.setdefault('turns', 0)
+            self._step(episode, route)
+        else:
+            # No turn boundary committed yet: opening the episode again repeats no external tool call.
+            self._step(episode, episode.submit_traj)
+
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def load_state_dict(self, state: Optional[Dict[str, Any]] = None) -> None:
+        """Rebuild a fresh driver from a snapshot, or from the store's latest snapshot."""
+        if state is None:
+            if self.resume_store is None:
+                raise UnsafeResume('load_state_dict() without state needs a resume store')
+            state = self.resume_store.load_object('driver', self.run_id)
+        if state.get('format') != 'twinkle.streaming-driver.v1':
+            raise UnsafeResume('unsupported StreamingDriver checkpoint format')
+        if str(state.get('run_id')) != self.run_id:
+            raise UnsafeResume(f'driver snapshot belongs to run {state.get("run_id")!r}, not {self.run_id!r}')
+        observed_version = int(self.checkpoint_manager.version()) if self.checkpoint_manager is not None else 0
+        with self._lock:
+            if self._thread is not None or self._iter_started:
+                raise UnsafeResume('load_state_dict must run before the driver starts')
+            self._groups = {}
+            for item in state.get('groups') or ():
+                group = self._restore_group(item)
+                self._groups[group.key] = group
+            ready_groups = {group.key: group for group in
+                            (self._restore_group(item) for item in state.get('ready_groups') or ())}
+            self._ready = deque()
+            for members in state.get('ready') or ():
+                restored = []
+                for item in members:
+                    key = str(item.get('group_key'))
+                    group = ready_groups.get(key)
+                    if group is None:
+                        raise UnsafeResume(f'ready episode references unknown group {key!r}')
+                    restored.append(self._restore_episode(item, group))
+                self._ready.append(restored)
+            self._ready_rows = sum(len(episode.deliver) for members in self._ready for episode in members)
+            self._handed = int(state.get('handed') or 0)
+            self._prompt_seq = int(state.get('prompts_drawn') or 0)
+            self._version = max(int(state.get('version') or 0), observed_version)
+            self._base_version = int(state.get('base_version') or 0)
+            self._exhausted = bool(state.get('exhausted'))
+            self._counters = dict(state.get('counters') or self._counters)
+            lease = state.get('lease')
+            if lease is not None and self.resume_store is not None:
+                last = self.resume_store.journal.last(
+                    str(lease['lease_id']), events=(JournalEvent.BATCH_LEASED,
+                                                     JournalEvent.MODEL_CHECKPOINT_COMMITTED))
+                if last is not None and last.event == JournalEvent.MODEL_CHECKPOINT_COMMITTED:
+                    lease = None
+            self._lease = lease
+            self._lease_returned = False
+            self._drop_stale()
+            for group in list(self._groups.values()):
+                if self.checkpoint_manager is not None and self._version - group.version > self.max_staleness:
+                    self._retire_stale_group(group)
+            self._live = sum(not episode.lost for group in self._groups.values()
+                             for episode in group.members)
+            self._live += sum(not episode.lost for members in self._ready for episode in members)
+            self._inflight = sum(episode.counted_inflight for group in self._groups.values()
+                                 for episode in group.members + group.baselines)
+            self._counters['resumed_groups'] += len(self._groups)
+            live = [episode for group in self._groups.values()
+                    for episode in group.members + group.baselines]
+        loader_state = state.get('loader_state')
+        loader = getattr(self.dataloader, 'load_state_dict', None) or getattr(self.dataloader, 'set_state', None)
+        if loader_state is not None:
+            if not callable(loader):
+                raise UnsafeResume('snapshot has DataLoader state but the dataloader cannot load it')
+            loader(loader_state)
+        for episode in live:
+            self._resume_live_episode(episode)
+        with self._lock:
+            for group in list(self._groups.values()):
+                self._settle(group)
+            self._lock.notify_all()
+
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def commit_batch(self, checkpoint_ref: str = '', manifest: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Mark the open lease trained after its model checkpoint is durable."""
+        with self._lock:
+            lease = self._lease
+            if lease is None:
+                return None
+            if self.resume_store is not None and not checkpoint_ref:
+                raise UnsafeResume('commit_batch() needs the durable model checkpoint reference')
+            lease_id = str(lease['lease_id'])
+            if self.resume_store is not None:
+                self.resume_store.journal.append(
+                    JournalEvent.MODEL_CHECKPOINT_COMMITTED, lease_id,
+                    {
+                        'checkpoint': str(checkpoint_ref),
+                        'batch': lease['batch'],
+                        'policy_versions': list(lease.get('policy_versions') or ()),
+                        'manifest': dict(manifest or {}),
+                    })
+                self.resume_store.delete_object('leases', lease_id)
+            self._lease = None
+            self._lease_returned = False
+            self._lock.notify_all()
+            return lease_id
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
     def close(self) -> None:
@@ -677,8 +970,22 @@ class StreamingDriver:
                 return
             key = str(self._prompt_seq)
             self._prompt_seq += 1
-            group = _Group(key=key, row=row)
+            version = self._version
+            adapter_path = None
+            if self.checkpoint_manager is not None:
+                lookup = getattr(self.checkpoint_manager, 'adapter_path', None)
+                if callable(lookup):
+                    adapter_path = lookup(version)
+                    if adapter_path is None:
+                        raise UnsafeResume(
+                            f'checkpoint manager has no adapter path for admitted policy version {version}')
+            group = _Group(key=key, row=row, version=version, adapter_path=adapter_path)
             self._groups[key] = group
+            if self.resume_store is not None:
+                prompt_key = f'{self.run_id}/prompt/{key}'
+                self.resume_store.save_object('prompts', prompt_key, row)
+                self.resume_store.journal.append(
+                    JournalEvent.PROMPT_ASSIGNED, prompt_key, {'group_key': key, 'object': prompt_key})
             self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
 
     def _next_row(self) -> Any:
@@ -709,18 +1016,23 @@ class StreamingDriver:
             self._live += len(members)
             self._counters['admitted'] += len(members)
         group.baselines = []
-        for traj in members:
-            group.members.append(self._submit(group, traj, ''))
-        for traj in baselines:
-            group.baselines.append(self._submit(group, traj, _BASELINE))
+        for slot, traj in enumerate(members):
+            group.members.append(self._submit(group, traj, '', slot))
+        for slot, traj in enumerate(baselines):
+            group.baselines.append(self._submit(group, traj, _BASELINE, slot))
 
-    def _submit(self, group: _Group, traj: Any, role: str) -> _Episode:
-        episode = _Episode(episode_id=uuid.uuid4().hex, group=group, role=role, version=self._version)
+    def _submit(self, group: _Group, traj: Any, role: str, slot: int) -> _Episode:
+        kind = 'baseline' if role == _BASELINE else 'member'
+        episode_id = f'{self.run_id}:g{group.key}:a{group.attempt}:{kind}:{slot}'
+        episode = _Episode(episode_id=episode_id, group=group, role=role, version=group.version)
         # The identity travels on top of the trajectory: episode / group / role / the admission
         # version. The rollout reads the episode id to route its steps back to this episode.
         traj = dict(traj)
         traj.update(episode_id=episode.episode_id, group_key=group.key, role=role,
-                    policy_version=episode.version, group_attempt=group.attempt)
+                    policy_version=group.version, group_attempt=group.attempt,
+                    state_key=f'{self.run_id}/group/{group.key}/attempt/{group.attempt}/{kind}/{slot}')
+        if group.adapter_path is not None:
+            traj['adapter_path'] = group.adapter_path
         episode.submit_traj = traj
         self._inflight += 1
         episode.counted_inflight = True
@@ -899,7 +1211,7 @@ class StreamingDriver:
                         self._drop_group(group)
                         break
                     episode.no_slot_retry_at = None
-                    fresh = self._submit(group, copy.deepcopy(episode.submit_traj), episode.role)
+                    fresh = self._submit(group, copy.deepcopy(episode.submit_traj), episode.role, index)
                     fresh.no_slot_attempts = episode.no_slot_attempts
                     fresh.no_slot_deadline = episode.no_slot_deadline
                     slots[index] = fresh
@@ -940,6 +1252,9 @@ class StreamingDriver:
             return
         if any(not (e.finished or e.lost) for e in group.members + group.baselines):
             return
+        if self.checkpoint_manager is not None and self._version - group.version > self.max_staleness:
+            self._retire_stale_group(group)
+            return
         if group.missing:
             if group.attempt >= self.max_group_regenerations:
                 self._drop_group(group)
@@ -952,7 +1267,7 @@ class StreamingDriver:
             group.missing = 0
             for index, episode in enumerate(group.members):
                 if episode.lost:
-                    group.members[index] = self._submit(group, copy.deepcopy(group.source[index]), '')
+                    group.members[index] = self._submit(group, copy.deepcopy(group.source[index]), '', index)
             return
         if group.baselines:
             rows = [list(e.sample.orm_reward) for e in group.baselines]
@@ -985,6 +1300,15 @@ class StreamingDriver:
         del self._groups[group.key]
         self._ready.append(list(group.members))
         self._ready_rows += sum(len(episode.deliver) for episode in group.members)
+        if self.resume_store is not None:
+            state_key = f'{self.run_id}/group/{group.key}'
+            self.resume_store.journal.append(JournalEvent.GROUP_READY, state_key, {
+                'group_key': group.key,
+                'policy_version': group.version,
+                'adapter_path': group.adapter_path,
+                'attempt': group.attempt,
+                'episodes': [episode.episode_id for episode in group.members],
+            })
 
     def _drop_group(self, group: _Group) -> None:
         """Give the group up: its counted rows leave the bound, its unfinished episodes stop (under the lock)."""
@@ -1007,3 +1331,25 @@ class StreamingDriver:
 
 #: Placeholder for a score whose Future has not completed yet.
 _PENDING = object()
+_PENDING_KEY = '__twinkle_streaming_pending__'
+
+
+def _dump_pending(value: Any) -> Any:
+    """Turn process-local score placeholders into values a snapshot can carry."""
+    if value is _PENDING:
+        return {_PENDING_KEY: True}
+    if isinstance(value, dict):
+        return {key: _dump_pending(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_dump_pending(item) for item in value]
+    return copy.deepcopy(value)
+
+
+def _load_pending(value: Any) -> Any:
+    if isinstance(value, dict) and value.get(_PENDING_KEY) is True:
+        return _PENDING
+    if isinstance(value, dict):
+        return {key: _load_pending(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_load_pending(item) for item in value]
+    return copy.deepcopy(value)
