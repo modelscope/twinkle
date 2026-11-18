@@ -491,7 +491,9 @@ class SGLangEngine(BaseSamplerEngine):
         total = 0
 
         async for name, tensor in weight_aiter:
-            bucket.append((name, tensor))
+            # Checkpoint transports yield views into a reusable receive buffer. Own the values
+            # before advancing the iterator: its next receive can overwrite an unfinished bucket.
+            bucket.append((name, tensor.detach().clone()))
             bucket_bytes += tensor.numel() * tensor.element_size()
             total += 1
             if bucket_bytes >= bucket_limit:

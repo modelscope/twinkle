@@ -136,3 +136,38 @@ def test_bucketed_update_flushes_cache_once(monkeypatch, sessions, short_tail):
     assert [request.flush_cache for request in requests] == [False, short_tail]
     assert manager.flush_cache.await_count == (0 if short_tail else 1)
 
+
+@pytest.mark.parametrize('sessions', [False, True], ids=['legacy', 'sessions'])
+@pytest.mark.parametrize('async_source', [False, True], ids=['sync', 'async'])
+def test_bucketed_update_preserves_reused_transport_buffer(monkeypatch, sessions, async_source):
+    engine, manager, _ = _engine(monkeypatch, sessions)
+    loaded = {}
+
+    async def load(request, context):
+        # Snapshot what a TP worker loads at this call, before the next transport receive.
+        for name, tensor in request.serialized_named_tensors[0]:
+            loaded[name] = tensor.clone()
+        return True, 'ok'
+
+    manager.update_weights_from_tensor.side_effect = load
+    # Four 0.75 MiB weights fill the transport's 3 MiB buffer. The SGLang bucket flushes
+    # after three weights (>= 2 MiB), retaining the fourth across the next receive.
+    elements = 3 * (1 << 16)
+    buffer = torch.empty(4, elements)
+
+    def received():
+        for batch in range(2):
+            for index in range(4):
+                buffer[index].fill_(4 * batch + index + 1)
+            for index in range(4):
+                yield f'weight_{4 * batch + index + 1}', buffer[index]
+
+    async def received_async():
+        for item in received():
+            yield item
+
+    source = received_async() if async_source else received()
+    asyncio.run(engine.update_weights(source, bucket_size_mb=2))
+    assert len(loaded) == 8
+    for index in range(1, 9):
+        torch.testing.assert_close(loaded[f'weight_{index}'], torch.full((elements,), float(index)))
