@@ -918,7 +918,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         bf16_of_saved = True
         for start in range(0, total, chunk):
             stop = min(start + chunk, total)
-            live_values = live[start:stop].to(torch.float32)
+            live_values = live[start:stop].to(device='cpu', dtype=torch.float32)
             saved_values = saved[start:stop].to(torch.float32)
             differing += int((live_values != saved_values).sum())
             if differing:
