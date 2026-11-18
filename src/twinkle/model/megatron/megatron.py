@@ -1729,7 +1729,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         json.dump(trainer_state, f, indent=2)
                     tracker_path = os.path.join(checkpoint_dir, 'latest_checkpointed_iteration.txt')
                     with open(tracker_path, 'w') as f:
-                        f.write(str(optimizer_config.cur_step))
+                        # frozen trigger-time step, not the live cur_step which training advances before
+                        # this deferred finalize runs (async staging race wrote a later iteration).
+                        f.write(str(trainer_state['cur_step']))
                     copy_checkpoint_args(output_dir, checkpoint_dir)
 
             async_request.finalize_fns.append(_finalize_async_checkpoint)
