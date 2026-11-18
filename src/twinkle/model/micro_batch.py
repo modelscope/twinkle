@@ -16,12 +16,19 @@ class MicroBatchConfig:
     dynamic_batching: bool = False
     max_tokens_per_micro_batch: int | None = None
     packing_algorithm: Literal["ffd", "kk"] = "ffd"
+    # Execution order of the planned micro-batches: "none" keeps plan order, "descending"
+    # runs heavy batches first, "ends_small" also parks light batches at both ends.
+    micro_batch_order: Literal["none", "descending", "ends_small"] = "none"
 
     def __post_init__(self):
         if self.micro_batch_size <= 0:
             raise ValueError(f"micro_batch_size must be positive, got {self.micro_batch_size}")
         if self.packing_algorithm not in ("ffd", "kk"):
             raise ValueError(f"packing_algorithm must be ffd or kk, got {self.packing_algorithm!r}")
+        if self.micro_batch_order not in ("none", "descending", "ends_small"):
+            raise ValueError(
+                f"micro_batch_order must be none, descending or ends_small, got {self.micro_batch_order!r}"
+            )
         if self.dynamic_batching and (self.max_tokens_per_micro_batch is None or self.max_tokens_per_micro_batch <= 0):
             raise ValueError("max_tokens_per_micro_batch must be positive when dynamic_batching=true")
 
@@ -32,6 +39,7 @@ class MicroBatchConfig:
             "dynamic_batching",
             "max_tokens_per_micro_batch",
             "packing_algorithm",
+            "micro_batch_order",
         )
         if not any(name in kwargs for name in option_names):
             return None
@@ -42,6 +50,7 @@ class MicroBatchConfig:
             dynamic_batching=bool(kwargs.pop("dynamic_batching", False)),
             max_tokens_per_micro_batch=kwargs.pop("max_tokens_per_micro_batch", None),
             packing_algorithm=kwargs.pop("packing_algorithm", "ffd"),
+            micro_batch_order=kwargs.pop("micro_batch_order", "none"),
         )
 
 
@@ -165,6 +174,28 @@ def _kk_allocate(
     raise ValueError("unable to construct a valid KK micro-batch plan")
 
 
+def _reorder_micro_batches(
+    plan: list[list[int]], lengths: list[int], config: MicroBatchConfig, padding_free: bool
+) -> list[list[int]]:
+    """Order planned micro-batches for execution by their packed or padded cost.
+
+    The plan covers every sample exactly once regardless of list order, and
+    ``_MicroBatchOutputMerger`` restores sample order from the plan indices, so any
+    execution order is observation-safe.
+    """
+    if config.micro_batch_order == "none" or len(plan) < 2:
+        return plan
+    ordered = sorted(
+        plan,
+        key=lambda indices: (-_batch_cost(indices, lengths, padding_free), indices[0]),
+    )
+    if config.micro_batch_order == "ends_small":
+        # Lift every second batch to the front so warm-up and cool-down run light batches
+        # while the heavy ones stay in the middle.
+        ordered = ordered[::2][::-1] + ordered[1::2]
+    return ordered
+
+
 def plan_micro_batches(
     inputs: list[dict[str, Any]],
     config: MicroBatchConfig,
@@ -175,12 +206,12 @@ def plan_micro_batches(
     """Plan contiguous fixed batches or token-packed dynamic batches.
 
     ``min_micro_batches`` only applies to dynamic batching. Fixed batches keep
-    their configured size, with a possibly smaller final batch.
+    their configured size, with a possibly smaller final batch. ``micro_batch_order``
+    orders the returned list for execution; consumers merge outputs back into sample
+    order (see ``_MicroBatchOutputMerger``), so any execution order is observation-safe.
     """
     if not inputs:
         raise ValueError("cannot plan micro-batches for empty inputs")
-    if not config.dynamic_batching:
-        return _fixed_plan(len(inputs), config.micro_batch_size)
     lengths = [sequence_length(model_input) for model_input in inputs]
     return plan_micro_batches_for_lengths(
         lengths, config, padding_free=padding_free, min_micro_batches=min_micro_batches
@@ -202,7 +233,8 @@ def plan_micro_batches_for_lengths(
     if not lengths:
         raise ValueError("cannot plan micro-batches for empty inputs")
     if not config.dynamic_batching:
-        return _fixed_plan(len(lengths), config.micro_batch_size)
+        return _reorder_micro_batches(
+            _fixed_plan(len(lengths), config.micro_batch_size), lengths, config, padding_free)
     if min_micro_batches <= 0 or min_micro_batches > len(lengths):
         raise ValueError(f"invalid min_micro_batches={min_micro_batches} for {len(lengths)} inputs")
     capacity = config.max_tokens_per_micro_batch
@@ -210,8 +242,10 @@ def plan_micro_batches_for_lengths(
     if oversized:
         raise ValueError(f"sequence length {max(oversized)} exceeds max_tokens_per_micro_batch={capacity}")
     if config.packing_algorithm == "ffd":
-        return _ffd_allocate(lengths, config, padding_free, min_micro_batches)
-    return _kk_allocate(lengths, config, padding_free, min_micro_batches)
+        plan = _ffd_allocate(lengths, config, padding_free, min_micro_batches)
+    else:
+        plan = _kk_allocate(lengths, config, padding_free, min_micro_batches)
+    return _reorder_micro_batches(plan, lengths, config, padding_free)
 
 
 def plan_micro_batches_contiguous(

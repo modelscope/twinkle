@@ -1189,6 +1189,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 dynamic_batching: Pack samples under max_tokens_per_micro_batch.
                 max_tokens_per_micro_batch: Token budget required for dynamic batching.
                 packing_algorithm: Dynamic packing strategy, 'ffd' (default) or 'kk'.
+                micro_batch_order: Execution order of the planned micro-batches: 'none'
+                    (default) keeps plan order, 'descending' runs heavy batches first,
+                    'ends_small' also parks light batches at both ends; merged outputs
+                    keep sample order regardless.
                 output_frame: 'sequence' (default) keeps the full-length tensor channels;
                     'response' projects the public return onto per-sample response rows
                     (logps/values/entropies as Python numeric lists aligned with
