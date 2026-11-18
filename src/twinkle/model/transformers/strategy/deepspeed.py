@@ -300,8 +300,12 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         cfg = self._deepspeed_plugin.deepspeed_config
         if not isinstance(cfg, dict):
             cfg = getattr(cfg, 'config', {})
-        zero = cfg.get('zero_optimization', {})
-        if zero.get('offload_param') or zero.get('offload_optimizer'):
+        zero = cfg.get('zero_optimization') or {}
+        # Presets keep offload_* present with device 'none' when offload is off; a truthy
+        # dict alone does not mean CPU offload (same reading as swift's deepspeed_cpu_offload).
+        offload = any(
+            (zero.get(key) or {}).get('device') == 'cpu' for key in ('offload_param', 'offload_optimizer'))
+        if offload:
             return 'stale_view'
         if zero.get('stage', 0) == 3:
             return 'partitioned'
