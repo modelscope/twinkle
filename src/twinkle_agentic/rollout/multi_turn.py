@@ -21,6 +21,7 @@ from typing import Any, Optional
 from twinkle.data_format import Trajectory, user_data_get
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import remote_class, remote_function
+from twinkle.protocol.types.sampler import SampleResponseModel
 from twinkle.template.base import Template
 from twinkle.utils import get_logger
 from twinkle_agentic.envs.base import NoSlot
@@ -156,11 +157,15 @@ def _single_sequence(responses: Any) -> SampledSequence:
     if len(responses) != 1:
         raise RuntimeError(f'sampler returned {len(responses)} responses for a single request; expected exactly one.')
     response = responses[0]
-    if not isinstance(response, SampleResponse):
-        raise TypeError(f'expected SampleResponse from sampler.sample, got {type(response).__name__}')
+    if not isinstance(response, (SampleResponse, SampleResponseModel)):
+        raise TypeError(f'expected SampleResponse or SampleResponseModel from sampler.sample, '
+                        f'got {type(response).__name__}')
     if len(response.sequences) != 1:
         raise RuntimeError(f'SampleResponse contains {len(response.sequences)} sequences; expected exactly one.')
-    return response.sequences[0]
+    sequence = response.sequences[0]
+    if isinstance(response, SampleResponseModel):
+        return SampledSequence(**sequence.model_dump())
+    return sequence
 
 
 def is_error_observation(observation: str) -> bool:
