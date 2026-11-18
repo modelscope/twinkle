@@ -62,6 +62,11 @@ Ints3 = list[list[list[StrictInt]]]
 
 _Number = Union[StrictInt, float]
 Numbers1to2 = Annotated[Union[list[_Number], list[list[_Number]]], _LEFT_TO_RIGHT]
+# Classification targets ride ``labels`` too (the local InputFeature is an unvalidated TypedDict):
+# single_label/regression are a scalar per sample, multi_label a float one-hot list, causal_lm an
+# int token list. Accept every shape so the wire faithfully carries what the local path produces;
+# the backend interprets the shape per task_type/problem_type.
+WireLabels = Annotated[Union[StrictInt, float, list[_Number], list[list[_Number]]], _LEFT_TO_RIGHT]
 Numbers1to4 = Annotated[Union[list[_Number], list[list[_Number]], list[list[list[_Number]]],
                               list[list[list[list[_Number]]]]], _LEFT_TO_RIGHT]
 
@@ -106,7 +111,7 @@ class WireInputFeature(DataModel):
     input_ids: Ints1to2 | None = None
     input_embedding: Numbers1to2 | None = None
     attention_mask: Ints1to2 | None = None
-    labels: Ints1to2 | None = None
+    labels: WireLabels | None = None
     completion_mask: Ints1to2 | None = None
     # 1-D standard encoding, 2-D Qwen-VL mrope ``[3, T]``, 3-D megatron ``[3, 1, N]``.
     position_ids: Ints1to3 | None = None
