@@ -188,7 +188,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 send_auth_pyobj(self.socket, {'wire_probe': True}, self.auth_key,
                                 where='rendezvous.send_probe')
                 for r in list(pending):
-                    if self._store.check([f'sub_ready_{r}'])[0]:
+                    if self._store.check([f'sub_ready_{r}']):
                         pending.discard(r)
                 if pending:
                     if time.monotonic() > deadline:
