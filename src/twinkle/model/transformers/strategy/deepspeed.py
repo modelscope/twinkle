@@ -531,12 +531,15 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         return out
 
     def engine_grad_partition_digest(self, model) -> Dict[str, Any]:
-        """``[sum, absmax, norm]`` of the float32 gradients the offload optimizer updates from.
+        """Per-gradient digests of the float32 gradients the offload optimizer updates from.
 
-        ZeRO-2 keeps the reduced gradients in ``averaged_gradients`` and hands the CPU optimizer the
-        ``.grad`` of its own float32 partition; ZeRO-3 exposes neither under those names. Each tier is
-        read through whatever it has, and the names actually found are reported in ``sources``, so a
-        tier carrying no readable gradient shows up as such instead of reading as "gradients matched".
+        Each readable gradient carries ``agg`` ([sum, absmax, norm]), an all-element ``bits`` identity
+        fingerprint, ``numel`` and buffer identity -- an aggregate alone can show that a difference
+        exists but never that one is absent. ZeRO-2 keeps the reduced gradients in ``averaged_gradients``
+        and hands the CPU optimizer the ``.grad`` of its own float32 partition; ZeRO-3 exposes neither
+        under those names. Each tier is read through whatever it has, and the names actually found are
+        reported in ``sources``, so a tier carrying no readable gradient shows up as such instead of
+        reading as "gradients matched".
         """
         import torch
 
@@ -582,7 +585,15 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 for slot, grad in enumerate(averaged[index] or []):
                     if torch.is_tensor(grad):
                         name = f'averaged_gradients[{index}][{slot}]'
-                        out[name] = self._aggregate(self._chunk_stats(grad.detach().flatten(), chunks=chunks))
+                        flat = grad.detach().flatten()
+                        stats = self._chunk_stats(flat, chunks=chunks)
+                        out[name] = {
+                            'agg': self._aggregate(stats),
+                            'chunks': [s[0] for s in stats],
+                            'bits': self._bits_fingerprint(flat),
+                            'numel': int(grad.numel()),
+                            **self._buffer_identity(grad),
+                        }
                         out['sources'].append(name)
         if not out['sources']:
             # Name the failure instead of returning a bare empty digest. Two empty digests compare equal,
