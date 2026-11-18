@@ -31,9 +31,8 @@ def _engine(monkeypatch, sessions):
     io_struct.UpdateWeightsFromTensorReqInput = _UpdateRequest
     modules['sglang.srt.utils'].MultiprocessingSerializer = SimpleNamespace(serialize=lambda named: named)
     modules['sglang.srt.utils.patch_torch'].monkey_patch_torch_reductions = lambda: None
-    # Keep the weight-update API tests independent of accelerator availability.
-    monkeypatch.setattr(sglang_engine, 'torch', SimpleNamespace(
-        device=lambda *args: torch.device('cpu'), cuda=SimpleNamespace(current_device=lambda: 0)))
+    # Use real CPU tensors; selecting the staging device must not call CUDA APIs.
+    monkeypatch.setattr(sglang_engine.Platform, 'get_local_device', lambda: 'cpu')
 
     events = []
     manager = SimpleNamespace(
@@ -64,6 +63,30 @@ def test_tensor_update_supports_both_sglang_apis(monkeypatch, sessions):
     for payload in request.serialized_named_tensors:
         assert payload[0][0] == 'weight'
         torch.testing.assert_close(payload[0][1], weight)
+
+
+@pytest.mark.parametrize('device', ['npu:1', 'cuda:2'])
+def test_tensor_update_stages_on_the_platform_device(monkeypatch, device):
+    engine, manager, _ = _engine(monkeypatch, False)
+    staged_on = []
+
+    class Weight:
+        def detach(self):
+            return self
+
+        def to(self, target):
+            staged_on.append(target)
+            return self
+
+    def no_cuda():
+        raise AssertionError('Weight staging must use the platform device, not CUDA directly')
+
+    monkeypatch.setattr(sglang_engine.Platform, 'get_local_device', lambda: device)
+    monkeypatch.setattr(sglang_engine, 'torch', SimpleNamespace(
+        device=lambda value: value, cuda=SimpleNamespace(current_device=no_cuda)))
+    asyncio.run(engine._flush_bucket([('weight', Weight())], flush_cache=False))
+    assert staged_on == [device]
+    manager.update_weights_from_tensor.assert_awaited_once()
 
 
 @pytest.mark.parametrize('sessions', [False, True], ids=['legacy', 'sessions'])
