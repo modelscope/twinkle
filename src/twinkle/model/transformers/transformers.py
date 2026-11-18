@@ -2170,6 +2170,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # gradient this update actually consumed.
             'grad_partition_post': engine_step.get('grad_partition_post', {}),
             'grad_partition_layout': engine_step.get('layout', {}),
+            # The engine's own clip inputs per unscale_and_clip_grads call (fp64, not the bf16
+            # print aggregate): the last unmeasured input to the update on the engine-owned path.
+            'clip_coefficients': engine_step.get('clip_coefficients', []),
         }
         with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
             handle.write(json.dumps(record) + '\n')

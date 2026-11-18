@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from typing import Any, Dict, Literal, Mapping, Optional
 
@@ -200,6 +200,46 @@ def _select_offload(zero, *, offload_model: bool, offload_optimizer: bool):
         else:
             include.update({Kind.hp_params, Kind.optim_states})
     return include, manual_optim
+
+
+@contextmanager
+def _clip_coefficient_probe(optimizer):
+    """Record the engine's own clip inputs per ``unscale_and_clip_grads`` call (QUEUE3486).
+
+    ``combined_scale`` is local to DeepSpeed's clip method, so mirror its exact expression
+    from the same live attributes (``loss_scale``, ``clip_grad``) and the actual ``total_norm``
+    argument, in the same arithmetic order -- the recorded coefficient is the one the engine
+    applies, not the bf16-rounded print aggregate ``engine_grad_norm``. Values are kept as fp64
+    Python floats. An overflow step skips the clip call entirely, leaving the list empty.
+    """
+    import torch
+
+    records = []
+    original = getattr(optimizer, 'unscale_and_clip_grads', None)
+    if original is None:
+        yield records
+        return
+
+    def wrapped(*args, **kwargs):
+        total_norm = args[-1] if args else kwargs['total_norm']
+        loss_scale = optimizer.loss_scale
+        clip_grad = optimizer.clip_grad
+        combined_scale = loss_scale
+        if clip_grad > 0.:
+            clip = ((total_norm / loss_scale) + 1e-6) / clip_grad
+            clip = torch.clamp(clip, min=1.0)
+            combined_scale = clip * loss_scale
+        records.append({
+            'scaled_global_grad_norm': float(total_norm),
+            'combined_scale': float(combined_scale),
+        })
+        return original(*args, **kwargs)
+
+    optimizer.unscale_and_clip_grads = wrapped
+    try:
+        yield records
+    finally:
+        optimizer.unscale_and_clip_grads = original
 
 
 class DeepSpeedStrategy(TransformerStrategyBase):
@@ -674,9 +714,11 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                     # the value the update is about to consume, which is the one that has to match.
                     'optim_moment_pre': self.engine_optim_moment_digest(model),
                 }
-            engine.step()
+            with _clip_coefficient_probe(engine.optimizer) as clip_records:
+                engine.step()
             if probe:
                 step_probe = self.__dict__['_engine_step_probe']
+                step_probe['clip_coefficients'] = clip_records
                 step_probe['master_post'] = self.engine_master_digest(model, stepped=True)
                 # ZeRO-2 assigns this step's reduced gradient to the float32 partition's ``.grad``
                 # inside ``step`` and the CPU optimizer consumes it there, so the partition read BEFORE
