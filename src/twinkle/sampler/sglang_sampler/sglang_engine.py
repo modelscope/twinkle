@@ -540,16 +540,11 @@ class SGLangEngine(BaseSamplerEngine):
         CUDA enumeration differs from this process's then maps the handle onto its own card instead
         of whatever carries the same index here. Idempotent, so calling it per flush is free.
 
-        The load runs inside a begin/end weight-update session, which sglang requires and which
-        brackets exactly one bucket: the session restores the in-place-packed weights before the
-        load and finalizes them after, so leaving one open across buckets would keep the runners in
-        the restored state while a later bucket lands.
+        When sglang exposes begin/end weight-update sessions, bracket exactly one bucket to restore
+        packed weights before loading and finalize them afterwards. Older versions expose only
+        update_weights_from_tensor and receive the same bucket directly.
         """
-        from sglang.srt.managers.io_struct import (
-            BeginWeightUpdateReqInput,
-            EndWeightUpdateReqInput,
-            UpdateWeightsFromTensorReqInput,
-        )
+        from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
         from sglang.srt.utils import MultiprocessingSerializer
         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -567,16 +562,20 @@ class SGLangEngine(BaseSamplerEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        # sglang requires the load to run inside a weight-update session: begin restores the
-        # in-place-packed weights so new ones can land, end finalizes the runners it opened. The
-        # selector defaults to 'all', which covers the draft runner too when one is attached.
-        opened, begin_message = await self._manager.begin_weight_update(BeginWeightUpdateReqInput(), None)
-        if not opened:
-            raise RuntimeError(f'sglang refused to open a weight-update session: {begin_message}')
-        try:
+        closed, end_message = True, ''
+        if callable(getattr(self._manager, 'begin_weight_update', None)):
+            from sglang.srt.managers.io_struct import BeginWeightUpdateReqInput, EndWeightUpdateReqInput
+
+            # The selector defaults to 'all', including the draft runner when one is attached.
+            opened, begin_message = await self._manager.begin_weight_update(BeginWeightUpdateReqInput(), None)
+            if not opened:
+                raise RuntimeError(f'sglang refused to open a weight-update session: {begin_message}')
+            try:
+                success, message = await self._manager.update_weights_from_tensor(request, None)
+            finally:
+                closed, end_message = await self._manager.end_weight_update(EndWeightUpdateReqInput(), None)
+        else:
             success, message = await self._manager.update_weights_from_tensor(request, None)
-        finally:
-            closed, end_message = await self._manager.end_weight_update(EndWeightUpdateReqInput(), None)
         if not success:
             raise RuntimeError(f'sglang rejected a weight update bucket of {len(bucket)} tensors: {message}')
         if not closed:
