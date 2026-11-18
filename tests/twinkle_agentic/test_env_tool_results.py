@@ -5,16 +5,23 @@ from twinkle_agentic.tools.tool_manager import ToolManager
 
 def test_batched_env_tools_retain_their_own_last_result():
     class Game(Env):
-        def step(self, name, arguments):
+        def _open(self, trajectory):
+            return None, StepResult()
+
+        def _step(self, state, name, arguments):
             return StepResult(observation=name, reward=arguments['reward'], done=bool(arguments['reward']))
 
     env = Game()
-    hit, stand = EnvTool(env, tool_name='hit'), EnvTool(env, tool_name='stand')
+    env.reset('game')
+    hit = EnvTool(env, 'game', tool_name='hit')
+    stand = EnvTool(env, 'game', tool_name='stand')
     manager = ToolManager([hit, stand])
     results = manager.call_many([
         {'function': {'name': name, 'arguments': {'reward': reward}}}
-        for name, reward in [('hit', 0), ('stand', -1), ('stand', 1)]
+        for name, reward in [('hit', 0), ('stand', -1), ('stand', 0)]
     ])
     assert results == ['hit', 'stand', 'stand']
-    assert not hit.done and hit.episode_reward == 0
-    assert stand.done and stand.episode_reward == 1
+    assert hit.last_result.observation == 'hit'
+    assert stand.last_result.observation == 'stand'
+    assert not stand.last_result.done
+    assert env.close('game') == -1

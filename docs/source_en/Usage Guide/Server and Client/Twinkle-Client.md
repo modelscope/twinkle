@@ -263,140 +263,57 @@ The client can train while sampling continues. After [installing Twinkle](../Ins
 | Blackjack with tools (StreamingDriver, explicit synchronous training loop) | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
 | Blackjack in E2B sandboxes (same training loop) | [e2b_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/e2b_multi_turn_grpo.py) |
 
-### 1. Start the Server
+### Connect and Run the Math Example
 
-The example uses Qwen3.5-4B with Transformers for training and vLLM for sampling, requiring two GPUs. Prepare a local model directory, then run these commands from the repository root:
+Ask your administrator for a Qwen3.5-4B service with GRPO and sampling support. The asynchronous math example also uses the server's DataPlane. [Server YAML](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/server_config.yaml)
 
-```bash
-pip install -e '.[async-rl,client,server]'
-export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3.5-4B
-export CUDA_VISIBLE_DEVICES=0,1
-bash cookbook/client/async_rl/run_server.sh
-```
-
-The server listens on `http://127.0.0.1:8000` by default. Skip this step if you already have a suitable server; see [server_config.yaml](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/server_config.yaml) for its configuration.
-
-### 2. Run the Math Example
-
-Keep the server running and use another terminal, also at the repository root:
+Set the client connection and run from the repository root:
 
 ```bash
-export TWINKLE_SERVER_URL=http://127.0.0.1:8000
-export TWINKLE_SERVER_TOKEN=EMPTY_TOKEN
-export TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B
+export TWINKLE_SERVER_URL=https://your-twinkle-server
+export TWINKLE_SERVER_TOKEN=your-token
 python cookbook/client/async_rl/client_orchestrated_grpo.py
 ```
 
-The example downloads GSM8K by default. For offline use, also set `TWINKLE_DATASET_ID=/absolute/path/to/gsm8k`. When connecting to an existing server, use its address and authentication token. The template directory must match the server's model.
+The example uses GSM8K. Offline clients can set `TWINKLE_DATASET_ID` to a local dataset and `TWINKLE_TEMPLATE_MODEL_ID` to tokenizer and template assets that match the server model.
 
-### 3. Run the Streaming Blackjack Example (Optional)
+### Run Multi-turn Blackjack GRPO
 
-`streaming_multi_turn_grpo.py` reuses Blackjack from the existing multi-turn examples: the model calls `play(hit/stand)`, the environment returns observations and terminal rewards, and complete groups feed GRPO training and policy publication. OpenEnv/OpenSpiel runs inside the client process; no environment server or generated-code execution is needed.
+The model calls `play(hit/stand)` and the environment returns the visible cards and final reward. `MultiTurnRollout` records the sampled tokens and log probabilities for each turn, and `HTTPSampler` sends sampling requests to the Twinkle server. The synchronous recipe gathers a group before training. The streaming recipe delegates group scheduling to `StreamingDriver`.
 
-`ClientMultiTurnRollout` controls each model/tool conversation; `StreamingDriver` schedules concurrent conversations and complete training groups. This example uses no external Agent harness. Embedded OpenEnv, remote OpenEnvClient and AgentENV share the `Env` interface, but process/OS isolation depends on the environment backend and deployment.
+Use the server URL and token from the section above. The default model is `Qwen/Qwen3.5-4B`. Set `TWINKLE_MODEL_ID` to select a model from the server configuration. Use the same tokenizer and template as the server. When the service uses an alias or the client is offline, set `TWINKLE_TEMPLATE_MODEL_ID` to the matching model ID or a local template directory.
 
-Install the client environment dependencies, then use the Twinkle server and client settings above:
+Install the shared client dependencies from the repository root. The E2B recipe also needs this step.
+
+```bash
+python -m pip install -e '.[client]' python-dotenv \
+  'ms-swift @ git+https://github.com/modelscope/ms-swift.git@e1ac89d24f47cb8fd73a7245dd79df0959aec284'
+```
+
+Install the local game environment for the synchronous and OpenEnv streaming recipes.
 
 ```bash
 pip install 'openenv==0.11.0' 'open_spiel==2.0.2'
 pip install 'openenv-openspiel-env @ git+https://github.com/huggingface/OpenEnv.git@9c6376390489f28e0e545cf74a277064e7edd52f#subdirectory=envs/openspiel_env'
+
+# Choose one from the repository root.
+python -m cookbook.client.twinkle.multi_turn_rollout
 python cookbook/client/async_rl/streaming_multi_turn_grpo.py
 ```
 
-Before running, configure a Swift version compatible with this branch that provides `swift.dev.template_contract`, and use the same tokenizer/template as the server. Check template imports first; this command creates neither a model nor a sandbox:
+Games in one group use the same deal seed and keep independent state. Training uses completed groups and skips groups with equal rewards. Read `train_batch()` to see advantage estimation, backward, the optimizer step and LoRA publication. At exit, check `completed_groups`, `optimizer_updates`, and `latest_lora`. With zero updates, the URI points to the initial policy.
 
-```bash
-python -c "from twinkle.template import Qwen3_5Template"
-```
+### Run the Same Task in E2B Sandboxes
 
-If the template contract is missing, configure the matching Swift environment first. The `[client,e2b]` extras supply client and E2B connectivity dependencies; they do not configure Swift.
-
-Group members use the same environment seed, independent environments and different model sampling seeds. Unfinished games and zero-advantage groups are skipped; a short run need not produce an update or increasing reward. `_train_loop` shows training explicitly, with one optimizer step per complete group. Top-level constants control group size, buffering and the update budget.
-
-Read `train()` for connection and setup, then `_train_loop()` for complete groups → advantages → `forward_backward` → `clip_grad_and_step` → publication request → `commit`. `commit(0)` records no update and consumes no optimizer budget; a publication request runs when the driver resumes. Inspect `_build_driver()` when adapting environments and rewards. The SDK's `RolloutResources` scope handles resource teardown; the recipe contains no cleanup exception handling.
-
-`twinkle_client.rollout.training_groups(samples, num_generations=..., drop_truncated=True)` prepares scored streaming batches: it preserves member order, skips incomplete or mixed-policy groups, and checks membership, response token/mask/logprob alignment and finite rewards. Rollout failures are checked across the whole batch before any group is returned, so filtering or an update budget cannot hide them. `drop_truncated` defaults to `False`; Blackjack explicitly enables it to train terminal games only. Advantage calculation, zero-advantage decisions and updates remain visible in the recipe. The synchronous batch multi-turn example keeps its Trajectory-dictionary training interface and also uses `RolloutResources` for resource ownership.
-
-Each `train()` invocation generates its own checkpoint name prefix automatically, avoiding overwritten `policy-0` snapshots across runs. No user configuration is required. This prefix only names checkpoints; it does not provide tenant isolation, control random seeds or resume a previous run.
-
-`rollout.streaming(driver)` closes batch and streaming admission, signals cancellation, attempts to settle every call and then joins the driver. Use a dedicated rollout instance; it accepts no further work after exit. A bare rollout borrows environments without closing them. The example passes connection settings explicitly via `RolloutResources(init_twinkle_client, base_url=..., api_key=...)`, reading `TWINKLE_SERVER_URL` and `TWINKLE_SERVER_TOKEN` from `.env`. The scope transfers client, rollout and environment ownership to the SDK. Register its dedicated rollout with `own_rollout()` and environments with `own_environment()` before `reset()`, covering partial initialization too. After collecting an episode, `close_environment()` releases its environment early. On scope exit, the SDK waits for calls, drains rollout and closes remaining environments and the client, handling repeated interrupts while preserving the primary error. Unconfirmed execution retains resource handles and reports failure rather than claiming successful release.
-
-`RolloutResources` automatically binds interrupt protection to this client's model operations, sampler creation and configuration. The recipe calls `model.forward_backward(...)`, `model.clip_grad_and_step()` and `model.save(...)` directly. If the waiting thread is interrupted, the SDK waits for the issued call to return, registers training handles and successful results, then propagates the interrupt. A failed or interrupted managed call stops subsequent managed calls; training operations are never automatically resubmitted. `model.completed_step_calls` counts successful step/clip_grad_and_step replies on that model object, not proof of device parameter changes. `model.last_checkpoint` retains the latest successful save response. Sampling remains concurrent under rollout execution and bypasses the training-operation sequence. Clients outside the scope retain their existing behavior. Timeouts, lost connections and failed task records do not prove physical completion: unconfirmed resources are retained and reported, never automatically reused. This does not provide remote force-cancellation.
-
-Sampling stays at `temperature=1`, `top_p=1`, `top_k=-1` and `repetition_penalty=1` to match processed logprobs to raw training logits. The shared `server_config.yaml` still deploys DataPlane and requires the server's `[async-rl]` dependencies.
-
-### 4. Run the Same Task in Official E2B Sandboxes (Optional)
-
-`e2b_multi_turn_grpo.py` connects `AgentEnv` to E2B's official service, with a separate sandbox for each trajectory. Game history, card draws and rewards execute inside the sandbox. The model still uses only `play(hit/stand)`, orchestrated by the same `ClientMultiTurnRollout` and `StreamingDriver`. It reuses the previous example's `train(env_factory=...)`; there is no additional training framework, verifier or external Agent harness.
-
-First run the [AgentEnv official E2B connectivity check](../../Components/Agentic/Envs.md). It checks creation, command execution and release without a training server, separating key/template/network issues from training setup.
-
-Keep the Twinkle server from the previous steps running. Configure both services in `.env` at the repository root. `TWINKLE_SERVER_TOKEN` authenticates training/sampling; `E2B_API_KEY` authenticates cloud sandboxes:
-
-```dotenv
-TWINKLE_SERVER_URL=http://127.0.0.1:8000
-TWINKLE_SERVER_TOKEN=EMPTY_TOKEN
-TWINKLE_MODEL_ID=Qwen/Qwen3.5-4B
-E2B_API_KEY=your_e2b_api_key
-# Offline clients also need a local template directory matching the server model:
-# TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B
-```
-
-Replace the URL, token and key with your own settings and keep `.env` out of Git. For the official service, remove `E2B_API_URL`, `E2B_SANDBOX_URL` and `E2B_DOMAIN` overrides from `.env` and the shell environment. Then run:
+After installing the shared client dependencies above, set `E2B_API_KEY` in `.env`. Leave endpoint overrides unset to use the official E2B service.
 
 ```bash
 pip install -e '.[client,e2b]'
 python cookbook/client/async_rl/e2b_multi_turn_grpo.py
 ```
 
-The default E2B `base` template installs `open_spiel==2.0.2` in the writable `/home/user/blackjack` directory and receives the adjacent `blackjack_game.py` file. OpenEnv/OpenSpiel is not needed on the client. Set `E2B_TEMPLATE` to a custom template with that OpenSpiel version preinstalled to reduce startup time. The default buffer holds up to 12 trajectories; match it to your account's sandbox concurrency quota.
+This entry point reuses the streaming loop and opens a sandbox for each episode. The sandbox runs the uploaded game program and computes the deal and reward through OpenSpiel. The default `base` template installs `open_spiel==2.0.2` in the sandbox. Set `E2B_TEMPLATE` to a template with that version preinstalled if you want faster startup. This entry point needs no local OpenSpiel installation.
 
-Read the three files by responsibility:
+### Use Your Own Tool Task
 
-Run the entry point directly: it constructs rollout and driver for you. Inspect the `submit/collect` callbacks in `_build_driver()` when adapting the task; initial setup needs no manual component assembly. Environments supply `system_prompt` and the standard `Env.tools()` definitions.
-
-| File | Responsibility |
-| --- | --- |
-| `streaming_multi_turn_grpo.py` | `train()` connects services and constructs rollout/driver; `_train_loop()` shows advantages, backward, optimizer step and policy publication. Reads task instructions and `tools()` from the environment rather than defining Blackjack rules. |
-| `e2b_multi_turn_grpo.py` | `E2BBlackjackEnv` implements the standard `reset/step/close` interface over E2B, then selects it with `train(env_factory=E2BBlackjackEnv)`. |
-| `blackjack_game.py` | Shared Blackjack task definition (`BlackjackTask.system_prompt` / `tools()`) and the OpenSpiel program uploaded to the sandbox. It stores seed/action history in the sandbox's `game.json` and returns cards, reward and terminal state. It performs no training. |
-
-The flow is: driver admits separate games → rollout calls the remote sampler → the model calls `play` → AgentEnv executes the game in E2B → complete groups supply advantages and training → newly published URIs serve subsequent games. Group members share a seed but own separate environments; each trajectory keeps one fixed policy URI.
-
-`env_factory` switches the same Blackjack task between local and E2B execution; both backends share instructions, the `play` tool and reward rules. To introduce another task, define its environment instructions, tools and rewards, then adapt `submit/collect` in `_build_driver()` while retaining the training loop. This recipe requires exactly one `play` tool and rejects empty, additional or differently named tools instead of silently dropping them. The SDK's `ClientMultiTurnRollout` / `ToolManager` still support multiple tools.
-
-Start by changing only connection settings. To adjust scale, edit `NUM_GENERATIONS`, `BUFFER_GROUPS`, `MAX_GROUPS` and `MAX_STEPS` in the shared training script: group size, buffered groups, finite group attempts and maximum updates. Each pull requests one complete group. Equal-reward groups are skipped, so the update count is an upper bound. Smaller buffers retain fewer sandboxes but allow less sampling/training overlap.
-
-Each collected trajectory releases its sandbox immediately. On exit, rollout stops and drains before remaining environments close. Cancellation is cooperative and waits for issued commands to return. Unconfirmed execution retains its handle and raises an error, with sandbox expiry after 600 seconds as a fallback; immediate remote abort is not provided. This example executes trusted game tools, not model-generated code.
-
-Game-process failures or malformed game responses abort training rather than becoming zero rewards or ordinary incomplete episodes. Invalid model tool arguments return a corrective observation instead.
-
-| Symptom | Check first |
-| --- | --- |
-| E2B authentication or template error | `E2B_API_KEY`, `E2B_TEMPLATE` and endpoint overrides. Rerun the standalone connectivity check; the default official template is `base`. |
-| Sandbox quota exceeded | Reduce `BUFFER_GROUPS` and check account quotas; the default budget is `3 × 4 = 12` trajectories. |
-| Slow environment startup | Each trajectory creates a sandbox and checks/installs OpenSpiel. Use an `E2B_TEMPLATE` with dependencies preinstalled and a compatible writable directory. |
-| E2B check passes but training connection fails | Check `TWINKLE_SERVER_URL/TOKEN`, server model and local template directory. E2B connectivity does not establish training-server readiness. |
-| Games run without optimizer updates | Inspect `zero advantage` / `truncated` logs; legitimate skips within a finite attempt budget are separate from connection failures. |
-
-### Use Your Own Task
-
-- Math tasks: change the dataset and reward function in the script.
-- Streaming tool tasks: replace the Blackjack environment, tools and environment reward seam while keeping complete groups, advantages, training and publication.
-- Start with the default training settings; edit the constants at the top of the script when needed. Training logs show rewards and metrics, and LoRA checkpoints are saved.
-
-## Trainable Multi-turn Rollout (ClientMultiTurnRollout)
-
-For a custom multi-turn training loop, use `twinkle_client.rollout.ClientMultiTurnRollout`. It supports text-only tool use and returns complete trajectories ready for training.
-
-Inside an async training loop where the rollout, trajectories, tools and policy checkpoint are already initialized:
-
-```python
-rolled = await rollout.acall(
-    trajectories,
-    tool_manager=tool_managers,
-    adapter_uri=policy_uri,
-)
-```
-
-For synchronous use, call `rollout(...)` with the same arguments and result format. Give each trajectory the `ToolManager` for its independent environment; rollout does not close environments you pass in. See [multi_turn_rollout.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/multi_turn_rollout.py) for the full synchronous example.
+Use `BlackjackEnv` or `E2BBlackjackEnv` as a starting point. Define the tools, opening observation and rewards on the environment, then pass the environment into `MultiTurnRollout`. Call `rollout(trajectories)` for a synchronous batch. For streaming, pass the same rollout to `StreamingDriver` and iterate over `(rows, facts)`. Both entry points use `ClientCheckpointManager` to publish policies and `RolloutResources` to drain the rollout, close the environment and release training handles before closing the client.

@@ -203,6 +203,9 @@ class MultiLoraTransformersModel:
             with self._training_lock:
                 self._training_ids[adapter_name] = result.training_id
                 self.adapter_name = adapter_name
+            scope = self._transport._operation_scope
+            if scope is not None:
+                scope.own_training(result.training_id, lambda: self._release_adapter(adapter_name, result.training_id))
         finally:
             with self._training_lock:
                 self._creating.discard(adapter_name)
@@ -214,13 +217,19 @@ class MultiLoraTransformersModel:
         with self._training_lock:
             training_id = self._training_ids.get(name)
         try:
-            self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
+            self._release_adapter(name, training_id)
         except TwinkleHTTPError as exc:
             if exc.status_code == 404:
                 self._forget_training(name, training_id)
             # A missing handle is unusable, but does not certify device release.
             raise
+
+    def _release_adapter(self, name, training_id):
+        self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
         self._forget_training(name, training_id)
+        scope = self._transport._operation_scope
+        if scope is not None:
+            scope.forget_training(training_id)
 
     def _forget_training(self, name: str, training_id: str) -> None:
         """A late response must never erase a newer same-name binding."""

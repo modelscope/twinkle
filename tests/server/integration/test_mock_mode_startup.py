@@ -161,15 +161,18 @@ def test_mock_mode_reaches_ready_and_is_deterministic(ray_cluster, monkeypatch) 
 
 def _exercise_twinkle_clients(base: str) -> None:
     from twinkle import init_twinkle_client
-    from twinkle_client.model import MultiLoraTransformersModel
+    from twinkle_client.resources import RolloutResources
+
+    with RolloutResources(init_twinkle_client, base_url=base, api_key='EMPTY_TOKEN') as resources:
+        client = resources.client
+        model = client.model('mock-model')
+        _exercise_twinkle_session(client, model)
+    assert client.transport.closed and not model._training_ids
+
+
+def _exercise_twinkle_session(client, model) -> None:
     from twinkle_client.sampler import vLLMSampler
 
-    # Creates a server-side session so adapter endpoints get
-    # ``X-Twinkle-Session-Id``; also wires base_url + api_key for the SDK.
-    twinkle = init_twinkle_client(base_url=base, api_key='EMPTY_TOKEN')  # noqa: F841
-
-    # --- model service ---
-    model = MultiLoraTransformersModel(model_id='mock-model')
     # Pass an actual ``LoraConfig`` (not a dict): the client auto-serializes
     # objects with ``__dict__`` to JSON, which the server's ``config: str``
     # field accepts; plain dicts fail pydantic validation.
@@ -219,9 +222,8 @@ def _exercise_twinkle_clients(base: str) -> None:
 
     # --- sampler service ---
     from twinkle_client.http import ClientTransport
-    from twinkle_client.http.context import capture_transport
     # Cold PEFT imports on NAS can exceed the default 90-second HTTP timeout.
-    sampler_transport = ClientTransport(capture_transport().context, timeout=600)
+    sampler_transport = ClientTransport(client.transport.context, timeout=600)
     sampler = vLLMSampler(model_id='mock-model', transport=sampler_transport)
     # Sampler /add_adapter_to_sampler reuses the model-side ``AddAdapterRequest``
     # shape (``config: str``), so send JSON. Skip a real ``LoraConfig`` here
@@ -251,8 +253,6 @@ def _exercise_twinkle_clients(base: str) -> None:
 
     sampler.apply_patch('NoopPatch')
     sampler_transport.close()
-    model.remove_adapter()
-    twinkle.close()
 
 
 def _exercise_tinker_client(base: str) -> None:

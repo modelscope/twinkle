@@ -16,18 +16,21 @@ def test_initialization_checks_exit_codes_and_retains_cleanup_handle(monkeypatch
         failed = failed_command is not None and command.startswith(failed_command)
         return SimpleNamespace(exit_code=1 if failed else 0, stdout='', stderr='permission denied' if failed else '')
 
-    sandbox = SimpleNamespace(sandbox_id='sandbox', commands=SimpleNamespace(run=run), kill=lambda: True)
+    killed = []
+    sandbox = SimpleNamespace(sandbox_id='sandbox', commands=SimpleNamespace(run=run), kill=lambda: killed.append(True))
     monkeypatch.setattr(agentenv, '_require_e2b', lambda: SimpleNamespace(create=lambda *a, **k: sandbox))
     env = AgentEnv(template='base', setup_commands=['setup', 'later'])
     try:
         if failed_command is None:
-            env.reset()
+            env.reset('episode')
             assert calls[-2:] == ['setup', 'later']
         else:
             with pytest.raises(RuntimeError, match='permission denied'):
-                env.reset()
+                env.reset('episode')
             assert 'later' not in calls
-        assert env.sandbox is sandbox
+        assert bool(env._sessions) == (failed_command is None)
+        assert killed == ([] if failed_command is None else [True])
     finally:
-        env.close()
-    assert env.sandbox_id is None
+        env.shutdown()
+    assert not env._sessions
+    assert killed == [True]

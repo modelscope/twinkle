@@ -210,8 +210,11 @@ def test_default_new_input_feature_appends_sampled_tokens() -> None:
     assert 'input_ids' in seq.new_input_feature
     assert seq.new_input_feature['input_ids'] == [1, 2, 3] + list(seq.tokens)
     # Prior context stays non-trainable; sampled tokens are trainable (their ids).
-    assert seq.new_input_feature['labels'] == [-100, -100, -100] + list(seq.tokens)
+    assert seq.new_input_feature['labels'] == [-100, -100] + list(seq.tokens) + [-100]
+    assert seq.new_input_feature['completion_mask'] == [0, 0, 1, 1, 1, 1, 0]
     assert seq.new_input_feature['length'] == 3 + len(seq.tokens)
+    second = s.sample(seq.new_input_feature, SamplingParams(max_tokens=2))[0].sequences[0]
+    assert second.new_input_feature['labels'] == [-100, -100] + seq.tokens + second.tokens + [-100]
 
 
 def test_set_template_does_not_resolve_model_assets():

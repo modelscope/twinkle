@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Real SDK boundaries, plus subprocess SIGINT tests over a local HTTP server."""
-import importlib.util
 import os
 import signal
 import subprocess
@@ -109,8 +108,10 @@ def test_unconfirmed_remote_operation_retains_resources_and_is_not_retried(failu
     assert session.calls.count('clip_grad_and_step') == 1
     with pytest.raises(RuntimeError, match='stopped'):
         model.clip_grad_and_step()
-    with pytest.raises(BaseExceptionGroup, match='unconfirmed'):
+    with pytest.raises(BaseExceptionGroup) as close_error:
         client.close()
+    assert 'unconfirmed' in str(close_error.value.exceptions[0])
+    assert 'remove_adapter' not in session.calls
     assert session.calls.count('clip_grad_and_step') == 1
 
 
@@ -126,6 +127,42 @@ def test_known_rejection_does_not_quarantine_settled_client(reject_locally):
     assert session.closed
     assert not resources._operation_scope.uncertain_errors
     assert session.calls.count('clip_grad_and_step') == (0 if reject_locally else 1)
+    assert session.calls[-1] == 'remove_adapter'
+
+
+def test_scope_releases_other_handles_and_retains_failed_release_until_retry():
+    class RejectFirstRelease(Session):
+        def __init__(self):
+            super().__init__()
+            self.releases = []
+            self.reject = True
+
+        def post(self, url, **kwargs):
+            endpoint = url.rsplit('/', 1)[-1]
+            if endpoint == 'add_adapter_to_model':
+                label = json.loads(kwargs['data'])['adapter_name']
+                return Response({'request_id': label, 'status': 'completed',
+                                 'result': {'training_id': f'training-{label}', 'adapter_name': label}})
+            if endpoint == 'remove_adapter':
+                training_id = json.loads(kwargs['data'])['training_id']
+                self.releases.append(training_id)
+                if self.reject and training_id == 'training-a':
+                    return Response({'detail': 'release temporarily rejected'}, 429)
+            return super().post(url, **kwargs)
+
+    session = RejectFirstRelease()
+    resources = RolloutResources(lambda: client_for(session))
+    with pytest.raises(BaseExceptionGroup, match='resource cleanup'):
+        with resources:
+            model = resources.client.model('model')
+            model.add_adapter_to_model('a')
+            model.add_adapter_to_model('b')
+    assert session.releases == ['training-a', 'training-b']
+    assert model._training_ids == {'a': 'training-a'} and not session.closed
+    session.reject = False
+    resources.close()
+    assert session.releases == ['training-a', 'training-b', 'training-a']
+    assert not model._training_ids and session.closed
 
 
 def test_sampling_remains_concurrent_while_a_guarded_training_call_is_blocked():
@@ -229,50 +266,33 @@ def test_a_second_scope_cannot_close_or_stop_an_already_owned_client():
     assert session.closed
 
 
-def test_recipe_trains_and_publishes_through_real_sdk_methods(monkeypatch):
-    from twinkle_agentic.rollout.multi_turn import RolloutStatus
+def test_recipe_trains_and_publishes_through_real_sdk_methods():
+    from cookbook.client.async_rl.streaming_multi_turn_grpo import train_batch
+    from twinkle.advantage import GRPOAdvantage
+    from twinkle_client.rollout import ClientCheckpointManager
 
-    path = Path(__file__).parents[2] / 'cookbook/client/async_rl/streaming_multi_turn_grpo.py'
-    monkeypatch.syspath_prepend(str(path.parent))
-    spec = importlib.util.spec_from_file_location('scoped_training_recipe', path)
-    recipe = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(recipe)
-    samples = [RolloutStatus(
-        encoded={'input_ids': [1, 10], 'labels': [10, -100]}, response_token_ids=[10],
-        rollout_logprobs=[-0.1], response_loss_mask=[1], orm_reward=[reward], group_key='group',
-        extra={'trajectory_idx': index, 'adapter_uri': 'policy-0'},
-    ) for index, reward in enumerate((1, -1, 1, -1))]
-
-    class Driver:
-        def __init__(self):
-            self.stats = SimpleNamespace(publishes=0, optimizer_steps=0)
-            self.paths = []
-
-        def __iter__(self):
-            return iter([samples])
-
-        def request_publish(self, push):
-            self.paths.append(push(None))
-            self.stats.publishes += 1
-
-        def commit(self, steps):
-            self.stats.optimizer_steps += steps
-
-    session, driver = Session(), Driver()
+    rows = [
+        {'input_ids': [1, 10], 'labels': [10, -100], 'response_token_ids': [10], 'response_positions': [0],
+         'rollout_logps': [-0.1], 'group_key': 'deal', 'episode_id': str(index), 'rewards': {'env': reward}}
+        for index, reward in enumerate((1, -1))
+    ]
+    session = Session()
+    sampler = SimpleNamespace(adapter_path=None)
     with RolloutResources(lambda: client_for(session)) as resources:
         model = resources.client.model('model')
         model.add_adapter_to_model('slot')
-        recipe._train_loop(driver, model, 'test-policy')
-        assert model.completed_step_calls == driver.stats.optimizer_steps == 1
-        assert driver.paths == ['twinkle://saved-policy']
-        assert model.last_checkpoint.twinkle_path == driver.paths[0]
+        checkpoints = ClientCheckpointManager(model, sampler)
+        assert train_batch(model, checkpoints, GRPOAdvantage(num_generations=2), rows)
+        assert model.completed_step_calls == checkpoints.version() == 1
+        assert sampler.adapter_path == model.last_checkpoint.twinkle_path == 'twinkle://saved-policy'
     assert session.calls == ['create', 'add_adapter_to_model', 'forward_backward',
-                             'clip_grad_and_step', 'calculate_metric', 'save']
+                             'clip_grad_and_step', 'save', 'calculate_metric', 'remove_adapter']
     assert session.closed
 
 
 @pytest.mark.parametrize('endpoint', [
     'add_adapter_to_model', 'clip_grad_and_step', 'save', 'poll', 'sampler_create', 'sampler_template', 'legacy',
+    'streaming_rollout', 'batch_rollout',
 ])
 def test_real_http_and_repeated_sigint_record_outcome_before_cleanup(endpoint):
     # Signals go to a child, so pytest and the user's terminal are never interrupted.
@@ -280,21 +300,43 @@ def test_real_http_and_repeated_sigint_record_outcome_before_cleanup(endpoint):
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
     observed = json.loads(result.stdout)
-    assert observed == {'endpoint': endpoint, 'calls': 1, 'registered': True, 'closed': True}
+    assert observed == {'endpoint': endpoint, 'calls': 1, 'released': True, 'closed': True}
 
 
 def signal_scenario(endpoint):
-    started, release = threading.Event(), threading.Event()
+    started, release, draining = threading.Event(), threading.Event(), threading.Event()
     target = {'poll': 'retrieve_future', 'legacy': 'clip_grad_and_step',
               'sampler_template': 'set_template'}.get(endpoint, endpoint)
+    rollout_probe = endpoint in ('streaming_rollout', 'batch_rollout')
     calls = []
+    if rollout_probe:
+        from twinkle.data_format.sampling import SampledSequence, SampleResponse
+        from twinkle_agentic.async_rl import StreamingDriver
+        from twinkle_agentic.envs import Env, StepResult
+        from twinkle_agentic.rollout import MultiTurnRollout
+
+        class DelayedEnv(Env):
+            def _open(self, trajectory):
+                calls.append(endpoint)
+                started.set()
+                assert release.wait(timeout=5)
+                return None, StepResult(observation='ready')
+
+            def _step(self, state, name, arguments):
+                raise AssertionError('the policy makes no tool calls')
+
+            def _close(self, state):
+                calls.append('env.close')
+
+        def sample(*args, **kwargs):
+            return [SampleResponse(sequences=[SampledSequence(tokens=[], stop_reason='stop', decoded='finished')])]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
         def do_POST(self):
-            self.rfile.read(int(self.headers['Content-Length']))
+            payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             action = self.path.rsplit('/', 1)[-1]
             if action == 'create' and '/sampler/' in self.path:
                 action = 'sampler_create'
@@ -330,7 +372,10 @@ def signal_scenario(endpoint):
     def interrupt():
         assert started.wait(timeout=5)
         os.kill(os.getpid(), signal.SIGINT)
-        time.sleep(0.05)
+        if endpoint == 'streaming_rollout':
+            assert draining.wait(timeout=5)
+        else:
+            time.sleep(0.05)
         os.kill(os.getpid(), signal.SIGINT)
         time.sleep(0.05)
         release.set()
@@ -344,10 +389,27 @@ def signal_scenario(endpoint):
                     model.add_adapter_to_model('slot')
                 if endpoint == 'sampler_template':
                     sampler = client.sampler('model')
+                if rollout_probe:
+                    env = resources.own_environment(DelayedEnv())
+                    rollout = resources.own_rollout(MultiTurnRollout(sampler=SimpleNamespace(sample=sample), env=env))
+                    rows = [{'messages': [{'role': 'user', 'content': 'hello'}]}]
+                    if endpoint == 'streaming_rollout':
+                        driver = resources.own_rollout(StreamingDriver([rows], rollout, batch_size=1))
+                        close = driver.close
+
+                        def observed_close():
+                            draining.set()
+                            close()
+
+                        driver.close = observed_close
                 if endpoint != 'legacy':
                     signal_thread = threading.Thread(target=interrupt, daemon=True)
                     signal_thread.start()
-                if endpoint == 'add_adapter_to_model':
+                if endpoint == 'streaming_rollout':
+                    next(iter(driver))
+                elif endpoint == 'batch_rollout':
+                    resources.operations.run(rollout, rows)
+                elif endpoint == 'add_adapter_to_model':
                     model.add_adapter_to_model('slot')
                 elif endpoint == 'save':
                     model.save('policy-1')
@@ -362,14 +424,17 @@ def signal_scenario(endpoint):
                 assert endpoint == 'legacy', 'expected KeyboardInterrupt after remote success'
         except KeyboardInterrupt:
             assert endpoint != 'legacy'
-        assert model._training_ids == {'slot': 'training-1'}
+        assert not model._training_ids
+        assert calls.count('remove_adapter') == 1 and calls[-1] == 'remove_adapter'
+        if rollout_probe:
+            assert calls.count('env.close') == 1 and not env._sessions
         assert model.completed_step_calls == (1 if endpoint in ('clip_grad_and_step', 'legacy', 'poll') else 0)
         if endpoint == 'save':
             assert model.last_checkpoint.twinkle_path == 'twinkle://saved-policy'
         assert client.transport.closed
         assert 'cancel' not in calls
         print(json.dumps({  # noqa: T201 - subprocess result
-            'endpoint': endpoint, 'calls': calls.count(target), 'registered': True, 'closed': True}))
+            'endpoint': endpoint, 'calls': calls.count(target), 'released': True, 'closed': True}))
     finally:
         release.set()
         if signal_thread is not None:
