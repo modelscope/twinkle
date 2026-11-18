@@ -450,7 +450,7 @@ class Advantage:
         # An episode delivered as several rows (collected segments) counts ONCE in the group
         # statistics -- its reward entering the mean per row would weight compacted episodes by
         # their segment count -- and the per-episode advantage is broadcast back to every row.
-        folded, owner = self._episode_fold(trajs, matrix_rows)
+        folded, owner = self._episode_fold(trajs)
         if folded is None:
             reward_matrix = torch.tensor(matrix_rows, dtype=torch.float32)
             response_lengths = [len(traj['response_token_ids']) for traj in trajs]
@@ -614,7 +614,7 @@ class Advantage:
     # ---------------------------------------------------------------------- helpers
 
     @staticmethod
-    def _episode_fold(trajs: List[Trajectory], matrix_rows: List[List[float]]) -> Tuple[Optional[List[int]], List[int]]:
+    def _episode_fold(trajs: List[Trajectory]) -> Tuple[Optional[List[int]], List[int]]:
         """Fold the batch's rows to one per episode: ``(folded, owner)``.
 
         An episode delivered as several rows (collected segments under
