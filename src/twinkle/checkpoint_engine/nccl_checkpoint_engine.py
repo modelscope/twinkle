@@ -91,12 +91,18 @@ class BroadcastOperation:
                 where='BroadcastOperation.send',
             )
         else:
-            self.socket.recv_string()
-            self.metadata = recv_auth_pyobj(
-                self.socket,
-                self.auth_key,
-                where='BroadcastOperation.recv',
-            )
+            while True:
+                topic = self.socket.recv_string()
+                payload = recv_auth_pyobj(
+                    self.socket,
+                    self.auth_key,
+                    where='BroadcastOperation.recv',
+                )
+                if topic == self.topic:
+                    self.metadata = payload
+                    break
+                # A stale wire-probe from the subscription rendezvous: drain it and keep waiting for
+                # the manifest topic (the slow-joiner re-probe leaves extra probes in a fast receiver).
 
         # Broadcast tensor data via NCCL
         _pg_broadcast(self.pg, self.bucket, src=0)
@@ -164,6 +170,36 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.socket = connect_subscriber(metadata.zmq_ip, metadata.zmq_port, self.topic)
 
     # ── Core lifecycle ───────────────────────────────────────────────────
+
+    def _rendezvous_subscribers(self, timeout: float = 60.0) -> None:
+        # ZMQ PUB/SUB drops messages published before a subscriber's subscription reaches the
+        # publisher (the slow-joiner race): the first manifest after init would vanish for a late
+        # subscriber and hang the first weight sync. Rank 0 re-publishes a wire probe on a topic the
+        # SUB prefix already matches until each receiver acks via the group TCPStore; receivers
+        # consume one probe and ack. Stale probes left in a fast receiver's queue are drained by
+        # BroadcastOperation._run's topic skip-loop. The fresh per-init TCPStore isolates these acks
+        # from any prior group epoch (reset reallocates the port and re-enters init_process_group).
+        probe_topic = self.topic + '__wire_probe__'
+        if self.rank == 0:
+            pending = set(range(1, self.world_size))
+            deadline = time.monotonic() + timeout
+            while pending:
+                self.socket.send_string(probe_topic, flags=zmq.SNDMORE)
+                send_auth_pyobj(self.socket, {'wire_probe': True}, self.auth_key,
+                                where='rendezvous.send_probe')
+                for r in list(pending):
+                    if self._store.check([f'sub_ready_{r}'])[0]:
+                        pending.discard(r)
+                if pending:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f'checkpoint rendezvous: ranks {sorted(pending)} never subscribed to the '
+                            f'weight-sync PUB socket within {timeout:.0f}s (world_size={self.world_size}).')
+                    time.sleep(0.02)
+        else:
+            self.socket.recv_string()
+            recv_auth_pyobj(self.socket, self.auth_key, where='rendezvous.recv_probe')
+            self._store.set(f'sub_ready_{self.rank}', b'1')
 
     def prepare(self) -> MasterMetadata | None:
         """Allocate double buffers and start ZMQ server (master only).
@@ -367,6 +403,10 @@ class NCCLCheckpointEngine(CheckpointEngine):
                     f'device_count={torch.cuda.device_count()}, tensor_device={barrier_tensor.device})')
         _pg_broadcast(self._pg, barrier_tensor, src=0)
         torch.cuda.synchronize()
+
+        # Wait until every receiver's SUB subscription has propagated to the PUB socket before the
+        # first manifest broadcast, else a slow joiner misses it and the first weight sync hangs.
+        self._rendezvous_subscribers()
 
         self._group_initialized = True
         logger.info(f'init_process_group: rank={self.rank}, '
