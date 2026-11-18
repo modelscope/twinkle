@@ -847,6 +847,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 del unpacked_logits
             losses = result['loss']
             counts = result['num_tokens']
+            reporting_num_tokens = counts
             if compute_loss and not counts:
                 # Later will gather this value, so it becomes:
                 # 1. SUM loss: gather_sum(local_num_tokens) = global_num_tokens
@@ -858,6 +859,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 #       / (gradient_accumulation_steps  * world_size ) = avg_per_token_grad
                 counts = torch.tensor(1, device=losses.device)
             reduced = self.strategy.reduce_loss(losses, counts, reported_logits, logps)
+            # Report the ORIGINAL num_tokens (0 for MEAN-contract losses) so the aggregator averages
+            # per-microbatch losses instead of summing them; the clamped counts above feed only the
+            # backward denominator, which must stay >=1. SUM contract (num_tokens>0) is unchanged.
+            reduced[2]['num_tokens'] = torch.as_tensor(reporting_num_tokens).to(torch.int64)
             if decision_outputs is not None:
                 # The decision metric reads the readout's non-logits fields (option_mask / kinds /
                 # counts) off the returned outputs, mirroring the transformers backend where the
