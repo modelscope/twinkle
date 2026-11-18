@@ -1,3 +1,4 @@
+import pickle
 import sys
 from types import SimpleNamespace
 
@@ -55,3 +56,22 @@ def test_npu_fallback_identity_matches_physical_device_across_visible_masks(monk
     assert npu.NPU.get_vllm_device_uuid(0) != trainer
     monkeypatch.setattr(npu.socket, 'gethostname', lambda: 'node-b')
     assert npu.NPU.get_vllm_device_uuid(3) != trainer
+
+
+def test_npu_native_uuid_is_a_serializable_string(monkeypatch):
+    class NativeUUID:
+        def __str__(self):
+            return '00cc0800-d001-0000-0000-48706f0f1ee7'
+
+        def __reduce__(self):
+            raise TypeError("cannot pickle 'torch_npu._C._CUuuid' object")
+
+    native_uuid = NativeUUID()
+    monkeypatch.setitem(sys.modules, 'vllm.platforms', SimpleNamespace(
+        current_platform=SimpleNamespace(get_device_uuid=lambda device_id: native_uuid)))
+
+    result = npu.NPU.get_vllm_device_uuid(0)
+
+    assert isinstance(result, str)
+    assert result == str(native_uuid)
+    assert pickle.loads(pickle.dumps(result)) == result

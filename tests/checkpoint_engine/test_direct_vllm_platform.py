@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """CUDA and Ascend must use the same device-paired direct transport."""
 import asyncio
+import pickle
+import sys
 import threading
 import uuid
 from types import SimpleNamespace as NS
@@ -33,6 +35,38 @@ def test_direct_identity_keeps_unavailable_or_other_platforms_on_existing_transp
     monkeypatch.setattr(Platform, 'get_platform', lambda: NS(
         device_prefix=lambda: prefix, device_module=lambda: module))
     assert CheckpointEngineMixin.direct_weight_sync_device.__wrapped__(NS()) is None
+
+
+def test_npu_trainer_identity_and_vllm_metadata_are_serializable_and_match(monkeypatch):
+    from twinkle.sampler.vllm_sampler.vllm_worker_extension import TwinkleWorkerExtension
+    from twinkle.utils.platforms.npu import NPU, _resolve_ascend_physical_device_id
+
+    class NativeUUID:
+        def __init__(self, physical_id):
+            self.physical_id = physical_id
+
+        def __str__(self):
+            return f'physical-npu-{self.physical_id}'
+
+        def __reduce__(self):
+            raise TypeError("cannot pickle 'torch_npu._C._CUuuid' object")
+
+    monkeypatch.setitem(sys.modules, 'vllm.platforms', NS(current_platform=NS(
+        get_device_uuid=lambda device_id: NativeUUID(_resolve_ascend_physical_device_id(device_id)))))
+    monkeypatch.setattr(Platform, 'get_platform', lambda: NS(
+        device_prefix=lambda: 'npu', device_module=lambda: object()))
+    monkeypatch.setattr(Platform, 'get_vllm_device_uuid', NPU.get_vllm_device_uuid)
+    monkeypatch.setattr(Torch, 'get_current_device', lambda: 0)
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES', '13')
+    trainer = CheckpointEngineMixin.direct_weight_sync_device.__wrapped__(NS())
+
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES', '6,8,9,13')
+    worker = NS(device=NS(index=3))
+    metadata = TwinkleWorkerExtension.weight_sync_metadata(worker)
+
+    assert metadata['device_uuid'] == trainer == 'physical-npu-13'
+    assert pickle.loads(pickle.dumps(metadata)) == metadata
+    assert TwinkleWorkerExtension.weight_sync_metadata(worker) is metadata
 
 
 @pytest.mark.parametrize('prefix', ['cuda', 'npu'])

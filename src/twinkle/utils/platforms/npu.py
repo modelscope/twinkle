@@ -191,7 +191,8 @@ class NPU(Platform):
     def get_vllm_device_uuid(device_id: int = 0) -> str:
         from vllm.platforms import current_platform
         try:
-            return current_platform.get_device_uuid(device_id)
+            # torch_npu can return a native _CUuuid, which RPC queues cannot pickle.
+            return str(current_platform.get_device_uuid(device_id))
         except NotImplementedError:
             # fix: Root cause was NPU platform calling vLLM base placeholder and raising NotImplementedError.
             # fix: Use Bus-Id fallback first so sender/receiver compute the same IPC endpoint.
