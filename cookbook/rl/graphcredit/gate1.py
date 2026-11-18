@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seed', type=int, default=20261118)
     parser.add_argument('--steps', type=int, default=20)
     parser.add_argument('--eval-tasks', type=int, default=24)
+    parser.add_argument('--eval-every', type=int, default=0)
     parser.add_argument('--group-size', type=int, default=8)
     parser.add_argument('--distance', type=int, default=2)
     parser.add_argument('--grid-size', type=int, default=5)
@@ -57,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--temperature', type=float, default=1.2)
     parser.add_argument('--top-p', type=float, default=0.95)
     parser.add_argument('--group-retries', type=int, default=12)
+    parser.add_argument('--max-step-attempts', type=int, default=6)
     parser.add_argument('--beta-episode', type=float, default=1.0)
     parser.add_argument('--beta-graph', type=float, default=1.0)
     parser.add_argument('--gamma', type=float, default=0.5)
@@ -653,19 +655,25 @@ def train(policy: Any, tokenizer: Any, args: argparse.Namespace, device: torch.d
     )
     reset_peak_hbm()
     history = []
-    skipped = 0
-    for step in range(args.steps):
+    completed_steps = 0
+    attempted_steps = 0
+    max_attempts = args.steps * args.max_step_attempts
+    while completed_steps < args.steps and attempted_steps < max_attempts:
+        attempted_steps += 1
         step_started = time.perf_counter()
         sampled = sample_training_group(
             policy,
             tokenizer,
             args,
             device,
-            step=step,
+            step=attempted_steps - 1,
         )
         if sampled is None:
-            skipped += 1
-            history.append({'step': step + 1, 'skipped': True})
+            history.append({
+                'attempt': attempted_steps,
+                'completed_steps': completed_steps,
+                'skipped': True,
+            })
             continue
         task, episodes = sampled
         synchronize(device)
@@ -674,7 +682,7 @@ def train(policy: Any, tokenizer: Any, args: argparse.Namespace, device: torch.d
         advantages, diagnostics = compute_advantages(
             args.mode,
             episodes,
-            policy_version=step + 1,
+            policy_version=completed_steps + 1,
             group_size=args.group_size,
             args=args,
         )
@@ -689,7 +697,8 @@ def train(policy: Any, tokenizer: Any, args: argparse.Namespace, device: torch.d
         )
         synchronize(device)
         record = {
-            'step': step + 1,
+            'step': completed_steps + 1,
+            'attempt': attempted_steps,
             'task_uid': task.task_uid,
             'reward_mean': float(np.mean(rewards)),
             'success_rate': float(np.mean([episode.success for episode in episodes])),
@@ -703,6 +712,27 @@ def train(policy: Any, tokenizer: Any, args: argparse.Namespace, device: torch.d
         }
         history.append(record)
         print(json.dumps(record, ensure_ascii=False), flush=True)
+        completed_steps += 1
+        if args.eval_every > 0 and completed_steps % args.eval_every == 0:
+            heldout = evaluate(
+                policy,
+                tokenizer,
+                args,
+                device,
+                split_offset=args.seed + 500_000,
+            )
+            record['heldout_eval'] = heldout
+            print(
+                json.dumps(
+                    {
+                        'step': completed_steps,
+                        'heldout_success_rate': heldout['success_rate'],
+                        'heldout_invalid_rate': heldout['invalid_rate'],
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
     final_eval = evaluate(
         policy,
         tokenizer,
@@ -713,7 +743,9 @@ def train(policy: Any, tokenizer: Any, args: argparse.Namespace, device: torch.d
     return {
         'mode': args.mode,
         'history': history,
-        'skipped_steps': skipped,
+        'completed_steps': completed_steps,
+        'attempted_steps': attempted_steps,
+        'skipped_steps': attempted_steps - completed_steps,
         'initial_eval': initial_eval,
         'final_eval': final_eval,
         'peak_hbm_gb': peak_hbm_gb(),

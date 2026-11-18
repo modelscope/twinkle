@@ -45,6 +45,23 @@ python cookbook/rl/graphcredit/gate1.py \
 - `result.json`：逐步 reward、loss、耗时、峰值 HBM 和 GraphCredit diagnostics；
 - 标准输出：每一步一行 JSON，便于远端日志采集。
 
+也可以使用统一启动脚本：
+
+```bash
+bash cookbook/rl/graphcredit/run_gate1_a2.sh grpo 20 24
+bash cookbook/rl/graphcredit/run_gate1_a2.sh graphcredit 20 24
+```
+
+可通过环境变量覆盖难度和周期性评测，例如：
+
+```bash
+DISTANCE=3 GRID_SIZE=7 EVAL_EVERY=4 \
+  bash cookbook/rl/graphcredit/run_gate1_a2.sh graphcredit 12 16
+```
+
+`--steps` 表示成功优化更新次数，不是跳过组也计数的尝试次数。候选训练组最多允许
+`MAX_STEP_ATTEMPTS` 倍尝试，避免两臂实际更新预算不同。
+
 ## 证据边界
 
 该实验验证 advantage consumer 的训练方向，不替代 Twinkle 完整 `GRPOLoss` 和生产训练

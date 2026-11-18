@@ -1,9 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import importlib.util
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import torch
+import pytest
 
 from twinkle.advantage import StateGraphAdvantage
 
@@ -89,3 +91,52 @@ def test_graph_credit_prefers_useful_intermediate_action():
     failure_start = failure.turns[0].action_token_start
     assert torch.all(result[0, success_start:success_start + 2] > 0)
     assert torch.all(result[1, failure_start:failure_start + 2] < 0)
+
+
+def test_train_counts_completed_updates_but_not_skipped_attempts(monkeypatch):
+    task = gate1.GridTask(
+        task_uid=3,
+        grid_size=5,
+        distance=2,
+        start=(2, 2),
+        goal=(2, 4),
+    )
+    episode = _episode(task, ['right', 'right'])
+    sampled = (task, [episode])
+    samples = iter([None, sampled, None, sampled])
+    policy_versions = []
+
+    monkeypatch.setattr(gate1, 'evaluate', lambda *args, **kwargs: {
+        'success_rate': 0.0,
+        'invalid_rate': 0.0,
+    })
+    monkeypatch.setattr(gate1, 'reset_peak_hbm', lambda: None)
+    monkeypatch.setattr(gate1, 'synchronize', lambda device: None)
+    monkeypatch.setattr(gate1, 'peak_hbm_gb', lambda: 0.0)
+    monkeypatch.setattr(gate1, 'sample_training_group', lambda *args, **kwargs: next(samples))
+
+    def compute_advantages(mode, episodes, policy_version, group_size, args):
+        policy_versions.append(policy_version)
+        return torch.zeros(1), {'fallback_counts': {}}
+
+    monkeypatch.setattr(gate1, 'compute_advantages', compute_advantages)
+    monkeypatch.setattr(gate1, 'policy_gradient_update', lambda *args, **kwargs: (0.0, 1))
+    args = SimpleNamespace(
+        learning_rate=5e-5,
+        steps=2,
+        max_step_attempts=3,
+        eval_every=0,
+        seed=20261119,
+        mode='graphcredit',
+        group_size=2,
+        max_grad_norm=1.0,
+    )
+    tokenizer = SimpleNamespace(pad_token_id=0)
+
+    result = gate1.train(torch.nn.Linear(1, 1), tokenizer, args, torch.device('cpu'))
+
+    assert result['completed_steps'] == 2
+    assert result['attempted_steps'] == 4
+    assert result['skipped_steps'] == 2
+    assert policy_versions == [1, 2]
+    assert [record['step'] for record in result['history'] if not record.get('skipped')] == [1, 2]
