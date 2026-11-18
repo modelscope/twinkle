@@ -97,6 +97,11 @@ class LossMetric(Metric):
             results['loss'] = f'{avg_loss:.5f}'
         if grad_norm is not None:
             results['grad_norm'] = f'{grad_norm:.6f}'
+        if num_tokens > 0:
+            # Same channel name as the GRPO metric's; a recipe metric added later (add_metric
+            # appends) overwrites this in calculate_metrics' in-order merge, so the algorithm's
+            # own count always wins where one exists.
+            results['train/n_trainable_tokens'] = num_tokens
         for channel in sorted(channel_loss, key=lambda value: '' if value is None else str(value)):
             loss_sum, token_count = channel_loss[channel]
             if token_count > 0:

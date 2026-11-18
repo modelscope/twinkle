@@ -309,6 +309,62 @@ class TestLossMetric:
         assert m.num_tokens == 6
         assert m.calculate()['loss'] == '2.00000'
 
+    def test_sum_reduction_emits_trainable_token_channel(self):
+        # The SFT throughput channel mirrors GRPO's train/n_trainable_tokens: the window's
+        # gathered token denominator, summed over every micro-batch (3 + 5), not just the last.
+        m = _no_dist_metric(LossMetric)
+        m.accumulate(
+            {'labels': torch.tensor([1])},
+            {'loss': torch.tensor(3.0), 'num_tokens': torch.tensor(3.0)},
+            loss_reduction='sum',
+        )
+        m.accumulate(
+            {'labels': torch.tensor([1])},
+            {'loss': torch.tensor(5.0), 'num_tokens': torch.tensor(5.0)},
+            loss_reduction='sum',
+        )
+        assert m.calculate()['train/n_trainable_tokens'] == 8
+
+    def test_token_channel_absent_without_sum_reduction(self):
+        # mean-reduction never counts tokens; a fabricated 0 channel would read as "no tokens
+        # trained" rather than "not measured".
+        m = _no_dist_metric(LossMetric)
+        m.accumulate({'labels': torch.tensor([1])}, {'loss': torch.tensor(3.0)})
+        assert 'train/n_trainable_tokens' not in m.calculate()
+
+    def test_token_channel_counts_labels_fallback(self):
+        # Without outputs['num_tokens'] the channel must ride the same labels >= 0 fallback as
+        # the loss denominator: the 0 token counts, -100 does not, two micros give 6.
+        m = _no_dist_metric(LossMetric)
+        inputs = {'labels': torch.tensor([[1, 0, -100, 3]])}
+        m.accumulate(inputs, {'loss': torch.tensor(6.0)}, loss_reduction='sum')
+        m.accumulate(inputs, {'loss': torch.tensor(6.0)}, loss_reduction='sum')
+        assert m.calculate()['train/n_trainable_tokens'] == 6
+
+    def test_token_channel_gathers_across_ranks(self):
+        # The channel is DP-global: two ranks' 3 + 5 must sum to 8, not report rank-local 3.
+        m = _no_dist_metric(LossMetric)
+        rows = [{'loss': 1.0, 'count': 1, 'grad_norm': None, 'num_tokens': 3, 'channel_loss': {}},
+                {'loss': 1.0, 'count': 1, 'grad_norm': None, 'num_tokens': 5, 'channel_loss': {}}]
+        m.gather_results = lambda local: rows
+        assert m.calculate()['train/n_trainable_tokens'] == 8
+
+    def test_token_channel_resets_between_windows(self):
+        # Per-step window semantics: the second calculate reports 5, not the cumulative 8.
+        m = _no_dist_metric(LossMetric)
+        m.accumulate(
+            {'labels': torch.tensor([1])},
+            {'loss': torch.tensor(3.0), 'num_tokens': torch.tensor(3.0)},
+            loss_reduction='sum',
+        )
+        m.calculate()
+        m.accumulate(
+            {'labels': torch.tensor([1])},
+            {'loss': torch.tensor(5.0), 'num_tokens': torch.tensor(5.0)},
+            loss_reduction='sum',
+        )
+        assert m.calculate()['train/n_trainable_tokens'] == 5
+
     def test_mean_without_num_tokens_averages_over_steps(self):
         m = _no_dist_metric(LossMetric)
         m.accumulate({'labels': torch.tensor([1])}, {'loss': torch.tensor(3.0)})
