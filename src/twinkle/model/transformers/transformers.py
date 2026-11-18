@@ -2317,6 +2317,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             lr_scheduler.step(**kwargs)
 
     @remote_function()
+    @timed
     def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], torch.Tensor]],
                  **kwargs):
         """Set the loss instance.
@@ -2333,6 +2334,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config.set_loss(construct_class(loss_cls, Loss, twinkle.loss, **kwargs), loss_key=loss_key)
 
     @remote_function(dispatch='all')
+    @timed
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str, Optimizer], **kwargs):
         """Set the optimizer.
 
@@ -2436,6 +2438,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         return params
 
     @remote_function()
+    @timed
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str, LRScheduler], **kwargs):
         """Set the lr_scheduler.
 
@@ -3234,6 +3237,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         config.modules_to_save = list(dict.fromkeys(expanded))
 
     @remote_function()
+    @timed
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         """Add adapter to model.
 
@@ -3247,6 +3251,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         self._patch_adapter(adapter_name, config_or_dir, **kwargs)
 
     @remote_function()
+    @timed
     def set_template(self, template_cls: Union[Type[Template], str, Template], **kwargs):
         """Set template. This is optional, if you need to input `Trajectory`,
             you need to set the template to encode them.
@@ -3264,6 +3269,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config.template = construct_template(template_cls, **kwargs)
 
     @remote_function()
+    @timed
     def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor, Callable], **kwargs):
         """Set task processor to prepare the task inputs.
         Args:
@@ -3295,6 +3301,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config.scaler = GradScaler(**grad_scaler_config)
 
     @remote_function()
+    @timed
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         """Add an eval metric
 
