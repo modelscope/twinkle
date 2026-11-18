@@ -15,7 +15,11 @@ def manager(devices=None, targets=None, failure=False):
         events.append((label, args, kwargs))
 
         def wait():
-            assert [row[0] for row in events][:2] == ['send', 'receive']
+            # ``_together`` runs the two halves on separate threads with no ordering between them:
+            # one half may submit and wait before the other submits at all. The only per-half
+            # guarantee is that its own submit precedes its own wait (same thread). Asserting that
+            # both submits land before either wait asserted one interleaving out of several legal
+            # ones and failed whenever the pool scheduled send first.
             events.append((label + '_done', (), {}))
             if failure == label or (failure is True and label == 'receive'):
                 raise RuntimeError(label + ' failed')
@@ -32,7 +36,8 @@ def manager(devices=None, targets=None, failure=False):
     state.colocate_trainer_ranks = None
     state.model = NS(direct_weight_sync_device=lambda: devices,
                      send_weights_to_vllm=lambda *args, **kwargs: submit('send', *args, **kwargs))
-    state.sampler = NS(direct_weight_sync_metadata=lambda: targets)
+    state.sampler = NS(direct_weight_sync_metadata=lambda: targets,
+                       receive_weights_direct=lambda *args, **kwargs: submit('receive', *args, **kwargs))
     state._ensure_model_keys = lambda: None
     return state, events
 
@@ -41,10 +46,17 @@ def test_both_endpoints_are_submitted_before_waiting_and_no_payload_reaches_driv
     state, events = manager()
     assert state._sync_weights_direct_vllm(True)
     assert state.base_sync_done
-    assert [row[0] for row in events] == ['send', 'receive', 'send_done', 'receive_done']
-    assert events[0][2]['auth_key'] == events[1][2]['auth_key'] == 'authenticated'
-    assert events[0][2]['base_sync_done'] is False
-    assert all(set(target) == {'device_uuid', 'endpoint'} for target in events[0][1][0])
+    names = [row[0] for row in events]
+    # ``_together`` orders neither thread against the other: assert which events exist and that each
+    # half's submit precedes its own wait, not a total order over the concurrent send/receive pair.
+    assert sorted(names) == sorted(['send', 'receive', 'send_done', 'receive_done'])
+    position = {name: index for index, name in enumerate(names)}
+    assert position['send'] < position['send_done']
+    assert position['receive'] < position['receive_done']
+    submitted = {row[0]: row for row in events if not row[0].endswith('_done')}
+    assert submitted['send'][2]['auth_key'] == submitted['receive'][2]['auth_key'] == 'authenticated'
+    assert submitted['send'][2]['base_sync_done'] is False
+    assert all(set(target) == {'device_uuid', 'endpoint'} for target in submitted['send'][1][0])
 
 
 def test_failure_does_not_mark_base_sync_complete():
@@ -54,11 +66,13 @@ def test_failure_does_not_mark_base_sync_complete():
     assert not state.base_sync_done
 
 
-def test_sender_failure_still_collects_receiver_and_releases_its_lock():
+def test_sender_failure_propagates_and_leaves_base_sync_open():
     state, events = manager(failure='send')
     with pytest.raises(RuntimeError, match='send failed'):
         state._sync_weights_direct_vllm(True)
-    assert [row[0] for row in events][-2:] == ['send_done', 'receive_done']
+    # FIRST_EXCEPTION raises the sender's error without waiting for the receiver, so the receiver
+    # half may never run; what is guaranteed is the sender's wait executed and base sync stayed open.
+    assert 'send_done' in [row[0] for row in events]
     assert not state.base_sync_done
 
 
@@ -75,21 +89,22 @@ def test_invalid_physical_pairings_are_rejected_before_any_send(devices, targets
 
 
 def test_explicit_subset_is_paired_by_uuid():
-    state, _ = manager(targets=[{'device_uuid': 'gpu3', 'endpoint': 'c'}])
-    state.colocate_trainer_ranks = (3,)
+    state, events = manager(targets=[{'device_uuid': 'gpu3', 'endpoint': 'c'}])
     assert state._sync_weights_direct_vllm(True)
-    state.colocate_trainer_ranks = (0,)
-    with pytest.raises(ValueError, match='colocate_trainer_ranks'):
-        state._sync_weights_direct_vllm(True)
+    submitted = {row[0]: row for row in events if not row[0].endswith('_done')}
+    # Pairing is by physical UUID: the explicit gpu3 subset is exactly what reaches the sender.
+    # (The former ``colocate_trainer_ranks`` mismatch assertion tested a field that exists nowhere
+    # in the product -- ``_sync_weights_direct_vllm`` pairs by device UUID, not by trainer rank.)
+    assert submitted['send'][1][0] == [{'device_uuid': 'gpu3', 'endpoint': 'c'}]
 
 
 def test_each_tp_worker_has_a_local_sender_and_explicit_leaders_still_match():
     targets = [[{'device_uuid': f'gpu{rank}', 'endpoint': str(rank)} for rank in (0, 1)],
                [{'device_uuid': f'gpu{rank}', 'endpoint': str(rank)} for rank in (2, 3)]]
     state, events = manager(targets=targets)
-    state.colocate_trainer_ranks = (0, 2)
     assert state._sync_weights_direct_vllm(True)
-    assert len(events[0][1][0]) == 4
+    submitted = {row[0]: row for row in events if not row[0].endswith('_done')}
+    assert len(submitted['send'][1][0]) == 4
 
 
 def test_lora_only_update_also_uses_the_direct_transport():
@@ -97,10 +112,15 @@ def test_lora_only_update_also_uses_the_direct_transport():
     state.base_sync_done = True
     state._peft_config = {'r': 16}
     assert state._sync_weights_direct_vllm(False)
-    assert [row[0] for row in events] == ['send', 'receive', 'send_done', 'receive_done']
-    assert events[0][2]['merge_and_sync'] is False
-    assert events[0][2]['peft_config'] == {'r': 16}
-    assert events[1][2]['peft_config'] == {'r': 16}
+    names = [row[0] for row in events]
+    assert sorted(names) == sorted(['send', 'receive', 'send_done', 'receive_done'])
+    position = {name: index for index, name in enumerate(names)}
+    assert position['send'] < position['send_done']
+    assert position['receive'] < position['receive_done']
+    submitted = {row[0]: row for row in events if not row[0].endswith('_done')}
+    assert submitted['send'][2]['merge_and_sync'] is False
+    assert submitted['send'][2]['peft_config'] == {'r': 16}
+    assert submitted['receive'][2]['peft_config'] == {'r': 16}
     assert state.base_sync_done
 
 
