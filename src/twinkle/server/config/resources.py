@@ -23,6 +23,9 @@ SHARED_WORKER_ENV_KEYS: tuple[str, ...] = (
     "TWINKLE_TELEMETRY_ENDPOINT",
     "TWINKLE_TELEMETRY_INTERVAL",
     "TWINKLE_MODEL_ID_ALIASES",
+    # Must reach every backend worker (RayRuntime.deployment_options), not just the
+    # deployment replica: run_worker_setup_hook reads it to register startup plugins.
+    "TWINKLE_WORKER_SETUP_HOOK",
 )
 
 
