@@ -104,8 +104,10 @@ class BroadcastOperation:
                 # A stale wire-probe from the subscription rendezvous: drain it and keep waiting for
                 # the manifest topic (the slow-joiner re-probe leaves extra probes in a fast receiver).
 
-        # Broadcast tensor data via NCCL
-        _pg_broadcast(self.pg, self.bucket, src=0)
+        # An empty final bucket still sends its manifest to terminate the stream.
+        length = self.metadata['length']
+        if length:
+            _pg_broadcast(self.pg, self.bucket[:length], src=0)
 
     async def wait_for_complete(self) -> dict[str, TensorMeta]:
         """Wait for the broadcast operation to complete.
@@ -457,7 +459,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
                     bucket=send_buf,
                     metadata={
                         'bucket_meta': bucket_meta,
-                        'is_last': False
+                        'is_last': False,
+                        'length': offset,
                     },
                     socket=self.socket,
                     topic=self.topic,
@@ -496,7 +499,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
             bucket=send_buf,
             metadata={
                 'bucket_meta': bucket_meta,
-                'is_last': True
+                'is_last': True,
+                'length': offset,
             },
             socket=self.socket,
             topic=self.topic,
@@ -536,7 +540,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
             auth_key=self.auth_key,
         )
         metadata = await broadcast_op.wait_for_complete()
-        total_bytes += self.bucket_size
+        total_bytes += metadata['length']
         total_params += len(metadata['bucket_meta'])
 
         # Swap buffers
@@ -563,7 +567,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
             # 3. Wait for next bucket
             metadata = await broadcast_op.wait_for_complete()
-            total_bytes += self.bucket_size
+            total_bytes += metadata['length']
             total_params += len(metadata['bucket_meta'])
 
             # 4. Swap buffers
@@ -580,5 +584,5 @@ class NCCLCheckpointEngine(CheckpointEngine):
         elapsed = time.time() - start_time
         bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024)
         logger.info(f'receive_weights done: rank={self.rank}, '
-                    f'params={total_params}, '
+                    f'params={total_params}, bytes={total_bytes}, '
                     f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')

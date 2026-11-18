@@ -1045,7 +1045,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         loss_mask = (labels != -100).bool()
                         masked_labels = labels.clone()
                         masked_labels[~loss_mask] = 0
-                        output_tensor.div_(temperature)
+                        if temperature != 1.0:
+                            output_tensor.div_(temperature)
                         if _loss_require_entropy:
                             logps, entropies = selective_log_softmax(output_tensor, masked_labels, return_entropy=True)
                         else:
