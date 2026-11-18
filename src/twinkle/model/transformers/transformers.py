@@ -964,6 +964,31 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     raise ValueError(f'output_fields requested {field!r} but this forward produced none')
         return return_outputs
 
+    def _strip_encoder_position_ids(self, model, inputs):
+        """Drop twinkle's synthetic ``position_ids`` for encoder backbones that derive their own.
+
+        BERT/RoBERTa/XLM-R embeddings expose ``create_position_ids_from_input_ids`` and, when
+        ``token_type_ids`` is absent, gather the registered token-type buffer using
+        ``position_ids`` as the index (``modeling_xlm_roberta.py`` embeddings.forward). twinkle
+        pads ``position_ids`` with -1 (a last-valid-token pooling sentinel), which is out of
+        bounds for that gather and triggers a CUDA device-side assert (defect85, first hit on
+        bge-reranker-base cross-encoder training). Causal LMs have no
+        ``create_position_ids_from_input_ids`` and consume the -1 padding through rotary
+        masking, so this branch never fires for them. For encoder models we let HF derive
+        position_ids from input_ids (padded slots get ``padding_idx``, masked downstream) by
+        handing the model a copy of the batch without the synthetic position_ids; the caller's
+        original dict keeps position_ids for pooling.
+        """
+        if 'position_ids' not in inputs or 'input_ids' not in inputs:
+            return inputs
+        derives = getattr(model, '_twinkle_derives_position_ids', None)
+        if derives is None:
+            derives = any(hasattr(m, 'create_position_ids_from_input_ids') for m in model.modules())
+            model._twinkle_derives_position_ids = derives
+        if not derives:
+            return inputs
+        return {k: v for k, v in inputs.items() if k != 'position_ids'}
+
     def _forward_with_task_readout(self, unwrapped_model, task, inputs, adapter_name=None):
         """Model call for tasks whose registry row carries a readout kind (``TaskSpec.readout``).
 
@@ -981,6 +1006,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         normal call too -- the task's context patch above surfaces that built head.
         """
         spec = get_task_spec(task)
+        inputs = self._strip_encoder_position_ids(unwrapped_model, inputs)
         if not spec.readout:
             return self.model(**inputs, use_cache=False)
         spec_obj = get_task_spec_obj(task)
