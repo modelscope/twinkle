@@ -132,6 +132,22 @@ class DeviceMesh:
                 world_size *= tp_size
         if ep_size is not None and ep_size > 1 and ep_fsdp_size is None:
             ep_fsdp_size = world_size // ep_size
+        # Fail with an actionable message BEFORE the reshape: a layout whose declared axes do not
+        # tile world_size (e.g. parallel_spec fsdp2 with nproc_per_node=4) otherwise dies as a bare
+        # numpy "cannot reshape array of size 4 into shape (2,1)", preempting every caller's own
+        # size guard (swift build_dp_mesh's "implies N ranks but nproc_per_node=M" never runs).
+        known_prod = 1
+        for size in mesh_dim_sizes:
+            if size != -1:
+                known_prod *= size
+        residual = -1 in mesh_dim_sizes
+        if (residual and (known_prod <= 0 or world_size % known_prod != 0)) or (
+                not residual and known_prod != world_size):
+            layout = dict(zip(mesh_dim_names, mesh_dim_sizes))
+            raise ValueError(
+                f'parallel layout {layout} does not tile world_size={world_size} '
+                f'(declared axes imply {known_prod} ranks{" with a residual axis" if residual else ""}); '
+                'size the ranks (nproc_per_node / world_size) or the layout so they agree.')
         return DeviceMesh(
             device_type=device_type,
             mesh=np.arange(world_size).reshape(mesh_dim_sizes),
