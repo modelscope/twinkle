@@ -294,13 +294,17 @@ class InfonceLoss(EmbeddingLoss):
         """InfoNCE with only the per-sample negatives (no cross-sample sharing)."""
         if can_batched:
             sentences = torch.stack(split_tensors, dim=0)  # [B, neg+2, D]
-            similarity_matrix = torch.matmul(sentences[:, 0:1], sentences[:, 1:].transpose(1, 2)) / self.temperature
+            similarity_matrix = torch.matmul(sentences[:, 0:1], sentences[:, 1:].transpose(1, 2))
+            if self.temperature != 1.0:
+                similarity_matrix = similarity_matrix / self.temperature
             labels = torch.zeros(len(split_tensors), dtype=torch.int64, device=sentences.device)
             return nn.CrossEntropyLoss()(similarity_matrix.squeeze(1), labels)
 
         loss = 0
         for tensor in split_tensors:
-            similarity_matrix = torch.matmul(tensor[0], tensor[1:].T) / self.temperature
+            similarity_matrix = torch.matmul(tensor[0], tensor[1:].T)
+            if self.temperature != 1.0:
+                similarity_matrix = similarity_matrix / self.temperature
             labels = torch.tensor(0, device=tensor.device)
             loss = loss + nn.CrossEntropyLoss()(similarity_matrix, labels)
         return loss / len(split_tensors)
@@ -353,7 +357,9 @@ class InfonceLoss(EmbeddingLoss):
         else:
             similarity_matrix = torch.cat(logits_list, dim=1)
 
-        return nn.CrossEntropyLoss()(similarity_matrix / self.temperature, labels)
+        if self.temperature != 1.0:
+            similarity_matrix = similarity_matrix / self.temperature
+        return nn.CrossEntropyLoss()(similarity_matrix, labels)
 
     def _in_batch_loss_unbatched(self, split_tensors) -> torch.Tensor:
         # docs from every sample concatenated as a shared negative bank
@@ -383,7 +389,9 @@ class InfonceLoss(EmbeddingLoss):
                 dd_vec[length] = float('-inf')
                 logits_parts.append(dd_vec)
 
-            logits_row = torch.cat(logits_parts, dim=-1) / self.temperature
+            logits_row = torch.cat(logits_parts, dim=-1)
+            if self.temperature != 1.0:
+                logits_row = logits_row / self.temperature
             loss = loss + nn.CrossEntropyLoss()(logits_row.unsqueeze(0), target.unsqueeze(0))
             length += tensor.size(0) - 1
         return loss / len(split_tensors)

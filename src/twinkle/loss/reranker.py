@@ -108,7 +108,9 @@ class ListwiseRerankerLoss(Loss):
             if labels[start] != 1:
                 continue
             target = torch.zeros(1, dtype=torch.long, device=logits.device)
-            group_loss = loss_fct((group_logits / self.temperature).unsqueeze(0), target)
+            if self.temperature != 1.0:
+                group_logits = group_logits / self.temperature
+            group_loss = loss_fct(group_logits.unsqueeze(0), target)
             total_loss = group_loss if total_loss is None else total_loss + group_loss
             num_groups += 1
 

@@ -412,12 +412,15 @@ def replayed_selective_log_softmax(
         positions[row_ids, 0],
         positions[row_ids, 1],
         kept_token_ids,
-    ].float() / temperature
+    ].float()
     selected_logits = logits[
         positions[:, 0],
         positions[:, 1],
         sampled_labels,
-    ].float() / temperature
+    ].float()
+    if temperature != 1.0:
+        kept_logits = kept_logits / temperature
+        selected_logits = selected_logits / temperature
 
     # Use max-shifted log-sum-exp for numerically stable restricted softmax.
     row_max = torch.full(

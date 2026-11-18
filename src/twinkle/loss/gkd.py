@@ -170,24 +170,17 @@ class GKDLoss(Loss):
         import torch.nn.functional as F
 
         # ── Top-k reduction ──────────────────────────────────────────────────
-        # Top-k mode: gather/topk first to get small [*, k] tensors, then scale in-place
         if teacher_topk_logprobs is not None and teacher_topk_indices is not None:
             # Remote API teacher: teacher already provides top-k log-probs (T=1).
-            # Gather student logits at teacher's top-k indices, then scale in-place.
             teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
             teacher_topk_logprobs = teacher_topk_logprobs.to(student_logits.device)
             student_logits = torch.gather(student_logits, dim=-1, index=teacher_topk_indices)
-            student_logits.div_(temperature)
-            teacher_logits = teacher_topk_logprobs / temperature
-            temperature = 1.0
+            teacher_logits = teacher_topk_logprobs
         elif topk is not None and teacher_logits is not None:
             # Local teacher: select top-k from teacher, gather corresponding student logits
             teacher_logits = teacher_logits.to(student_logits.device)
             teacher_logits, topk_idx = torch.topk(teacher_logits, k=topk, dim=-1)
-            teacher_logits.div_(temperature)
             student_logits = torch.gather(student_logits, dim=-1, index=topk_idx)
-            student_logits.div_(temperature)
-            temperature = 1.0
 
         if teacher_logits is not None and teacher_logits.device != student_logits.device:
             teacher_logits = teacher_logits.to(student_logits.device)
@@ -210,12 +203,16 @@ class GKDLoss(Loss):
             num_valid = mask.sum()
             # ``[mask]`` already created fresh storage, so in-place divide is safe
             # and avoids an extra [num_valid, V] allocation.
-            student_logits.div_(temperature)
-            teacher_logits.div_(temperature)
+            if temperature != 1.0:
+                student_logits.div_(temperature)
+                teacher_logits.div_(temperature)
         else:
             # Keep logits, may be an infer scenario
-            student_logits = student_logits.reshape(-1, student_logits.size(-1)) / temperature
-            teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1)) / temperature
+            student_logits = student_logits.reshape(-1, student_logits.size(-1))
+            teacher_logits = teacher_logits.reshape(-1, teacher_logits.size(-1))
+            if temperature != 1.0:
+                student_logits = student_logits / temperature
+                teacher_logits = teacher_logits / temperature
             num_valid = student_logits.size(0)
 
         if num_valid == 0:
