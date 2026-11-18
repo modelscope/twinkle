@@ -306,7 +306,11 @@ async def test_forward_backward_preflights_loss_inputs_before_backend() -> None:
             'labels': [-100, 5],
         } for index in range(3)],
         adapter_name='adapter',
-        loss_kwargs={'old_logps': [[-0.1], [-0.2], [-0.3]]}, training_id='training-a',
+        loss_kwargs={
+            'old_logps': [[-0.1], [-0.2], [-0.3]],
+            'advantages': [[0.1], [-0.2], [0.3]],
+            'teacher_logps': [[-0.4], [-0.5], [-0.6]],
+        }, training_id='training-a',
     )
 
     await route.endpoint(request, body, management)
@@ -320,6 +324,66 @@ async def test_forward_backward_preflights_loss_inputs_before_backend() -> None:
     assert management.model_calls[0][0] == 'preflight'
     assert management.model_calls[-1][0] != 'preflight'
     assert management.model_calls[-1][1] == 'training-a'
+    assert management.model_calls[-1][2] == body.loss_kwargs
+
+
+@pytest.mark.asyncio
+async def test_forward_backward_restores_gkd_logits_before_batch_slicing() -> None:
+    import torch
+
+    from twinkle.infra.dispatch import _dispatch_args
+    from twinkle.loss.gkd import GKDLoss
+    from twinkle.utils.device_mesh import DeviceMesh
+
+    management = _SchedulingManagement()
+    app = FastAPI()
+    _register_model_twinkle_routes(app, lambda: management)
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward')
+    request = Request({'type': 'http', 'headers': []})
+    request.state.session_id = 'session'
+    logits = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3)
+    body = types.ForwardBackwardTaskRequest(
+        inputs=[{'input_ids': [index, index + 1]} for index in range(4)],
+        adapter_name='adapter',
+        training_id='training-a',
+        loss_kwargs={'teacher_logits': logits.tolist()},
+    )
+
+    await route.endpoint(request, body, management)
+
+    inputs, _, kwargs = management.model_calls[-1]
+    teacher = kwargs['teacher_logits']
+    assert teacher.dtype == torch.float32 and teacher.device.type == 'cpu'
+    torch.testing.assert_close(teacher, logits)
+    mesh = DeviceMesh.from_sizes(device_type='cpu', dp_size=2)
+    shards = _dispatch_args([0, 1], 'slice_dp', 'all', mesh, (), dict(kwargs, inputs=inputs))
+    for rank, _, shard in shards:
+        assert [row['input_ids'][0].item() for row in shard['inputs']] == [2 * rank, 2 * rank + 1]
+        torch.testing.assert_close(shard['teacher_logits'], logits[2 * rank:2 * rank + 2])
+        micro_batch = GKDLoss().micro_batch_kwargs(shard, [1], batch_size=2)
+        assert micro_batch['inputs'] == [shard['inputs'][1]]
+        torch.testing.assert_close(micro_batch['teacher_logits'], logits[[2 * rank + 1]])
+
+
+@pytest.mark.asyncio
+async def test_forward_backward_rejects_gkd_logits_with_wrong_batch_size() -> None:
+    management = _SchedulingManagement()
+    app = FastAPI()
+    _register_model_twinkle_routes(app, lambda: management)
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_backward')
+    request = Request({'type': 'http', 'headers': []})
+    request.state.session_id = 'session'
+    body = types.ForwardBackwardTaskRequest(
+        inputs=[{'input_ids': [1, 2]}, {'input_ids': [2, 3]}],
+        adapter_name='adapter',
+        training_id='training-a',
+        loss_kwargs={'teacher_logits': [[[0.1, 0.2], [0.3, 0.4]]]},
+    )
+
+    with pytest.raises(ValueError, match='teacher_logits must have shape'):
+        await route.endpoint(request, body, management)
+
+    assert not management.model_calls
 
 
 @pytest.mark.asyncio

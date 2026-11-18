@@ -11,6 +11,7 @@ obtain the ModelManagement instance at request time.
 """
 from __future__ import annotations
 
+import asyncio
 import torch
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -134,6 +135,15 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                     if isinstance(inputs[key], list) and isinstance(first_element(inputs[key]), (int, float)):
                         inputs[key] = torch.tensor(inputs[key])
             kwargs = backend_kwargs(body)
+            teacher_logits = kwargs.get('teacher_logits')
+            if isinstance(teacher_logits, list):
+                # Restore the dense GKD tensor on CPU before splitting the batch across workers.
+                teacher_logits = await asyncio.to_thread(torch.as_tensor, teacher_logits, dtype=torch.float32,
+                                                         device='cpu')
+                if teacher_logits.ndim != 3 or teacher_logits.shape[0] != len(all_inputs) or not teacher_logits.numel():
+                    raise ValueError('teacher_logits must have shape [batch_size, sequence_length, vocab_size] '
+                                     'with one row per input and non-empty sequence and vocabulary axes.')
+                kwargs['teacher_logits'] = teacher_logits
             resolved_adapter_name = self.resolve_model_adapter_name(adapter_name)
             preflight = getattr(self.model, 'preflight_loss_inputs', None)
             if preflight is not None and any(key in kwargs for key in ('old_logps', 'ref_logps', 'advantages')):
