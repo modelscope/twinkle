@@ -2623,8 +2623,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config = self.optimizer_group[adapter_name]
         optimizer_config.require_finalized('save training state')
         optimizer = optimizer_config.optimizer
-        pending_gradients = optimizer is not None and any(
-            parameter.grad is not None for group in optimizer.param_groups for parameter in group['params'])
+        # A strategy that owns the update step also owns the gradient lifecycle: ZeRO-offload
+        # keeps its flat fp32 partition grad buffer non-None on CPU after a COMPLETE step, so
+        # param.grad is not a pending-backward signal there -- require_finalized and the
+        # accumulation-window check are. Non-offload engines null the grad after stepping, so
+        # skipping the heuristic changes nothing for them.
+        pending_gradients = (optimizer is not None and not self.strategy.owns_update_step()
+                             and any(parameter.grad is not None
+                                     for group in optimizer.param_groups for parameter in group['params']))
         if optimizer_config.cur_step % optimizer_config.gradient_accumulation_steps or pending_gradients:
             raise ValueError(
                 'save_optimizer=True requires a complete gradient accumulation window; '
