@@ -207,6 +207,51 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 
 The rest of the data processing, training loop, checkpoint saving, and other code remains exactly the same.
 
+## Client Training Learning Path
+
+Use a fixed set of held-out questions to compare the model before and after training. Keep training examples, scoring, and evaluation separate so you can diagnose changes when bringing your own task.
+
+| Stage | Exercise | What to learn |
+|---|---|---|
+| 1. SFT | [Self-cognition fine-tuning](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/self_cognition.py) | Predict the next token from a reference response. Inspect which tokens carry labels and which parameters LoRA updates. |
+| 2. DPO (optional) | [Preference fine-tuning](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/dpo.py) | Use a preferred and a rejected answer to the same prompt to teach relative preferences. |
+| 3. GRPO | [Short-answer math](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/short_math_grpo.py) | Sample multiple answers, reward correctness and brevity, and turn within-group differences into advantages. |
+| 4. Online distillation | [The multiplication exercise below](#client-online-distillation) | Compare vocabulary distributions, token advantages, and self-distillation on the student's own replies. |
+| 5. Agentic RL | [Blackjack below](#client-async-grpo) | Follow a multi-turn trajectory through tools, observations, environment rewards, and overlapping sampling and training. |
+
+To bring your own task, replace the questions and targets, then write a reward or worked solution you can verify independently. For tool training, inspect one complete episode before increasing concurrency. Use held-out tasks to measure accuracy, format, tool success, and output cost. In your own project, use SFT to teach the response format or tool calls first. Start reward training from that checkpoint and retain evaluation results for each stage.
+
+(client-online-distillation)=
+## Online Distillation
+
+[One client script](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/online_distillation.py) trains Qwen3.5-0.8B on short multiplication with thinking disabled. Read `train()` for sampling, updating, publishing, and evaluation. Then read `distillation_signal()` to see how the methods score the same sampled replies.
+
+| Method | Teacher signal | Server devices |
+|---|---|---|
+| OPSD | The current student sees a worked solution and scores its original reply token by token. | Two GPUs for Transformers and vLLM |
+| OPD-RL | Frozen Qwen3.5-2B scores the original reply. The teacher logprob minus the rollout logprob becomes the token advantage. | One additional teacher GPU |
+| GKD | The same frozen teacher returns a full vocabulary distribution. One sample per step limits the logits sent over HTTP. | Same as OPD-RL |
+
+Run from a Twinkle source checkout with this example and GKD HTTP support. On CUDA, install the server with `python -m pip install -e '.[client,rl,server]'`. A separate client environment can use `python -m pip install -e '.[client]'`. Both environments need the Swift dev template API. Set up the device-specific PyTorch and vLLM runtime first on PPU.
+
+```bash
+python -m pip install 'ms-swift @ git+https://github.com/modelscope/ms-swift.git@e1ac89d24f47cb8fd73a7245dd79df0959aec284' 'qwen-vl-utils>=0.0.14'
+modelscope download --model Qwen/Qwen3.5-0.8B --local_dir ./models/Qwen3.5-0.8B
+export TWINKLE_DISTILL_STUDENT_PATH="$PWD/models/Qwen3.5-0.8B"
+CUDA_VISIBLE_DEVICES=0,1 twinkle-server launch -c cookbook/client/server/transformer/distillation.yaml
+```
+
+Wait for vLLM warm-up and the server message `All applications started`. In a second terminal, run:
+
+```bash
+export TWINKLE_DISTILL_STUDENT_PATH="$PWD/models/Qwen3.5-0.8B"
+python cookbook/client/twinkle/online_distillation.py --method opsd --steps 4
+```
+
+For OPD-RL or GKD, prepare `Qwen/Qwen3.5-2B` in both environments and set `TWINKLE_DISTILL_TEACHER_PATH` to its local directory. Launch the same [configuration](https://github.com/modelscope/twinkle/blob/main/cookbook/client/server/transformer/distillation.yaml) with `CUDA_VISIBLE_DEVICES=0,1,2` and use `--method opd-rl` or `--method gkd`. For a remote server, use the server URL and token described above. If the student directories differ, set `TWINKLE_DISTILL_SERVER_STUDENT_PATH` in the client to the server-side directory.
+
+Compare accuracy and output length on the same held-out questions in `eval=before` and `eval=after`. Answers must match the single-integer format exactly, so the score also measures format compliance. Four steps demonstrate the flow. For learning comparisons, match the held-out questions, number of training samples, and sampling settings, then repeat with different seeds.
+
 (client-async-grpo)=
 ## Client-side Async GRPO
 

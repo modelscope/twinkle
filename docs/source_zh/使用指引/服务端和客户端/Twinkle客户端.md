@@ -206,6 +206,51 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 
 其余数据处理、训练循环、检查点保存等代码完全相同。
 
+## 客户端训练学习路线
+
+每一章都可以先用一批固定的留出题测基线，训练后再测同一批。把训练数据、评分和评测分开，换自己的任务时仍能判断哪一步起了作用。
+
+| 顺序 | 练习 | 看懂什么 |
+|---|---|---|
+| 1. SFT | [自我认知微调](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/self_cognition.py) | 用标准答案做下一 token 预测。看为什么只给助手回复打标签，以及如何用 LoRA 更新局部参数。 |
+| 2. DPO（选学） | [偏好微调](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/dpo.py) | 同一道题配较好和较差的回答，学习如何增加相对偏好。 |
+| 3. GRPO | [短答案数学](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/short_math_grpo.py) | 让模型对同一道题生成多个答案，用对错和长度给分，再用组内相对奖励决定更新方向。 |
+| 4. 在线蒸馏 | [下方的短乘法练习](#client-online-distillation) | 保留学生自己的回复，对比整词表分布、逐 token advantage 和自蒸馏三种训练信号。 |
+| 5. Agentic RL | [下方的 Blackjack](#client-async-grpo) | 将一条回复扩展为多轮轨迹。工具返回观察，环境给奖励，训练用实际生成的 token，采样与训练可以重叠。 |
+
+换成自己的任务时，先替换题目和标准答案，再写能独立检查的奖励或参考解法。接入工具后，用一条完整轨迹核对模型看到的消息、工具返回和终止条件。逐步增加组大小和并发，用留出题查正确率、格式、工具成功率与输出成本。把这几章串成自己的项目时，让 SFT 先教会模型输出格式或工具调用，再从该权重出发做奖励训练，逐阶段保留 checkpoint 和同题评测。
+
+(client-online-distillation)=
+## 在线蒸馏入门
+
+[同一份客户端脚本](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/online_distillation.py) 用 Qwen3.5-0.8B 学习短乘法，关闭 thinking。先看 `train()` 的采样、更新、发布和评测，再看 `distillation_signal()` 如何为同一批回复构造训练信号。
+
+| 方法 | 教师信号 | 服务端设备 |
+|---|---|---|
+| OPSD | 当前学生看参考解法，对原回复逐 token 打分。 | 两张卡，运行 Transformers 和 vLLM |
+| OPD-RL | 冻结的 Qwen3.5-2B 对原回复打分。教师 logprob 减去学生采样 logprob，得到每个 token 的 advantage。 | 增加一张教师卡 |
+| GKD | 同一冻结教师给出整词表分布。每步一题，控制全词表 logits 的 HTTP 传输量。 | 同 OPD-RL |
+
+从包含此示例和 GKD HTTP 支持的 Twinkle 源码目录运行。CUDA 服务端使用 `python -m pip install -e '.[client,rl,server]'`。独立的客户端环境使用 `python -m pip install -e '.[client]'`。两端都需要 Swift dev 的模板接口，可安装下面的版本。使用 PPU 时先按设备文档配置专用 PyTorch 和 vLLM 环境。
+
+```bash
+python -m pip install 'ms-swift @ git+https://github.com/modelscope/ms-swift.git@e1ac89d24f47cb8fd73a7245dd79df0959aec284' 'qwen-vl-utils>=0.0.14'
+modelscope download --model Qwen/Qwen3.5-0.8B --local_dir ./models/Qwen3.5-0.8B
+export TWINKLE_DISTILL_STUDENT_PATH="$PWD/models/Qwen3.5-0.8B"
+CUDA_VISIBLE_DEVICES=0,1 twinkle-server launch -c cookbook/client/server/transformer/distillation.yaml
+```
+
+等服务端预热 vLLM 并显示 `All applications started`。在另一个终端执行：
+
+```bash
+export TWINKLE_DISTILL_STUDENT_PATH="$PWD/models/Qwen3.5-0.8B"
+python cookbook/client/twinkle/online_distillation.py --method opsd --steps 4
+```
+
+运行 OPD-RL 或 GKD 时，在两端准备 `Qwen/Qwen3.5-2B` 并通过 `TWINKLE_DISTILL_TEACHER_PATH` 指向本地模型目录。用 `CUDA_VISIBLE_DEVICES=0,1,2` 启动同一份[配置](https://github.com/modelscope/twinkle/blob/main/cookbook/client/server/transformer/distillation.yaml)，将 `--method` 改为 `opd-rl` 或 `gkd`。远程连接沿用上文的服务地址和令牌配置。如果两端的学生模型目录不同，在客户端另设 `TWINKLE_DISTILL_SERVER_STUDENT_PATH` 为服务端的学生目录。
+
+比较 `eval=before` 和 `eval=after` 中同一留出题的准确率和输出长度。答案严格匹配单个整数，分数包含格式遵循。四步用来读懂训练流程。做效果对比时固定留出题、实际训练样本数和采样设置，并用不同种子复跑。
+
 (client-async-grpo)=
 ## 客户端异步 GRPO
 

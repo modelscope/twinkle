@@ -1,0 +1,81 @@
+# Two GPUs for OPSD. The external teacher starts on a third GPU when GKD or OPD-RL requests it.
+http_options:
+  host: 127.0.0.1
+  port: 8000
+telemetry:
+  enabled: false
+persistence:
+  mode: memory
+
+applications:
+  - name: server
+    import_path: server
+    route_prefix: /api/v1
+    args:
+      supported_models: [distill-student]
+    deployments:
+      - name: GatewayServer
+
+  - name: student
+    import_path: model
+    route_prefix: /api/v1/model/distill-student
+    args:
+      backend: transformers
+      model_id: ${oc.env:TWINKLE_DISTILL_STUDENT_PATH}
+      train_mode: lora
+      task_type: causal_lm
+      min_replicas: 0
+      max_replicas: 1
+      idle_timeout_s: 900
+      max_r: 8
+      max_loras: 2
+      target_modules: [q_proj, v_proj]
+      max_length: 256
+      mixed_precision: bf16
+      gradient_checkpointing: false
+      nproc_per_node: 1
+      device_group: {name: student, ranks: 1, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 1}
+    deployments:
+      - name: ModelManagement
+
+  - name: sampler
+    import_path: sampler
+    route_prefix: /api/v1/sampler/distill-student
+    args:
+      model_id: ${oc.env:TWINKLE_DISTILL_STUDENT_PATH}
+      sampler_type: vllm
+      min_replicas: 1  # Warm vLLM before the first client request.
+      max_replicas: 1
+      nproc_per_node: 1
+      device_group: {name: sampler, ranks: 1, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 1}
+      engine_args:
+        max_model_len: 256
+        gpu_memory_utilization: 0.35
+        enforce_eager: true
+        enable_lora: true
+        max_lora_rank: 8
+        logprobs_mode: processed_logprobs
+    deployments:
+      - name: SamplerManagement
+
+  - name: teacher
+    import_path: model
+    route_prefix: /api/v1/model/distill-teacher
+    args:
+      backend: transformers
+      model_id: ${oc.env:TWINKLE_DISTILL_TEACHER_PATH,ms://Qwen/Qwen3.5-2B}
+      train_mode: full
+      task_type: causal_lm
+      min_replicas: 0
+      max_replicas: 1
+      idle_timeout_s: 900
+      max_length: 256
+      mixed_precision: bf16
+      gradient_checkpointing: false
+      nproc_per_node: 1
+      device_group: {name: teacher, ranks: 1, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 1}
+    deployments:
+      - name: ModelManagement
