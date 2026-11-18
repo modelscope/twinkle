@@ -296,6 +296,17 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             cfg = getattr(cfg, 'config', {})
         return cfg.get('zero_optimization', {}).get('stage', 0)
 
+    def param_lane_status(self) -> str:
+        cfg = self._deepspeed_plugin.deepspeed_config
+        if not isinstance(cfg, dict):
+            cfg = getattr(cfg, 'config', {})
+        zero = cfg.get('zero_optimization', {})
+        if zero.get('offload_param') or zero.get('offload_optimizer'):
+            return 'stale_view'
+        if zero.get('stage', 0) == 3:
+            return 'partitioned'
+        return 'authoritative'
+
     # -- twinkle Strategy interface -----------------------------------------
 
     def pretrained_load_context(self):

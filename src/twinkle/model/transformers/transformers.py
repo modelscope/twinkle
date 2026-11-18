@@ -2092,6 +2092,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # parameters holding bf16-representable values mean the cast happened inside the
             # distributed load itself.
             'param_dtypes': sorted({str(t.dtype) for t in self.model.parameters()}),
+            'param_lane': self.strategy.param_lane_status(),
             'optimizer_step': optimizer_step,
             'lrs': [float(g.get('lr', 0.0)) for g in optimizer.param_groups],
             'weight_decays': [float(g.get('weight_decay', 0.0)) for g in optimizer.param_groups],
