@@ -911,7 +911,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.masked_fill(~loss_mask, 0)
                 logits = outputs['logits']
-                logits.div_(temperature)
+                if temperature != 1.0:
+                    logits.div_(temperature)
                 if loss_require_entropy:
                     outputs['logps'], outputs['entropies'] = selective_log_softmax(
                         logits, masked_labels, return_entropy=True)
