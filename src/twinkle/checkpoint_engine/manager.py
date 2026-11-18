@@ -310,6 +310,9 @@ class CheckpointEngineManager:
 
     def _sync_colocate(self, merge_and_sync):
         """Weights in, trainer out, KV cache in: the sampler is ready to generate when this returns."""
+        # Backward's freed blocks are still reserved by the trainer's allocator. The
+        # sampler is another process: return those blocks before it restores its weights.
+        _wait(self.model.empty_cache())
         self._wake_sampler(['weights'])
         if not self._sync_weights_direct_vllm(merge_and_sync):
             self._sync_channel(merge_and_sync)

@@ -378,8 +378,9 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         if optimizer is not None and not moved_optimizer:
             move_optimizer_state(optimizer, torch.device('cpu'))
         record_offload(self, model=moved_model or offload_model, optimizer=moved_optimizer or optimizer is not None)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # The next process to use the device is the colocated sampler. Moving live
+        # tensors to CPU is not enough while our allocator keeps their freed blocks.
+        release_caching_allocator()
 
     def reload_to_gpu(self, model, optimizer=None) -> None:
         """Bring back the shard and optimizer state :meth:`offload_to_cpu` moved."""
