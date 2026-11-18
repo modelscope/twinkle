@@ -166,6 +166,11 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
                 # not kept; the attempt index is what tells a resampled-then-exhausted group from one
                 # the admission kept outright, which a reward column alone cannot distinguish.
                 'group_attempt': before.get('group_attempt'),
+                'group_key': before.get('group_key'),
+                'segment_index': (before.get('extra') or {}).get('segment_index'),
+                'token_lengths': before.get('token_lengths'),
+                'turns': before.get('turns'),
+                'rewards_env': (scores[index].get('rewards') or {}).get('env'),
                 'targets': added,
             }, default=str) + '\n')
             if token_root:
