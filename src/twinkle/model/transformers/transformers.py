@@ -2056,6 +2056,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     break
             if optimizer_step is not None:
                 break
+        # ZeRO-3's wrapper param_groups reference fp32 partition tensors whose inner Adam
+        # state is not reachable here; fall back to the engine's completed-update counter
+        # so compare_stepdelta can still align fresh/resume pairs by global step.
+        if optimizer_step is None:
+            _counters = self.strategy.engine_counters(self.model)
+            if _counters and 'global_steps' in _counters:
+                optimizer_step = int(_counters['global_steps'])
         # Where the loop owns the update there is no engine record bracketing it, and by the time
         # this probe runs the step has already consumed and overwritten the moments in place. The
         # read is therefore post-update and is named so: ``post(N)`` is ``pre(N+1)``, so the two
