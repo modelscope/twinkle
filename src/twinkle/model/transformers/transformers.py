@@ -1933,7 +1933,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # defect44: capture the lr this update consumes before lr_step advances the schedule,
         # so the metric record pairs step N's loss/grad_norm with step N's lr (not N+1's).
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
-        self.optimizer_group[adapter_name]._last_lrs = list(self._get_lr())
+        optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config._last_lrs = list(optimizer_config._get_lr())
         self.step(**kwargs)
         if probe:
             self._write_step_probe(probe, pre, grad, master_pre=master_pre, **kwargs)

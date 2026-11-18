@@ -1632,6 +1632,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
     @remote_function(dispatch='all', sync=True)
     @timed
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
+        # defect44: capture the lr this update consumes before lr_step advances the schedule.
+        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config._last_lrs = list(optimizer_config._get_lr())
         self.step(**kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
