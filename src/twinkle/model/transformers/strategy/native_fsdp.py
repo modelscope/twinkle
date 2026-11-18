@@ -264,11 +264,23 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             if ep_enabled:
                 _rebuild_ep_param_groups(model)
 
-            # Initialize dtype bookkeeping while trainable adapters are enabled.
-            # A first reference forward under PEFT disable_adapter() temporarily
-            # freezes them, otherwise caching no trainable parameter dtype.
-            if isinstance(model, FSDPModule):
-                model._get_fsdp_state()._lazy_init()
+            # Initialize FSDP2 dtype bookkeeping while trainable adapters are ENABLED (defect78-s2).
+            # torch FSDP2 captures each param group's _orig_dtype/_reduce_dtype ONCE at the first
+            # forward (_lazy_init's _is_root guard is never reset) from the requires_grad-filtered
+            # trainable params. A first reference forward under PEFT disable_adapter() flips lora
+            # requires_grad=False, so every lora-bearing group would capture trainable=0 ->
+            # _orig_dtype=None; the later training backward then reduce-scatters in the autograd
+            # dtype (bf16) and, with _orig_dtype=None, skips the cast back to the fp32 storage dtype,
+            # assigning a bf16 grad into a grad_dtype=Float sharded param -> torch raises. Pre-running
+            # the ROOT state's _lazy_init here makes that first forward's _lazy_init a no-op and keeps
+            # _orig_dtype=fp32. The top `model` may be a wrapper (e.g. a multimodal PeftModel) that is
+            # not itself an FSDPModule instance, so locate the outermost FSDP-managed module in the
+            # tree rather than relying on isinstance(model, FSDPModule) alone (which silently skipped
+            # this initialization for the real LoRA model).
+            fsdp_root = model if isinstance(model, FSDPModule) else next(
+                (m for m in model.modules() if isinstance(m, FSDPModule)), None)
+            if fsdp_root is not None:
+                fsdp_root._get_fsdp_state()._lazy_init()
 
         return (model, *(_rebind_optimizer(optimizer, model) if optimizer is not None else None
                          for optimizer in optimizers))
