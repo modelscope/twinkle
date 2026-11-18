@@ -2046,23 +2046,23 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # object that was just stepped.
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
         optimizer = self.optimizer_group[adapter_name].optimizer
+        # Prefer the engine's authoritative completed-update counter: optimizer.state['step']
+        # reads one ahead on zero0 (DeepSpeed increments during step before the probe reads),
+        # and is unreachable on ZeRO-3 (wrapper param_groups reference fp32 partitions).
         optimizer_step = None
-        for group in optimizer.param_groups:
-            for param in group['params']:
-                state = optimizer.state.get(param)
-                if state is not None and 'step' in state:
-                    counter = state['step']
-                    optimizer_step = int(counter.item()) if hasattr(counter, 'item') else int(counter)
-                    break
-            if optimizer_step is not None:
-                break
-        # ZeRO-3's wrapper param_groups reference fp32 partition tensors whose inner Adam
-        # state is not reachable here; fall back to the engine's completed-update counter
-        # so compare_stepdelta can still align fresh/resume pairs by global step.
+        _counters = self.strategy.engine_counters(self.model)
+        if _counters and 'global_steps' in _counters:
+            optimizer_step = int(_counters['global_steps'])
         if optimizer_step is None:
-            _counters = self.strategy.engine_counters(self.model)
-            if _counters and 'global_steps' in _counters:
-                optimizer_step = int(_counters['global_steps'])
+            for group in optimizer.param_groups:
+                for param in group['params']:
+                    state = optimizer.state.get(param)
+                    if state is not None and 'step' in state:
+                        counter = state['step']
+                        optimizer_step = int(counter.item()) if hasattr(counter, 'item') else int(counter)
+                        break
+                if optimizer_step is not None:
+                    break
         # Where the loop owns the update there is no engine record bracketing it, and by the time
         # this probe runs the step has already consumed and overwritten the moments in place. The
         # read is therefore post-update and is named so: ``post(N)`` is ``pre(N+1)``, so the two
