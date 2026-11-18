@@ -486,16 +486,17 @@ def stateless_init_process_group(
     from .platforms import Platform
     Platform.apply_vllm_patch()
 
-    from vllm.distributed.utils import StatelessProcessGroup
-
     # The platform hook decides both branches: socket-env injection (HCCL's fixed
     # base port collides across jobs) and the py communicator class to hand vLLM.
     if Platform.get_platform().ensures_socket_env():
         # fix: Stateless PG + HCCL path needs the same port policy, otherwise workers can still collide.
         from .platforms import ensure_hccl_socket_env
         ensure_hccl_socket_env(master_port)
-        from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as Communicator
+        # Temporary local copies for SGLang-only testing without vLLM installed.
+        from twinkle.checkpoint_engine._hccl_test.stateless import StatelessProcessGroup
+        from twinkle.checkpoint_engine._hccl_test.pyhccl import PyHcclCommunicator as Communicator
     else:
+        from vllm.distributed.utils import StatelessProcessGroup
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator as Communicator
 
     if device is None:
