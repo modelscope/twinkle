@@ -179,7 +179,7 @@ class OptimizerGroup(BaseOptimizerGroup):
         self.train_status = TrainStatus(metrics=train_metrics)
 
         eval_metrics = [
-            LossMetric(self._device_mesh, self._dp_group),
+            LossMetric(self._device_mesh, self._dp_group, is_training=False),
             Accuracy(self._device_mesh, self._dp_group, strategy=self.acc_strategy),
             TrainMetric(self._device_mesh, self._dp_group),
         ]

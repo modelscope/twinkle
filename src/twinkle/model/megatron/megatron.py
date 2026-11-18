@@ -147,7 +147,7 @@ class MegatronOptimizerGroup(BaseOptimizerGroup):
         self.train_status = TrainStatus(metrics=train_metrics)
 
         eval_metrics = [
-            LossMetric(self._device_mesh, self._dp_group),
+            LossMetric(self._device_mesh, self._dp_group, is_training=False),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
         self.eval_status = TrainStatus(metrics=eval_metrics)

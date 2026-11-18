@@ -365,6 +365,19 @@ class TestLossMetric:
         )
         assert m.calculate()['train/n_trainable_tokens'] == 5
 
+    def test_token_channel_absent_on_eval_instance(self):
+        # The channel counts TRAINED tokens; the eval LossMetric instance must not emit a
+        # train/-prefixed key counting eval tokens into eval records.
+        m = _no_dist_metric(LossMetric, is_training=False)
+        m.accumulate(
+            {'labels': torch.tensor([1])},
+            {'loss': torch.tensor(3.0), 'num_tokens': torch.tensor(3.0)},
+            loss_reduction='sum',
+        )
+        result = m.calculate()
+        assert 'train/n_trainable_tokens' not in result
+        assert result['loss'] == '1.00000'
+
     def test_mean_without_num_tokens_averages_over_steps(self):
         m = _no_dist_metric(LossMetric)
         m.accumulate({'labels': torch.tensor([1])}, {'loss': torch.tensor(3.0)})

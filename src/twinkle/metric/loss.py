@@ -13,8 +13,9 @@ class LossMetric(Metric):
         process_group: The process group to collect data from
     """
 
-    def __init__(self, device_mesh, process_group, **kwargs):
+    def __init__(self, device_mesh, process_group, is_training=True, **kwargs):
         super().__init__(device_mesh, process_group, **kwargs)
+        self.is_training = is_training
         self.total_loss = 0
         self.total_count = 0
         # ``None`` means no gradient norm reached this metric, and must stay distinguishable from a
@@ -97,10 +98,11 @@ class LossMetric(Metric):
             results['loss'] = f'{avg_loss:.5f}'
         if grad_norm is not None:
             results['grad_norm'] = f'{grad_norm:.6f}'
-        if num_tokens > 0:
+        if num_tokens > 0 and self.is_training:
             # Same channel name as the GRPO metric's; a recipe metric added later (add_metric
             # appends) overwrites this in calculate_metrics' in-order merge, so the algorithm's
-            # own count always wins where one exists.
+            # own count always wins where one exists. Training-only: the eval instance counts
+            # eval tokens, which must not surface under a train/-prefixed key.
             results['train/n_trainable_tokens'] = num_tokens
         for channel in sorted(channel_loss, key=lambda value: '' if value is None else str(value)):
             loss_sum, token_count = channel_loss[channel]
