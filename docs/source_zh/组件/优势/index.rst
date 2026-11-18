@@ -7,3 +7,4 @@
    GRPOAdvantage.md
    GroupAdmissionPolicy.md
    RLOOAdvantage.md
+   StateGraphAdvantage.md
