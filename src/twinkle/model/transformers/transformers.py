@@ -1990,7 +1990,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 # instead of returning an identity, and an empty shard contributes nothing to any
                 # aggregate, so it digests as zeros -- the key stays present, which keeps two runs
                 # comparable parameter by parameter.
-                out[name] = {'agg': [0.0, 0.0, 0.0], 'bits': [0, 0], 'numel': 0}
+                out[name] = {'agg': [0.0, 0.0, 0.0], 'bits': [0, 0], 'numel': 0, 'dtype': str(tensor.dtype)}
                 continue
             bits = bits_fingerprint(tensor.detach().flatten())
             flat = tensor.detach().double().flatten()
@@ -2003,6 +2003,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 # establish identity.
                 'bits': bits,
                 'numel': numel,
+                'dtype': str(tensor.dtype),
             }
         return out
 
