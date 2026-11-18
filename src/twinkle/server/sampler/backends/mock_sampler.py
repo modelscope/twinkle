@@ -20,7 +20,6 @@ import numpy as np
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
-from twinkle.template.utils import construct_template
 from twinkle.utils.logger import get_logger
 from twinkle.utils.seed import stable_seed
 
@@ -188,11 +187,8 @@ class MockSampler:
 
     @remote_function()
     def set_template(self, template_cls: Any, **kwargs: Any) -> None:
-        # Mirror the base sampler's rule: pin to this sampler's own model when the caller
-        # (the construct-time template pin) did not carry a model_id.
-        if 'model_id' not in kwargs and hasattr(self, 'model_id'):
-            kwargs['model_id'] = self.model_id
-        self.template = construct_template(template_cls, **kwargs)
+        """Acknowledge template setup; mock generation only operates on token IDs."""
+        return None
 
     @remote_function()
     def reset_prefix_cache(self) -> None:

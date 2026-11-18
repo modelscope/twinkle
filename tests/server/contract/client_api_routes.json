@@ -609,7 +609,7 @@
     },
     "POST /twinkle/apply_patch": {
       "body": [
-        "ApplyPatchRequest"
+        "SamplerApplyPatchRequest"
       ],
       "response": null,
       "statusCode": 200

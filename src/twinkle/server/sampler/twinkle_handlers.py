@@ -448,8 +448,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
     @app.post('/twinkle/apply_patch')
     async def apply_patch(
-            request: Request,
-            body: types.ApplyPatchRequest,
+            body: sampler_types.SamplerApplyPatchRequest,
             self: SamplerManagement = Depends(self_fn),
     ) -> None:
         patch_cls = deserialize_object(body.patch_cls)

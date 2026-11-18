@@ -22,7 +22,8 @@ from .model import (AdapterRequest, AddAdapterRequest, AddMetricRequest, AddMetr
 from .processor import (ProcessorCallRequest, ProcessorCallResponse, ProcessorCreateRequest, ProcessorCreateResponse,
                         ProcessorHeartbeatRequest, ProcessorHeartbeatResponse)
 from .sampler import (EncodeRequest, SampledSequenceModel, SamplerAddAdapterRequest, SamplerAddAdapterResponse,
-                      SamplerCreateResponse, SampleRequest, SampleResponseModel, SampleResponseModelList,
+                      SamplerApplyPatchRequest, SamplerCreateResponse, SampleRequest, SampleResponseModel,
+                      SampleResponseModelList,
                       SamplerSetTemplateRequest, SamplerSetTemplateResponse)
 from .server import (CapacityInfoResponse, CheckpointPathResponse, ClientFeatures, DeleteCheckpointResponse,
                      GetServerCapabilitiesResponse, HealthResponse, ProtocolLimits, SupportedModel, WeightsInfoRequest)
@@ -126,6 +127,7 @@ __all__ = [
     'SampledSequenceModel',
     'SamplerAddAdapterRequest',
     'SamplerAddAdapterResponse',
+    'SamplerApplyPatchRequest',
     'SamplerCreateResponse',
     'SampleRequest',
     'SampleResponseModel',

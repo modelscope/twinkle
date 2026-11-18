@@ -3,8 +3,8 @@
 
 Shared by the server handler and the twinkle client. Field roles follow
 :mod:`twinkle.protocol.types.base`; the sampler handlers pass everything they need
-explicitly, so these requests carry control fields and -- for the template setter --
-one passthrough region, and no free-floating backend kwargs.
+explicitly. Template and patch requests each declare a passthrough region for
+plugin arguments.
 
 Class names carry a ``Sampler`` prefix wherever ``model.py`` already owns the bare
 name (``AddAdapterRequest``, ``SetTemplateRequest``, ``CreateResponse`` and their
@@ -91,6 +91,12 @@ class SamplerSetTemplateRequest(StrictRequest):
 class SamplerSetTemplateResponse(ResponseModel):
     """Response body for the sampler /set_template endpoint."""
     status: str = 'ok'
+
+
+class SamplerApplyPatchRequest(StrictRequest):
+    """Apply a patch to the sampler instance."""
+    patch_cls: str
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class SamplerAddAdapterRequest(StrictRequest):
