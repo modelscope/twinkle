@@ -979,7 +979,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # per-token patch path produces.
             return {'logits': out} if torch.is_tensor(out) else out
 
-        handle = unwrapped_model.register_forward_hook(_readout, with_kwargs=True)
+        # Run the head before FSDP reshards its parameters and installs backward hooks
+        # on the returned tensors, so both the forward and backward see the head.
+        handle = unwrapped_model.register_forward_hook(_readout, with_kwargs=True, prepend=True)
         try:
             return self.model(**inputs, use_cache=False)
         finally:
