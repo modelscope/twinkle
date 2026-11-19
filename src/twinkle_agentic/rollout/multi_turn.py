@@ -26,7 +26,8 @@ from twinkle.protocol.types.sampler import SampleResponseModel
 from twinkle.template.base import Template
 from twinkle.utils import get_logger
 from twinkle_agentic.async_rl.rollout_resume import ResumeStore, UnsafeResume
-from twinkle_agentic.envs.base import EnvResumeCapability, NoSlot
+from twinkle_agentic.envs.base import NoSlot
+from twinkle_agentic.envs.resume import EnvResumeCapability, env_resume_capability
 from twinkle_agentic.envs.env_tool import EnvTool
 from twinkle_agentic.protocol.api_sampler import APIGenerationError
 from twinkle_agentic.tools.tool_manager import ToolManager
@@ -543,7 +544,7 @@ class MultiTurnRollout:
             raise UnsafeResume('message-ledger episodes lose sampled token ids and cannot be resumed safely')
         env_state = None
         if ep.env_open:
-            capability = EnvResumeCapability(getattr(self.env, 'resume_capability', EnvResumeCapability.NONE))
+            capability = env_resume_capability(self.env)
             if capability == EnvResumeCapability.NONE:
                 raise UnsafeResume(f'{type(self.env).__name__} declares no durable resume capability')
             env_state = self.env.checkpoint_episode(ep.episode_id, ep.state_key)
@@ -625,7 +626,7 @@ class MultiTurnRollout:
         if ep.env_open:
             if self.env is None:
                 raise UnsafeResume('checkpoint has an environment state but this rollout has no env')
-            capability = EnvResumeCapability(getattr(self.env, 'resume_capability', EnvResumeCapability.NONE))
+            capability = env_resume_capability(self.env)
             if capability == EnvResumeCapability.NONE:
                 raise UnsafeResume(f'{type(self.env).__name__} declares no durable resume capability')
             self.env.restore_episode(episode_id, state_key, state['env_state'], ep.trajectory)

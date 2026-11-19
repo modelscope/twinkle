@@ -16,7 +16,7 @@ if "ray" not in sys.modules:
     ray.is_initialized = lambda: False
     sys.modules["ray"] = ray
 
-from twinkle_agentic.envs.base import UnsafeCheckpoint  # noqa: E402
+from twinkle_agentic.envs.resume import UnsafeCheckpoint  # noqa: E402
 from twinkle_agentic.envs.localenv import LocalEnv  # noqa: E402
 
 

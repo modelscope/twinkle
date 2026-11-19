@@ -22,7 +22,6 @@ queue when it finishes, and the driver's thread only reads that queue, so its co
 with the number of episodes in flight.
 """
 from __future__ import annotations
-
 import copy
 import math
 import queue
@@ -37,7 +36,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 from twinkle import remote_class, remote_function
 from twinkle.data_format import user_data_get
 from twinkle.utils import get_logger
-from twinkle_agentic.async_rl.rollout_resume import JournalEvent, ResumeStore, UnsafeResume
+from twinkle_agentic.async_rl.rollout_resume import GroupPolicyBinding, JournalEvent, ResumeStore, UnsafeResume
 from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutStatus
 
 logger = get_logger()
@@ -60,8 +59,9 @@ def _record_driver_probe(event: str, episode_id: str = '', **fields: Any) -> Non
     that drains the queue is still turning. Without it the two possible causes -- a future that
     never resolves and a queue that is never drained -- are indistinguishable from outside.
     """
-    import json
     import os
+
+    import json
     root = os.environ.get('TWINKLE_DRIVER_PROBE')
     if not root:
         return
@@ -130,8 +130,7 @@ class _Group:
     row: Any
     #: Fixed for the group's whole lifetime. Recovery and replacement members must use this
     #: behavior policy, never whichever version happens to be current after a restart.
-    version: int = 0
-    adapter_path: Optional[str] = None
+    binding: GroupPolicyBinding
     attempt: int = 0
     #: The current attempt's member trajectories, aligned with ``members`` (a lost one is redone from here).
     source: List[Any] = field(default_factory=list)
@@ -139,6 +138,18 @@ class _Group:
     baselines: List['_Episode'] = field(default_factory=list)
     #: Members of the current attempt that will not produce a sample (failed, stopped, dropped).
     missing: int = 0
+
+    @property
+    def state_key(self) -> str:
+        return self.binding.state_key
+
+    @property
+    def version(self) -> int:
+        return self.binding.policy_version
+
+    @property
+    def adapter_path(self) -> Optional[str]:
+        return self.binding.adapter_path
 
 
 @dataclass
@@ -308,7 +319,7 @@ class StreamingDriver:
         self.max_no_slot_wait = max_no_slot_wait
 
         self._lock = threading.Condition()
-        self._events: 'queue.Queue[Tuple[Any, ...]]' = queue.Queue()
+        self._events: 'queue.Queue[tuple[Any, ...]]' = queue.Queue()
         self._ready: deque = deque()
         self._ready_rows = 0
         self._thread: Optional[threading.Thread] = None
@@ -477,7 +488,7 @@ class StreamingDriver:
                             replace(episode.sample, token_lengths=tuple(map(int, pair)),
                                     extra=dict(extra, segment_index=index))
                             for index, pair in enumerate(lengths)]
-                    for row, row_sample in zip(episode.deliver, row_samples):
+                    for row, row_sample in zip(episode.deliver, row_samples, strict=True):
                         trajs.append(row)
                         samples.append(row_sample)
                         scores.append(score)
@@ -494,12 +505,16 @@ class StreamingDriver:
                 'facts': facts,
             }
             self._lease_returned = True
+            self._handed += 1
             if self.resume_store is not None:
                 self.resume_store.save_object('leases', lease_id, self._lease)
+                # The snapshot must point at the lease before the journal makes
+                # it durable.  A crash in between re-delivers this same lease;
+                # the reverse order could strand the lease object unreferenced.
+                self._persist_snapshot_locked()
                 self.resume_store.journal.append(
                     JournalEvent.BATCH_LEASED, lease_id,
                     {'batch': batch_index, 'rows': len(trajs), 'object': lease_id})
-            self._handed += 1
             self._lock.notify_all()
         self._returned_at = time.monotonic()
         self._wait_time = self._returned_at - started
@@ -519,7 +534,7 @@ class StreamingDriver:
         sample = episode.sample
         rewards: Dict[str, Any] = {
             'orm': {name: (None if value is None else float(value))
-                    for name, value in zip(self.orm_names, episode.orm or ())},
+                    for name, value in zip(self.orm_names, episode.orm or (), strict=True)},
         }
         if sample.baseline is not None:
             rows = sample.baseline if (sample.baseline and isinstance(sample.baseline[0], (list, tuple))) \
@@ -528,13 +543,13 @@ class StreamingDriver:
                 raise RuntimeError(f'episode {episode.episode_id} carries {len(rows)} baseline rows; the named '
                                    'baseline column carries one. Return a single baseline per group.')
             rewards['baseline'] = {name: (None if value is None else float(value))
-                                   for name, value in zip(self.orm_names, rows[0])}
+                                   for name, value in zip(self.orm_names, rows[0], strict=True)}
         score: Dict[str, Any] = {'rewards': rewards}
         if episode.prm is not None:
             score['prm_segments'] = {
                 'end_turns': [int(turns) for turns in episode.prm_turns],
                 'scores': {name: [(None if value is None else float(value)) for value in column]
-                           for name, column in zip(self.prm_names, episode.prm)},
+                           for name, column in zip(self.prm_names, episode.prm, strict=True)},
             }
         return score
 
@@ -564,10 +579,10 @@ class StreamingDriver:
         self._counters['dropped_stale'] += len(group.members)
         self._counters['dropped_group'] += 1
         if self.resume_store is not None:
-            state_key = f'{self.run_id}/group/{group.key}'
             self.resume_store.journal.append(
-                JournalEvent.GROUP_DROPPED, state_key,
-                {'reason': 'stale', 'version': group.version, 'current_version': self._version})
+                JournalEvent.GROUP_DROPPED, group.state_key,
+                {'reason': 'stale', 'binding': group.binding.to_dict(), 'current_version': self._version})
+            self._persist_snapshot_locked()
         for episode in group.members + group.baselines:
             if episode.lost:
                 continue
@@ -619,6 +634,8 @@ class StreamingDriver:
         return {
             'key': group.key,
             'row': group.row,
+            'binding': group.binding.to_dict(),
+            # Flat fields keep snapshots readable by earlier draft readers.
             'version': group.version,
             'adapter_path': group.adapter_path,
             'attempt': group.attempt,
@@ -644,6 +661,17 @@ class StreamingDriver:
             'ready_groups': [self._group_state(members[0].group) for members in self._ready if members],
             'lease': self._lease,
         }
+
+    def _persist_snapshot_locked(self) -> None:
+        """Persist the current snapshot at a stable transition while holding ``_lock``.
+
+        Callers order this write before the matching journal event where a stale
+        snapshot would otherwise lose an in-memory object.  Checkpoint commit is
+        the exception: its journal record is the transaction point, and restore
+        uses it to retire a lease even when the following snapshot was torn.
+        """
+        if self.resume_store is not None:
+            self.resume_store.save_object('driver', self.run_id, self._snapshot())
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
     def state_dict(self) -> Dict[str, Any]:
@@ -691,14 +719,42 @@ class StreamingDriver:
             (int(item.get('version') or 0) for item in members if item.get('version') is not None), 0)
         version = int(state.get('version') if state.get('version') is not None else member_version)
         adapter_path = state.get('adapter_path')
-        if adapter_path is None and self.checkpoint_manager is not None:
+        raw_binding = state.get('binding')
+        if raw_binding is not None:
+            try:
+                binding = GroupPolicyBinding.from_dict(raw_binding)
+            except (TypeError, ValueError) as exc:
+                raise UnsafeResume(f'invalid group policy binding: {exc}') from exc
+            if state.get('version') is not None and int(state['version']) != binding.policy_version:
+                raise UnsafeResume(
+                    f'group binding version {binding.policy_version} disagrees with snapshot version '
+                    f'{state["version"]}')
+            if 'adapter_path' in state and state.get('adapter_path') != binding.adapter_path:
+                raise UnsafeResume('group binding adapter_path disagrees with the flat snapshot field')
+            version = binding.policy_version
+            adapter_path = binding.adapter_path
+        else:
+            binding = GroupPolicyBinding(
+                state_key=str(state.get('state_key') or f'{self.run_id}/group/{state.get("key")}'),
+                policy_version=version,
+                adapter_path=adapter_path,
+            )
+        expected_state_key = f'{self.run_id}/group/{state.get("key")}'
+        if binding.state_key != expected_state_key:
+            raise UnsafeResume(
+                f'group binding state_key {binding.state_key!r} does not match {expected_state_key!r}')
+        # A legacy flat snapshot had no binding, so the manager may upgrade its
+        # missing adapter path.  An explicit binding with adapter_path=None
+        # means the base model and must not be silently rebound to an adapter.
+        if raw_binding is None and adapter_path is None and self.checkpoint_manager is not None:
             lookup = getattr(self.checkpoint_manager, 'adapter_path', None)
             if callable(lookup):
                 adapter_path = lookup(version)
                 if adapter_path is None:
                     raise UnsafeResume(f'policy version {version} has no resolvable adapter path')
+                binding = replace(binding, adapter_path=adapter_path)
         group = _Group(
-            key=str(state['key']), row=state.get('row'), version=version, adapter_path=adapter_path,
+            key=str(state['key']), row=state.get('row'), binding=binding,
             attempt=int(state.get('attempt') or 0),
             source=list(state.get('source') or ()), missing=int(state.get('missing') or 0))
         group.members = [self._restore_episode(item, group) for item in state.get('members') or ()]
@@ -831,6 +887,7 @@ class StreamingDriver:
                 self.resume_store.delete_object('leases', lease_id)
             self._lease = None
             self._lease_returned = False
+            self._persist_snapshot_locked()
             self._lock.notify_all()
             return lease_id
 
@@ -979,14 +1036,21 @@ class StreamingDriver:
                     if adapter_path is None:
                         raise UnsafeResume(
                             f'checkpoint manager has no adapter path for admitted policy version {version}')
-            group = _Group(key=key, row=row, version=version, adapter_path=adapter_path)
+            binding = GroupPolicyBinding(
+                state_key=f'{self.run_id}/group/{key}',
+                policy_version=version,
+                adapter_path=adapter_path,
+            )
+            group = _Group(key=key, row=row, binding=binding)
             self._groups[key] = group
+            self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
             if self.resume_store is not None:
                 prompt_key = f'{self.run_id}/prompt/{key}'
                 self.resume_store.save_object('prompts', prompt_key, row)
+                self._persist_snapshot_locked()
                 self.resume_store.journal.append(
-                    JournalEvent.PROMPT_ASSIGNED, prompt_key, {'group_key': key, 'object': prompt_key})
-            self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
+                    JournalEvent.PROMPT_ASSIGNED, prompt_key,
+                    {'group_key': key, 'object': prompt_key, 'binding': binding.to_dict()})
 
     def _next_row(self) -> Any:
         # TODO: rows are drawn here, ahead of training; see state_dict for what a resume skips.
@@ -1301,11 +1365,10 @@ class StreamingDriver:
         self._ready.append(list(group.members))
         self._ready_rows += sum(len(episode.deliver) for episode in group.members)
         if self.resume_store is not None:
-            state_key = f'{self.run_id}/group/{group.key}'
-            self.resume_store.journal.append(JournalEvent.GROUP_READY, state_key, {
+            self._persist_snapshot_locked()
+            self.resume_store.journal.append(JournalEvent.GROUP_READY, group.state_key, {
                 'group_key': group.key,
-                'policy_version': group.version,
-                'adapter_path': group.adapter_path,
+                'binding': group.binding.to_dict(),
                 'attempt': group.attempt,
                 'episodes': [episode.episode_id for episode in group.members],
             })
@@ -1327,6 +1390,12 @@ class StreamingDriver:
                 if episode.held is not None:
                     # waiting for its PRM scores, no step in flight; a stepping one is stopped when it returns
                     self.rollout.stop(episode.traj, episode_id=episode.episode_id)
+        if self.resume_store is not None:
+            self.resume_store.journal.append(
+                JournalEvent.GROUP_DROPPED, group.state_key,
+                {'reason': 'incomplete_or_invalid', 'binding': group.binding.to_dict(),
+                 'current_version': self._version})
+            self._persist_snapshot_locked()
 
 
 #: Placeholder for a score whose Future has not completed yet.

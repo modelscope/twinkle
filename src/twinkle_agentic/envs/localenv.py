@@ -40,8 +40,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from twinkle import remote_class, remote_function
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
-from .base import (DEFAULT_TOOLS, ENV_MAX_CONCURRENCY, TIMEOUT_EXIT_CODE, Env, EnvResumeCapability, StepResult,
-                   UnsafeCheckpoint, format_command_output, truncate_observation)
+from .base import (DEFAULT_TOOLS, ENV_MAX_CONCURRENCY, TIMEOUT_EXIT_CODE, Env, StepResult, format_command_output,
+                   truncate_observation)
+from .resume import EnvResumeCapability, UnsafeCheckpoint
 
 logger = get_logger()
 

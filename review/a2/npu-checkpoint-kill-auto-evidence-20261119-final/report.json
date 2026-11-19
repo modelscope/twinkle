@@ -1,0 +1,565 @@
+{
+  "cases": [
+    {
+      "case": "optimizer_step_uncommitted",
+      "elapsed_s": 33.072556257247925,
+      "marker": {
+        "batch_facts": {
+          "episode_ids": [
+            "npu-checkpoint-kill:g0:a0:member:0",
+            "npu-checkpoint-kill:g0:a0:member:1"
+          ],
+          "num_rows": 2,
+          "num_truncated": 0,
+          "policy_versions": [
+            0
+          ],
+          "prompt_lengths": [
+            1,
+            1
+          ],
+          "response_length_max": 1,
+          "response_length_min": 1,
+          "response_length_sum": 2,
+          "response_lengths": [
+            1,
+            1
+          ],
+          "scores": [
+            {
+              "rewards": {
+                "orm": {}
+              }
+            },
+            {
+              "rewards": {
+                "orm": {}
+              }
+            }
+          ],
+          "truncated": [
+            false,
+            false
+          ],
+          "turns": [
+            1,
+            1
+          ],
+          "version_spans": [
+            0,
+            0
+          ]
+        },
+        "batch_rows": 2,
+        "candidate_checkpoint": null,
+        "case": "optimizer_step_uncommitted",
+        "container": {
+          "hostname": "e1f3eeac3fc6",
+          "peft": "0.21.3",
+          "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+          "torch": "2.10.0+cpu",
+          "torch_npu": "2.10.0",
+          "transformers": "5.20.2"
+        },
+        "device": "npu:0",
+        "driver_handed": 1,
+        "driver_persistence": "automatic",
+        "driver_state_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/optimizer_step_uncommitted/resume/objects/driver",
+        "final_checkpoint_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/optimizer_step_uncommitted/checkpoints/step-1",
+        "format": "twinkle.npu-checkpoint-kill-marker.v1",
+        "initial_checkpoint": {
+          "checkpoint_digest": "ed9408efec4528f96595c8ed785d332509626727bb4468961d7f7933e0337c10",
+          "format": "twinkle.npu-checkpoint-kill.v1",
+          "lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+          "model": "/workspace/shared_assets/models/Qwen/Qwen3-0.6B",
+          "optimizer_steps": [],
+          "path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/optimizer_step_uncommitted/checkpoints/step-0",
+          "step": 0
+        },
+        "initial_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+        "lease_id": "npu-checkpoint-kill/batch/0",
+        "marker_created_unix": 1795077221.5744615,
+        "optimizer_loss": 5.960464477539063e-08,
+        "pending_checkpoint_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/optimizer_step_uncommitted/checkpoints/.step-1.tmp.24343",
+        "root": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/optimizer_step_uncommitted",
+        "run_id": "npu-checkpoint-kill",
+        "seed": 20261119,
+        "trained_lora_digest": "40bf9abc1e7edffcc78e99b1b4b35fb03b411ad51077d15a0ca5bd4ed107a5bf",
+        "trained_optimizer_steps": [
+          1
+        ],
+        "trajectory": {
+          "accuracy": 0.5,
+          "correct": "The final answer is \\boxed{72}.",
+          "format": 1.0,
+          "reward": 0.7,
+          "wrong": "The final answer is \\boxed{0}."
+        }
+      },
+      "ok": true,
+      "verification": {
+        "actual_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+        "actual_optimizer_steps": [],
+        "case": "optimizer_step_uncommitted",
+        "commit_checkpoint": null,
+        "committed": false,
+        "container": {
+          "hostname": "e1f3eeac3fc6",
+          "peft": "0.21.3",
+          "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+          "torch": "2.10.0+cpu",
+          "torch_npu": "2.10.0",
+          "transformers": "5.20.2"
+        },
+        "device": "npu:0",
+        "expected_checkpoint": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/optimizer_step_uncommitted/checkpoints/step-0",
+        "expected_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+        "expected_optimizer_steps": [],
+        "format": "twinkle.npu-checkpoint-kill-verify.v1",
+        "ok": true,
+        "orphan_check": null,
+        "redelivered_batch": true,
+        "redelivered_rows": 2,
+        "restored_lease": "npu-checkpoint-kill/batch/0"
+      },
+      "worker_killed_by_sigkill": true,
+      "worker_returncode": -9
+    },
+    {
+      "case": "adapter_temp_uncommitted",
+      "elapsed_s": 34.285804748535156,
+      "marker": {
+        "batch_facts": {
+          "episode_ids": [
+            "npu-checkpoint-kill:g0:a0:member:0",
+            "npu-checkpoint-kill:g0:a0:member:1"
+          ],
+          "num_rows": 2,
+          "num_truncated": 0,
+          "policy_versions": [
+            0
+          ],
+          "prompt_lengths": [
+            1,
+            1
+          ],
+          "response_length_max": 1,
+          "response_length_min": 1,
+          "response_length_sum": 2,
+          "response_lengths": [
+            1,
+            1
+          ],
+          "scores": [
+            {
+              "rewards": {
+                "orm": {}
+              }
+            },
+            {
+              "rewards": {
+                "orm": {}
+              }
+            }
+          ],
+          "truncated": [
+            false,
+            false
+          ],
+          "turns": [
+            1,
+            1
+          ],
+          "version_spans": [
+            0,
+            0
+          ]
+        },
+        "batch_rows": 2,
+        "candidate_checkpoint": {
+          "checkpoint_digest": "bdbdfaad7b1cebf05f96132e76742631f3f63cc4e2d6ead72576989435dcc9d9",
+          "format": "twinkle.npu-checkpoint-kill.v1",
+          "lora_digest": "40bf9abc1e7edffcc78e99b1b4b35fb03b411ad51077d15a0ca5bd4ed107a5bf",
+          "model": "/workspace/shared_assets/models/Qwen/Qwen3-0.6B",
+          "optimizer_steps": [
+            1
+          ],
+          "path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/adapter_temp_uncommitted/checkpoints/.step-1.tmp.25089",
+          "step": 1
+        },
+        "case": "adapter_temp_uncommitted",
+        "container": {
+          "hostname": "e1f3eeac3fc6",
+          "peft": "0.21.3",
+          "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+          "torch": "2.10.0+cpu",
+          "torch_npu": "2.10.0",
+          "transformers": "5.20.2"
+        },
+        "device": "npu:0",
+        "driver_handed": 1,
+        "driver_persistence": "automatic",
+        "driver_state_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/adapter_temp_uncommitted/resume/objects/driver",
+        "final_checkpoint_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/adapter_temp_uncommitted/checkpoints/step-1",
+        "format": "twinkle.npu-checkpoint-kill-marker.v1",
+        "initial_checkpoint": {
+          "checkpoint_digest": "79c39d048a16be1d07cbec97e040b6604fff6b96835ded8aa913426a33be2a23",
+          "format": "twinkle.npu-checkpoint-kill.v1",
+          "lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+          "model": "/workspace/shared_assets/models/Qwen/Qwen3-0.6B",
+          "optimizer_steps": [],
+          "path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/adapter_temp_uncommitted/checkpoints/step-0",
+          "step": 0
+        },
+        "initial_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+        "lease_id": "npu-checkpoint-kill/batch/0",
+        "marker_created_unix": 1795077255.8905628,
+        "optimizer_loss": 5.960464477539063e-08,
+        "pending_checkpoint_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/adapter_temp_uncommitted/checkpoints/.step-1.tmp.25089",
+        "root": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/adapter_temp_uncommitted",
+        "run_id": "npu-checkpoint-kill",
+        "seed": 20261119,
+        "trained_lora_digest": "40bf9abc1e7edffcc78e99b1b4b35fb03b411ad51077d15a0ca5bd4ed107a5bf",
+        "trained_optimizer_steps": [
+          1
+        ],
+        "trajectory": {
+          "accuracy": 0.5,
+          "correct": "The final answer is \\boxed{72}.",
+          "format": 1.0,
+          "reward": 0.7,
+          "wrong": "The final answer is \\boxed{0}."
+        }
+      },
+      "ok": true,
+      "verification": {
+        "actual_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+        "actual_optimizer_steps": [],
+        "case": "adapter_temp_uncommitted",
+        "commit_checkpoint": null,
+        "committed": false,
+        "container": {
+          "hostname": "e1f3eeac3fc6",
+          "peft": "0.21.3",
+          "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+          "torch": "2.10.0+cpu",
+          "torch_npu": "2.10.0",
+          "transformers": "5.20.2"
+        },
+        "device": "npu:0",
+        "expected_checkpoint": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/adapter_temp_uncommitted/checkpoints/step-0",
+        "expected_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+        "expected_optimizer_steps": [],
+        "format": "twinkle.npu-checkpoint-kill-verify.v1",
+        "ok": true,
+        "orphan_check": {
+          "final_absent": true,
+          "pending_exists": true,
+          "pending_matches_trained": true
+        },
+        "redelivered_batch": true,
+        "redelivered_rows": 2,
+        "restored_lease": "npu-checkpoint-kill/batch/0"
+      },
+      "worker_killed_by_sigkill": true,
+      "worker_returncode": -9
+    },
+    {
+      "case": "checkpoint_promoted_uncommitted",
+      "elapsed_s": 33.72851920127869,
+      "marker": {
+        "batch_facts": {
+          "episode_ids": [
+            "npu-checkpoint-kill:g0:a0:member:0",
+            "npu-checkpoint-kill:g0:a0:member:1"
+          ],
+          "num_rows": 2,
+          "num_truncated": 0,
+          "policy_versions": [
+            0
+          ],
+          "prompt_lengths": [
+            1,
+            1
+          ],
+          "response_length_max": 1,
+          "response_length_min": 1,
+          "response_length_sum": 2,
+          "response_lengths": [
+            1,
+            1
+          ],
+          "scores": [
+            {
+              "rewards": {
+                "orm": {}
+              }
+            },
+            {
+              "rewards": {
+                "orm": {}
+              }
+            }
+          ],
+          "truncated": [
+            false,
+            false
+          ],
+          "turns": [
+            1,
+            1
+          ],
+          "version_spans": [
+            0,
+            0
+          ]
+        },
+        "batch_rows": 2,
+        "candidate_checkpoint": {
+          "checkpoint_digest": "6074bfdcdd336d81c15ec5db6a91688c6f4dda259194384bf6ea9d97a406b8b7",
+          "format": "twinkle.npu-checkpoint-kill.v1",
+          "lora_digest": "40bf9abc1e7edffcc78e99b1b4b35fb03b411ad51077d15a0ca5bd4ed107a5bf",
+          "model": "/workspace/shared_assets/models/Qwen/Qwen3-0.6B",
+          "optimizer_steps": [
+            1
+          ],
+          "path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_promoted_uncommitted/checkpoints/.step-1.tmp.25835",
+          "promoted_checkpoint_digest": "6074bfdcdd336d81c15ec5db6a91688c6f4dda259194384bf6ea9d97a406b8b7",
+          "promoted_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_promoted_uncommitted/checkpoints/step-1",
+          "step": 1
+        },
+        "case": "checkpoint_promoted_uncommitted",
+        "container": {
+          "hostname": "e1f3eeac3fc6",
+          "peft": "0.21.3",
+          "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+          "torch": "2.10.0+cpu",
+          "torch_npu": "2.10.0",
+          "transformers": "5.20.2"
+        },
+        "device": "npu:0",
+        "driver_handed": 1,
+        "driver_persistence": "automatic",
+        "driver_state_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_promoted_uncommitted/resume/objects/driver",
+        "final_checkpoint_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_promoted_uncommitted/checkpoints/step-1",
+        "format": "twinkle.npu-checkpoint-kill-marker.v1",
+        "initial_checkpoint": {
+          "checkpoint_digest": "ed9408efec4528f96595c8ed785d332509626727bb4468961d7f7933e0337c10",
+          "format": "twinkle.npu-checkpoint-kill.v1",
+          "lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+          "model": "/workspace/shared_assets/models/Qwen/Qwen3-0.6B",
+          "optimizer_steps": [],
+          "path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_promoted_uncommitted/checkpoints/step-0",
+          "step": 0
+        },
+        "initial_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+        "lease_id": "npu-checkpoint-kill/batch/0",
+        "marker_created_unix": 1795077289.5118372,
+        "optimizer_loss": 5.960464477539063e-08,
+        "pending_checkpoint_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_promoted_uncommitted/checkpoints/.step-1.tmp.25835",
+        "root": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_promoted_uncommitted",
+        "run_id": "npu-checkpoint-kill",
+        "seed": 20261119,
+        "trained_lora_digest": "40bf9abc1e7edffcc78e99b1b4b35fb03b411ad51077d15a0ca5bd4ed107a5bf",
+        "trained_optimizer_steps": [
+          1
+        ],
+        "trajectory": {
+          "accuracy": 0.5,
+          "correct": "The final answer is \\boxed{72}.",
+          "format": 1.0,
+          "reward": 0.7,
+          "wrong": "The final answer is \\boxed{0}."
+        }
+      },
+      "ok": true,
+      "verification": {
+        "actual_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+        "actual_optimizer_steps": [],
+        "case": "checkpoint_promoted_uncommitted",
+        "commit_checkpoint": null,
+        "committed": false,
+        "container": {
+          "hostname": "e1f3eeac3fc6",
+          "peft": "0.21.3",
+          "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+          "torch": "2.10.0+cpu",
+          "torch_npu": "2.10.0",
+          "transformers": "5.20.2"
+        },
+        "device": "npu:0",
+        "expected_checkpoint": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_promoted_uncommitted/checkpoints/step-0",
+        "expected_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+        "expected_optimizer_steps": [],
+        "format": "twinkle.npu-checkpoint-kill-verify.v1",
+        "ok": true,
+        "orphan_check": {
+          "journal_left_it_uncommitted": true,
+          "promoted_exists": true,
+          "promoted_matches_trained": true
+        },
+        "redelivered_batch": true,
+        "redelivered_rows": 2,
+        "restored_lease": "npu-checkpoint-kill/batch/0"
+      },
+      "worker_killed_by_sigkill": true,
+      "worker_returncode": -9
+    },
+    {
+      "case": "checkpoint_committed",
+      "elapsed_s": 33.86141848564148,
+      "marker": {
+        "batch_facts": {
+          "episode_ids": [
+            "npu-checkpoint-kill:g0:a0:member:0",
+            "npu-checkpoint-kill:g0:a0:member:1"
+          ],
+          "num_rows": 2,
+          "num_truncated": 0,
+          "policy_versions": [
+            0
+          ],
+          "prompt_lengths": [
+            1,
+            1
+          ],
+          "response_length_max": 1,
+          "response_length_min": 1,
+          "response_length_sum": 2,
+          "response_lengths": [
+            1,
+            1
+          ],
+          "scores": [
+            {
+              "rewards": {
+                "orm": {}
+              }
+            },
+            {
+              "rewards": {
+                "orm": {}
+              }
+            }
+          ],
+          "truncated": [
+            false,
+            false
+          ],
+          "turns": [
+            1,
+            1
+          ],
+          "version_spans": [
+            0,
+            0
+          ]
+        },
+        "batch_rows": 2,
+        "candidate_checkpoint": {
+          "checkpoint_digest": "3d30ef9cdf38c37027ccd30378c5479c761da06e4370346265176b62496c974e",
+          "format": "twinkle.npu-checkpoint-kill.v1",
+          "lora_digest": "40bf9abc1e7edffcc78e99b1b4b35fb03b411ad51077d15a0ca5bd4ed107a5bf",
+          "model": "/workspace/shared_assets/models/Qwen/Qwen3-0.6B",
+          "optimizer_steps": [
+            1
+          ],
+          "path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_committed/checkpoints/.step-1.tmp.26580",
+          "promoted_checkpoint_digest": "3d30ef9cdf38c37027ccd30378c5479c761da06e4370346265176b62496c974e",
+          "promoted_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_committed/checkpoints/step-1",
+          "step": 1
+        },
+        "case": "checkpoint_committed",
+        "container": {
+          "hostname": "e1f3eeac3fc6",
+          "peft": "0.21.3",
+          "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+          "torch": "2.10.0+cpu",
+          "torch_npu": "2.10.0",
+          "transformers": "5.20.2"
+        },
+        "device": "npu:0",
+        "driver_handed": 1,
+        "driver_persistence": "automatic",
+        "driver_state_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_committed/resume/objects/driver",
+        "final_checkpoint_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_committed/checkpoints/step-1",
+        "format": "twinkle.npu-checkpoint-kill-marker.v1",
+        "initial_checkpoint": {
+          "checkpoint_digest": "60b7fa29642a7a3c44e16344a2436fa460c8a9d7c2a49f3e8fa60f259dbdea39",
+          "format": "twinkle.npu-checkpoint-kill.v1",
+          "lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+          "model": "/workspace/shared_assets/models/Qwen/Qwen3-0.6B",
+          "optimizer_steps": [],
+          "path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_committed/checkpoints/step-0",
+          "step": 0
+        },
+        "initial_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
+        "lease_id": "npu-checkpoint-kill/batch/0",
+        "marker_created_unix": 1795077323.612138,
+        "optimizer_loss": 5.960464477539063e-08,
+        "pending_checkpoint_path": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_committed/checkpoints/.step-1.tmp.26580",
+        "root": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_committed",
+        "run_id": "npu-checkpoint-kill",
+        "seed": 20261119,
+        "trained_lora_digest": "40bf9abc1e7edffcc78e99b1b4b35fb03b411ad51077d15a0ca5bd4ed107a5bf",
+        "trained_optimizer_steps": [
+          1
+        ],
+        "trajectory": {
+          "accuracy": 0.5,
+          "correct": "The final answer is \\boxed{72}.",
+          "format": 1.0,
+          "reward": 0.7,
+          "wrong": "The final answer is \\boxed{0}."
+        }
+      },
+      "ok": true,
+      "verification": {
+        "actual_lora_digest": "40bf9abc1e7edffcc78e99b1b4b35fb03b411ad51077d15a0ca5bd4ed107a5bf",
+        "actual_optimizer_steps": [
+          1
+        ],
+        "case": "checkpoint_committed",
+        "commit_checkpoint": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_committed/checkpoints/step-1",
+        "committed": true,
+        "container": {
+          "hostname": "e1f3eeac3fc6",
+          "peft": "0.21.3",
+          "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+          "torch": "2.10.0+cpu",
+          "torch_npu": "2.10.0",
+          "transformers": "5.20.2"
+        },
+        "device": "npu:0",
+        "expected_checkpoint": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/checkpoint_committed/checkpoints/step-1",
+        "expected_lora_digest": "40bf9abc1e7edffcc78e99b1b4b35fb03b411ad51077d15a0ca5bd4ed107a5bf",
+        "expected_optimizer_steps": [
+          1
+        ],
+        "format": "twinkle.npu-checkpoint-kill-verify.v1",
+        "ok": true,
+        "orphan_check": null,
+        "redelivered_batch": false,
+        "redelivered_rows": 0,
+        "restored_lease": null
+      },
+      "worker_killed_by_sigkill": true,
+      "worker_returncode": -9
+    }
+  ],
+  "container": {
+    "hostname": "e1f3eeac3fc6",
+    "peft": "0.21.3",
+    "python": "3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0",
+    "transformers": "5.20.2"
+  },
+  "finished_unix": 1795077342.160995,
+  "format": "twinkle.npu-checkpoint-kill-report.v1",
+  "model": "/workspace/shared_assets/models/Qwen/Qwen3-0.6B",
+  "ok": true,
+  "seed": 20261119,
+  "started_unix": 1795077207.204393,
+  "train_jsonl": "data/gsm8k/train.jsonl"
+}

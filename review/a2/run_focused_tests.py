@@ -28,6 +28,7 @@ TESTS = [
     "tests/twinkle_agentic/test_localenv_resume.py",
     "tests/twinkle_agentic/test_turn_ledger_resume.py",
     "tests/twinkle_agentic/test_multi_turn_resume.py",
+    "tests/twinkle_agentic/test_group_policy_binding.py",
     "tests/twinkle_agentic/test_streaming_driver_resume.py",
     "tests/twinkle_agentic/test_resume_boundaries.py",
     "tests/twinkle_agentic/test_tail_prefetch.py",

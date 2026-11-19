@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from twinkle_agentic.async_rl.rollout_resume import ResumeStore
+from twinkle_agentic.async_rl.rollout_resume import GroupPolicyBinding, ResumeStore, UnsafeResume
 from twinkle_agentic.async_rl.streaming_driver import StreamingDriver
 from twinkle_agentic.rollout.multi_turn import RolloutStatus
 
@@ -115,6 +115,40 @@ def test_inflight_prompt_and_group_survive_snapshot(tmp_path):
     assert [member.submit_traj["state_key"] for member in restored._groups["0"].members] == [
         member.submit_traj["state_key"] for member in driver._groups["0"].members
     ]
+    assert restored._groups["0"].binding == driver._groups["0"].binding
+
+
+def test_prompt_assignment_is_persisted_without_manual_state_dict(tmp_path):
+    store = ResumeStore(tmp_path, "run-auto-prompt")
+    source = StreamingDriver(
+        _prompts(),
+        _BlockingRollout(),
+        batch_size=2,
+        num_generations=2,
+        max_staleness=0,
+        resume_store=store,
+    )
+    try:
+        source._admit()
+    finally:
+        source.close()
+
+    rollout = _BlockingRollout()
+    restored = StreamingDriver(
+        _prompts(),
+        rollout,
+        batch_size=2,
+        num_generations=2,
+        max_staleness=0,
+        resume_store=store,
+    )
+    restored.load_state_dict()
+
+    assert restored._prompt_seq == 1
+    assert list(restored._groups) == ["0"]
+    assert restored._groups["0"].binding.state_key == "run-auto-prompt/group/0"
+    assert restored._groups["0"].binding.policy_version == 0
+    assert restored._groups["0"].adapter_path is None
 
 
 def test_ready_group_round_trip_and_lease_redelivery(tmp_path):
@@ -158,6 +192,45 @@ def test_ready_group_round_trip_and_lease_redelivery(tmp_path):
     assert stale._lease is None
 
 
+def test_ready_group_and_lease_are_persisted_without_manual_state_dict(tmp_path):
+    store = ResumeStore(tmp_path, "run-auto-lease")
+    source = StreamingDriver(
+        _prompts(), _DoneRollout(), batch_size=2, num_generations=2, max_staleness=0, max_steps=1, resume_store=store
+    )
+    source._start()
+    _wait_until(lambda: source._ready_rows == 2)
+    source.close()
+
+    after_ready = StreamingDriver(
+        _prompts(), _DoneRollout(), batch_size=2, num_generations=2, max_staleness=0, max_steps=1, resume_store=store
+    )
+    after_ready.load_state_dict()
+    assert after_ready._ready_rows == 2
+    rows, facts = after_ready._next_batch()
+    assert len(rows) == 2
+    assert facts["policy_versions"] == [0]
+    lease_id = after_ready._lease["lease_id"]
+    after_ready.close()
+
+    after_lease = StreamingDriver(
+        _prompts(), _DoneRollout(), batch_size=2, num_generations=2, max_staleness=0, max_steps=1, resume_store=store
+    )
+    after_lease.load_state_dict()
+    assert after_lease._lease["lease_id"] == lease_id
+    again_rows, again_facts = after_lease._next_batch()
+    assert again_rows == rows
+    assert again_facts == facts
+    after_lease.commit_batch("checkpoint/auto-lease")
+    after_lease.close()
+
+    after_commit = StreamingDriver(
+        _prompts(), _DoneRollout(), batch_size=2, num_generations=2, max_staleness=0, max_steps=1, resume_store=store
+    )
+    after_commit.load_state_dict()
+    assert after_commit._lease is None
+    assert after_commit._next_batch() is None
+
+
 def test_resumed_group_keeps_its_pinned_adapter_after_policy_advances(tmp_path):
     store = ResumeStore(tmp_path, "run-policy")
     manager = _PolicyManager(1, {1: "/policies/policy-1.adapter"})
@@ -193,8 +266,130 @@ def test_resumed_group_keeps_its_pinned_adapter_after_policy_advances(tmp_path):
 
     assert restored._groups["0"].version == 1
     assert restored._groups["0"].adapter_path == "/policies/policy-1.adapter"
+    assert restored._groups["0"].binding == GroupPolicyBinding(
+        state_key="run-policy/group/0",
+        policy_version=1,
+        adapter_path="/policies/policy-1.adapter",
+    )
     assert {call[1:] for call in rollout.calls} == {(1, "/policies/policy-1.adapter")}
     assert restored.stats()["resumed_groups"] == 1
+
+
+def test_flat_group_snapshot_is_upgraded_to_policy_binding(tmp_path):
+    store = ResumeStore(tmp_path, "run-flat")
+    driver = StreamingDriver(
+        _prompts(1),
+        _DoneRollout(),
+        batch_size=2,
+        num_generations=2,
+        max_staleness=1,
+        resume_store=store,
+    )
+    state = {
+        "key": "0",
+        "row": _prompts(1)[0],
+        "version": 3,
+        "adapter_path": "/policies/policy-3.adapter",
+        "attempt": 0,
+        "source": [],
+        "members": [],
+        "baselines": [],
+        "missing": 0,
+    }
+    group = driver._restore_group(state)
+    assert group.binding == GroupPolicyBinding(
+        state_key="run-flat/group/0",
+        policy_version=3,
+        adapter_path="/policies/policy-3.adapter",
+    )
+
+
+def test_invalid_binding_snapshot_fails_closed(tmp_path):
+    driver = StreamingDriver(
+        _prompts(1),
+        _DoneRollout(),
+        batch_size=2,
+        num_generations=2,
+        resume_store=ResumeStore(tmp_path, "run-invalid-binding"),
+    )
+    with pytest.raises(UnsafeResume, match="invalid group policy binding"):
+        driver._restore_group({
+            "key": "0",
+            "row": _prompts(1)[0],
+            "binding": {"state_key": "", "policy_version": 0, "adapter_path": None},
+            "members": [],
+        })
+
+
+def test_conflicting_binding_and_flat_snapshot_fails_closed(tmp_path):
+    driver = StreamingDriver(
+        _prompts(1),
+        _DoneRollout(),
+        batch_size=2,
+        num_generations=2,
+        resume_store=ResumeStore(tmp_path, "run-conflict"),
+    )
+    with pytest.raises(UnsafeResume, match="disagrees"):
+        driver._restore_group({
+            "key": "0",
+            "row": _prompts(1)[0],
+            "binding": {
+                "state_key": "run-conflict/group/0",
+                "policy_version": 1,
+                "adapter_path": "/policies/one.adapter",
+            },
+            "version": 2,
+            "adapter_path": "/policies/two.adapter",
+            "members": [],
+        })
+
+
+def test_explicit_base_model_binding_is_not_rebound_to_an_adapter(tmp_path):
+    manager = _PolicyManager(1, {1: "/policies/reused-policy.adapter"})
+    driver = StreamingDriver(
+        _prompts(1),
+        _DoneRollout(),
+        batch_size=2,
+        num_generations=2,
+        checkpoint_manager=manager,
+        resume_store=ResumeStore(tmp_path, "run-base-binding"),
+    )
+    group = driver._restore_group({
+        "key": "0",
+        "row": _prompts(1)[0],
+        "binding": {
+            "state_key": "run-base-binding/group/0",
+            "policy_version": 1,
+            "adapter_path": None,
+        },
+        "version": 1,
+        "adapter_path": None,
+        "members": [],
+    })
+    assert group.binding.adapter_path is None
+
+
+def test_group_binding_state_key_must_match_run_identity(tmp_path):
+    driver = StreamingDriver(
+        _prompts(1),
+        _DoneRollout(),
+        batch_size=2,
+        num_generations=2,
+        resume_store=ResumeStore(tmp_path, "run-identity"),
+    )
+    with pytest.raises(UnsafeResume, match="does not match"):
+        driver._restore_group({
+            "key": "0",
+            "row": _prompts(1)[0],
+            "binding": {
+                "state_key": "other-run/group/0",
+                "policy_version": 0,
+                "adapter_path": None,
+            },
+            "version": 0,
+            "adapter_path": None,
+            "members": [],
+        })
 
 
 def test_ready_group_over_staleness_is_dropped_whole(tmp_path):

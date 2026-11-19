@@ -15,7 +15,7 @@ from twinkle_agentic.async_rl.rollout_resume import (
     atomic_write_bytes,
 )
 from twinkle_agentic.async_rl.streaming_driver import StreamingDriver
-from twinkle_agentic.envs.base import EnvResumeCapability
+from twinkle_agentic.envs.resume import EnvResumeCapability, env_resume_capability
 from twinkle_agentic.rollout.multi_turn import MultiTurnRollout, RolloutStatus, _Episode
 
 
@@ -330,6 +330,6 @@ def test_openenv_adapters_declare_no_resume_capability():
     from twinkle_agentic.envs.agentenv import AgentEnv
     from twinkle_agentic.envs.openenv import OpenEnv, OpenEnvClient
 
-    assert AgentEnv.resume_capability is EnvResumeCapability.NONE
-    assert OpenEnv.resume_capability is EnvResumeCapability.NONE
-    assert OpenEnvClient.resume_capability is EnvResumeCapability.NONE
+    assert env_resume_capability(AgentEnv) is EnvResumeCapability.NONE
+    assert env_resume_capability(OpenEnv) is EnvResumeCapability.NONE
+    assert env_resume_capability(OpenEnvClient) is EnvResumeCapability.NONE

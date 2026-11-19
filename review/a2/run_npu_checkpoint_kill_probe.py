@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
-import io
 import json
 import os
 import platform
@@ -18,7 +17,6 @@ import subprocess
 import sys
 import time
 import traceback
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -385,7 +383,10 @@ def _worker(case: str, root: Path, model_path: str, train_jsonl: str, seed: int)
             if committed_lease != lease_id:
                 raise AssertionError(f"commit returned {committed_lease!r}, expected {lease_id!r}")
 
-    state = driver.state_dict()
+    # Do not take a manual snapshot here.  The probe is meant to prove that
+    # StreamingDriver persists its own stable boundaries; an explicit
+    # state_dict() would hide a missing automatic write.
+    stats = driver.stats()
     marker = {
         "format": "twinkle.npu-checkpoint-kill-marker.v1",
         "case": case,
@@ -405,7 +406,8 @@ def _worker(case: str, root: Path, model_path: str, train_jsonl: str, seed: int)
         "trained_optimizer_steps": trained_steps,
         "optimizer_loss": trained["loss"],
         "driver_state_path": str(store.root / "objects" / "driver"),
-        "driver_handed": state["handed"],
+        "driver_handed": stats["handed"],
+        "driver_persistence": "automatic",
         "trajectory": trajectory,
         "container": _container_info(),
         "marker_created_unix": time.time(),

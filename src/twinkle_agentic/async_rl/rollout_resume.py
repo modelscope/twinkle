@@ -89,6 +89,52 @@ class JournalEvent(str, Enum):
 
 
 @dataclass(frozen=True)
+class GroupPolicyBinding:
+    """The behavior policy fixed for one complete GRPO group.
+
+    ``state_key`` is the group's logical identity across processes.  The
+    policy version and adapter path travel with it so recovery, regeneration,
+    and replacement members cannot silently switch to a newer policy.
+    """
+
+    state_key: str
+    policy_version: int
+    adapter_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state_key, str) or not self.state_key.strip():
+            raise ValueError("group state_key must not be empty")
+        if isinstance(self.policy_version, bool) or not isinstance(self.policy_version, int):
+            raise ValueError("group policy_version must be an integer")
+        if self.policy_version < 0:
+            raise ValueError("group policy_version must be >= 0")
+        if self.adapter_path is not None and (
+            not isinstance(self.adapter_path, str) or not self.adapter_path.strip()
+        ):
+            raise ValueError("group adapter_path must be a non-empty string when provided")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state_key": self.state_key,
+            "policy_version": self.policy_version,
+            "adapter_path": self.adapter_path,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> GroupPolicyBinding:
+        if not isinstance(value, dict):
+            raise ValueError("group policy binding must be a mapping")
+        raw_version = value.get("policy_version")
+        if isinstance(raw_version, bool):
+            raise ValueError("group policy_version must be an integer")
+        return cls(
+            state_key=str(value.get("state_key") or ""),
+            policy_version=int(raw_version),
+            adapter_path=value.get("adapter_path"),
+        )
+
+
+@dataclass(frozen=True)
 class JournalRecord:
     seq: int
     event: JournalEvent
