@@ -486,7 +486,9 @@ class MultiLora:
             return re.fullmatch(target_modules, cleaned) is not None
 
         if isinstance(target_modules, (list, set)):
-            return any(cleaned.endswith(t) for t in target_modules)
+            # resolve_lora_targets stores full prefixed layer names (base_model.model....) back into
+            # tenant_config.target_modules, so strip the same prefix from the targets as from the name.
+            return any(cleaned.endswith(t.removeprefix('base_model.model.')) for t in target_modules)
 
         return False
 

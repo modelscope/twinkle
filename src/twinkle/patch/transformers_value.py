@@ -53,8 +53,9 @@ class TransformersValuePatch(Patch):
 
         score.forward = MethodType(_score_capture, score)
         self._captured = captured
-        # Top-level hook replaces the pooled SequenceClassifierOutput with the captured per-token scores.
-        self._hook = module.register_forward_hook(self._surface, with_kwargs=True)
+        # Surface the per-token scores before FSDP's post-forward hook registers the
+        # backward unshard hook; replacing its output afterwards bypasses that hook.
+        self._hook = module.register_forward_hook(self._surface, with_kwargs=True, prepend=True)
         return module
 
     def _surface(self, module, args, kwargs, output):

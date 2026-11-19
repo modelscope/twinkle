@@ -3,7 +3,7 @@ import inspect
 import torch
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from twinkle import get_logger, requires
+from twinkle import Platform, get_logger, requires
 from twinkle.data_format.sampling import (PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
                                            SamplingParams, StopReason, pooling_to_list)
 from twinkle.sampler.base_engine import BaseSamplerEngine
@@ -491,7 +491,9 @@ class SGLangEngine(BaseSamplerEngine):
         total = 0
 
         async for name, tensor in weight_aiter:
-            bucket.append((name, tensor))
+            # Checkpoint transports yield views into a reusable receive buffer. Own the values
+            # before advancing the iterator: its next receive can overwrite an unfinished bucket.
+            bucket.append((name, tensor.detach().clone()))
             bucket_bytes += tensor.numel() * tensor.element_size()
             total += 1
             if bucket_bytes >= bucket_limit:
@@ -533,33 +535,28 @@ class SGLangEngine(BaseSamplerEngine):
 
     async def _flush_bucket(self, bucket: List[Tuple[str, torch.Tensor]], flush_cache: bool,
                             load_format: Optional[str] = None) -> None:
-        """Hand one bucket to sglang, which forwards it to the TP workers as CUDA IPC handles.
+        """Hand one bucket to sglang, which forwards it to the TP workers as device IPC handles.
 
         ``monkey_patch_torch_reductions`` swaps the device index inside each handle for the physical
         device UUID (the flow sglang's own weight sync and verl's integration use): a TP worker whose
         CUDA enumeration differs from this process's then maps the handle onto its own card instead
         of whatever carries the same index here. Idempotent, so calling it per flush is free.
 
-        The load runs inside a begin/end weight-update session, which sglang requires and which
-        brackets exactly one bucket: the session restores the in-place-packed weights before the
-        load and finalizes them after, so leaving one open across buckets would keep the runners in
-        the restored state while a later bucket lands.
+        When sglang exposes begin/end weight-update sessions, bracket exactly one bucket to restore
+        packed weights before loading and finalize them afterwards. Older versions expose only
+        update_weights_from_tensor and receive the same bucket directly.
         """
-        from sglang.srt.managers.io_struct import (
-            BeginWeightUpdateReqInput,
-            EndWeightUpdateReqInput,
-            UpdateWeightsFromTensorReqInput,
-        )
+        from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
         from sglang.srt.utils import MultiprocessingSerializer
         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
         monkey_patch_torch_reductions()
         # Every tensor must be in device memory before it is serialized: the payload each TP worker
-        # receives is a CUDA IPC handle, and a host tensor's reduction tuple carries no device index
+        # receives is a device IPC handle, and a host tensor's reduction tuple carries no device index
         # at all, which sglang's patched reducer indexes unconditionally. The collect transport
         # returns its flush stream on the host, so stage it here -- the same reason the vLLM lane
         # stages host tensors into its device bucket instead of switching the wire format.
-        device = torch.device('cuda', torch.cuda.current_device())
+        device = torch.device(Platform.get_local_device())
         staged = [(name, tensor.detach().to(device)) for name, tensor in bucket]
         request = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=[MultiprocessingSerializer.serialize(staged)
@@ -567,16 +564,20 @@ class SGLangEngine(BaseSamplerEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        # sglang requires the load to run inside a weight-update session: begin restores the
-        # in-place-packed weights so new ones can land, end finalizes the runners it opened. The
-        # selector defaults to 'all', which covers the draft runner too when one is attached.
-        opened, begin_message = await self._manager.begin_weight_update(BeginWeightUpdateReqInput(), None)
-        if not opened:
-            raise RuntimeError(f'sglang refused to open a weight-update session: {begin_message}')
-        try:
+        closed, end_message = True, ''
+        if callable(getattr(self._manager, 'begin_weight_update', None)):
+            from sglang.srt.managers.io_struct import BeginWeightUpdateReqInput, EndWeightUpdateReqInput
+
+            # The selector defaults to 'all', including the draft runner when one is attached.
+            opened, begin_message = await self._manager.begin_weight_update(BeginWeightUpdateReqInput(), None)
+            if not opened:
+                raise RuntimeError(f'sglang refused to open a weight-update session: {begin_message}')
+            try:
+                success, message = await self._manager.update_weights_from_tensor(request, None)
+            finally:
+                closed, end_message = await self._manager.end_weight_update(EndWeightUpdateReqInput(), None)
+        else:
             success, message = await self._manager.update_weights_from_tensor(request, None)
-        finally:
-            closed, end_message = await self._manager.end_weight_update(EndWeightUpdateReqInput(), None)
         if not success:
             raise RuntimeError(f'sglang rejected a weight update bucket of {len(bucket)} tensors: {message}')
         if not closed:
