@@ -24,4 +24,8 @@ def test_batched_env_tools_retain_their_own_last_result():
     assert hit.last_result.observation == 'hit'
     assert stand.last_result.observation == 'stand'
     assert not stand.last_result.done
-    assert env.close('game') == -1
+    assert not hit.done and hit.last_result.reward == 0
+    assert stand.last_result.reward == 0
+    assert manager.call_many([{'function': {'name': 'stand', 'arguments': {'reward': 1}}}]) == ['stand']
+    assert stand.done and stand.last_result.reward == 1
+    assert env.close('game') == 0

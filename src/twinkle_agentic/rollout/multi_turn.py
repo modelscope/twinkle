@@ -21,6 +21,7 @@ from typing import Any, Optional
 from twinkle.data_format import Trajectory, user_data_get
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import remote_class, remote_function
+from twinkle.protocol.types.sampler import SampleResponseModel
 from twinkle.template.base import Template
 from twinkle.utils import get_logger
 from twinkle_agentic.envs.base import NoSlot
@@ -31,6 +32,62 @@ from .endpoint import ENDPOINTS, EndpointRequest, PolicyEndpoint, assistant_mess
 from .ledger import MessageLedger, TurnLedger
 
 logger = get_logger()
+
+
+def _dump_rollout_rows(episode_id: str, rows: list) -> None:
+    """Write each delivered training row's contract arrays when ``TWINKLE_ROLLOUT_TRAJ_DUMP`` names a dir.
+
+    An independent depth oracle for the rollout trajectory contract (G28). The producer already
+    asserts ``validate_trajectory`` at ``ledger.merge``, but a self-consistent encoding can still
+    pass its own check; dumping the arrays lets an offline judge re-derive the shifted-labels,
+    logps-alignment and mask-count contracts from the numbers themselves, and compare an episode's
+    segments for prefix-extension. Write-only and env-gated: a no-op (zero cost) when unset.
+    """
+    import os
+    root = os.environ.get('TWINKLE_ROLLOUT_TRAJ_DUMP')
+    if not root:
+        return
+    os.makedirs(root, exist_ok=True)
+    rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+    path = os.path.join(root, f'rows.rank{rank}.jsonl')
+
+    def _grid(value: Any) -> Any:
+        # image_grid_thw / video_grid_thw arrive as a tensor (one row per media item);
+        # the judge re-derives the placeholder-token count from the grid, so dump it as
+        # plain nested ints. Absent on text rows -- leave it None, not an empty grid.
+        if value is None:
+            return None
+        tolist = getattr(value, 'tolist', None)
+        return tolist() if callable(tolist) else value
+
+    def _media_count(value: Any) -> Optional[int]:
+        return len(value) if isinstance(value, (list, tuple)) else None
+
+    with open(path, 'a', encoding='utf-8') as handle:
+        for seg, row in enumerate(rows):
+            messages = row.get('messages') or []
+            rec = {
+                'episode_id': episode_id,
+                'segment_index': row.get('segment_index', seg),
+                'rank': rank,
+                'input_ids': row.get('input_ids') or [],
+                'labels': row.get('labels') or [],
+                'completion_mask': row.get('completion_mask'),
+                'response_token_ids': row.get('response_token_ids') or [],
+                'response_positions': row.get('response_positions') or [],
+                'rollout_logps': row.get('rollout_logps'),
+                'messages': messages,
+                'stop_reason': row.get('stop_reason'),
+                # D6 media frame: raw media counts + the processor grid. The judge checks
+                # image-count consistency and the placeholder-token expansion against the grid.
+                'images_count': _media_count(row.get('images')),
+                'videos_count': _media_count(row.get('videos')),
+                'audios_count': _media_count(row.get('audios')),
+                'image_grid_thw': _grid(row.get('image_grid_thw')),
+                'video_grid_thw': _grid(row.get('video_grid_thw')),
+            }
+            handle.write(json.dumps(rec, default=str) + '\n')
+
 
 # Termination reasons surfaced via ``trajectory['stop_reason']``. The sampler
 # path takes the first three from the sampler itself; the API path has to name
@@ -156,11 +213,15 @@ def _single_sequence(responses: Any) -> SampledSequence:
     if len(responses) != 1:
         raise RuntimeError(f'sampler returned {len(responses)} responses for a single request; expected exactly one.')
     response = responses[0]
-    if not isinstance(response, SampleResponse):
-        raise TypeError(f'expected SampleResponse from sampler.sample, got {type(response).__name__}')
+    if not isinstance(response, (SampleResponse, SampleResponseModel)):
+        raise TypeError(f'expected SampleResponse or SampleResponseModel from sampler.sample, '
+                        f'got {type(response).__name__}')
     if len(response.sequences) != 1:
         raise RuntimeError(f'SampleResponse contains {len(response.sequences)} sequences; expected exactly one.')
-    return response.sequences[0]
+    sequence = response.sequences[0]
+    if isinstance(response, SampleResponseModel):
+        return SampledSequence(**sequence.model_dump())
+    return sequence
 
 
 def is_error_observation(observation: str) -> bool:
@@ -655,7 +716,15 @@ class MultiTurnRollout:
         """Open the episode's env session and first turn. Returns True only on a no-slot sentinel."""
         if self.env is not None:
             _record_dispatch_probe('reset_start', ep.episode_id)
-            result = self.env.reset(ep.episode_id, ep.trajectory, wait=session_wait)
+            try:
+                result = self.env.reset(ep.episode_id, ep.trajectory, wait=session_wait)
+            except TimeoutError as exc:
+                # A waiting reset that exhausts its slot deadline raises a bare TimeoutError. The batch
+                # driver's __call__ catches only EpisodeError, so without this wrap a full pool crashes
+                # the whole batch instead of recording one generation_error row. Discard the registration
+                # (no session opened) and surface it as an episode failure, preserving the real cause.
+                self._discard(ep.episode_id)
+                raise EpisodeError(f'episode {ep.episode_id!r} could not open an env session: {exc}') from exc
             _record_dispatch_probe('reset_returned', ep.episode_id, discarded=ep.discarded)
             if isinstance(result, NoSlot):
                 # The pool is full and this call was asked not to wait. Drop the registration we just
@@ -724,6 +793,7 @@ class MultiTurnRollout:
             # the episode, and every row of it carries the same one.
             row['rewards'] = dict(row.get('rewards') or {}, env=env_reward)
         rows = list(ep.closed_rows) + [traj]
+        _dump_rollout_rows(ep.episode_id, rows)
         extra = {
             key: traj[key]
             for key in ('stuck_stop', 'tool_stop', 'followups', 'segments', 'agent_exit_code', 'error') if key in traj

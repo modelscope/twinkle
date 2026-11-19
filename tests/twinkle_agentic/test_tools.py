@@ -5,6 +5,8 @@ import pytest
 
 from twinkle.data_format import ToolCall
 from twinkle.data_format.message import Tool as ToolInfo
+from twinkle_agentic.envs.base import Env, StepResult
+from twinkle_agentic.envs.env_tool import EnvTool
 from twinkle_agentic.tools.base import Tool
 from twinkle_agentic.tools.tool_manager import ToolManager, _extract_name
 
@@ -39,13 +41,6 @@ class CalculatorTool(Tool):
 
     def tool_info(self) -> ToolInfo:
         return {'function': {'name': 'calculator', 'description': 'Basic calculator.'}}
-
-
-class BoundTool(MockTool):
-
-    def __init__(self, env, name='bound_tool'):
-        super().__init__(name)
-        self._env = env
 
 
 class FailingTool(Tool):
@@ -253,33 +248,63 @@ class TestToolManager:
         with pytest.raises(ValueError, match='non-empty'):
             ToolManager([BadTool()])
 
-    def test_bound_envs_empty_and_deduplicated_by_identity(self):
-        class Env:
-            def __init__(self):
-                self.idle_calls = 0
+    def test_call_many_keeps_distinct_envs_apart_under_one_episode(self):
+        # Successor to bound_envs' identity-dedup: call_many must group on env
+        # identity too, not just episode_id, or two environments sharing an
+        # episode id would have their calls merged onto one of them.
+        env_a, env_b = RecordingEnv(), RecordingEnv()
+        env_a.reset('ep1')
+        env_b.reset('ep1')
+        manager = ToolManager([
+            EnvTool(env_a, 'ep1', tool_name='a1'),
+            EnvTool(env_a, 'ep1', tool_name='a2'),
+            EnvTool(env_b, 'ep1', tool_name='b1'),
+        ])
+        out = manager.call_many([
+            {'function': {'name': name, 'arguments': {}}} for name in ('a1', 'a2', 'b1')
+        ])
+        assert env_a.batches == [('ep1', [('a1', {}), ('a2', {})])]
+        assert env_b.batches == [('ep1', [('b1', {})])]
+        assert out == ['ran a1', 'ran a2', 'ran b1']
 
-            def ensure_idle(self):
-                self.idle_calls += 1
+    def test_call_many_keeps_distinct_episodes_apart_on_one_env(self):
+        env = RecordingEnv()
+        env.reset('ep1')
+        env.reset('ep2')
+        manager = ToolManager([EnvTool(env, 'ep1', tool_name='a1'), EnvTool(env, 'ep2', tool_name='a2')])
+        manager.call_many([{'function': {'name': name, 'arguments': {}}} for name in ('a1', 'a2')])
+        assert env.batches == [('ep1', [('a1', {})]), ('ep2', [('a2', {})])]
 
-        env = Env()
-        manager = ToolManager([BoundTool(env, 'first'), BoundTool(env, 'second'), MockTool('stateless')])
-        assert ToolManager().bound_envs() == ()
-        assert manager.bound_envs() == (env, )
+    def test_call_many_does_not_drag_sessionless_tools_into_a_batch(self):
+        env = RecordingEnv()
+        env.reset('ep1')
+        manager = ToolManager([EnvTool(env, 'ep1', tool_name='a1'), MockTool('stateless')])
+        out = manager.call_many([
+            {'function': {'name': 'a1', 'arguments': {}}},
+            {'function': {'name': 'stateless', 'arguments': {}}},
+        ])
+        assert env.batches == [('ep1', [('a1', {})])]
+        assert out == ['ran a1', 'executed stateless with {}']
 
-        manager.ensure_idle()
-        assert env.idle_calls == 1
 
-    def test_bound_envs_returns_each_distinct_environment(self):
-        first, second = object(), object()
-        manager = ToolManager([BoundTool(first, 'first'), BoundTool(second, 'second')])
-        assert manager.bound_envs() == (first, second)
+class RecordingEnv(Env):
+    """Records each ``step_batch`` dispatch as ``(episode_id, calls)``.
 
-    def test_ensure_idle_failure_propagates(self):
-        class Env:
-            @staticmethod
-            def ensure_idle():
-                raise RuntimeError('execution unknown')
+    The grouping under test is invisible from the observations alone -- a batch
+    and a serial loop return the same list -- so the dispatch itself is recorded.
+    """
 
-        manager = ToolManager([BoundTool(Env())])
-        with pytest.raises(RuntimeError, match='execution unknown'):
-            manager.ensure_idle()
+    def __init__(self):
+        super().__init__()
+        self.batches = []
+
+    def _open(self, trajectory):
+        return None, StepResult()
+
+    def _step(self, state, tool_name, arguments):
+        return StepResult(observation=f'ran {tool_name}')
+
+    def step_batch(self, episode_id, calls):
+        calls = [(name, args or {}) for name, args in calls]
+        self.batches.append((episode_id, calls))
+        return [StepResult(observation=f'ran {name}') for name, _ in calls]

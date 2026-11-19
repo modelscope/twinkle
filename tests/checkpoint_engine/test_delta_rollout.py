@@ -2,6 +2,7 @@
 """Rollout side: sampler coordination, GPU-local receivers, topology placement, request admission and device mapping."""
 import asyncio
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
@@ -10,6 +11,7 @@ import torch
 
 from twinkle.checkpoint_engine.delta.rollout.cuda_receiver import CudaDeltaReceiver
 from twinkle.checkpoint_engine.delta.rollout.mixin import VLLMDeltaSamplerMixin
+from twinkle.sampler.base import Sampler
 from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
 from twinkle.sampler.vllm_sampler.vllm_worker_extension import _cuda_visible_device
 
@@ -17,6 +19,16 @@ from twinkle.sampler.vllm_sampler.vllm_worker_extension import _cuda_visible_dev
 class LocalCudaSampler(VLLMDeltaSamplerMixin):
     def _run_in_loop(self, coroutine):
         return asyncio.run(coroutine)
+
+
+class GateSampler(Sampler):
+    """Concrete sampler exercising the base pause/resume gate (no engine-native pause)."""
+
+    def sample(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def apply_patch(self, *args, **kwargs):
+        raise NotImplementedError
 
 
 def receiver_stub(flags):
@@ -30,19 +42,20 @@ def test_zero_change_skips_native_update_but_restores_kv_and_generation():
     sampler = LocalCudaSampler()
     sampler._delta_receivers = [receiver_stub([None]), receiver_stub([None])]
     sampler._delta_config = SimpleNamespace(timeout_seconds=1, free_cache_engine=True)
-    sampler.engine = SimpleNamespace(pause_delta_generation=AsyncMock(), engine=SimpleNamespace(
-        sleep=AsyncMock(), wake_up=AsyncMock(), reset_prefix_cache=AsyncMock(return_value=True),
-        resume_generation=AsyncMock()))
+    sampler.pause_generation = Mock()
+    sampler.resume_generation = Mock()
+    sampler.engine = SimpleNamespace(engine=SimpleNamespace(
+        sleep=AsyncMock(), wake_up=AsyncMock(), reset_prefix_cache=AsyncMock(return_value=True)))
     sampler._delta_rpc = AsyncMock()
     sampler.begin_delta_sync()
     assert sampler.receive_delta_weights() == {'changed': False}
     sampler.publish_delta_sampler()
     sampler._delta_rpc.assert_not_called()
-    sampler.engine.pause_delta_generation.assert_awaited_once_with(1)
+    sampler.pause_generation.assert_called_once()
     sampler.engine.engine.sleep.assert_awaited_once_with(level=1)
     assert sampler.engine.engine.wake_up.await_args_list == [
         call(tags=['weights']), call(tags=['kv_cache'])]
-    sampler.engine.engine.resume_generation.assert_awaited_once()
+    sampler.resume_generation.assert_called_once()
 
 
 def test_sampler_coordinates_native_update_and_gpu_local_senders():
@@ -87,12 +100,14 @@ def test_cache_reset_failure_does_not_resume_generation():
 def test_without_kv_release_pause_and_resume_still_run():
     sampler = LocalCudaSampler()
     sampler._delta_config = SimpleNamespace(timeout_seconds=1, free_cache_engine=False)
-    sampler.engine = SimpleNamespace(pause_delta_generation=AsyncMock(), engine=SimpleNamespace(
-        sleep=AsyncMock(), wake_up=AsyncMock(), resume_generation=AsyncMock()))
+    sampler.pause_generation = Mock()
+    sampler.resume_generation = Mock()
+    sampler.engine = SimpleNamespace(engine=SimpleNamespace(
+        sleep=AsyncMock(), wake_up=AsyncMock()))
     sampler.begin_delta_sync()
     sampler.publish_delta_sampler()
-    sampler.engine.pause_delta_generation.assert_awaited_once()
-    sampler.engine.engine.resume_generation.assert_awaited_once()
+    sampler.pause_generation.assert_called_once()
+    sampler.resume_generation.assert_called_once()
     sampler.engine.engine.sleep.assert_not_called()
     sampler.engine.engine.wake_up.assert_not_called()
 
@@ -208,63 +223,116 @@ def test_sampler_dp_allows_independent_rollout_replicas():
     assert sampler.validate_delta_sampler(DeltaSyncConfig()) == dict(tp=2, device='cuda')
 
 
-def test_submission_barrier_waits_for_request_already_past_gate():
-    async def run():
-        engine = VLLMEngine.__new__(VLLMEngine)
-        admitted = asyncio.Event()
-        release = asyncio.Event()
-        paused = asyncio.Event()
-        engine.engine = SimpleNamespace(pause_generation=AsyncMock(side_effect=lambda **_: paused.set()))
+def test_pause_waits_for_inflight_request_then_blocks_new_until_resume():
+    # The submission barrier now lives in the base _GenerationGate: pause must wait for a request
+    # already past the gate (in-flight reader) and block new reads until resume.
+    sampler = GateSampler()
+    gate = sampler._gate()
+    entered, release, read_done = threading.Event(), threading.Event(), threading.Event()
 
-        async def source():
-            admitted.set()
-            await release.wait()
+    def reader():
+        with gate.read():
+            entered.set()
+            release.wait()
+        read_done.set()
+
+    inflight = threading.Thread(target=reader, daemon=True)
+    inflight.start()
+    assert entered.wait(2)
+    paused = threading.Event()
+
+    def pauser():
+        sampler.pause_generation()
+        paused.set()
+
+    pausing = threading.Thread(target=pauser, daemon=True)
+    pausing.start()
+    assert not paused.wait(0.2), 'pause completed while a request still held the gate'
+    new_started = threading.Event()
+
+    def new_reader():
+        with gate.read():
+            new_started.set()
+
+    blocked = threading.Thread(target=new_reader, daemon=True)
+    blocked.start()
+    assert not new_started.wait(0.2), 'a new read slipped through while paused'
+    release.set()
+    inflight.join(2)
+    pausing.join(2)
+    assert read_done.is_set() and paused.is_set()
+    sampler.resume_generation()
+    blocked.join(2)
+    assert new_started.is_set(), 'resume did not release the blocked read'
+
+
+def test_admitted_outputs_close_source_on_early_consumer_close():
+    engine = VLLMEngine.__new__(VLLMEngine)
+    closed = asyncio.Event()
+
+    async def source():
+        try:
             yield 'first'
+            yield 'second'  # consumer closes after the first; only aclose can end the source here
+        finally:
+            closed.set()
 
-        async def consume():
-            return [output async for output in engine._delta_admitted_outputs(source())]
-
-        request = asyncio.create_task(consume())
-        await admitted.wait()
-        update = asyncio.create_task(engine.pause_delta_generation(1))
-        await asyncio.sleep(0)
-        assert engine._delta_unavailable
-        assert not paused.is_set()
-        with pytest.raises(RuntimeError, match='unavailable'):
-            await consume()
-        release.set()
-        assert await request == ['first']
-        await update
-        assert paused.is_set()
-        assert engine._delta_admitting == 0
+    async def run():
+        source_gen = source()  # keep an external ref so only an explicit aclose can close it
+        outputs = engine._delta_admitted_outputs(source_gen)
+        assert await anext(outputs) == 'first'
+        await outputs.aclose()
+        assert closed.is_set(), 'early consumer close stranded the engine generator'
     asyncio.run(run())
 
 
-def test_admission_error_does_not_strand_barrier():
+def test_admitted_outputs_propagate_source_error():
+    engine = VLLMEngine.__new__(VLLMEngine)
+
+    async def source():
+        yield 'first'
+        raise ValueError('source failed')
+
     async def run():
-        engine = VLLMEngine.__new__(VLLMEngine)
-        engine.engine = SimpleNamespace(pause_generation=AsyncMock())
-        async def source():
-            raise ValueError('admission failed')
-            yield
-        with pytest.raises(ValueError, match='admission failed'):
+        outputs = engine._delta_admitted_outputs(source())
+        assert await anext(outputs) == 'first'
+        with pytest.raises(ValueError, match='source failed'):
+            await anext(outputs)
+    asyncio.run(run())
+
+
+def test_admitted_outputs_reject_before_consuming_when_delta_unavailable():
+    engine = VLLMEngine.__new__(VLLMEngine)
+    engine._delta_unavailable = True
+    started = False
+
+    async def source():
+        nonlocal started
+        started = True
+        yield 'x'
+
+    async def run():
+        with pytest.raises(RuntimeError, match='unavailable'):
             async for _ in engine._delta_admitted_outputs(source()):
                 pass
-        await engine.pause_delta_generation(1)
-        engine.engine.pause_generation.assert_awaited_once()
-        assert engine._delta_admitting == 0
+        assert not started, 'generator was consumed despite the closed availability gate'
     asyncio.run(run())
 
 
-def test_admission_timeout_keeps_gate_closed_and_does_not_pause_or_write():
+def test_admitted_outputs_pass_through_in_order_and_close_on_exhaustion():
+    engine = VLLMEngine.__new__(VLLMEngine)
+    closed = asyncio.Event()
+
+    async def source():
+        try:
+            yield 'a'
+            yield 'b'
+        finally:
+            closed.set()
+
     async def run():
-        engine = VLLMEngine.__new__(VLLMEngine)
-        engine._delta_admitting = 1
-        engine.engine = SimpleNamespace(pause_generation=AsyncMock())
-        with pytest.raises(TimeoutError):
-            await engine.pause_delta_generation(.01)
-        engine.engine.pause_generation.assert_not_awaited()
-        assert engine._delta_unavailable
+        assert [item async for item in engine._delta_admitted_outputs(source())] == ['a', 'b']
+        assert closed.is_set(), 'generator left open after normal exhaustion'
     asyncio.run(run())
 
 
@@ -295,7 +363,6 @@ def test_stream_close_closes_admitted_engine_generator(monkeypatch):
         assert await anext(stream) == ('token', None)
         await stream.aclose()
         assert closed.is_set()
-        assert engine._delta_admitting == 0
     asyncio.run(run())
 
 

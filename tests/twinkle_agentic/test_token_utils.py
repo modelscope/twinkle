@@ -135,6 +135,7 @@ class FakeTemplate:
     render_delta = Template.render_delta
     _collapse_system_messages = staticmethod(Template._collapse_system_messages)
     decode_tool_calls = staticmethod(Template.decode_tool_calls)
+    _collapse_system_messages = staticmethod(Template._collapse_system_messages)
 
     def __init__(self, tokenizer: FakeTokenizer) -> None:
         self.tokenizer = tokenizer

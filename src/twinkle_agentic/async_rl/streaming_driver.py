@@ -698,10 +698,17 @@ class StreamingDriver:
         return (max(synced_batches, self._consumed_batches) + ahead_batches) * self.batch_size
 
     def _admit(self) -> None:
-        """Open groups while the admitted-and-alive rows stay within the version bound (under the lock)."""
+        """Open groups within the version window and remaining-batch budget (under the lock)."""
+        remaining_groups = None
         if self.max_steps is not None and self._handed >= self.max_steps:
             self._exhausted = True
+        elif self.max_steps is not None:
+            # Each successful episode delivers at least one row, including when segments are collected.
+            remaining_groups = (self.max_steps - self._handed) * (self.batch_size // self.num_generations)
         while not self._exhausted and self._live + self.num_generations <= self._capacity():
+            # A group with missing members keeps its reservation until the group itself is dropped.
+            if remaining_groups is not None and len(self._ready) + len(self._groups) >= remaining_groups:
+                return
             row = self._next_row()
             if row is None:
                 self._exhausted = True

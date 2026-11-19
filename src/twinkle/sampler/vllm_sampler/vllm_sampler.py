@@ -830,7 +830,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
                 self.engine.engine.collective_rpc('weight_sync_metadata'))
         return self._direct_weight_targets
 
-    @remote_function(dispatch='all', lazy_collect=True)
+    @remote_function(dispatch='all', lazy_collect=True, offload_blocking=True)
     @timed
     def receive_weights_direct(self, targets, *, auth_key='', base_sync_done=False, peft_config=None):
         async def receive():
@@ -843,7 +843,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
 
         self._run_in_loop(receive())
 
-    @remote_function(dispatch='all', lazy_collect=True)
+    @remote_function(dispatch='all', lazy_collect=True, offload_blocking=True)
     @timed
     def receive_weights(
         self,

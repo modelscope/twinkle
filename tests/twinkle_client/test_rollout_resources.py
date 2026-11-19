@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +73,16 @@ def test_partial_environment_setup_and_primary_error_are_preserved():
     assert events == ['env.shutdown', 'client.close']
 
 
+def note_unconfirmed(resources):
+    """Drive the real settlement path: a managed remote op that sent a request then lost its outcome."""
+    def operation():
+        resources._operation_scope.note_request('/train/step')
+        raise ConnectionError('lost server')
+
+    with pytest.raises(ConnectionError):
+        resources._operation_scope.run(operation)
+
+
 def test_unconfirmed_operation_retains_environments_and_client():
     events = []
     primary = ConnectionError('lost server')
@@ -89,6 +100,18 @@ def test_unconfirmed_operation_retains_environments_and_client():
     assert events == ['rollout.close']
     assert resources.client is not None and resources._environments == {id(env): env}
     assert 'environments and client retained' in '\n'.join(primary.__notes__)
+
+
+def test_unconfirmed_remote_settlement_retains_environments_and_client():
+    events = []
+    with pytest.raises(BaseExceptionGroup, match='resource cleanup') as caught:
+        with scope_for(events) as resources:
+            resources.own_rollout(Rollout(events))
+            env = resources.own_environment(Environment(events))
+            note_unconfirmed(resources)
+    assert events == ['rollout.close']
+    assert resources.client is not None and resources._environments == {id(env): env}
+    assert 'environments and client retained' in ''.join(traceback.format_exception(caught.value))
 
 
 @pytest.mark.parametrize('failure', [RuntimeError('close failed'), KeyboardInterrupt('worker interrupted')])

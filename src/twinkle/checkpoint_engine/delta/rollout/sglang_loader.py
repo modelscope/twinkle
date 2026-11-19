@@ -79,17 +79,24 @@ def _densify(encoding: str, patch: DeltaPatch) -> torch.Tensor:
 
 @contextmanager
 def _masked_copy() -> Iterator[None]:
-    """Temporarily make ``Tensor.copy_`` skip NaN positions in the source.
+    """Temporarily make ``Tensor.copy_`` and ``Tensor.__setitem__`` skip NaN positions in the source.
 
     SGLang's per-model ``load_weights`` ultimately lands on ``param.copy_(loaded)`` (possibly
     on a narrowed TP slice). Under this context a NaN-masked source overwrites only the changed
     positions; fully dense sources (the first full-seed flush) degenerate to a plain copy.
+
+    Some loaders -- notably sglang's ``mamba_v2_sharded_weight_loader`` -- write through index
+    assignment (``param.data[boundary:boundary+take] = loaded[...]``) rather than ``copy_``. That
+    path bypassed the ``copy_`` patch and let the sparse-delta NaN sentinel leak into the model
+    (defect71: delta_sharded loss=nan while full-sync stayed finite), so ``__setitem__`` is masked
+    the same way. Only floating-point tensor values are touched; dense values pass through unchanged.
 
     The NaN sentinel assumes the model's own weights never legitimately contain NaN -- the same
     assumption the bf16 bitwise diff on the trainer side makes (a NaN weight would not round-trip
     the shard snapshot comparison anyway).
     """
     orig_copy = torch.Tensor.copy_
+    orig_setitem = torch.Tensor.__setitem__
 
     def masked_copy_(self: torch.Tensor, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         if isinstance(src, torch.Tensor) and src.is_floating_point() and self.shape == src.shape:
@@ -97,8 +104,21 @@ def _masked_copy() -> Iterator[None]:
             return orig_copy(self, torch.where(torch.isnan(cast), self, cast))
         return orig_copy(self, src, *args, **kwargs)
 
+    def masked_setitem_(self: torch.Tensor, key, value) -> None:
+        if isinstance(value, torch.Tensor) and value.is_floating_point():
+            try:
+                dest = self[key]
+                if isinstance(dest, torch.Tensor) and dest.shape == value.shape:
+                    cast = value.to(self.dtype)
+                    value = torch.where(torch.isnan(cast), dest, cast)
+            except Exception:  # noqa: exotic keys fall back to the unmasked assignment
+                pass
+        return orig_setitem(self, key, value)
+
     torch.Tensor.copy_ = masked_copy_
+    torch.Tensor.__setitem__ = masked_setitem_
     try:
         yield
     finally:
         torch.Tensor.copy_ = orig_copy
+        torch.Tensor.__setitem__ = orig_setitem

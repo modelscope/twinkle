@@ -147,7 +147,7 @@ class MegatronOptimizerGroup(BaseOptimizerGroup):
         self.train_status = TrainStatus(metrics=train_metrics)
 
         eval_metrics = [
-            LossMetric(self._device_mesh, self._dp_group),
+            LossMetric(self._device_mesh, self._dp_group, is_training=False),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
         self.eval_status = TrainStatus(metrics=eval_metrics)
@@ -847,6 +847,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 del unpacked_logits
             losses = result['loss']
             counts = result['num_tokens']
+            reporting_num_tokens = counts
             if compute_loss and not counts:
                 # Later will gather this value, so it becomes:
                 # 1. SUM loss: gather_sum(local_num_tokens) = global_num_tokens
@@ -858,6 +859,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 #       / (gradient_accumulation_steps  * world_size ) = avg_per_token_grad
                 counts = torch.tensor(1, device=losses.device)
             reduced = self.strategy.reduce_loss(losses, counts, reported_logits, logps)
+            # Report the ORIGINAL num_tokens (0 for MEAN-contract losses) so the aggregator averages
+            # per-microbatch losses instead of summing them; the clamped counts above feed only the
+            # backward denominator, which must stay >=1. SUM contract (num_tokens>0) is unchanged.
+            reduced[2]['num_tokens'] = torch.as_tensor(reporting_num_tokens).to(torch.int64)
             if decision_outputs is not None:
                 # The decision metric reads the readout's non-logits fields (option_mask / kinds /
                 # counts) off the returned outputs, mirroring the transformers backend where the
@@ -1040,7 +1045,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         loss_mask = (labels != -100).bool()
                         masked_labels = labels.clone()
                         masked_labels[~loss_mask] = 0
-                        output_tensor.div_(temperature)
+                        if temperature != 1.0:
+                            output_tensor.div_(temperature)
                         if _loss_require_entropy:
                             logps, entropies = selective_log_softmax(output_tensor, masked_labels, return_entropy=True)
                         else:
@@ -1626,6 +1632,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
     @remote_function(dispatch='all', sync=True)
     @timed
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
+        # defect44: capture the lr this update consumes before lr_step advances the schedule.
+        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config._last_lrs = list(optimizer_config._get_lr())
         self.step(**kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
@@ -1723,7 +1733,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         json.dump(trainer_state, f, indent=2)
                     tracker_path = os.path.join(checkpoint_dir, 'latest_checkpointed_iteration.txt')
                     with open(tracker_path, 'w') as f:
-                        f.write(str(optimizer_config.cur_step))
+                        # frozen trigger-time step, not the live cur_step which training advances before
+                        # this deferred finalize runs (async staging race wrote a later iteration).
+                        f.write(str(trainer_state['cur_step']))
                     copy_checkpoint_args(output_dir, checkpoint_dir)
 
             async_request.finalize_fns.append(_finalize_async_checkpoint)

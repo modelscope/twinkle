@@ -256,6 +256,17 @@ class TransformerStrategyBase(ABC):
         """
         return False
 
+    def param_lane_status(self) -> str:
+        """Reliability of the param pre/post digest lane in step-probe records.
+
+        'authoritative': pre/post directly reflect the update (FSDP2, DDP, non-offload ZeRO-0/1/2).
+        'stale_view': offload tier — bf16 param view not yet updated by copy-back at digest time
+            (defect34); master lane is authoritative instead.
+        'partitioned': ZeRO-3 — some params read as numel==0 placeholders (defect37); master lane
+            is authoritative instead.
+        """
+        return 'authoritative'
+
     def engine_backward(self, model, loss, *, sync_gradients: bool) -> None:
         """Run the backward for one micro-batch, applying the update at the accumulation boundary."""
         raise NotImplementedError(f'{type(self).__name__} does not own the update step.')

@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable
@@ -356,7 +357,12 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         """
         checkpoint_name = self.get_ckpt_name(name)
         save_dir = self.get_save_dir(model_id)
+        perf = os.environ.get('TWINKLE_PERF') == '1'
+        t0 = time.perf_counter() if perf else 0.0
         checkpoint_dir = await save_weights(name=checkpoint_name, output_dir=save_dir)
+        if perf:
+            logger.info('[server][perf] weight-save disk write %.3fs model=%s ckpt=%s',
+                        time.perf_counter() - t0, model_id, checkpoint_name)
         uri = self.save(model_id, checkpoint_name)
         return uri, checkpoint_dir
 
@@ -391,7 +397,12 @@ class BaseCheckpointManager(BaseFileManager, ABC):
                     version_id=version_id,
                     live_alias_name=live_alias_name)
                 try:
+                    perf = os.environ.get('TWINKLE_PERF') == '1'
+                    t0 = time.perf_counter() if perf else 0.0
                     await save_weights(name=checkpoint_name, output_dir=staging)
+                    if perf:
+                        logger.info('[server][perf] weight-save disk write %.3fs model=%s ckpt=%s sampler=true',
+                                    time.perf_counter() - t0, model_id, checkpoint_name)
                     if not files.staged_checkpoint.is_dir():
                         raise RuntimeError('Backend did not materialize the sampler checkpoint.')
                     metadata = self._build_checkpoint_metadata(

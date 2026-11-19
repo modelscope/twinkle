@@ -269,7 +269,37 @@ class AccelerateStrategy(TransformerStrategyBase):
                 self._rebind_unsharded_optimizer_params(
                     prepared[0], optimizer, self.__dict__.get('_optimizer_param_names'))
                 self._remember_optimizer_params(prepared[0], optimizer)
+        self._init_fsdp_dtype_bookkeeping(prepared[0])
         return result
+
+    @staticmethod
+    def _init_fsdp_dtype_bookkeeping(model):
+        """Capture FSDP2 dtype bookkeeping while trainable adapters are ENABLED (defect78-s2).
+
+        torch FSDP2 captures each param group's ``_orig_dtype``/``_reduce_dtype`` ONCE at the first
+        forward (``_lazy_init``'s ``_is_root`` guard is never reset) from the requires_grad-filtered
+        trainable params. A LoRA run's first forward is the ``disable_adapter()`` reference forward
+        (KL ref_logps), which flips lora ``requires_grad=False``; every lora-bearing group then
+        captures ``trainable=0 -> _orig_dtype=None``, and the later training backward reduce-scatters
+        in the autograd dtype (bf16) and, with ``_orig_dtype=None``, skips the cast back to the fp32
+        storage dtype -- assigning a bf16 grad into a ``grad_dtype=Float`` sharded param, which torch
+        raises on. Pre-running the ROOT state's ``_lazy_init`` here (adapters still enabled) makes
+        that first reference forward's ``_lazy_init`` a no-op and keeps ``_orig_dtype=fp32``.
+
+        ``Accelerator.prepare`` applies FSDP2 but never initializes this bookkeeping ahead of the
+        first forward. The prepared ``model`` may be a wrapper (e.g. a multimodal PeftModel) that is
+        not itself an ``FSDPModule`` instance, so locate the outermost FSDP-managed module in the
+        tree rather than relying on ``isinstance(model, FSDPModule)`` alone. No-op for non-FSDP2
+        (DeepSpeed / FSDP1 / single rank) models, which have no such lazy dtype bookkeeping.
+        """
+        import torch
+        from torch.distributed.fsdp import FSDPModule
+        if not isinstance(model, torch.nn.Module):
+            return
+        fsdp_root = model if isinstance(model, FSDPModule) else next(
+            (m for m in model.modules() if isinstance(m, FSDPModule)), None)
+        if fsdp_root is not None:
+            fsdp_root._get_fsdp_state()._lazy_init()
 
     @staticmethod
     def _untie_shared_weights(model, optimizers, duplicates):

@@ -210,7 +210,7 @@ class VLLMDeltaSamplerMixin:
         await self._clear_delta_cache()
         return {'changed': True}
 
-    @remote_function(dispatch='all', lazy_collect=True)
+    @remote_function(dispatch='all', lazy_collect=True, offload_blocking=True)
     def receive_delta_weights(self) -> dict[str, bool]:
         if self._delta_is_npu:
             return self._run_in_loop(self._receive_delta_weights_npu())

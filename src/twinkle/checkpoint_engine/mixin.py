@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
+import os
 import threading
 import uuid
 from typing import List
@@ -58,6 +59,21 @@ class CheckpointEngineMixin:
         """Choose the default transport channel for backward-compatible callers."""
         self._select_checkpoint_engine(backend, 'default')
 
+    def _resolve_bucket_size(self) -> int:
+        """Transport bucket bytes; ``TWINKLE_CHECKPOINT_BUCKET_MB`` overrides the class default.
+
+        The NCCL/HCCL/XCCL engines assert a single weight fits one bucket, so a model whose largest
+        tensor exceeds the 3 GB default (e.g. a 9B fp32 embedding ≈ 4 GB) needs a larger bucket. The
+        assertion tells the user to increase bucket_size; this env knob is how they do so.
+        """
+        env = os.environ.get('TWINKLE_CHECKPOINT_BUCKET_MB')
+        if env:
+            mb = int(env)
+            if mb <= 0:
+                raise ValueError(f'TWINKLE_CHECKPOINT_BUCKET_MB must be > 0, got {mb}')
+            return mb << 20
+        return self._bucket_size
+
     def _get_or_create_checkpoint_engine(self) -> 'CheckpointEngine':
         """Get or create the engine for the currently active transport channel."""
         backend = self._checkpoint_engine_backend
@@ -72,29 +88,33 @@ class CheckpointEngineMixin:
             self._checkpoint_engines = engines
         engine = engines.get(key)
         if engine is None:
+            bucket_size = self._resolve_bucket_size()
             if backend == 'ipc':
                 # Colocated: the sampler is on this GPU, so weights are mapped, not broadcast. NCCL
                 # is not an option here -- it refuses two ranks on one device. The channel reaches
                 # the engine so the endpoint separates colocate managers sharing a GPU pair; the
-                # bucket only passes when the class default was overridden, because the IPC default
-                # (512 MB) is deliberately smaller than this mixin's NCCL-tuned 3 GB.
+                # bucket only passes when the class default was overridden or the env knob is set,
+                # because the IPC default (512 MB) is deliberately smaller than this mixin's
+                # NCCL-tuned 3 GB.
                 from twinkle.checkpoint_engine import IPCCheckpointEngine
-                bucket = None if type(self)._bucket_size == CheckpointEngineMixin._bucket_size else self._bucket_size
+                overridden = (type(self)._bucket_size != CheckpointEngineMixin._bucket_size
+                              or bool(os.environ.get('TWINKLE_CHECKPOINT_BUCKET_MB')))
+                bucket = bucket_size if overridden else None
                 auth_keys = self._checkpoint_engine_auth_keys or {}
                 engine = IPCCheckpointEngine(bucket, channel=key[1], auth_key=auth_keys.get(key, ''))
             elif backend == 'nccl':
                 from twinkle.checkpoint_engine import NCCLCheckpointEngine
-                engine = NCCLCheckpointEngine(self._bucket_size)
+                engine = NCCLCheckpointEngine(bucket_size)
             elif backend == 'xccl':
                 from twinkle.checkpoint_engine import XCCLCheckpointEngine
-                engine = XCCLCheckpointEngine(self._bucket_size)
+                engine = XCCLCheckpointEngine(bucket_size)
             elif backend == 'hccl':
                 from twinkle.checkpoint_engine import HCCLCheckpointEngine
 
                 # Reusing HCCL communicator across sync steps avoids frequent
                 # stream/channel allocation and reduces resource exhaustion risk.
                 engine = HCCLCheckpointEngine(
-                    self._bucket_size,
+                    bucket_size,
                     rebuild_group=False,
                 )
             engines[key] = engine

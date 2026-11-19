@@ -66,7 +66,7 @@ class SGLangDeltaSamplerMixin:
         # manager raises out of the failed sync and the job stops.
         self._delta_job_failed = True
 
-    @remote_function(dispatch='all', lazy_collect=True)
+    @remote_function(dispatch='all', lazy_collect=True, offload_blocking=True)
     def receive_delta_flushes(self, flushes: list[tuple[list[tuple[str, Any]], bool]]) -> dict[str, bool]:
         """Apply the trainer's collected flush stream (see :mod:`..transport.collect_engine`).
 

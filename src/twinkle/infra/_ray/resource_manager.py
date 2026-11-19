@@ -148,8 +148,14 @@ class ResourceManager:
             if node_cpu // 4 >= ncpu_proc_per_node:
                 self.cpu_nodes.append(node)
 
-        assert self.nnodes <= len(
-            self.nodes), f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}'
+        assert self.nnodes <= len(self.nodes), (
+            f'Not enough resources, required nodes: {self.nnodes}, available: {len(self.nodes)}. '
+            f'The device plan allocates physical ranks {sorted(all_ranks)}, which at {nproc_per_node} '
+            f'{device_type}(s) per node spans {self.nnodes} node(s); only {len(self.nodes)} alive node(s) '
+            f'have at least {nproc_per_node} {device_type}(s) '
+            f'(per-node counts: {[int(n["Resources"].get(device_type, 0)) for n in ray.nodes() if n.get("Alive", True)]}). '
+            'Give the run more devices, or shrink the group widths -- auxiliary models (reference/teacher/'
+            'reward) plan disjoint devices on top of the trainer and sampler.')
 
         bundles = []
         cpu_bundles = []

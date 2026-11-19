@@ -207,8 +207,9 @@ def make_sampler(monkeypatch, *, rank=0, world=1, tp=2, device='npu', sleep=True
         monkeypatch.setenv('RANK', str(rank))
     monkeypatch.setenv('WORLD_SIZE', str(world))
     sampler = LocalSampler()
+    sampler.pause_generation = Mock()
     sampler.engine = SimpleNamespace(
-        enable_sleep_mode=sleep, pause_delta_generation=AsyncMock(),
+        enable_sleep_mode=sleep,
         engine=SimpleNamespace(reset_prefix_cache=AsyncMock(return_value=True), reset_mm_cache=AsyncMock(),
                                reset_encoder_cache=AsyncMock()))
     sampler._delta_rpc = AsyncMock(side_effect=lambda method, kwargs=None: (
@@ -333,7 +334,7 @@ def test_npu_close_shuts_workers_down_and_resets(monkeypatch):
     sampler._delta_rpc.reset_mock()
     sampler.close_delta_sampler()
     assert rpc_calls(sampler) == [('shutdown_delta_weight_transfer', None)]
-    sampler.engine.pause_delta_generation.assert_awaited_once_with(7)
+    sampler.pause_generation.assert_called_once()
     assert sampler.engine._delta_unavailable is True
     assert not sampler._delta_weight_transfer_initialized
 

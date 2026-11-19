@@ -57,33 +57,35 @@ class TestDoGradSync:
             assert group.do_grad_sync() is True
 
     def test_first_step_never_syncs_while_accumulating(self):
-        # cur_step == 1 satisfies (cur_step-1) % gas == 0 but is excluded by cur_step > 1,
-        # so the very first micro step of a run does not trigger a sync.
+        # cur_step is the 1-based micro index (incremented before backward), so the first micro
+        # of a ga=4 window is not its boundary: 1 % 4 != 0.
         group = BaseOptimizerGroup(gradient_accumulation_steps=4, cur_step=1)
         assert group.do_grad_sync() is False
 
     def test_mid_window_steps_do_not_sync(self):
         group = BaseOptimizerGroup(gradient_accumulation_steps=4)
-        for step in (2, 3, 4):
+        for step in (1, 2, 3):
             group.cur_step = step
             assert group.do_grad_sync() is False
 
     def test_syncs_at_accumulation_boundary(self):
+        # Sync fires on the window's LAST micro (cur_step % gas == 0): reducing on the first
+        # micro of the next window would merge two windows' gradients.
         group = BaseOptimizerGroup(gradient_accumulation_steps=4)
-        for step in (5, 9, 13):  # (step-1) % 4 == 0 and step > 1
+        for step in (4, 8, 12):
             group.cur_step = step
             assert group.do_grad_sync() is True
 
     def test_explicit_argument_updates_state(self):
         group = BaseOptimizerGroup(gradient_accumulation_steps=1)
-        group.cur_step = 5
+        group.cur_step = 4
         # Passing gas explicitly both mutates the stored value and gates on it.
         assert group.do_grad_sync(4) is True
         assert group.gradient_accumulation_steps == 4
 
     def test_none_argument_uses_state_without_mutation(self):
         group = BaseOptimizerGroup(gradient_accumulation_steps=3)
-        group.cur_step = 4  # (4-1) % 3 == 0 and > 1 -> sync
+        group.cur_step = 3  # 3 % 3 == 0 -> last micro of the first window
         assert group.do_grad_sync(None) is True
         assert group.gradient_accumulation_steps == 3
 
@@ -197,3 +199,25 @@ class TestMetricFlow:
         result = group.calculate_metrics(is_training=True)
         # LossMetric formats grad_norm to 6 decimals as a string.
         assert result['grad_norm'] == '0.750000'
+
+    def test_later_recipe_metric_overwrites_default_token_channel(self):
+        # LossMetric now emits train/n_trainable_tokens too; a recipe metric registered later
+        # (add_metric appends) must win the in-order merge, or GRPO's own count would be
+        # silently replaced by the default loss denominator's.
+        from twinkle.metric import Metric
+
+        class RecipeMetric(Metric):
+
+            def accumulate(self, inputs, outputs, **kwargs):
+                pass
+
+            def calculate(self):
+                return {'train/n_trainable_tokens': 999}
+
+        group = BaseOptimizerGroup()
+        status, metric = _loss_status()
+        status.loss_reduction = 'sum'
+        status.metrics.append(RecipeMetric(device_mesh=None, process_group=None))
+        group.train_status = status
+        result = group.calculate_metrics(is_training=True)
+        assert result['train/n_trainable_tokens'] == 999
