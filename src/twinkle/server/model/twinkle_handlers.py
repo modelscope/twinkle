@@ -573,23 +573,9 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
 
         async def _task():
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
-            if body.checkpoint_dir.startswith('twinkle://'):
-                parsed = checkpoint_manager.parse_twinkle_path(body.checkpoint_dir)
-                if not parsed:
-                    raise ValueError(f'Invalid twinkle path format: {body.checkpoint_dir}')
-                checkpoint_dir = checkpoint_manager.resolve_checkpoint_dir(body.checkpoint_dir)
-            else:
-                # A raw local path is still confined to this token's directory: without the check an
-                # authenticated user could upload any readable directory (another tenant's weights).
-                from pathlib import Path
-
-                from twinkle.server.checkpoint.paths import ensure_inside
-
-                checkpoint_dir = str(ensure_inside(
-                    checkpoint_manager.training_run_manager.get_base_dir(), Path(body.checkpoint_dir)))
             await self.call_backend(
                 self.model.upload_to_hub,
-                checkpoint_dir=checkpoint_dir,
+                checkpoint_dir=checkpoint_manager.resolve_upload_dir(body.checkpoint_dir),
                 hub_model_id=body.hub_model_id,
                 hub_token=body.hub_token or token,
                 async_upload=False,

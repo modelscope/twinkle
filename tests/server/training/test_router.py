@@ -9,6 +9,7 @@ from starlette.requests import Request
 from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import settle
 from twinkle.hub import HubOperation
+from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.state import ServerState
 from twinkle.server.model.pool.router import TrainingRouter
 from twinkle.server.config.training import TrainingConfig
@@ -24,7 +25,12 @@ def http_request(body):
 
 
 @pytest.mark.asyncio
-async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(monkeypatch, tmp_path):
+@pytest.mark.parametrize('owned', [True, False], ids=['owned', 'outside-tenant-directory'])
+async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(monkeypatch, tmp_path, owned):
+    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    manager = create_checkpoint_manager('owner', client_type='twinkle')
+    checkpoint = (manager.training_run_manager.get_base_dir() if owned else tmp_path) / 'checkpoint'
+    checkpoint.mkdir(parents=True)
     router = TrainingRouter.__new__(TrainingRouter)
     router.state = ServerState(backend=FakeBackend())
     router.store = router.state.create_training_store('upload-test')
@@ -37,11 +43,16 @@ async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(m
     monkeypatch.setattr(HubOperation, 'push_to_hub', upload)
     try:
         response = await router.native_request(http_request({
-            'checkpoint_dir': str(tmp_path), 'hub_model_id': 'owner/saved', 'hub_token': 'hub-token',
+            'checkpoint_dir': str(checkpoint), 'hub_model_id': 'owner/saved', 'hub_token': 'hub-token',
         }), 'upload_to_hub')
         future = await settle(router.state, response.request_id)
-        assert future['status'] == 'completed'
-        upload.assert_called_once_with(repo_id='owner/saved', folder_path=str(tmp_path), token='hub-token', private=True)
+        if owned:
+            assert future['status'] == 'completed'
+            upload.assert_called_once_with(
+                repo_id='owner/saved', folder_path=str(checkpoint), token='hub-token', private=True)
+        else:
+            assert future['status'] == 'failed'
+            upload.assert_not_called()
         assert (await router.state.get_future(response.request_id))['owner_token'] == 'owner'
         assert not await router.state._backend.keys('model::*')
     finally:

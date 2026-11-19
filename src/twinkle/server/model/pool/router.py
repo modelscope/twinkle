@@ -177,15 +177,11 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         if endpoint == "upload_to_hub":
 
             async def upload():
-                checkpoint = body.checkpoint_dir
-                if checkpoint.startswith("twinkle://"):
-                    checkpoint = create_checkpoint_manager(token, client_type="twinkle").resolve_checkpoint_dir(
-                        checkpoint
-                    )
+                manager = create_checkpoint_manager(token, client_type="twinkle")
                 await self.call_backend(
                     HubOperation.push_to_hub,
                     repo_id=body.hub_model_id,
-                    folder_path=checkpoint,
+                    folder_path=manager.resolve_upload_dir(body.checkpoint_dir),
                     token=body.hub_token or token,
                     private=True,
                 )
