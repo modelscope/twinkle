@@ -31,6 +31,10 @@ applications:
       max_loras: 2
       target_modules: [q_proj, v_proj]
       max_length: 256
+      template: &distillation_template
+        template_cls: Qwen3_5Template
+        enable_thinking: false
+        max_length: 256
       mixed_precision: bf16
       gradient_checkpointing: false
       nproc_per_node: 1
@@ -45,6 +49,7 @@ applications:
     args:
       model_id: ${oc.env:TWINKLE_DISTILL_STUDENT_PATH}
       sampler_type: vllm
+      template: *distillation_template
       min_replicas: 1  # Warm vLLM before the first client request.
       max_replicas: 1
       nproc_per_node: 1

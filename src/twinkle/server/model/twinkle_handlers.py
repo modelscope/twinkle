@@ -105,11 +105,24 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
         self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
 
         async def _call(self, body, adapter_name, token):
+            inputs = to_backend_inputs(body.inputs)
+            resolved_adapter_name = self.resolve_model_adapter_name(adapter_name)
+            if body.continuation_token_ids is not None:
+                encode = getattr(self.model, 'encode_scoring_inputs', None)
+                if encode is None:
+                    raise RequestRejectedError('This model service does not support continuation scoring.',
+                                               error_code=422)
+                inputs = await self.call_backend(
+                    encode, inputs, body.continuation_token_ids, adapter_name=resolved_adapter_name)
+            kwargs = backend_kwargs(body)
+            if isinstance(kwargs.get('output_fields'), list):
+                # Field names describe the operation, so DP must deliver them to every rank.
+                kwargs['output_fields'] = tuple(kwargs['output_fields'])
             ret = await self.call_backend(
                 self.model.forward_only,
-                inputs=to_backend_inputs(body.inputs),
-                adapter_name=self.resolve_model_adapter_name(adapter_name),
-                **backend_kwargs(body))
+                inputs=inputs,
+                adapter_name=resolved_adapter_name,
+                **kwargs)
             return {'result': ret}
 
         return await run_submit(

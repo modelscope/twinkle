@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import threading
 import uuid
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
 
 from twinkle.protocol.types import model as model_types
 from twinkle.protocol.types.component import DataRef
-from twinkle_client._request_builder import build_request
+from twinkle_client._request_builder import build_request, to_wire_value
 from twinkle_client.exceptions import TwinkleHTTPError
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
@@ -180,7 +181,10 @@ class MultiLoraTransformersModel:
         if isinstance(config, Mapping):
             from peft import LoraConfig
 
-            config = LoraConfig(**config)
+            validated = LoraConfig(**config)
+            # Only send the requested options. Client PEFT defaults can include fields
+            # that the server's PEFT version does not know. Admission also needs the rank.
+            config = json.dumps({**to_wire_value(config), 'r': validated.r, '_TWINKLE_TYPE_': 'LoraConfig'})
         save_dir = kwargs.pop('save_dir', None)
         if save_dir:
             save_dir = Path(save_dir).expanduser().resolve().as_posix()

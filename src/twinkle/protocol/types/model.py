@@ -19,7 +19,7 @@ user-supplied argument.
 """
 from __future__ import annotations
 
-from pydantic import Field, JsonValue, field_validator, model_validator
+from pydantic import Field, JsonValue, StrictInt, field_validator, model_validator
 from typing import Any, Dict, List, Optional, Union
 
 from .base import ResponseModel, StrictRequest, backend_kwarg, backend_only, passthrough
@@ -146,6 +146,8 @@ class ForwardOnlyRequest(_InlineForwardBase):
     """
 
     disable_lora: bool | None = backend_kwarg(default=None)
+    continuation_token_ids: list[list[StrictInt]] | None = Field(
+        default=None, description='One exact, already-generated reply per text trajectory to score')
 
 
 class ForwardBackwardTaskRequest(_InlineForwardBase):

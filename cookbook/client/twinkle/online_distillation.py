@@ -12,22 +12,15 @@ from itertools import combinations_with_replacement, cycle, islice
 from uuid import uuid4
 
 import numpy as np
-from swift.dev.builders.template import build_template_spec
-from swift.dev.config import ModelConfig, TemplateConfig
-from swift.dev.template import Template
-from transformers import AutoTokenizer
-
 from twinkle import init_twinkle_client
 from twinkle.data_format import SamplingParams
-from twinkle.processor import encode_privileged_feature
 from twinkle.signals import response_positions, response_token_scores
-from twinkle_agentic.rollout.ledger import sampled_token_logprobs
 
 STUDENT_NAME = 'distill-student'
 TEACHER_NAME = 'distill-teacher'
 MAX_LENGTH = 256
 TEMPLATE_CLASS = 'swift.dev.template.Template'
-LORA = {'r': 8, 'lora_alpha': 16, 'lora_dropout': 0.0, 'target_modules': ['q_proj', 'v_proj']}
+LORA = {'r': 8, 'lora_alpha': 16, 'lora_dropout': 0.0, 'target_modules': 'all-linear'}
 LOSS = {'gkd': 'GKDLoss', 'opd-rl': 'GRPOLoss', 'opsd': 'OPSDLoss'}
 
 
@@ -57,7 +50,8 @@ def sample(sampler, pairs, policy, seed, *, temperature=1.0, logprobs=None):
 
 def training_feature(feature, tokens):
     positions = response_positions(feature)
-    if not tokens or [feature['labels'][i] for i in positions] != list(tokens):
+    if (not tokens or [feature['labels'][i] for i in positions] != tokens
+            or [feature['input_ids'][i + 1] for i in positions] != tokens):
         raise RuntimeError('Training labels must match the sampled response token IDs.')
     return {key: feature[key] for key in ('input_ids', 'labels', 'attention_mask', 'completion_mask') if key in feature}
 
@@ -70,7 +64,22 @@ def response_scores(model, features):
     return scores
 
 
-def distillation_signal(method, model, teacher, template, pairs, sequences, features):
+def score_completions(model, prompts, token_rows):
+    inputs = [dict(prompt, episode_id=str(index)) for index, prompt in enumerate(prompts)]
+    result = model.forward_only(
+        inputs=inputs, continuation_token_ids=token_rows, output_fields=['logps'], output_frame='response').result
+    if (result.get('episode_ids') != [row['episode_id'] for row in inputs]
+            or result.get('response_token_ids') != token_rows
+            or (result.get('field_frames') or {}).get('logps') != 'response'):
+        raise RuntimeError('Teacher scores do not match the sampled reply rows and token IDs.')
+    scores = result['logps']
+    for tokens, row in zip(token_rows, scores, strict=True):
+        if len(row) != len(tokens) or not np.isfinite(row).all():
+            raise RuntimeError('Expected one finite teacher logprob per sampled token.')
+    return scores
+
+
+def distillation_signal(method, model, teacher, pairs, sequences, features):
     if method == 'gkd':
         # Full vocabulary scores. Use one row per step to keep the HTTP payload small.
         result = teacher.forward_only(inputs=features, return_logits=True).result
@@ -83,6 +92,8 @@ def distillation_signal(method, model, teacher, template, pairs, sequences, feat
         return {'teacher_logits': logits.tolist()}
 
     if method == 'opd-rl':
+        from twinkle_agentic.rollout.ledger import sampled_token_logprobs
+
         old_logps = [sampled_token_logprobs(seq.tokens, seq.logprobs) for seq in sequences]
         teacher_logps = response_scores(teacher, features)
         # Pure OPD-RL: base task advantage is zero, so A_t = teacher_logp - rollout_logp.
@@ -91,19 +102,19 @@ def distillation_signal(method, model, teacher, template, pairs, sequences, feat
         return {'advantages': advantages, 'old_logps': old_logps}
 
     # OPSD: the current student reads the solution and scores its own original reply.
-    teacher_features = []
-    for pair, sequence in zip(pairs, sequences, strict=True):
-        messages = question(pair)['messages']
-        teacher_prompt = f"{messages[-1]['content']}\nReference solution: {worked_solution(pair)}"
-        encoded = encode_privileged_feature(template, messages, teacher_prompt, list(sequence.tokens))
-        teacher_features.append(training_feature(encoded, sequence.tokens))
-    return {'teacher_logps': response_scores(model, teacher_features)}
+    prompts = [question(pair) for pair in pairs]
+    for prompt, pair in zip(prompts, pairs, strict=True):
+        prompt['messages'][-1]['content'] += f'\nReference solution: {worked_solution(pair)}'
+    return {'teacher_logps': score_completions(model, prompts, [seq.tokens for seq in sequences])}
 
 
 def evaluate(sampler, tokenizer, pairs, policy, label, seed):
     # Fixed held-out questions, greedy sampling and no solution in the prompt.
     sequences = sample(sampler, pairs, policy, seed, temperature=0.0)
-    texts = [tokenizer.decode(seq.tokens, skip_special_tokens=True).strip() for seq in sequences]
+    if tokenizer is None and any(seq.text is None for seq in sequences):
+        raise RuntimeError('OPSD evaluation requires decoded assistant text from the sampler.')
+    texts = [(seq.text if tokenizer is None else tokenizer.decode(seq.tokens, skip_special_tokens=True)).strip()
+             for seq in sequences]
     correct = sum(text == str(a * b) for (a, b), text in zip(pairs, texts, strict=True))
     print(json.dumps({
         'eval': label, 'correct': correct, 'total': len(pairs), 'accuracy': correct / len(pairs),
@@ -113,37 +124,42 @@ def evaluate(sampler, tokenizer, pairs, policy, label, seed):
     }), flush=True)
 
 
-def train(method, steps, eval_size, seed, student_path, teacher_path):
+def train(method, steps, eval_size, seed, model_name, student_path=None, teacher_path=None):
     # Use unordered operand pairs so '17 × 23' and '23 × 17' cannot leak across splits.
     pairs = list(combinations_with_replacement(range(11, 30), 2))
     random.Random(seed).shuffle(pairs)
     evaluation, training = pairs[:eval_size], cycle(pairs[eval_size:])
     batch_size = 1 if method == 'gkd' else 2
-    tokenizer = AutoTokenizer.from_pretrained(student_path)
+    tokenizer = server_spec = None
     if method != 'opsd':
+        from swift.dev.builders.template import build_template_spec
+        from swift.dev.config import ModelConfig, TemplateConfig
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(student_path)
         teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_path)
         special_ids = ('bos_token_id', 'eos_token_id', 'pad_token_id')
         if tokenizer.get_vocab() != teacher_tokenizer.get_vocab() or any(
                 getattr(tokenizer, key) != getattr(teacher_tokenizer, key) for key in special_ids):
             raise ValueError('The student and external teacher must share the same token IDs.')
 
-    spec = build_template_spec(
-        TemplateConfig(template='qwen3_5', max_length=MAX_LENGTH, padding_side='right', enable_thinking=False),
-        ModelConfig(model=student_path, model_type='qwen3_5', torch_dtype='bfloat16'))
-    template = Template.from_spec(spec) if method == 'opsd' else None
-    server_spec = asdict(spec)
-    server_spec['model']['model_id_or_dir'] = os.getenv('TWINKLE_DISTILL_SERVER_STUDENT_PATH', student_path)
+        spec = build_template_spec(
+            TemplateConfig(template='qwen3_5', max_length=MAX_LENGTH, padding_side='right', enable_thinking=False),
+            ModelConfig(model=student_path, model_type='qwen3_5', torch_dtype='bfloat16'))
+        server_spec = asdict(spec)
+        server_spec['model']['model_id_or_dir'] = os.getenv('TWINKLE_DISTILL_SERVER_STUDENT_PATH', student_path)
 
     run = f'{method}-{uuid4().hex[:8]}'
     with init_twinkle_client() as client, ExitStack() as adapters:
-        model, sampler = client.model(STUDENT_NAME), client.sampler(STUDENT_NAME)
+        model, sampler = client.model(model_name), client.sampler(model_name)
         model.add_adapter_to_model(run, LORA, gradient_accumulation_steps=1)
         adapters.callback(model.remove_adapter, run)
-        model.set_template(TEMPLATE_CLASS, template_spec=server_spec)
+        if server_spec is not None:
+            model.set_template(TEMPLATE_CLASS, template_spec=server_spec)
+            sampler.set_template(TEMPLATE_CLASS, template_spec=server_spec)
         model.set_processor('InputProcessor', padding_side='right')
         model.set_loss(LOSS[method])
         model.set_optimizer('AdamW', lr=1e-4, weight_decay=0.0)
-        sampler.set_template(TEMPLATE_CLASS, template_spec=server_spec)
         teacher = None
         if method != 'opsd':
             teacher = client.model(TEACHER_NAME)
@@ -157,7 +173,7 @@ def train(method, steps, eval_size, seed, student_path, teacher_path):
             batch = list(islice(training, batch_size))
             sequences = sample(sampler, batch, policy, seed + step, logprobs=1 if method == 'opd-rl' else None)
             features = [training_feature(seq.new_input_feature, seq.tokens) for seq in sequences]
-            signal = distillation_signal(method, model, teacher, template, batch, sequences, features)
+            signal = distillation_signal(method, model, teacher, batch, sequences, features)
             model.forward_backward(inputs=features, **signal)
             model.clip_grad_and_step()
             metrics = model.calculate_metric(is_training=True).result
@@ -174,13 +190,14 @@ if __name__ == '__main__':
     parser.add_argument('--steps', type=int, default=4)
     parser.add_argument('--eval-size', type=int, default=16)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--model', default=STUDENT_NAME, help='Student model name published by the server')
     args = parser.parse_args()
     if args.steps < 1 or not 1 <= args.eval_size <= 64:
         parser.error('steps must be positive and eval-size must be between 1 and 64')
     student_path = os.getenv('TWINKLE_DISTILL_STUDENT_PATH')
     teacher_path = os.getenv('TWINKLE_DISTILL_TEACHER_PATH')
-    if not student_path:
+    if args.method != 'opsd' and not student_path:
         parser.error('Set TWINKLE_DISTILL_STUDENT_PATH to the local Qwen3.5-0.8B directory.')
     if args.method != 'opsd' and not teacher_path:
         parser.error('Set TWINKLE_DISTILL_TEACHER_PATH to the local Qwen3.5-2B directory.')
-    train(args.method, args.steps, args.eval_size, args.seed, student_path, teacher_path)
+    train(args.method, args.steps, args.eval_size, args.seed, args.model, student_path, teacher_path)

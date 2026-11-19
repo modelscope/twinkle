@@ -131,6 +131,7 @@ def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
                 tokens=list(sequence.tokens),
                 logprobs=list(sequence.logprobs) if sequence.logprobs is not None else None,
                 decoded=sequence.decoded,
+                text=sequence.new_state.messages[-1].get('content') if sequence.new_state is not None else None,
                 new_input_feature=(_serialize_input_feature(sequence.new_input_feature)
                                    if sequence.new_input_feature is not None else None),
             ) for sequence in response.sequences

@@ -2,6 +2,8 @@
 """
 Shared helpers and base classes for backend model implementations.
 """
+from copy import copy
+
 import numpy as np
 import re
 import torch
@@ -11,6 +13,8 @@ from tinker import types
 from typing import Any, List
 
 from twinkle import DeviceMesh, remote_function
+from twinkle.data_format.encoding import is_encoded
+from twinkle.signals import response_positions
 from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.template import Template
@@ -154,6 +158,36 @@ class TwinkleCompatModelBase:
 
     def get_template(self, adapter_name: str) -> Template:
         return self.optimizer_group[adapter_name].template
+
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def encode_scoring_inputs(self, inputs, continuation_token_ids, *, adapter_name):
+        """Use the same prompt/continuation primitives as sampling before sharding the scoring batch."""
+        template = self.get_template(adapter_name)
+        if template is None:
+            raise ValueError('Continuation scoring requires a template on the training handle.')
+        template = copy(template)
+        template.truncation_strategy = 'delete'
+        rows = []
+        for row, tokens in zip(inputs, continuation_token_ids, strict=True):
+            messages = row.get('messages')
+            if (is_encoded(row) or not messages or messages[-1].get('role') != 'user'
+                    or any(message.get('role') not in ('system', 'user') for message in messages)
+                    or any(row.get(key) for key in ('images', 'videos', 'audios', 'tools'))
+                    or any(not isinstance(message.get('content'), str) for message in messages)):
+                raise ValueError('Continuation scoring expects a text prompt ending in a user message.')
+            if not tokens or min(tokens) < 0 or max(tokens) >= len(template.tokenizer):
+                raise ValueError('Continuation tokens must be nonempty and in the configured vocabulary.')
+            prompt = template.encode_prompt(row)
+            feature = template.append_completion(prompt.state, tokens).state.feature
+            positions = response_positions(feature)
+            if [int(feature['labels'][i]) for i in positions] != tokens:
+                raise ValueError('Encoded scoring labels do not match the given continuation.')
+            # Preserve identity for the response-framed forward result.
+            feature['response_token_ids'] = tokens
+            if 'episode_id' in row:
+                feature['episode_id'] = row['episode_id']
+            rows.append(feature)
+        return rows
 
     def _tinker_setup_loss(self, loss_fn: str, inputs, adapter_name: str, kwargs: dict):
         """Set up loss function based on loss_fn; pops DPO/GRPO-specific params from kwargs in-place."""

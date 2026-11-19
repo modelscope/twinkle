@@ -50,6 +50,7 @@ class SampledSequenceModel(ResponseModel):
     tokens: list[int] = Field(..., description='Token IDs of the sampled sequence')
     logprobs: list[list[tuple[int, float]] | None] | None = Field(None, description='Per-token log-probabilities')
     decoded: str | None = Field(None, description='Decoded text of the sampled sequence')
+    text: str | None = Field(None, description='Assistant content parsed by the serving template')
     new_input_feature: dict[str, Any] | None = Field(
         None, description='Updated InputFeature after sampling (input_ids, labels, etc.)')
 

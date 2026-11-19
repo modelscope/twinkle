@@ -1,6 +1,6 @@
 # Twinkle Client
 
-Twinkle Client is the native client, designed with the philosophy: **Change `from twinkle import` to `from twinkle_client import`, and you can migrate local training code to remote calls without modifying the original training logic**.
+Use Twinkle Client to define training data, objectives, and evaluation. Twinkle Server runs the models, updates weights, and saves checkpoints. Connect with the endpoint, token, and model name advertised by the server. The client can run on CPU.
 
 ## Initialization
 
@@ -56,9 +56,11 @@ client = init_twinkle_client(base_url=base_url, api_key=api_key)
 model = client.model(f'ms://{base_model}')
 ```
 
-Training loops and data processing do not need any modifications. Prefer `client.model(...)` over constructing `MultiLoraTransformersModel(...)` directly so the model wrapper explicitly reuses the current client's transport, session, and authentication context.
+Use `client.model(...)` to bind the model to the current session and credentials. Data processing and training loops can reuse operations supported by the model service. Check its loss, optimizer, scheduler, and resume support before migrating.
 
-## Complete Training Example (Transformers Backend)
+## SFT Training Example
+
+This example requires a Qwen3.5-4B service with LoRA, `CrossEntropyLoss`, and `Adam`.
 
 ```python
 import dotenv
@@ -133,11 +135,8 @@ model.set_template('Qwen3_5Template')
 model.set_processor('InputProcessor', padding_side='right')
 model.set_loss('CrossEntropyLoss')
 
-# Set optimizer (only Adam is supported if the server uses Megatron backend)
+# Set the optimizer for this exercise
 model.set_optimizer('Adam', lr=1e-4)
-
-# Set LR scheduler (not supported if the server uses Megatron backend)
-# model.set_lr_scheduler('LinearLR')
 
 # Step 5: Resume training (optional)
 start_step = 0
@@ -192,65 +191,55 @@ For checkpoint resumption, the recommended client-side flow is:
 
 This matches the end-to-end example in `cookbook/client/twinkle/self_cognition.py`.
 
-## Differences with Megatron Backend
+## Model Services and Training Capabilities
 
-When using the Megatron backend, the main differences in client code:
+`client.model(...)` uses the same HTTP interface across deployments. The model name routes the request. The service configuration controls how the model runs. Use `client.get_server_capabilities().supported_models` to discover model names. The currently advertised protocol features and limits are service-wide. Check the model service's documentation for its supported losses, optimizers, and resumption modes.
 
-```python
-# Megatron backend does not need explicit loss setting (computed internally by Megatron)
-# model.set_loss('CrossEntropyLoss')  # Not needed
-
-# Optimizer and LR scheduler use Megatron built-in defaults
-model.set_optimizer('default', lr=1e-4)
-model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
-```
-
-The rest of the data processing, training loop, checkpoint saving, and other code remains exactly the same.
+Use `forward_backward` for training and `forward_only` for read-only scoring. Some services fuse training forward and backward, so the separate training calls are unavailable. Optimizer and scheduler options also vary. Confirm the required capabilities before running an example.
 
 ## Client Training Learning Path
 
-Use a fixed set of held-out questions to compare the model before and after training. Keep training examples, scoring, and evaluation separate so you can diagnose changes when bringing your own task.
+Start each lesson with a question about training, then inspect the data that determines the update. Record a baseline and evaluate the same held-out examples after training. Agentic-RL-Lab's OPSD chapter shows this structure with an explanation, reproducible commands, checkpoint comparisons, and limitations. [Agentic-RL-Lab OPSD](https://github.com/datawhalechina/agentic-rl-lab/blob/main/experiments/opsd/readme.md)
 
-| Stage | Exercise | What to learn |
-|---|---|---|
-| 1. SFT | [Self-cognition fine-tuning](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/self_cognition.py) | Predict the next token from a reference response. Inspect which tokens carry labels and which parameters LoRA updates. |
-| 2. DPO (optional) | [Preference fine-tuning](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/dpo.py) | Use a preferred and a rejected answer to the same prompt to teach relative preferences. |
-| 3. GRPO | [Short-answer math](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/short_math_grpo.py) | Sample multiple answers, reward correctness and brevity, and turn within-group differences into advantages. |
-| 4. Online distillation | [The multiplication exercise below](#client-online-distillation) | Compare vocabulary distributions, token advantages, and self-distillation on the student's own replies. |
-| 5. Agentic RL | [Blackjack below](#client-async-grpo) | Follow a multi-turn trajectory through tools, observations, environment rewards, and overlapping sampling and training. |
+| Stage | Exercise and model | Training question | First check |
+|---|---|---|---|
+| 1. SFT | [Self-cognition fine-tuning](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/self_cognition.py), Qwen3.5-4B | Which tokens learn from the reference answer? | Check assistant-response labels and compare responses to the same questions. |
+| 2. DPO (optional) | [Preference fine-tuning](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/dpo.py), Qwen3.5-4B | How does a preferred answer gain probability relative to a rejected answer? | Inspect a preference pair, then evaluate held-out pairs. |
+| 3. GRPO | [Short-answer math](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/short_math_grpo.py), Qwen3.5-4B | How does an outcome reward guide generated answers? | Compare scores and advantages for one prompt group, then check accuracy and length. |
+| 4. Online distillation | [The multiplication exercise below](#client-online-distillation), Qwen3.5-0.8B student with Qwen3.5-2B for the external teacher methods | Who is the teacher, what does it see, and how do its scores update the student? | Verify that teacher and student scores refer to the same reply tokens. |
+| 5. Agentic RL | [Blackjack below](#client-async-grpo), Qwen3.5-4B | Where do rewards and labels go in a tool trajectory? | Read one episode with actions, observations, and a terminal reward, then measure completion and reward. |
 
-To bring your own task, replace the questions and targets, then write a reward or worked solution you can verify independently. For tool training, inspect one complete episode before increasing concurrency. Use held-out tasks to measure accuracy, format, tool success, and output cost. In your own project, use SFT to teach the response format or tool calls first. Start reward training from that checkpoint and retain evaluation results for each stage.
+To connect these exercises on your own task, use SFT to teach response format or tool use. Start reward training from that checkpoint and keep the same held-out tasks. Verify each new reward or tool outcome before changing the training algorithm. Each example can also run independently.
 
 (client-online-distillation)=
 ## Online Distillation
 
-[One client script](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/online_distillation.py) trains Qwen3.5-0.8B on short multiplication with thinking disabled. Read `train()` for sampling, updating, publishing, and evaluation. Then read `distillation_signal()` to see how the methods score the same sampled replies.
+[One client script](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/online_distillation.py) teaches all three methods on short multiplication. For `17 × 23`, the student answers first. GKD asks an external teacher for every candidate token's score at each position. OPD-RL compares scores for the sampled tokens. OPSD gives the current student the worked solution and has it score its own original reply. Read `train()` for the shared loop and `distillation_signal()` for the three signals.
 
-| Method | Teacher signal | Server devices |
-|---|---|---|
-| OPSD | The current student sees a worked solution and scores its original reply token by token. | Two GPUs for Transformers and vLLM |
-| OPD-RL | Frozen Qwen3.5-2B scores the original reply. The teacher logprob minus the rollout logprob becomes the token advantage. | One additional teacher GPU |
-| GKD | The same frozen teacher returns a full vocabulary distribution. One sample per step limits the logits sent over HTTP. | Same as OPD-RL |
+Ask your service administrator for its URL, token, and model services. The example uses `distill-student` (Qwen3.5-0.8B). OPD-RL and GKD also use `distill-teacher` (frozen Qwen3.5-2B). GKD requires HTTP support for `teacher_logits`. The service administrator manages model weights, devices, and the training backend. [Server YAML](https://github.com/modelscope/twinkle/blob/main/cookbook/client/server/transformer/distillation.yaml)
 
-Run from a Twinkle source checkout with this example and GKD HTTP support. On CUDA, install the server with `python -m pip install -e '.[client,rl,server]'`. A separate client environment can use `python -m pip install -e '.[client]'`. Both environments need the Swift dev template API. Set up the device-specific PyTorch and vLLM runtime first on PPU.
+Install the client from the checkout that includes this example. Use the URL, token, and model name from your administrator:
+
+```bash
+python -m pip install -e '.[client]'
+export TWINKLE_SERVER_URL=https://your-twinkle-server
+export TWINKLE_SERVER_TOKEN=your-token
+python cookbook/client/twinkle/online_distillation.py --method opsd --model distill-student --steps 4
+```
+
+OPSD sends the exact sampled reply tokens with the worked solution and requests scores from the training model. The reference YAML pins the same template for sampling and training. The CPU client evaluates the assistant text returned by the server.
+
+OPD-RL and GKD still use local student and teacher template assets and a compatible Swift revision. In addition to the connection settings above, set:
 
 ```bash
 python -m pip install 'ms-swift @ git+https://github.com/modelscope/ms-swift.git@e1ac89d24f47cb8fd73a7245dd79df0959aec284' 'qwen-vl-utils>=0.0.14'
-modelscope download --model Qwen/Qwen3.5-0.8B --local_dir ./models/Qwen3.5-0.8B
-export TWINKLE_DISTILL_STUDENT_PATH="$PWD/models/Qwen3.5-0.8B"
-CUDA_VISIBLE_DEVICES=0,1 twinkle-server launch -c cookbook/client/server/transformer/distillation.yaml
+export TWINKLE_DISTILL_STUDENT_PATH=/path/to/student-template-assets
+export TWINKLE_DISTILL_TEACHER_PATH=/path/to/teacher-template-assets
+export TWINKLE_DISTILL_SERVER_STUDENT_PATH=/server/path/to/student-model
+python cookbook/client/twinkle/online_distillation.py --method opd-rl --model distill-student --steps 4
 ```
 
-Wait for vLLM warm-up and the server message `All applications started`. In a second terminal, run:
-
-```bash
-export TWINKLE_DISTILL_STUDENT_PATH="$PWD/models/Qwen3.5-0.8B"
-python cookbook/client/twinkle/online_distillation.py --method opsd --steps 4
-```
-
-For OPD-RL or GKD, prepare `Qwen/Qwen3.5-2B` in both environments and set `TWINKLE_DISTILL_TEACHER_PATH` to its local directory. Launch the same [configuration](https://github.com/modelscope/twinkle/blob/main/cookbook/client/server/transformer/distillation.yaml) with `CUDA_VISIBLE_DEVICES=0,1,2` and use `--method opd-rl` or `--method gkd`. For a remote server, use the server URL and token described above. If the student directories differ, set `TWINKLE_DISTILL_SERVER_STUDENT_PATH` in the client to the server-side directory.
-
-Compare accuracy and output length on the same held-out questions in `eval=before` and `eval=after`. Answers must match the single-integer format exactly, so the score also measures format compliance. Four steps demonstrate the flow. For learning comparisons, match the held-out questions, number of training samples, and sampling settings, then repeat with different seeds.
+Switch to `--method gkd` to run GKD. Compare accuracy and output length on the same held-out questions in `eval=before` and `eval=after`. Four steps demonstrate the flow. Match the training example count and evaluation settings and use multiple seeds to compare learning.
 
 (client-async-grpo)=
 ## Client-side Async GRPO

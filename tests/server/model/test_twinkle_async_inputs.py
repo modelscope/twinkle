@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from starlette.requests import Request
 
 import twinkle.protocol.types as types
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.model.data_plane_inputs import model_result_rows
 from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
 
@@ -80,6 +81,60 @@ class _SchedulingManagement:
 
     async def call_backend(self, fn, /, *args, admit=True, **kwargs):
         return fn(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_forward_only_does_not_shard_output_field_names():
+    management = _SchedulingManagement()
+    management.forward_only = management.forward_backward
+    app = FastAPI()
+    _register_model_twinkle_routes(app, lambda: management)
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_only')
+    request = Request({'type': 'http', 'headers': []})
+    request.state.session_id = 'session'
+    body = types.ForwardOnlyRequest(
+        training_id='training-a',
+        adapter_name='adapter',
+        inputs=[{'input_ids': [10]}, {'input_ids': [20]}],
+        loss_kwargs={'output_fields': ['logps']},
+    )
+    await route.endpoint(request, body, management)
+    assert management.model_calls[-1][2]['output_fields'] == ('logps',)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('supports_continuations', [True, False])
+async def test_forward_only_encodes_continuations_before_dispatch(supports_continuations):
+    management = _SchedulingManagement()
+    management.forward_only = management.forward_backward
+    encoded = [{'input_ids': [10, 20], 'labels': [20, -100]}]
+
+    def encode_scoring_inputs(inputs, tokens, *, adapter_name):
+        assert inputs[0]['messages'][0]['content'] == 'Question'
+        assert tokens == [[20]]
+        assert adapter_name == 'training-a'
+        return encoded
+
+    if supports_continuations:
+        management.encode_scoring_inputs = encode_scoring_inputs
+    app = FastAPI()
+    _register_model_twinkle_routes(app, lambda: management)
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/forward_only')
+    request = Request({'type': 'http', 'headers': []})
+    request.state.session_id = 'session'
+    body = types.ForwardOnlyRequest(
+        training_id='training-a',
+        adapter_name='adapter',
+        inputs=[{'messages': [{'role': 'user', 'content': 'Question'}]}],
+        continuation_token_ids=[[20]],
+    )
+    if supports_continuations:
+        await route.endpoint(request, body, management)
+        assert management.model_calls[-1][0] == encoded
+    else:
+        with pytest.raises(RequestRejectedError, match='does not support continuation scoring'):
+            await route.endpoint(request, body, management)
+        assert not management.model_calls
 
 
 @pytest.mark.asyncio
