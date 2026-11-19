@@ -326,6 +326,7 @@ def test_accelerate_fsdp_optimizer_save_and_load_ignore_sharded_plugin_options(t
 
 
 def test_native_fsdp_optimizer_remaps_logical_slot_to_current_slot(tmp_path, monkeypatch):
+    from types import SimpleNamespace
     from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
     from twinkle.utils.platforms import Platform
     import torch.distributed.checkpoint.state_dict as state_dict_api
@@ -356,8 +357,12 @@ def test_native_fsdp_optimizer_remaps_logical_slot_to_current_slot(tmp_path, mon
     saved_state = torch.load(checkpoint, map_location='cpu', weights_only=True)
     assert list(saved_state['state']) == [logical_name]
 
+    # load_optimizer_checkpoint reads model.named_parameters() to prune explicitly-empty Adam
+    # slots after DCP load; model the current-slot parameter so that contract is exercised.
+    current_param = torch.nn.Parameter(torch.zeros(1))
+    fake_model = SimpleNamespace(named_parameters=lambda: iter([(current_name, current_param)]))
     strategy.load_optimizer_checkpoint(
-        object(), object(), str(checkpoint), param_name_mapping={logical_name: current_name})
+        fake_model, object(), str(checkpoint), param_name_mapping={logical_name: current_name})
     assert list(calls['load']['state']) == [current_name]
     assert calls['load']['param_groups'][0]['params'] == [current_name]
 
@@ -468,7 +473,7 @@ def test_server_hybrid_config_is_strict():
             'allocation_path': '/shared/allocation.json',
             'default_lr_fft': -1.0,
         })
-    with pytest.raises(ValidationError, match='only supported by the transformers backend'):
+    with pytest.raises(ValidationError, match='hybrid requires the transformers backend'):
         ModelArgs(**{**base, 'backend': 'megatron'}, hybrid={
             'allocation_path': '/shared/allocation.json',
         })
