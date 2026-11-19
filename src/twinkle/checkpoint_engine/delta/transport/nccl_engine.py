@@ -45,7 +45,8 @@ class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
                 self._nccl_store_port = find_free_port()
             self._prepared = True
         if self.is_master:
-            return MasterMetadata(self.ip, self.listen_port, self._nccl_store_host, self._nccl_store_port)
+            return MasterMetadata(self.ip, self.listen_port, self._nccl_store_host, self._nccl_store_port,
+                                  auth_key=self.auth_key)
         return None
 
     def close(self):
