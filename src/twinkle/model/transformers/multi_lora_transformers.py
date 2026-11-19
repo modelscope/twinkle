@@ -437,7 +437,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
         adapter_state = self.multi_adapter.get_state_dict(adapter_name)
-        return {key: torch_util.to_local_tensor(value).cpu() for key, value in adapter_state.items()}
+        # CPU weights may still share storage with the live slot while an async save is pending.
+        return {key: torch_util.to_local_tensor(value).detach().to('cpu', copy=True)
+                for key, value in adapter_state.items()}
 
     def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
         """Map the tenant's physical LoRA slot to the PEFT ``default`` name."""
