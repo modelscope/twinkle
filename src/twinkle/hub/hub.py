@@ -3,10 +3,11 @@ import concurrent.futures
 import hashlib
 import os
 import tempfile
+import threading
 from concurrent.futures import Future
 from pathlib import Path
 from requests.exceptions import HTTPError
-from typing import Dict, List, Literal, Optional, Union
+from typing import Callable, Dict, List, Literal, Optional, Union
 
 from twinkle.utils import requires
 from twinkle.utils.parallel import processing_lock
@@ -106,6 +107,13 @@ class HubOperation:
         return hub.push_to_hub(
             cls.remove_source_type(repo_id), folder_path, path_in_repo, commit_message, commit_description, token,
             private, revision, ignore_patterns, **kwargs)
+
+    @classmethod
+    def upload_checkpoint(cls, repo_id: str, folder_path: str, token: str, report: Callable[..., None]) -> str:
+        """Upload a private checkpoint and return the provider's commit ID."""
+        if cls.source_type(repo_id) == 'hf':
+            return cls.push_to_hub(repo_id, folder_path, token=token, private=True).oid
+        return MSHub.upload_checkpoint(cls.remove_source_type(repo_id), folder_path, token, report)
 
     @classmethod
     def async_push_to_hub(cls,
@@ -220,7 +228,51 @@ class HubOperation:
 
 
 class MSHub(HubOperation):
+    @staticmethod
+    def _ensure_configuration(folder_path):
+        config = Path(folder_path) / 'configuration.json'
+        if not config.exists():
+            config.write_text(
+                '{"framework": "pytorch", "task": "text-generation", "allow_remote": true}', encoding='utf-8')
 
+    @staticmethod
+    def upload_checkpoint(repo_id: str, folder_path: str, token: str, report: Callable[..., None]) -> str:
+        from modelscope_hub import HubApi
+        from modelscope_hub.errors import AlreadyExistsError
+
+        api = HubApi(token=token)
+        try:
+            api.create_repo(repo_id, 'model', visibility='private')
+        except AlreadyExistsError:
+            pass
+
+        MSHub._ensure_configuration(folder_path)
+        stages = {
+            'upload_progress': 'uploading',
+            'batch_committed': 'batch_committed',
+            'recovery_committed': 'batch_committed',
+            'batch_failed': 'batch_failed',
+        }
+        uploaded = committed = inline = 0
+        lock = threading.Lock()
+
+        def progress(event):
+            nonlocal uploaded, committed, inline
+            with lock:
+                uploaded = max(uploaded, event.get('uploaded_bytes', 0))
+                committed = max(committed, event['committed_bytes'])
+                inline += event.get('batch_inline_bytes', 0)
+                report(stage=stages[event['event']], uploaded_bytes=uploaded + inline,
+                       total_bytes=event['total_bytes'], committed_bytes=committed)
+
+        # A fresh upload lets the Hub deduplicate bytes and still return its exact commit ID.
+        result = api.upload_folder(
+            repo_id, 'model', folder_path, use_cache=False, disable_tqdm=True, progress_callback=progress)
+        commit = result[-1] if isinstance(result, list) and result else result
+        revision = commit.get('commit_id') if isinstance(commit, dict) else None
+        if not revision:
+            raise RuntimeError(f'ModelScope did not return a commit ID for {repo_id}.')
+        return revision
 
     @classmethod
     def try_login(cls, token: Optional[str] = None) -> bool:
@@ -289,9 +341,7 @@ class MSHub(HubOperation):
         commit_message = commit_message or 'Upload folder using api'
         if commit_description:
             commit_message = commit_message + '\n' + commit_description
-        if not os.path.exists(os.path.join(folder_path, 'configuration.json')):
-            with open(os.path.join(folder_path, 'configuration.json'), 'w', encoding='utf-8') as f:
-                f.write('{"framework": "pytorch", "task": "text-generation", "allow_remote": true}')
+        cls._ensure_configuration(folder_path)
         if ignore_patterns:
             ignore_patterns = [p for p in ignore_patterns if p != '_*']
         if path_in_repo:

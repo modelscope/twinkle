@@ -175,18 +175,33 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             )
             return envelope_from_record(ref["request_id"], await self.state.get_future(ref["request_id"]))
         if endpoint == "upload_to_hub":
+            request_id = f"req_{uuid.uuid4().hex}"
 
             async def upload():
                 manager = create_checkpoint_manager(token, client_type="twinkle")
-                await self.call_backend(
-                    HubOperation.push_to_hub,
-                    repo_id=body.hub_model_id,
-                    folder_path=manager.resolve_upload_dir(body.checkpoint_dir),
-                    token=body.hub_token or token,
-                    private=True,
-                )
+                folder = manager.resolve_upload_dir(body.checkpoint_dir)
+                loop = asyncio.get_running_loop()
+                await self.state.report_future_progress(request_id, {"stage": "preparing"})
 
-            ref = await self.schedule_background_task(upload, task_type=endpoint, token=token)
+                def report(**progress):
+                    write = asyncio.run_coroutine_threadsafe(self.state.report_future_progress(request_id, progress), loop)
+                    try:
+                        write.result(timeout=5)
+                    except TimeoutError:
+                        write.cancel()
+                        raise
+
+                revision = await self.call_backend(
+                    HubOperation.upload_checkpoint,
+                    repo_id=body.hub_model_id,
+                    folder_path=folder,
+                    token=body.hub_token or token,
+                    report=report,
+                )
+                return native.UploadToHubResponse(
+                    repo_id=HubOperation.remove_source_type(body.hub_model_id), revision=revision)
+
+            ref = await self.schedule_background_task(upload, task_type=endpoint, token=token, request_id=request_id)
             return envelope_from_record(ref["request_id"], await self.state.get_future(ref["request_id"]))
         session = get_session_id_from_request(request)
         if not session:

@@ -1,5 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import asyncio
 import json
+import threading
 from unittest.mock import Mock
 from types import SimpleNamespace
 
@@ -10,6 +12,8 @@ from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import settle
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager
+from twinkle.server.gateway.use_cases import poll_future
+from twinkle.server.exceptions import ResourceNotFoundError
 from twinkle.server.state import ServerState
 from twinkle.server.model.pool.router import TrainingRouter
 from twinkle.server.config.training import TrainingConfig
@@ -39,23 +43,43 @@ async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(m
     await router.state.touch_replica_last_seen(router.replica_id)
     router._init_task_queue()
     router.controller = Mock(side_effect=AssertionError('Upload must not create or route a training'))
-    upload = Mock(return_value=None)
-    monkeypatch.setattr(HubOperation, 'push_to_hub', upload)
+    finish = threading.Event()
+
+    def transfer(*, repo_id, folder_path, token, report):
+        report(stage='uploading', uploaded_bytes=5, total_bytes=10, committed_bytes=0)
+        assert finish.wait(5), 'poll did not receive progress during upload'
+        report(stage='batch_committed', uploaded_bytes=10, total_bytes=10, committed_bytes=10)
+        return 'commit-sha'
+
+    upload = Mock(side_effect=transfer)
+    monkeypatch.setattr(HubOperation, 'upload_checkpoint', upload)
     try:
         response = await router.native_request(http_request({
             'checkpoint_dir': str(checkpoint), 'hub_model_id': 'owner/saved', 'hub_token': 'hub-token',
         }), 'upload_to_hub')
-        future = await settle(router.state, response.request_id)
         if owned:
+            with pytest.raises(ResourceNotFoundError):
+                await router.state.assert_future_owner(response.request_id, 'another-tenant')
+            outcome = await asyncio.wait_for(poll_future(router.state, response.request_id, after_progress=1), 3)
+            assert outcome.record['status'] == 'running'
+            assert outcome.record['progress']['uploaded_bytes'] == 5
+            finish.set()
+            future = await settle(router.state, response.request_id)
             assert future['status'] == 'completed'
-            upload.assert_called_once_with(
-                repo_id='owner/saved', folder_path=str(checkpoint), token='hub-token', private=True)
+            assert future['result'] == {'repo_id': 'owner/saved', 'revision': 'commit-sha'}
+            await router.state.report_future_progress(response.request_id, {'stage': 'batch_failed'})
+            assert (await router.state.get_future(response.request_id))['progress']['stage'] == 'batch_committed'
+            assert upload.call_count == 1
+            assert upload.call_args.kwargs['folder_path'] == str(checkpoint)
+            assert upload.call_args.kwargs['token'] == 'hub-token'
         else:
+            future = await settle(router.state, response.request_id)
             assert future['status'] == 'failed'
             upload.assert_not_called()
         assert (await router.state.get_future(response.request_id))['owner_token'] == 'owner'
         assert not await router.state._backend.keys('model::*')
     finally:
+        finish.set()
         await router.shutdown_task_queue()
 
 

@@ -459,13 +459,16 @@ class TaskQueueMixin:
         model_id: str | None = None,
         task_type: str | None = None,
         token: str | None = None,
+        *,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         """Run pure I/O outside serial compute, with the same supervised lifecycle.
 
         Capacity, timeout, cancellation and shutdown are owned by ComputeWorker;
         background jobs must not create a second unsupervised execution path.
         """
-        return await self.schedule_concurrent_task(coro_factory, model_id=model_id, task_type=task_type, token=token)
+        return await self.schedule_concurrent_task(
+            coro_factory, model_id=model_id, task_type=task_type, token=token, request_id=request_id)
 
     async def _fail_queue_tasks_async(self, queue_key: str, reason: str) -> None:
         await self._compute_worker.fail_queue_tasks(queue_key, reason)

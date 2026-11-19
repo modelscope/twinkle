@@ -384,6 +384,11 @@ class CalculateMetricResponse(ResponseModel):
     result: dict[str, Any]
 
 
+class UploadToHubResponse(ResponseModel):
+    repo_id: str
+    revision: str
+
+
 class SaveResponse(ResponseModel):
     """Response for /save endpoint (returns twinkle path + checkpoint dir)."""
     twinkle_path: str

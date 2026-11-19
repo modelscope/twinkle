@@ -172,15 +172,17 @@ for epoch in range(3):
     logger.info(f'Saved checkpoint: {twinkle_path}')
 
 # Step 8: 上传到 ModelScope Hub（可选）
-# 服务端始终在后台执行上传；当前调用会通过 future layer 等待上传完成或抛出失败。
-# 不要传 async_upload 或 poll_interval：两者仅为兼容旧调用保留，已废弃且无效果。
+# SDK 会在等待期间显示传输进度，完成后返回仓库 ID 和提交版本。
 # YOUR_USER_NAME = "your_username"
 # hub_model_id = f'{YOUR_USER_NAME}/twinkle-self-cognition'
-# model.upload_to_hub(
+# upload = model.upload_to_hub(
 #     checkpoint_dir=twinkle_path,
 #     hub_model_id=hub_model_id,
 # )
+# logger.info(f'Uploaded {upload.repo_id} at {upload.revision}')
 ```
+
+可传入 `on_progress` 回调，在自己的界面显示已传字节、总量、已提交字节和提交状态。ModelScope 在文件传完或批次提交后更新进度。Hub 去重时，已传字节可能小于已提交字节。服务端通过 `server` 安装选项获取上传依赖。
 
 Twinkle Client 场景下，推荐的断点续训流程是：
 

@@ -56,7 +56,7 @@ def _parity_client(monkeypatch, canonical_record):
 
     from twinkle.server.gateway import tinker_handlers, twinkle_handlers
 
-    async def _fixed_poll(_state, _request_id):
+    async def _fixed_poll(_state, _request_id, **_kwargs):
         return services.FuturePollResult(record=canonical_record, timed_out=False)
 
     app = FastAPI()

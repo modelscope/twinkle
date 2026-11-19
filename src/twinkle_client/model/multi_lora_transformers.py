@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import itertools
 import json
-import logging
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -14,13 +13,15 @@ if TYPE_CHECKING:
 
 from twinkle.protocol.types import model as model_types
 from twinkle.protocol.types.component import DataRef
+from twinkle.protocol.types.lifecycle import UploadProgress
+from twinkle.utils.logger import get_logger
 from twinkle_client._request_builder import build_request, to_wire_value
 from twinkle_client.exceptions import TwinkleHTTPError
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
 from twinkle_client.operations import _guarded_operation
 
-logger = logging.getLogger('twinkle_client')
+logger = get_logger()
 
 
 def _data_refs(inputs: DataRef | list[DataRef]) -> list[dict[str, Any]]:
@@ -127,7 +128,7 @@ class MultiLoraTransformersModel:
         return {**values, 'adapter_name': name, 'training_id': training_id}
 
     @_guarded_operation
-    def _submit(self, endpoint: str, model_cls, response_cls, **values):
+    def _submit(self, endpoint: str, model_cls, response_cls, *, on_progress=None, **values):
         """Validate once, then send with a stable handle and retry identity."""
         if issubclass(model_cls, model_types.TrainingRequest):
             values = self._training_values(values)
@@ -138,7 +139,8 @@ class MultiLoraTransformersModel:
         body = build_request(model_cls, **values)
         self._ensure_created()
         response = self._transport.post_model(f'{self.server_url}/{endpoint}', body)
-        result = self._await_task(response, response_cls)
+        progress_args = {} if on_progress is None else {'on_progress': on_progress}
+        result = self._await_task(response, response_cls, **progress_args)
         with self._training_lock:
             if endpoint in {'step', 'clip_grad_and_step'}:
                 self._completed_step_calls += 1
@@ -146,7 +148,7 @@ class MultiLoraTransformersModel:
                 self._last_checkpoint = result
         return result
 
-    def _await_task(self, response, model_cls):
+    def _await_task(self, response, model_cls, *, on_progress=None):
         """Resolve a Submit_Endpoint response through the Client_Future_Layer.
 
         Blocks until the task is terminal and returns the deserialized ``model_cls``
@@ -154,7 +156,7 @@ class MultiLoraTransformersModel:
         Keeps every public method's synchronous signature unchanged.
         """
         from twinkle_client._future import resolve_response
-        return resolve_response(response, model_cls, transport=self._transport)
+        return resolve_response(response, model_cls, transport=self._transport, on_progress=on_progress)
 
     def _next_seq_id(self) -> int:
         """Reserve the next monotonic seq_id for a stateful op (dedup key with session)."""
@@ -458,7 +460,9 @@ class MultiLoraTransformersModel:
         checkpoint_dir: str,
         hub_model_id: str,
         hub_token: str | None = None,
-    ) -> None:
+        *,
+        on_progress: Callable[[UploadProgress], None] | None = None,
+    ) -> model_types.UploadToHubResponse | None:
         """Upload model checkpoint to hub.
 
         Submits the upload task and blocks (via the Client_Future_Layer) until it
@@ -468,13 +472,25 @@ class MultiLoraTransformersModel:
             checkpoint_dir: The directory path of the checkpoint to upload.
             hub_model_id: The hub model id.
             hub_token: The hub token (optional).
+            on_progress: Receive the latest upload snapshots on the calling thread.
+                By default the SDK logs those snapshots.
+
+        Returns the repository ID and immutable commit revision. Older servers
+        that do not send a receipt return ``None``.
         """
+        def log_progress(progress: UploadProgress) -> None:
+            total = '?' if progress.total_bytes is None else progress.total_bytes
+            logger.info('[upload_to_hub] %s: %d/%s bytes transferred, %d bytes committed',
+                        progress.stage, progress.uploaded_bytes, total, progress.committed_bytes)
+
         logger.info('[upload_to_hub] submitting upload, waiting for completion...')
-        self._submit(
+        result = self._submit(
             'upload_to_hub',
             model_types.UploadToHubRequest,
             None,
+            on_progress=on_progress if on_progress is not None else log_progress,
             checkpoint_dir=checkpoint_dir,
             hub_model_id=hub_model_id,
             hub_token=hub_token)
         logger.info('[upload_to_hub] upload completed successfully.')
+        return model_types.UploadToHubResponse.model_validate(result) if result is not None else None

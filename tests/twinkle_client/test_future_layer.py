@@ -6,13 +6,15 @@
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import requests
 
 from twinkle_client import _future
 from twinkle_client.exceptions import TaskFailedError, TaskRecordLostError, TaskWaitTimeoutError
 from twinkle.protocol.types.errors import ErrorPayload
-from twinkle.protocol.types.lifecycle import TaskEnvelope
+from twinkle.protocol.types.lifecycle import TaskEnvelope, UploadProgress
 
 
 class _Model:
@@ -82,6 +84,36 @@ def test_non_terminal_submit_polls_until_terminal(monkeypatch):
     monkeypatch.setattr(_future, '_post_retrieve', lambda _r, _transport: replies.pop(0))
     out = _future.resolve(_running(), model_cls=_Model)
     assert out.result == {'ok': 1}
+    assert replies == []
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_upload_poll_cursor_and_legacy_response(monkeypatch, legacy):
+    seen = []
+    running = _running()
+    if legacy:
+        payload = running.model_dump(exclude={'progress'})
+        replies = [(_completed(None), {})]
+    else:
+        payload = running.model_dump()
+        uploading = running.model_copy(update={
+            'progress': UploadProgress(sequence=2, stage='uploading', uploaded_bytes=5, total_bytes=10)})
+        completed = TaskEnvelope(
+            request_id='r', status='completed', result={'repo_id': 'owner/model', 'revision': 'sha'},
+            progress=UploadProgress(sequence=4, stage='batch_committed', uploaded_bytes=10, total_bytes=10,
+                                    committed_bytes=10))
+        replies = [(uploading, {'after_progress': 0}), (uploading, {'after_progress': 2}),
+                   (completed, {'after_progress': 2})]
+
+    def retrieve(_request_id, _transport, **kwargs):
+        reply, expected = replies.pop(0)
+        assert kwargs == expected
+        return reply
+
+    monkeypatch.setattr(_future, '_post_retrieve', retrieve)
+    receipt = _future.resolve_response(SimpleNamespace(json=lambda: payload), None, on_progress=seen.append)
+    assert [p.stage for p in seen] == ([] if legacy else ['uploading', 'batch_committed'])
+    assert receipt == (None if legacy else {'repo_id': 'owner/model', 'revision': 'sha'})
     assert replies == []
 
 

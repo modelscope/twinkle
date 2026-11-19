@@ -172,16 +172,17 @@ for epoch in range(3):
     logger.info(f'Saved checkpoint: {twinkle_path}')
 
 # Step 8: Upload to ModelScope Hub (optional)
-# The server always uploads in the background; this call waits through the future layer
-# until upload completion or failure. Do not pass async_upload or poll_interval: they
-# remain only for old-call compatibility, are deprecated, and have no effect.
+# The SDK shows progress while waiting and returns the repository ID and commit revision.
 # YOUR_USER_NAME = "your_username"
 # hub_model_id = f'{YOUR_USER_NAME}/twinkle-self-cognition'
-# model.upload_to_hub(
+# upload = model.upload_to_hub(
 #     checkpoint_dir=twinkle_path,
 #     hub_model_id=hub_model_id,
 # )
+# logger.info(f'Uploaded {upload.repo_id} at {upload.revision}')
 ```
+
+Pass an `on_progress` callback to display transferred bytes, total bytes, committed bytes, and commit status. ModelScope reports updates as files finish transferring or batches are committed. Deduplication can make transferred bytes lower than committed bytes. Install the server with the `server` extra to include the upload dependency.
 
 For checkpoint resumption, the recommended client-side flow is:
 

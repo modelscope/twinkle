@@ -461,6 +461,9 @@ class ServerState:
         record = await self._future_mgr.get(request_id)
         return record.model_dump() if record is not None else None
 
+    async def report_future_progress(self, request_id: str, progress: dict[str, Any]) -> None:
+        await self._future_mgr.report_progress(request_id, progress)
+
     async def assert_future_owner(self, request_id: str, token: str) -> None:
         record = await self._future_mgr.get(request_id)
         owner = record.owner_token if record is not None else None
