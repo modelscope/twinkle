@@ -206,9 +206,9 @@ Start each lesson with a question about training, then inspect the data that det
 
 | Stage | Exercise and model | Training question | First check |
 |---|---|---|---|
-| 1. SFT | [Self-cognition fine-tuning](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/self_cognition.py), Qwen3.5-4B | Which tokens learn from the reference answer? | Check assistant-response labels and compare responses to the same questions. |
-| 2. DPO (optional) | [Preference fine-tuning](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/dpo.py), Qwen3.5-4B | How does a preferred answer gain probability relative to a rejected answer? | Inspect a preference pair, then evaluate held-out pairs. |
-| 3. GRPO | [Short-answer math](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/short_math_grpo.py), Qwen3.5-4B | How does an outcome reward guide generated answers? | Compare scores and advantages for one prompt group, then check accuracy and length. |
+| 1. SFT | Self-cognition fine-tuning (`cookbook/client/twinkle/self_cognition.py`), Qwen3.5-4B | Which tokens learn from the reference answer? | Check assistant-response labels and compare responses to the same questions. |
+| 2. DPO (optional) | Preference fine-tuning (`cookbook/client/twinkle/dpo.py`), Qwen3.5-4B | How does a preferred answer gain probability relative to a rejected answer? | Inspect a preference pair, then evaluate held-out pairs. |
+| 3. GRPO | Short-answer math (`cookbook/client/twinkle/short_math_grpo.py`), Qwen3.5-4B | How does an outcome reward guide generated answers? | Compare scores and advantages for one prompt group, then check accuracy and length. |
 | 4. Online distillation | [The multiplication exercise below](#client-online-distillation), Qwen3.5-0.8B student with Qwen3.5-2B for the external teacher methods | Who is the teacher, what does it see, and how do its scores update the student? | Verify that teacher and student scores refer to the same reply tokens. |
 | 5. Agentic RL | [Blackjack below](#client-async-grpo), Qwen3.5-4B | Where do rewards and labels go in a tool trajectory? | Read one episode with actions, observations, and a terminal reward, then measure completion and reward. |
 
@@ -217,11 +217,11 @@ To connect these exercises on your own task, use SFT to teach response format or
 (client-online-distillation)=
 ## Online Distillation
 
-[One client script](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/online_distillation.py) teaches all three methods on short multiplication. For `17 × 23`, the student answers first. GKD asks an external teacher for every candidate token's score at each position. OPD-RL compares scores for the sampled tokens. OPSD gives the current student the worked solution and has it score its own original reply. Read `train()` for the shared loop and `distillation_signal()` for the three signals.
+One client script (`cookbook/client/twinkle/online_distillation.py`) teaches all three methods on short multiplication. For `17 × 23`, the student answers first. GKD asks an external teacher for every candidate token's score at each position. OPD-RL compares scores for the sampled tokens. OPSD gives the current student the worked solution and has it score its own original reply. Read `train()` for the shared loop and `distillation_signal()` for the three signals.
 
-Ask your service administrator for its URL, token, and model services. The example uses `distill-student` (Qwen3.5-0.8B). OPD-RL and GKD also use `distill-teacher` (frozen Qwen3.5-2B). GKD requires HTTP support for `teacher_logits`. The service administrator manages model weights, devices, and the training backend. [Server YAML](https://github.com/modelscope/twinkle/blob/main/cookbook/client/server/transformer/distillation.yaml)
+Ask your service administrator for its URL, token, and model services. The example uses `distill-student` (Qwen3.5-0.8B). OPD-RL and GKD also use `distill-teacher` (frozen Qwen3.5-2B). GKD requires HTTP support for `teacher_logits`. The service administrator manages model weights, devices, and the training backend. `cookbook/client/server/transformer/distillation.yaml`
 
-Install the client from the checkout that includes this example. Use the URL, token, and model name from your administrator:
+Install the client from the repository root for the same version as this guide. Use the URL, token, and model name provided by your administrator:
 
 ```bash
 python -m pip install -e '.[client]'
@@ -251,23 +251,28 @@ The client can train while sampling continues. After [installing Twinkle](../Ins
 
 | Task | Example |
 |---|---|
-| Single-turn math questions (GSM8K) | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
-| Blackjack with tools (StreamingDriver, explicit synchronous training loop) | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
-| Blackjack in E2B sandboxes (same training loop) | [e2b_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/e2b_multi_turn_grpo.py) |
+| Streaming single-turn math (GSM8K) | `cookbook/client/async_rl/client_orchestrated_grpo.py` |
+| Blackjack with tools (StreamingDriver, explicit synchronous training loop) | `cookbook/client/async_rl/streaming_multi_turn_grpo.py` |
+| Blackjack in E2B sandboxes (same training loop) | `cookbook/client/async_rl/e2b_multi_turn_grpo.py` |
 
 ### Connect and Run the Math Example
 
-Ask your administrator for a Qwen3.5-4B service with GRPO and sampling support. The asynchronous math example also uses the server's DataPlane. [Server YAML](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/server_config.yaml)
+Ask your administrator for a Qwen3.5-4B service with GRPO and sampling support. Use the client installation command under Blackjack below.
 
 Set the client connection and run from the repository root:
 
 ```bash
 export TWINKLE_SERVER_URL=https://your-twinkle-server
 export TWINKLE_SERVER_TOKEN=your-token
-python cookbook/client/async_rl/client_orchestrated_grpo.py
+TWINKLE_MAX_STEPS=6 python cookbook/client/twinkle/short_math_grpo.py
+
+# Advanced exercise: overlap sampling and training with StreamingDriver.
+TWINKLE_MAX_STEPS=6 python cookbook/client/async_rl/client_orchestrated_grpo.py
 ```
 
-The example uses GSM8K. Offline clients can set `TWINKLE_DATASET_ID` to a local dataset and `TWINKLE_TEMPLATE_MODEL_ID` to tokenizer and template assets that match the server model.
+Both examples use GSM8K. Start with the synchronous loop. Correct answers earn 1 point and can earn up to 0.25 extra for brevity. With group rewards of `[1.25, 1, 0, 0]`, the first two answers get positive advantages and the last two get negative advantages. Try setting the brevity coefficient to 0, then compare accuracy and output tokens on the same held-out questions. The streaming example rewards correctness only. `StreamingDriver` collects and scores groups of replies while you train on a previous group. `TWINKLE_MAX_STEPS` caps the number of groups delivered for training in this example; groups with no useful reward difference do not update the model.
+
+Offline clients can set `TWINKLE_DATASET_ID` to a local dataset and `TWINKLE_TEMPLATE_MODEL_ID` to tokenizer and template assets that match the server model.
 
 ### Run Multi-turn Blackjack GRPO
 

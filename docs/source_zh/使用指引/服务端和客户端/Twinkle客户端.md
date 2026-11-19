@@ -206,9 +206,9 @@ Twinkle Client 场景下，推荐的断点续训流程是：
 
 | 顺序 | 练习和模型 | 训练问题 | 先看什么 |
 |---|---|---|---|
-| 1. SFT | [自我认知微调](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/self_cognition.py)，Qwen3.5-4B | 给定标准答案，模型学哪些 token？ | 检查助手回复的标签，比较同一组问题的输出。 |
-| 2. DPO（选学） | [偏好微调](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/dpo.py)，Qwen3.5-4B | 同一道题有两个答案，怎样让模型偏向更好的那个？ | 检查成对回答，再测留出偏好对。 |
-| 3. GRPO | [短答案数学](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/short_math_grpo.py)，Qwen3.5-4B | 只有答案的奖励，怎么决定哪些采样结果值得加强？ | 看一组同题回复的分数和 advantage，再查正确率与长度。 |
+| 1. SFT | 自我认知微调（`cookbook/client/twinkle/self_cognition.py`），Qwen3.5-4B | 给定标准答案，模型学哪些 token？ | 检查助手回复的标签，比较同一组问题的输出。 |
+| 2. DPO（选学） | 偏好微调（`cookbook/client/twinkle/dpo.py`），Qwen3.5-4B | 同一道题有两个答案，怎样让模型偏向更好的那个？ | 检查成对回答，再测留出偏好对。 |
+| 3. GRPO | 短答案数学（`cookbook/client/twinkle/short_math_grpo.py`），Qwen3.5-4B | 只有答案的奖励，怎么决定哪些采样结果值得加强？ | 看一组同题回复的分数和 advantage，再查正确率与长度。 |
 | 4. 在线蒸馏 | [下方的短乘法练习](#client-online-distillation)，Qwen3.5-0.8B 学生，外部教师方法用 Qwen3.5-2B | 教师是谁、看到什么？它的分数怎样更新学生？ | 核对教师与学生打分的 token，再比较留出题。 |
 | 5. Agentic RL | [下方的 Blackjack](#client-async-grpo)，Qwen3.5-4B | 一次训练样本变成工具交互轨迹后，奖励和标签落在哪里？ | 先读一条含工具调用、观察和终局奖励的轨迹，再查完成率与环境奖励。 |
 
@@ -217,11 +217,11 @@ Twinkle Client 场景下，推荐的断点续训流程是：
 (client-online-distillation)=
 ## 在线蒸馏入门
 
-[同一份客户端脚本](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/online_distillation.py) 用短乘法演示三种方法。以 `17 × 23` 为例，学生先生成自己的回答。GKD 让外部教师给每个位置的所有候选 token 打分，OPD-RL 只比较实际选中 token 的 logprob，OPSD 让当前学生读完参考解法，再给原回答打分。三个方法共用采样、更新、发布和评测。先读 `train()` 看这条主线，再读 `distillation_signal()` 看信号如何构造。
+`cookbook/client/twinkle/online_distillation.py` 用短乘法演示三种方法。以 `17 × 23` 为例，学生先生成自己的回答。GKD 让外部教师给每个位置的所有候选 token 打分，OPD-RL 只比较实际选中 token 的 logprob，OPSD 让当前学生读完参考解法，再给原回答打分。三个方法共用采样、更新、发布和评测。先读 `train()` 看这条主线，再读 `distillation_signal()` 看信号如何构造。
 
-向服务管理员获取地址、令牌和兼容的模型服务。示例使用 `distill-student`（Qwen3.5-0.8B）。OPD-RL 和 GKD 另需 `distill-teacher`（冻结的 Qwen3.5-2B），其中 GKD 需要支持 `teacher_logits` 的 HTTP 接口。模型权重、设备和训练后端由服务管理员管理。[服务端参考 YAML](https://github.com/modelscope/twinkle/blob/main/cookbook/client/server/transformer/distillation.yaml)
+向服务管理员获取地址、令牌和兼容的模型服务。示例使用 `distill-student`（Qwen3.5-0.8B）。OPD-RL 和 GKD 另需 `distill-teacher`（冻结的 Qwen3.5-2B），其中 GKD 需要支持 `teacher_logits` 的 HTTP 接口。模型权重、设备和训练后端由服务管理员管理。`cookbook/client/server/transformer/distillation.yaml`
 
-在包含此示例的源码目录安装客户端，填入管理员提供的地址、令牌和模型名：
+在与本指南同一版本的仓库根目录安装客户端，填入管理员提供的地址、令牌和模型名：
 
 ```bash
 python -m pip install -e '.[client]'
@@ -251,23 +251,28 @@ python cookbook/client/twinkle/online_distillation.py --method opd-rl --model di
 
 | 场景 | 示例 |
 |---|---|
-| 单轮数学问答（GSM8K） | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
-| 工具多轮 Blackjack（StreamingDriver，显式同步训练循环） | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
-| E2B sandbox 中的 Blackjack（复用相同训练循环） | [e2b_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/e2b_multi_turn_grpo.py) |
+| 流式单轮数学问答（GSM8K） | `cookbook/client/async_rl/client_orchestrated_grpo.py` |
+| 工具多轮 Blackjack（StreamingDriver，显式同步训练循环） | `cookbook/client/async_rl/streaming_multi_turn_grpo.py` |
+| E2B sandbox 中的 Blackjack（复用相同训练循环） | `cookbook/client/async_rl/e2b_multi_turn_grpo.py` |
 
 ### 连接服务并运行单轮数学任务
 
-这些示例需要管理员提供可用于 GRPO 和采样的 Qwen3.5-4B 服务。单轮异步数学示例还需要服务端 DataPlane。[服务端参考 YAML](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/server_config.yaml)
+这两份示例需要管理员提供可用于 GRPO 和采样的 Qwen3.5-4B 服务。客户端可复用下文 Blackjack 的安装命令。
 
 在客户端设置连接信息，从仓库根目录执行：
 
 ```bash
 export TWINKLE_SERVER_URL=https://your-twinkle-server
 export TWINKLE_SERVER_TOKEN=your-token
-python cookbook/client/async_rl/client_orchestrated_grpo.py
+TWINKLE_MAX_STEPS=6 python cookbook/client/twinkle/short_math_grpo.py
+
+# 进阶练习：用 StreamingDriver 让采样和训练重叠
+TWINKLE_MAX_STEPS=6 python cookbook/client/async_rl/client_orchestrated_grpo.py
 ```
 
-默认使用 GSM8K。离线时可设置 `TWINKLE_DATASET_ID` 为本地数据目录，`TWINKLE_TEMPLATE_MODEL_ID` 为与服务模型匹配的 tokenizer 与模板目录。
+两份示例都使用 GSM8K。同步版适合第一次读 GRPO 循环。答对得 1 分，答对后最多再加 0.25 分的简短奖励。例如同组奖励为 `[1.25, 1, 0, 0]`，前两条的优势为正，后两条为负。试着把简短奖励系数改成 0，再用同一批留出题比较正确率和输出 token 数。流式版只按答案正误打分。训练上一组时，`StreamingDriver` 可以继续采样和评分。这个示例的 `TWINKLE_MAX_STEPS` 限制交给训练的组数；组内奖励相同就跳过更新。
+
+离线时，两份示例都可设置 `TWINKLE_DATASET_ID` 为本地数据目录，并用 `TWINKLE_TEMPLATE_MODEL_ID` 指定与服务模型匹配的 tokenizer 和模板目录。
 
 ### 运行 Blackjack 多轮 GRPO
 
