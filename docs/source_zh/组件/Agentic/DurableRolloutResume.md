@@ -161,8 +161,9 @@ cookbook/rl/async_rl/durable_multi_turn_grpo.sh
 
 示例使用官方 GSM8K、Qwen3.5、LoRA、真实多轮 rollout、GRPO 反向传播和 optimizer
 checkpoint，并在每个 batch 后调用 `commit_batch()`。每个已提交 step 的训练指标、policy
-version、driver 计数和累计耗时追加到 `TWINKLE_RESUME_ROOT/training-metrics.jsonl`，重启后续写，
-可据此绘制完整训练曲线。
+version、driver 计数和累计训练耗时（不含进程停止期间）写入
+`TWINKLE_RESUME_ROOT/training-metrics.jsonl`。指标同时随 checkpoint commit manifest 持久化；
+如果进程在 commit 后、JSONL 追加前退出，重启会从 journal 回填该 step，保证曲线没有缺步。
 
 聚焦测试：
 
@@ -183,13 +184,21 @@ PYTHONPATH="$PWD/src" python -m pytest \
 
 ## 实验结论与边界
 
-已验证：
+在单张 Ascend 910B4、Qwen3-0.6B、vLLM 0.23.0 和 vLLM-Ascend 0.23.0 上，正式 cookbook
+的两步 GSM8K 训练、after-save 和 after-commit 进程崩溃恢复均已跑通。两种故障恢复后的
+`history_steps` 与 `commit_steps` 都为 `[1, 2]`；after-commit 缺步指标可从 journal 回填。
 
-- 真实 Qwen3-0.6B LoRA 在 Ascend 910B4 上完成 optimizer step 后强杀；
-- checkpoint 临时目录、已发布未提交、已提交三种边界均可正确回退或前进；
-- 已提交 batch 不重复训练，未提交 optimizer 更新不泄漏；
-- 无故障时 baseline 与 durable 的训练信号和评测结果逐值一致；
-- 50% 组丢失故障下，保留完整组的 durable 路径在官方 GSM8K 测试集上取得显著提升。
+真实 vLLM A/B 在第 2、5 步保存 checkpoint 后、commit 前退出进程，结果如下：
+
+| 预算 | durable | cursor-restart |
+|---|---|---|
+| 固定 8 attempts | 8 optimizer steps，737 秒 | 6 optimizer steps，590 秒 |
+| 固定 8 optimizer steps | 8 attempts，621 秒 | 10 attempts，623 秒 |
+
+固定 step 下减少 20% 的 rollout attempts，但本轮墙钟时间基本相同，不能宣称耗时提升。
+相同 64 条 held-out GSM8K 上，base、durable、cursor-restart 准确率分别为 45.3125%、
+46.875%、45.3125%；durable 的差值为 +1.5625pp，但 McNemar 双侧 `p=1.0`，不构成
+统计显著的质量提升证据。完整逐 step 曲线由四组 `training-metrics.jsonl` 生成。
 
 尚未覆盖：
 
@@ -198,5 +207,5 @@ PYTHONPATH="$PWD/src" python -m pytest \
 - 无法 checkpoint 的远端 agent harness；
 - 所有外部工具协议都具备幂等结果查询。
 
-因此该机制不以“所有故障率下无条件提升”为结论，而是在完整组丢失或进程重启时保持
-GRPO 组语义、事务一致性和固定训练预算下的有效训练量。
+因此该机制的主要结论是进程重启时保持 GRPO 组语义、事务一致性、固定预算下的有效训练量，
+并减少重复采样，不宣称所有故障率下无条件提升模型质量或缩短墙钟时间。

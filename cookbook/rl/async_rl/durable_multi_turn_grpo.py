@@ -18,6 +18,7 @@ train the batch twice.
 """
 
 from __future__ import annotations
+import argparse
 import os
 import re
 import time
@@ -32,7 +33,6 @@ import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
 from twinkle.advantage import GRPOAdvantage
 from twinkle.checkpoint_engine import CheckpointEngineManager
-from twinkle.cli import CLI
 from twinkle.data_format import SamplingParams
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
@@ -48,24 +48,43 @@ from twinkle_agentic.async_rl import StreamingDriver
 from twinkle_agentic.async_rl.rollout_resume import JournalEvent, ResumeStore, atomic_write_bytes
 from twinkle_agentic.rollout.multi_turn import MultiTurnRollout
 
-logger = get_logger()
-args = CLI.from_args()
 
-MODEL_ID = args.model.model_id or "ms://Qwen/Qwen3.5-4B"
-MODEL_GPUS = args.infra.model_gpus or 4
-SAMPLER_GPUS = args.infra.sampler_gpus or 4
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-id")
+    parser.add_argument("--strategy", choices=("native_fsdp", "accelerate"), default="native_fsdp")
+    parser.add_argument("--model-gpus", type=int)
+    parser.add_argument("--sampler-gpus", type=int)
+    parser.add_argument("--num-generations", type=int)
+    parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--mini-batch-size", type=int)
+    parser.add_argument("--micro-batch-size", type=int)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--lora-r", type=int)
+    parser.add_argument("--adapter-name")
+    return parser.parse_known_args()[0]
+
+
+logger = get_logger()
+args = parse_args()
+
+MODEL_ID = args.model_id or "ms://Qwen/Qwen3.5-4B"
+MODEL_GPUS = args.model_gpus or 4
+SAMPLER_GPUS = args.sampler_gpus or 4
 NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
 
-NUM_GENERATIONS = args.rl.num_generations or 4
-BATCH_SIZE = args.training.batch_size or 2
+NUM_GENERATIONS = args.num_generations or 4
+BATCH_SIZE = args.batch_size or 2
 GLOBAL_BATCH_SIZE = BATCH_SIZE * NUM_GENERATIONS
-MINI_BATCH_SIZE = args.training.mini_batch_size or GLOBAL_BATCH_SIZE
-MICRO_BATCH_SIZE = args.training.micro_batch_size or 2
-MAX_STEPS = args.training.max_steps or 100
-MAX_NEW_TOKENS = args.sampling.max_tokens or 1024
-LEARNING_RATE = args.optimizer.learning_rate or 1e-5
-LORA_RANK = args.lora.lora_r or 8
-ADAPTER_NAME = args.lora.adapter_name or "durable-grpo"
+MINI_BATCH_SIZE = args.mini_batch_size or GLOBAL_BATCH_SIZE
+MICRO_BATCH_SIZE = args.micro_batch_size or 2
+MAX_STEPS = args.max_steps or 100
+MAX_NEW_TOKENS = args.max_tokens or 1024
+LEARNING_RATE = args.lr or 1e-5
+LORA_RANK = args.lora_r or 8
+ADAPTER_NAME = args.adapter_name or "durable-grpo"
 
 RUN_ID = os.environ.get("TWINKLE_DURABLE_RUN_ID", "gsm8k-durable-grpo")
 RESUME_ROOT = Path(os.environ.get("TWINKLE_RESUME_ROOT", "output/durable-gsm8k"))
@@ -172,6 +191,39 @@ class _PolicyIndex:
                 self.register(int(version), str(checkpoint))
 
 
+def _recover_history(commits: list[Any]) -> list[dict[str, Any]]:
+    rows = []
+    if HISTORY_PATH.is_file():
+        with HISTORY_PATH.open(encoding="utf-8") as stream:
+            rows = [json.loads(line) for line in stream if line.strip()]
+    by_step = {int(row["optimizer_step"]): row for row in rows}
+    recovered = False
+    for record in commits:
+        manifest = record.payload.get("manifest") or {}
+        metrics = manifest.get("metrics")
+        step = manifest.get("optimizer_step")
+        if step is None or not isinstance(metrics, dict) or int(step) in by_step:
+            continue
+        by_step[int(step)] = {
+            "optimizer_step": int(step),
+            "policy_version": manifest.get("policy_version"),
+            "checkpoint": record.payload.get("checkpoint"),
+            "elapsed_s": manifest.get("elapsed_s"),
+            "metrics": metrics,
+            "driver": manifest.get("driver") or {},
+            "recovered_from_journal": True,
+        }
+        recovered = True
+    rows = sorted(by_step.values(), key=lambda row: int(row["optimizer_step"]))
+    if recovered:
+        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(
+            HISTORY_PATH,
+            "".join(json.dumps(row, ensure_ascii=False, default=str) + "\n" for row in rows).encode("utf-8"),
+        )
+    return rows
+
+
 def create_gsm8k_dataset():
     dataset = Dataset()
     dataset.add_dataset(DatasetMeta("ms://modelscope/gsm8k", subset_name="main", split="train"))
@@ -271,6 +323,8 @@ def main() -> None:
     committed_records = [
         record for record in store.journal.records() if record.event == JournalEvent.MODEL_CHECKPOINT_COMMITTED
     ]
+    history = _recover_history(committed_records)
+    elapsed_offset = max((float(row.get("elapsed_s") or 0.0) for row in history), default=0.0)
     latest_checkpoint = policy_index.adapter_path(policy_index.latest_version)
     if latest_checkpoint is None:
         latest_checkpoint = model.save(
@@ -333,7 +387,7 @@ def main() -> None:
         driver.load_state_dict()
         logger.info("resumed StreamingDriver from the latest stable boundary")
 
-    advantage_fn = GRPOAdvantage()
+    advantage_fn = GRPOAdvantage(num_generations=NUM_GENERATIONS)
     metrics = CompletionRewardMetric()
     logger.info(get_device_placement())
 
@@ -343,11 +397,8 @@ def main() -> None:
             if optim_step >= MAX_STEPS:
                 break
             rewards = _score_vector(rows, facts)
-            advantages = advantage_fn(
-                rewards,
-                num_generations=NUM_GENERATIONS,
-                scale="group",
-            ).tolist()
+            rows, _ = advantage_fn(rows, scores=facts["scores"], global_step=optim_step)
+            advantages = [row["advantages"] for row in rows]
             old_logps = _old_logps(rows)
             completion_lengths = [sum(1 for label in (row.get("labels") or ()) if label != -100) for row in rows]
             metrics.accumulate(
@@ -374,38 +425,35 @@ def main() -> None:
                 async_save=False,
             )
             next_version = policy_index.version() + 1
+            log_dict = metrics.calculate()
+            log_dict.update(model.calculate_metric(is_training=True))
+            step_record = {
+                "optimizer_step": optim_step,
+                "policy_version": next_version,
+                "checkpoint": str(checkpoint),
+                "elapsed_s": elapsed_offset + time.monotonic() - started,
+                "metrics": log_dict,
+                "driver": driver.stats(),
+            }
             driver.commit_batch(
                 checkpoint,
                 manifest={
                     "optimizer_step": optim_step,
                     "policy_version": next_version,
+                    "elapsed_s": step_record["elapsed_s"],
+                    "metrics": log_dict,
+                    "driver": step_record["driver"],
                 },
             )
             policy_index.register(next_version, checkpoint)
 
             ckpt_manager.sync_weights(merge_and_sync=False)
             sampler.reset_prefix_cache()
-            log_dict = metrics.calculate()
-            log_dict.update(model.calculate_metric(is_training=True))
             logger.info(f"[durable step {optim_step}/{MAX_STEPS}] {log_dict}")
             HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with HISTORY_PATH.open("a", encoding="utf-8") as history:
-                history.write(
-                    json.dumps(
-                        {
-                            "optimizer_step": optim_step,
-                            "policy_version": next_version,
-                            "checkpoint": str(checkpoint),
-                            "elapsed_s": time.monotonic() - started,
-                            "metrics": log_dict,
-                            "driver": driver.stats(),
-                        },
-                        ensure_ascii=False,
-                        default=str,
-                    )
-                    + "\n"
-                )
-                history.flush()
+            with HISTORY_PATH.open("a", encoding="utf-8") as history_file:
+                history_file.write(json.dumps(step_record, ensure_ascii=False, default=str) + "\n")
+                history_file.flush()
             metrics.reset()
     finally:
         driver.close()

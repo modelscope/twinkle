@@ -931,7 +931,11 @@ class StreamingDriver:
             self._counters["resumed_groups"] += len(self._groups)
             live = [episode for group in self._groups.values() for episode in group.members + group.baselines]
         loader_state = state.get("loader_state")
-        loader = getattr(self.dataloader, "load_state_dict", None) or getattr(self.dataloader, "set_state", None)
+        loader = (
+            getattr(self.dataloader, "load_state_dict", None)
+            or getattr(self.dataloader, "load_state", None)
+            or getattr(self.dataloader, "set_state", None)
+        )
         if loader_state is not None:
             if not callable(loader):
                 raise UnsafeResume("snapshot has DataLoader state but the dataloader cannot load it")
