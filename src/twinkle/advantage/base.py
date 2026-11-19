@@ -257,8 +257,7 @@ class Advantage:
         if self._token_level:
             unused = [('num_generations', num_generations != 1), ('scale_rewards', scale_rewards is not None),
                       ('beta', beta != 0.0), ('kl_in_reward', kl_in_reward), ('f_norm', f_norm != 1.0),
-                      ('use_prm', use_prm), ('prm_orm_mix', prm_orm_mix != 0.0),
-                      ('prm_weights', prm_weights is not None), ('teacher_reweight', teacher_reweight is not None),
+                      ('teacher_reweight', teacher_reweight is not None),
                       ('teacher_kl_coef', teacher_kl_coef != 0.0), ('sdar_loss_coef', sdar_loss_coef != 0.0),
                       ('rlsd_lambda', rlsd_lambda != 0.0),
                       ('rlsd_lambda_warmup_steps', rlsd_lambda_warmup_steps != 0),
@@ -731,6 +730,37 @@ class Advantage:
                                f'but the trajectory has {len(spans)} trainable assistant turns; every turn must '
                                'fall in a segment (the last step always closes one).')
         return per_token
+
+    def _prm_turn_scores(self, traj: Trajectory, score: Dict[str, Any]) -> Optional[List[float]]:
+        """One PRM score per assistant turn, aligned with ``turn_token_spans(traj)`` (or ``None``).
+
+        The token-level (GAE) counterpart of :meth:`_process_row`: each turn carries the
+        ``prm_weights``-folded score of the segment that closed it, but yielded once per turn rather
+        than broadcast over its tokens -- the GAE reward-level fusion places it on the turn's LAST
+        token as an intermediate MDP reward (the critic then sees it through the returns target).
+        ``None`` when the driver stamped no ``prm_segments`` (this row has no process reward).
+        """
+        segments = score.get('prm_segments')
+        if not segments:
+            return None
+        ends = list(segments.get('end_turns') or ())
+        columns = list(zip(*(list(column) for column in (segments.get('scores') or {}).values())))
+        if len(columns) != len(ends):
+            raise RuntimeError(f'episode {traj.get("episode_id")!r} carries {len(columns)} PRM segment scores '
+                               f'for {len(ends)} recorded segments; the driver must record one end turn per '
+                               'segment.')
+        spans = turn_token_spans(traj)
+        per_turn: List[float] = []
+        start_turn = 0
+        for column, end_turn in zip(columns, ends):
+            value = weighted_score(column, self.prm_weights)
+            per_turn.extend([value] * (end_turn - start_turn))
+            start_turn = end_turn
+        if start_turn != len(spans):
+            raise RuntimeError(f'episode {traj.get("episode_id")!r}: its PRM segments end at turn {start_turn}, '
+                               f'but the trajectory has {len(spans)} trainable assistant turns; every turn must '
+                               'fall in a segment (the last step always closes one).')
+        return per_turn
 
     def _check_groups(self, trajs: List[Trajectory]) -> None:
         """Every prompt group arrives as one consecutive block of exactly ``num_generations``
