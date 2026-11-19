@@ -203,3 +203,126 @@ def test_nccl_engine_wiring():
     assert e._release_after_round('seed') is None
     assert e._release_after_round('steady') is None
     assert e._ensure_wire() is None
+
+
+# ---- delta flush transport fingerprint (C2⑵, task#281) ----
+# The delta wire carries flushes (raw uint8 position/value blobs), not per-param tensors, so the
+# fingerprint pairs send/recv by (name, flush occurrence). These tests guard that the rows are
+# written, pair bit-for-bit, detect corruption, and stay a no-op when the probe is off.
+def _flush_fp_rows(root):
+    import glob
+    import json
+    rows = []
+    for path in sorted(glob.glob(str(root / 'weightsync.*.jsonl'))):
+        with open(path, encoding='utf-8') as handle:
+            rows.extend(json.loads(line) for line in handle if line.strip())
+    return rows
+
+
+def test_delta_flush_fingerprint_pairs_send_recv_with_movement(monkeypatch, tmp_path):
+    from twinkle.checkpoint_engine.delta.transport.nccl_engine import _record_delta_flush_fp
+    from twinkle.utils.torch_utils import bits_fingerprint
+    monkeypatch.setenv('TWINKLE_WEIGHT_SYNC_FINGERPRINT', str(tmp_path))
+    sent_vals = []
+    for k in range(2):
+        val = torch.full((8,), k + 1, dtype=torch.uint8)
+        pos = torch.full((4,), k, dtype=torch.uint8)
+        sent_vals.append(val)
+        _record_delta_flush_fp('send', k, pos, val, rank=0)
+        _record_delta_flush_fp('recv', k, pos, val.clone(), rank=1)
+    rows = _flush_fp_rows(tmp_path)
+    send = {(r['name'], r['seq']): r for r in rows if r['side'] == 'send'}
+    recv = {(r['name'], r['seq']): r for r in rows if r['side'] == 'recv'}
+    assert set(send) == set(recv) == {('__positions__', 0), ('__values__', 0),
+                                      ('__positions__', 1), ('__values__', 1)}
+    # independent oracle: each row's bits equal bits_fingerprint of the exact bytes published
+    for k in range(2):
+        assert send[('__values__', k)]['bits'] == list(bits_fingerprint(sent_vals[k]))
+        assert send[('__values__', k)]['bits'] == recv[('__values__', k)]['bits']
+        assert send[('__positions__', k)]['bits'] == recv[('__positions__', k)]['bits']
+    # movement: the value bytes differ across flushes (a frozen transport would prove much less)
+    assert send[('__values__', 0)]['bits'] != send[('__values__', 1)]['bits']
+
+
+def test_delta_flush_fingerprint_detects_corrupted_recv(monkeypatch, tmp_path):
+    from twinkle.checkpoint_engine.delta.transport.nccl_engine import _record_delta_flush_fp
+    monkeypatch.setenv('TWINKLE_WEIGHT_SYNC_FINGERPRINT', str(tmp_path))
+    for k in range(2):
+        val = torch.full((8,), k + 1, dtype=torch.uint8)
+        recv_val = val.clone()
+        if k == 1:
+            recv_val[0] = 99
+        _record_delta_flush_fp('send', k, None, val, rank=0)
+        _record_delta_flush_fp('recv', k, None, recv_val, rank=1)
+    rows = _flush_fp_rows(tmp_path)
+    send = {r['seq']: r['bits'] for r in rows if r['side'] == 'send' and r['name'] == '__values__'}
+    recv = {r['seq']: r['bits'] for r in rows if r['side'] == 'recv' and r['name'] == '__values__'}
+    assert send[0] == recv[0]
+    assert send[1] != recv[1]  # the corrupted flush must not pair
+
+
+def test_delta_flush_fingerprint_noop_without_probe(monkeypatch, tmp_path):
+    from twinkle.checkpoint_engine.delta.transport.nccl_engine import _record_delta_flush_fp
+    monkeypatch.delenv('TWINKLE_WEIGHT_SYNC_FINGERPRINT', raising=False)
+    _record_delta_flush_fp('send', 0, torch.zeros(4, dtype=torch.uint8),
+                           torch.zeros(8, dtype=torch.uint8), rank=0)
+    assert _flush_fp_rows(tmp_path) == []
+
+
+def test_delta_flush_fingerprint_dense_flush_has_no_positions(monkeypatch, tmp_path):
+    from twinkle.checkpoint_engine.delta.transport.nccl_engine import _record_delta_flush_fp
+    monkeypatch.setenv('TWINKLE_WEIGHT_SYNC_FINGERPRINT', str(tmp_path))
+    _record_delta_flush_fp('send', 0, None, torch.zeros(8, dtype=torch.uint8), rank=0)
+    rows = _flush_fp_rows(tmp_path)
+    assert [r['name'] for r in rows] == ['__values__']
+
+
+# ---- collect transport (SGLang) named-flush fingerprint ----
+def test_delta_collect_flush_fingerprint_pairs_and_excludes_spec(monkeypatch, tmp_path):
+    from twinkle.checkpoint_engine.weight_keys import record_delta_flush_fingerprint
+    from twinkle.utils.torch_utils import bits_fingerprint
+    monkeypatch.setenv('TWINKLE_WEIGHT_SYNC_FINGERPRINT', str(tmp_path))
+    sent_vals = []
+    for k in range(2):
+        val = torch.full((8,), float(k + 1), dtype=torch.bfloat16)
+        sent_vals.append(val)
+        named = [('__delta_spec__', torch.zeros(3, dtype=torch.uint8)),
+                 ('__positions__', torch.full((4,), k, dtype=torch.int32)),
+                 ('__values__', val)]
+        record_delta_flush_fingerprint('send', k, named, 0)
+        record_delta_flush_fingerprint('recv', k, [(n, t.clone()) for n, t in named], 999)
+    rows = _flush_fp_rows(tmp_path)
+    # the manifest (__delta_spec__) is not a weight payload and must not be fingerprinted
+    assert all(r['name'] != '__delta_spec__' for r in rows)
+    send = {(r['name'], r['seq']): r for r in rows if r['side'] == 'send'}
+    recv = {(r['name'], r['seq']): r for r in rows if r['side'] == 'recv'}
+    assert set(send) == set(recv) == {('__positions__', 0), ('__values__', 0),
+                                      ('__positions__', 1), ('__values__', 1)}
+    for k in range(2):
+        assert send[('__values__', k)]['bits'] == list(bits_fingerprint(sent_vals[k]))
+        assert send[('__values__', k)]['bits'] == recv[('__values__', k)]['bits']
+    assert send[('__values__', 0)]['bits'] != send[('__values__', 1)]['bits']
+
+
+def test_delta_collect_flush_fingerprint_detects_corruption(monkeypatch, tmp_path):
+    from twinkle.checkpoint_engine.weight_keys import record_delta_flush_fingerprint
+    monkeypatch.setenv('TWINKLE_WEIGHT_SYNC_FINGERPRINT', str(tmp_path))
+    for k in range(2):
+        val = torch.full((8,), float(k + 1), dtype=torch.bfloat16)
+        recv_val = val.clone()
+        if k == 1:
+            recv_val[0] = 99.0
+        record_delta_flush_fingerprint('send', k, [('__values__', val)], 0)
+        record_delta_flush_fingerprint('recv', k, [('__values__', recv_val)], 999)
+    rows = _flush_fp_rows(tmp_path)
+    send = {r['seq']: r['bits'] for r in rows if r['side'] == 'send'}
+    recv = {r['seq']: r['bits'] for r in rows if r['side'] == 'recv'}
+    assert send[0] == recv[0]
+    assert send[1] != recv[1]
+
+
+def test_delta_collect_flush_fingerprint_noop_without_probe(monkeypatch, tmp_path):
+    from twinkle.checkpoint_engine.weight_keys import record_delta_flush_fingerprint
+    monkeypatch.delenv('TWINKLE_WEIGHT_SYNC_FINGERPRINT', raising=False)
+    record_delta_flush_fingerprint('send', 0, [('__values__', torch.zeros(8, dtype=torch.bfloat16))], 0)
+    assert _flush_fp_rows(tmp_path) == []

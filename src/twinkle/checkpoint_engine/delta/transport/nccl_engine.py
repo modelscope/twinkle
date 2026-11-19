@@ -25,6 +25,16 @@ from .pipeline import (  # noqa: F401
 logger = logging.getLogger(__name__)
 
 
+def _record_delta_flush_fp(side, seq, pos_u8, val_u8, rank):
+    # Env-gated transport fingerprint (no-op unless TWINKLE_WEIGHT_SYNC_FINGERPRINT). The delta wire
+    # carries flushes -- raw uint8 position/value blobs -- not per-param tensors, so send/recv pair by
+    # (name, flush occurrence): the k-th __values__ on each side is the k-th flush's weight bytes.
+    from twinkle.checkpoint_engine.weight_keys import record_weight_fingerprint
+    if pos_u8 is not None:
+        record_weight_fingerprint('delta', side, seq, '__positions__', pos_u8, tag=f'rank{rank}')
+    record_weight_fingerprint('delta', side, seq, '__values__', val_u8, tag=f'rank{rank}')
+
+
 class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
     """Sparse delta weight sync over NCCL, diffed on each rank's local shard.
 
@@ -62,6 +72,9 @@ class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
         return "cuda"
 
     def _broadcast_flush(self, pos_u8, val_u8) -> None:
+        seq = getattr(self, '_delta_fp_send_seq', 0)
+        _record_delta_flush_fp('send', seq, pos_u8, val_u8, self.rank)
+        self._delta_fp_send_seq = seq + 1
         if pos_u8 is not None:
             self._broadcast(pos_u8)
         self._broadcast(val_u8)
@@ -79,6 +92,7 @@ class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
         """
         assert self.rank > 0, "Rank 0 should not receive weights."
         applied = 0
+        fp_recv_seq = 0
         while True:
             self.socket.recv_string()
             meta = self.socket.recv_pyobj()
@@ -103,6 +117,8 @@ class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
             if pos is not None:
                 named.insert(1, ("__positions__", pos))
             is_last = bool(meta["is_last"])
+            _record_delta_flush_fp('recv', fp_recv_seq, pos, val_u8, self.rank)
+            fp_recv_seq += 1
             yield named, is_last
             applied += 1
             del pos, val_u8, val, spec_t

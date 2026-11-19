@@ -15,6 +15,27 @@ from .snapshot import list_workspace
 
 logger = get_logger()
 
+
+def _record_tool_exec(episode_id: str, n: int) -> None:
+    """Count model tool calls actually executed in an episode when ``TWINKLE_ROLLOUT_TRAJ_DUMP`` is set.
+
+    The independent side of the G28 D4 depth oracle: the trajectory records the tool_calls the policy
+    EMITTED (assistant messages); this records what the environment EXECUTED (step / step_batch land
+    here, one count per call). An offline judge joins the two by episode_id and flags a divergence --
+    a redo or a dropped tool call. run_script is the agent/verifier whole-script path, not a model
+    tool_call, so it is deliberately not counted. Write-only and env-gated: a no-op when unset.
+    """
+    import os
+    root = os.environ.get('TWINKLE_ROLLOUT_TRAJ_DUMP')
+    if not root:
+        return
+    import json
+    os.makedirs(root, exist_ok=True)
+    rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+    with open(os.path.join(root, f'tool_counts.rank{rank}.jsonl'), 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps({'episode_id': episode_id, 'executed': int(n)}) + '\n')
+
+
 # What :meth:`Env.run_script` returns when it had to kill the script. 124 is
 # what GNU ``timeout`` uses, so a caller that logs the number is logging
 # something a reader already knows how to interpret.
@@ -304,6 +325,7 @@ class Env(ABC):
         session = self._session(episode_id)
         result = self._step(session.state, tool_name, arguments or {})
         session.reward += float(result.reward or 0.0)
+        _record_tool_exec(episode_id, 1)
         return result
 
     @remote_function(enable_continous_work=True, sticky_key='episode_id')
@@ -315,6 +337,7 @@ class Env(ABC):
             result = self._step(session.state, name, args or {})
             session.reward += float(result.reward or 0.0)
             results.append(result)
+        _record_tool_exec(episode_id, len(results))
         return results
 
     @remote_function(enable_continous_work=True, sticky_key='episode_id')

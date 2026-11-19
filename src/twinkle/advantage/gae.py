@@ -2,6 +2,7 @@
 from typing import Any, List, Optional, Sequence, Tuple
 
 from twinkle import remote_class, remote_function
+from twinkle.data_format import turn_token_spans
 from .base import Advantage, _absmean, _check_unit, _mean, _zero_row_fraction, weighted_score
 
 
@@ -31,11 +32,6 @@ class GAEAdvantage(Advantage):
             raise ValueError('GAEAdvantage requires ref_out: the reference forward lane for the token KL.')
         if value_out is None:
             raise ValueError("GAEAdvantage requires value_out: the pre-update critic forward (task='value').")
-        if not any(value is not None and value == value
-                   for score in scores for value in self._orm_row(score)):
-            raise ValueError('GAEAdvantage got no valid ORM score in the batch (every score row is None): '
-                             'the reward would degenerate into pure KL + value bootstrap. Wire a reward '
-                             'scorer, or pick a scalar-family estimator for a teacher-only run.')
         # old_logps is fixed to the sampler's lane (no scalar-family pre-update policy forward);
         # old_values is the pre-update critic snapshot the value loss replays against.
         old_logps = rollout_logps
@@ -43,13 +39,37 @@ class GAEAdvantage(Advantage):
         old_values = self._lane('value_out', value_out, 'values', trajs)
         kl_rows = self._kl(old_logps, ref_logps, kind=self.kl_kind, reduce='none')
         rm_scores = [weighted_score(self._orm_row(score), self.reward_weights) for score in scores]
-        # A row whose every ORM scorer failed folds to nan: it carries no reward signal, so it must
+        # A row whose every ORM scorer failed folds to nan: it carries no outcome signal, so it must
         # not bootstrap a value target either. Zero it before shaping and drop its advantage/return
         # afterwards -- a nan left in the reward would spread through the GAE recursion to every
         # earlier token of the row, and a fake 0 would train it as a genuine zero reward.
-        unscored = [value != value for value in rm_scores]
+        orm_unscored = [value != value for value in rm_scores]
         rm_scores = [0.0 if value != value else value for value in rm_scores]
-        token_rewards = self._shape(rm_scores, kl_rows, beta=self.kl_coef, profile='token')
+        # PRM reward-level fusion (process reward as intermediate MDP reward): the outcome reward is
+        # scaled by (1 - mix) onto the last token and each turn's process reward by mix onto that
+        # turn's LAST token, then the continuous GAE recursion runs over the whole frame (no turn
+        # reset). The critic sees the process reward through the returns target, not as an input.
+        # mix=0 leaves the pure ORM-terminal form byte-identical to a non-PRM run.
+        mix = self.prm_orm_mix if self.use_prm else 0.0
+        prm_turns = ([self._prm_turn_scores(traj, score) for traj, score in zip(trajs, scores)]
+                     if self.use_prm else [None] * len(trajs))
+        # A row carries signal if its ORM scored, or (under PRM fusion) any turn's process reward
+        # scored; a row with neither folds to zero on both targets (the unscored-row contract).
+        unscored = [orm_unscored[i] and not (prm_turns[i] is not None and any(v == v for v in prm_turns[i]))
+                    for i in range(len(trajs))]
+        if all(unscored):
+            raise ValueError('GAEAdvantage got no valid reward in the batch (every ORM and PRM score row is '
+                             'None): the reward would degenerate into pure KL + value bootstrap. Wire a reward '
+                             'scorer, or pick a scalar-family estimator for a teacher-only run.')
+        token_rewards = self._shape([value * (1.0 - mix) for value in rm_scores], kl_rows,
+                                    beta=self.kl_coef, profile='token')
+        if self.use_prm:
+            for index, (traj, per_turn) in enumerate(zip(trajs, prm_turns)):
+                if unscored[index] or per_turn is None:
+                    continue
+                for (_start, end), value in zip(turn_token_spans(traj), per_turn):
+                    if end > 0 and value == value:
+                        token_rewards[index][end - 1] += value * mix
         advantages, returns = self.token_advantages(token_rewards, old_values)
         advantages = [[0.0] * len(row) if unscored[index] else row
                       for index, row in enumerate(advantages)]

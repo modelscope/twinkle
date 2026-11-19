@@ -136,3 +136,25 @@ def test_cpu_roundtrip_preserves_real_nonpersistent_buffer_gradients_and_adam(st
     module(torch.ones(1, 2)).sum().backward()
     optimizer.step()
     assert any(not torch.equal(param, before) for param, before in zip(module.parameters(), before_params))
+
+
+def test_offload_releases_npu_cache_after_weights_and_optimizer_move(monkeypatch):
+    """Returning tensors to CPU must also return their cached device blocks to the sampler."""
+    from twinkle.utils.framework import Torch
+
+    strategy = NativeFSDPStrategy(enable_ep=False)
+    module = PlacementModule('cuda:1')
+    optimizer = object()
+    events = []
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(offload, 'move_optimizer_state', lambda *args: events.append('optimizer_on_cpu'))
+
+    def empty_cache():
+        assert module.param.device.type == 'cpu'
+        assert events == ['optimizer_on_cpu']
+        events.append('npu_cache_released')
+
+    # Exercise the actual platform-neutral release helper without requiring an NPU.
+    monkeypatch.setattr(Torch, 'empty_cache', empty_cache)
+    strategy.offload_to_cpu(module, optimizer)
+    assert events == ['optimizer_on_cpu', 'npu_cache_released']

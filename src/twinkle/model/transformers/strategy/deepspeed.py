@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from typing import Any, Dict, Literal, Mapping, Optional
 
@@ -202,6 +202,46 @@ def _select_offload(zero, *, offload_model: bool, offload_optimizer: bool):
     return include, manual_optim
 
 
+@contextmanager
+def _clip_coefficient_probe(optimizer):
+    """Record the engine's own clip inputs per ``unscale_and_clip_grads`` call (QUEUE3486).
+
+    ``combined_scale`` is local to DeepSpeed's clip method, so mirror its exact expression
+    from the same live attributes (``loss_scale``, ``clip_grad``) and the actual ``total_norm``
+    argument, in the same arithmetic order -- the recorded coefficient is the one the engine
+    applies, not the bf16-rounded print aggregate ``engine_grad_norm``. Values are kept as fp64
+    Python floats. An overflow step skips the clip call entirely, leaving the list empty.
+    """
+    import torch
+
+    records = []
+    original = getattr(optimizer, 'unscale_and_clip_grads', None)
+    if original is None:
+        yield records
+        return
+
+    def wrapped(*args, **kwargs):
+        total_norm = args[-1] if args else kwargs['total_norm']
+        loss_scale = optimizer.loss_scale
+        clip_grad = optimizer.clip_grad
+        combined_scale = loss_scale
+        if clip_grad > 0.:
+            clip = ((total_norm / loss_scale) + 1e-6) / clip_grad
+            clip = torch.clamp(clip, min=1.0)
+            combined_scale = clip * loss_scale
+        records.append({
+            'scaled_global_grad_norm': float(total_norm),
+            'combined_scale': float(combined_scale),
+        })
+        return original(*args, **kwargs)
+
+    optimizer.unscale_and_clip_grads = wrapped
+    try:
+        yield records
+    finally:
+        optimizer.unscale_and_clip_grads = original
+
+
 class DeepSpeedStrategy(TransformerStrategyBase):
     """A training strategy backed by HuggingFace accelerate + DeepSpeed.
 
@@ -295,6 +335,21 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         if not isinstance(cfg, dict):
             cfg = getattr(cfg, 'config', {})
         return cfg.get('zero_optimization', {}).get('stage', 0)
+
+    def param_lane_status(self) -> str:
+        cfg = self._deepspeed_plugin.deepspeed_config
+        if not isinstance(cfg, dict):
+            cfg = getattr(cfg, 'config', {})
+        zero = cfg.get('zero_optimization') or {}
+        # Presets keep offload_* present with device 'none' when offload is off; a truthy
+        # dict alone does not mean CPU offload (same reading as swift's deepspeed_cpu_offload).
+        offload = any(
+            (zero.get(key) or {}).get('device') == 'cpu' for key in ('offload_param', 'offload_optimizer'))
+        if offload:
+            return 'stale_view'
+        if zero.get('stage', 0) == 3:
+            return 'partitioned'
+        return 'authoritative'
 
     # -- twinkle Strategy interface -----------------------------------------
 
@@ -531,12 +586,15 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         return out
 
     def engine_grad_partition_digest(self, model) -> Dict[str, Any]:
-        """``[sum, absmax, norm]`` of the float32 gradients the offload optimizer updates from.
+        """Per-gradient digests of the float32 gradients the offload optimizer updates from.
 
-        ZeRO-2 keeps the reduced gradients in ``averaged_gradients`` and hands the CPU optimizer the
-        ``.grad`` of its own float32 partition; ZeRO-3 exposes neither under those names. Each tier is
-        read through whatever it has, and the names actually found are reported in ``sources``, so a
-        tier carrying no readable gradient shows up as such instead of reading as "gradients matched".
+        Each readable gradient carries ``agg`` ([sum, absmax, norm]), an all-element ``bits`` identity
+        fingerprint, ``numel`` and buffer identity -- an aggregate alone can show that a difference
+        exists but never that one is absent. ZeRO-2 keeps the reduced gradients in ``averaged_gradients``
+        and hands the CPU optimizer the ``.grad`` of its own float32 partition; ZeRO-3 exposes neither
+        under those names. Each tier is read through whatever it has, and the names actually found are
+        reported in ``sources``, so a tier carrying no readable gradient shows up as such instead of
+        reading as "gradients matched".
         """
         import torch
 
@@ -582,7 +640,15 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                 for slot, grad in enumerate(averaged[index] or []):
                     if torch.is_tensor(grad):
                         name = f'averaged_gradients[{index}][{slot}]'
-                        out[name] = self._aggregate(self._chunk_stats(grad.detach().flatten(), chunks=chunks))
+                        flat = grad.detach().flatten()
+                        stats = self._chunk_stats(flat, chunks=chunks)
+                        out[name] = {
+                            'agg': self._aggregate(stats),
+                            'chunks': [s[0] for s in stats],
+                            'bits': self._bits_fingerprint(flat),
+                            'numel': int(grad.numel()),
+                            **self._buffer_identity(grad),
+                        }
                         out['sources'].append(name)
         if not out['sources']:
             # Name the failure instead of returning a bare empty digest. Two empty digests compare equal,
@@ -648,9 +714,11 @@ class DeepSpeedStrategy(TransformerStrategyBase):
                     # the value the update is about to consume, which is the one that has to match.
                     'optim_moment_pre': self.engine_optim_moment_digest(model),
                 }
-            engine.step()
+            with _clip_coefficient_probe(engine.optimizer) as clip_records:
+                engine.step()
             if probe:
                 step_probe = self.__dict__['_engine_step_probe']
+                step_probe['clip_coefficients'] = clip_records
                 step_probe['master_post'] = self.engine_master_digest(model, stepped=True)
                 # ZeRO-2 assigns this step's reduced gradient to the float32 partition's ``.grad``
                 # inside ``step`` and the CPU optimizer consumes it there, so the partition read BEFORE
@@ -918,7 +986,7 @@ class DeepSpeedStrategy(TransformerStrategyBase):
         bf16_of_saved = True
         for start in range(0, total, chunk):
             stop = min(start + chunk, total)
-            live_values = live[start:stop].to(torch.float32)
+            live_values = live[start:stop].to(device='cpu', dtype=torch.float32)
             saved_values = saved[start:stop].to(torch.float32)
             differing += int((live_values != saved_values).sum())
             if differing:

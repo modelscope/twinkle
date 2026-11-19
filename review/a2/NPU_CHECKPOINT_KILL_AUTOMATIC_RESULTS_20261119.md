@@ -44,7 +44,7 @@
 本地和 A2 均通过：
 
 ```text
-45 passed
+56 passed
 ```
 
 测试覆盖自动 prompt 快照、ready group、batch lease、commit、旧快照升级、

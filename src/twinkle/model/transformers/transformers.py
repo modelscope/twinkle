@@ -179,7 +179,7 @@ class OptimizerGroup(BaseOptimizerGroup):
         self.train_status = TrainStatus(metrics=train_metrics)
 
         eval_metrics = [
-            LossMetric(self._device_mesh, self._dp_group),
+            LossMetric(self._device_mesh, self._dp_group, is_training=False),
             Accuracy(self._device_mesh, self._dp_group, strategy=self.acc_strategy),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
@@ -1039,7 +1039,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # per-token patch path produces.
             return {'logits': out} if torch.is_tensor(out) else out
 
-        handle = unwrapped_model.register_forward_hook(_readout, with_kwargs=True)
+        # Run the head before FSDP reshards its parameters and installs backward hooks
+        # on the returned tensors, so both the forward and backward see the head.
+        handle = unwrapped_model.register_forward_hook(_readout, with_kwargs=True, prepend=True)
         try:
             return self.model(**inputs, use_cache=False)
         finally:
@@ -1930,6 +1932,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                                                         step=probe_step) if probe else None
         self.clip_grad_norm(max_grad_norm, norm_type, **kwargs)
         grad = self._digest_parameters('grad') if probe else None
+        # defect44: capture the lr this update consumes before lr_step advances the schedule,
+        # so the metric record pairs step N's loss/grad_norm with step N's lr (not N+1's).
+        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config._last_lrs = list(optimizer_config._get_lr())
         self.step(**kwargs)
         if probe:
             self._write_step_probe(probe, pre, grad, master_pre=master_pre, **kwargs)
@@ -1990,7 +1997,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 # instead of returning an identity, and an empty shard contributes nothing to any
                 # aggregate, so it digests as zeros -- the key stays present, which keeps two runs
                 # comparable parameter by parameter.
-                out[name] = {'agg': [0.0, 0.0, 0.0], 'bits': [0, 0], 'numel': 0}
+                out[name] = {'agg': [0.0, 0.0, 0.0], 'bits': [0, 0], 'numel': 0, 'dtype': str(tensor.dtype)}
                 continue
             bits = bits_fingerprint(tensor.detach().flatten())
             flat = tensor.detach().double().flatten()
@@ -2003,6 +2010,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 # establish identity.
                 'bits': bits,
                 'numel': numel,
+                'dtype': str(tensor.dtype),
             }
         return out
 
@@ -2046,16 +2054,23 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # object that was just stepped.
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
         optimizer = self.optimizer_group[adapter_name].optimizer
+        # Prefer the engine's authoritative completed-update counter: optimizer.state['step']
+        # reads one ahead on zero0 (DeepSpeed increments during step before the probe reads),
+        # and is unreachable on ZeRO-3 (wrapper param_groups reference fp32 partitions).
         optimizer_step = None
-        for group in optimizer.param_groups:
-            for param in group['params']:
-                state = optimizer.state.get(param)
-                if state is not None and 'step' in state:
-                    counter = state['step']
-                    optimizer_step = int(counter.item()) if hasattr(counter, 'item') else int(counter)
+        _counters = self.strategy.engine_counters(self.model)
+        if _counters and 'global_steps' in _counters:
+            optimizer_step = int(_counters['global_steps'])
+        if optimizer_step is None:
+            for group in optimizer.param_groups:
+                for param in group['params']:
+                    state = optimizer.state.get(param)
+                    if state is not None and 'step' in state:
+                        counter = state['step']
+                        optimizer_step = int(counter.item()) if hasattr(counter, 'item') else int(counter)
+                        break
+                if optimizer_step is not None:
                     break
-            if optimizer_step is not None:
-                break
         # Where the loop owns the update there is no engine record bracketing it, and by the time
         # this probe runs the step has already consumed and overwritten the moments in place. The
         # read is therefore post-update and is named so: ``post(N)`` is ``pre(N+1)``, so the two
@@ -2079,6 +2094,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # parameters holding bf16-representable values mean the cast happened inside the
             # distributed load itself.
             'param_dtypes': sorted({str(t.dtype) for t in self.model.parameters()}),
+            'param_lane': self.strategy.param_lane_status(),
             'optimizer_step': optimizer_step,
             'lrs': [float(g.get('lr', 0.0)) for g in optimizer.param_groups],
             'weight_decays': [float(g.get('weight_decay', 0.0)) for g in optimizer.param_groups],
@@ -2156,6 +2172,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # gradient this update actually consumed.
             'grad_partition_post': engine_step.get('grad_partition_post', {}),
             'grad_partition_layout': engine_step.get('layout', {}),
+            # The engine's own clip inputs per unscale_and_clip_grads call (fp64, not the bf16
+            # print aggregate): the last unmeasured input to the update on the engine-owned path.
+            'clip_coefficients': engine_step.get('clip_coefficients', []),
         }
         with open(f'{prefix}.rank{rank}.jsonl', 'a') as handle:
             handle.write(json.dumps(record) + '\n')
@@ -2300,6 +2319,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             lr_scheduler.step(**kwargs)
 
     @remote_function()
+    @timed
     def set_loss(self, loss_cls: Union[Loss, Type[Loss], str, Callable[[InputFeature, ModelOutput, ...], torch.Tensor]],
                  **kwargs):
         """Set the loss instance.
@@ -2316,6 +2336,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config.set_loss(construct_class(loss_cls, Loss, twinkle.loss, **kwargs), loss_key=loss_key)
 
     @remote_function(dispatch='all')
+    @timed
     def set_optimizer(self, optimizer_cls: Union[Type[Optimizer], str, Optimizer], **kwargs):
         """Set the optimizer.
 
@@ -2419,6 +2440,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         return params
 
     @remote_function()
+    @timed
     def set_lr_scheduler(self, scheduler_cls: Union[Type[LRScheduler], str, LRScheduler], **kwargs):
         """Set the lr_scheduler.
 
@@ -3217,6 +3239,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         config.modules_to_save = list(dict.fromkeys(expanded))
 
     @remote_function()
+    @timed
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         """Add adapter to model.
 
@@ -3230,6 +3253,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         self._patch_adapter(adapter_name, config_or_dir, **kwargs)
 
     @remote_function()
+    @timed
     def set_template(self, template_cls: Union[Type[Template], str, Template], **kwargs):
         """Set template. This is optional, if you need to input `Trajectory`,
             you need to set the template to encode them.
@@ -3247,6 +3271,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config.template = construct_template(template_cls, **kwargs)
 
     @remote_function()
+    @timed
     def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor, Callable], **kwargs):
         """Set task processor to prepare the task inputs.
         Args:
@@ -3278,6 +3303,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config.scaler = GradScaler(**grad_scaler_config)
 
     @remote_function()
+    @timed
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs):
         """Add an eval metric
 
@@ -3397,6 +3423,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         model_keys: List[str] = None,
         **kwargs,
     ):
+        if isinstance(self.strategy, NativeFSDPStrategy) and self.strategy.use_rank0_pretrained_broadcast():
+            # Initial publication can precede the first forward. Every rank must finish
+            # FSDP sharding/broadcast before reading weights: non-source ranks are on meta.
+            self._lazy_wrap_model()
         if adapter_name is None:
             adapter_name = self._get_default_group()
         # Get state dict from unwrapped model. Key shaping (PEFT segment stripping,

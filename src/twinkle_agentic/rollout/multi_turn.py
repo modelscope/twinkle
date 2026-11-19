@@ -36,6 +36,62 @@ from .ledger import MessageLedger, TurnLedger
 
 logger = get_logger()
 
+
+def _dump_rollout_rows(episode_id: str, rows: list) -> None:
+    """Write each delivered training row's contract arrays when ``TWINKLE_ROLLOUT_TRAJ_DUMP`` names a dir.
+
+    An independent depth oracle for the rollout trajectory contract (G28). The producer already
+    asserts ``validate_trajectory`` at ``ledger.merge``, but a self-consistent encoding can still
+    pass its own check; dumping the arrays lets an offline judge re-derive the shifted-labels,
+    logps-alignment and mask-count contracts from the numbers themselves, and compare an episode's
+    segments for prefix-extension. Write-only and env-gated: a no-op (zero cost) when unset.
+    """
+    import os
+    root = os.environ.get('TWINKLE_ROLLOUT_TRAJ_DUMP')
+    if not root:
+        return
+    os.makedirs(root, exist_ok=True)
+    rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+    path = os.path.join(root, f'rows.rank{rank}.jsonl')
+
+    def _grid(value: Any) -> Any:
+        # image_grid_thw / video_grid_thw arrive as a tensor (one row per media item);
+        # the judge re-derives the placeholder-token count from the grid, so dump it as
+        # plain nested ints. Absent on text rows -- leave it None, not an empty grid.
+        if value is None:
+            return None
+        tolist = getattr(value, 'tolist', None)
+        return tolist() if callable(tolist) else value
+
+    def _media_count(value: Any) -> Optional[int]:
+        return len(value) if isinstance(value, (list, tuple)) else None
+
+    with open(path, 'a', encoding='utf-8') as handle:
+        for seg, row in enumerate(rows):
+            messages = row.get('messages') or []
+            rec = {
+                'episode_id': episode_id,
+                'segment_index': row.get('segment_index', seg),
+                'rank': rank,
+                'input_ids': row.get('input_ids') or [],
+                'labels': row.get('labels') or [],
+                'completion_mask': row.get('completion_mask'),
+                'response_token_ids': row.get('response_token_ids') or [],
+                'response_positions': row.get('response_positions') or [],
+                'rollout_logps': row.get('rollout_logps'),
+                'messages': messages,
+                'stop_reason': row.get('stop_reason'),
+                # D6 media frame: raw media counts + the processor grid. The judge checks
+                # image-count consistency and the placeholder-token expansion against the grid.
+                'images_count': _media_count(row.get('images')),
+                'videos_count': _media_count(row.get('videos')),
+                'audios_count': _media_count(row.get('audios')),
+                'image_grid_thw': _grid(row.get('image_grid_thw')),
+                'video_grid_thw': _grid(row.get('video_grid_thw')),
+            }
+            handle.write(json.dumps(rec, default=str) + '\n')
+
+
 # Termination reasons surfaced via ``trajectory['stop_reason']``. The sampler
 # path takes the first three from the sampler itself; the API path has to name
 # them, and one vocabulary for both is what lets a consumer read either.
@@ -436,6 +492,7 @@ class MultiTurnRollout:
         use_base_model: bool = False,
         concurrency: int | None = None,
         segment_policy: str = 'drop',
+        seed: int | None = None,
         resume_store: ResumeStore | None = None,
     ):
         if sampler is None and response_callback is None:
@@ -513,6 +570,7 @@ class MultiTurnRollout:
         self.adapter_path = adapter_path
         self.concurrency = concurrency
         self.segment_policy = segment_policy
+        self._base_seed = seed
         self._template_backend = getattr(type(sampler), 'template_backend', 'vllm') if sampler is not None else 'vllm'
         self.sampling_params = self._params(sampling_params or SamplingParams())
         self._episodes: dict[str, _Episode] = {}
@@ -886,6 +944,7 @@ class MultiTurnRollout:
             # the episode, and every row of it carries the same one.
             row['rewards'] = dict(row.get('rewards') or {}, env=env_reward)
         rows = list(ep.closed_rows) + [traj]
+        _dump_rollout_rows(ep.episode_id, rows)
         extra = {
             key: traj[key]
             for key in ('stuck_stop', 'tool_stop', 'followups', 'segments', 'agent_exit_code', 'error') if key in traj
@@ -988,9 +1047,31 @@ class MultiTurnRollout:
 
     def _episode_params(self, traj: Trajectory) -> SamplingParams:
         override = user_data_get(traj.get('user_data'), 'sampling_params')
-        if not override:
-            return self.sampling_params
-        return self._params(replace(self.sampling_params, **dict(override)))
+        params = (self.sampling_params if not override
+                  else self._params(replace(self.sampling_params, **dict(override))))
+        # defect52b: --seed reaches the rollout half too. Derive a per-request seed from the episode's
+        # stable (group_key, sample_index) identity so a group's num_generations samples differ -- a
+        # constant seed would collapse them to one identical trajectory and zero the group's advantage.
+        # An explicit user_data seed override wins; an episode without a stable identity (the display
+        # stream, a bare __call__) stays unseeded.
+        if self._base_seed is not None and not (override and 'seed' in dict(override)):
+            derived = self._derive_seed(traj)
+            if derived is not None:
+                params = replace(params, seed=derived)
+        return params
+
+    def _derive_seed(self, traj: Trajectory) -> int | None:
+        """A per-(group, sample) seed: crc32 of the identity disperses without linear collisions."""
+        import zlib
+        group_key = traj.get('group_key')
+        sample_index = traj.get('sample_index')
+        if group_key is None or sample_index is None:
+            return None
+        try:
+            identity = f'{int(group_key)}:{int(sample_index)}'.encode()
+        except (TypeError, ValueError):
+            return None
+        return (self._base_seed + zlib.crc32(identity)) & 0x7FFFFFFF
 
     def _new_ledger(self, label: str):
         """The episode account: token-level with a template, message-level without one."""

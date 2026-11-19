@@ -147,7 +147,7 @@ class MegatronOptimizerGroup(BaseOptimizerGroup):
         self.train_status = TrainStatus(metrics=train_metrics)
 
         eval_metrics = [
-            LossMetric(self._device_mesh, self._dp_group),
+            LossMetric(self._device_mesh, self._dp_group, is_training=False),
             TrainMetric(self._device_mesh, self._dp_group),
         ]
         self.eval_status = TrainStatus(metrics=eval_metrics)
@@ -1632,6 +1632,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
     @remote_function(dispatch='all', sync=True)
     @timed
     def clip_grad_and_step(self, max_grad_norm: float = 1.0, norm_type=2, **kwargs):
+        # defect44: capture the lr this update consumes before lr_step advances the schedule.
+        adapter_name = kwargs.get('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        optimizer_config._last_lrs = list(optimizer_config._get_lr())
         self.step(**kwargs)
         self.zero_grad(**kwargs)
         self.lr_step(**kwargs)
@@ -1729,7 +1733,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         json.dump(trainer_state, f, indent=2)
                     tracker_path = os.path.join(checkpoint_dir, 'latest_checkpointed_iteration.txt')
                     with open(tracker_path, 'w') as f:
-                        f.write(str(optimizer_config.cur_step))
+                        # frozen trigger-time step, not the live cur_step which training advances before
+                        # this deferred finalize runs (async staging race wrote a later iteration).
+                        f.write(str(trainer_state['cur_step']))
                     copy_checkpoint_args(output_dir, checkpoint_dir)
 
             async_request.finalize_fns.append(_finalize_async_checkpoint)

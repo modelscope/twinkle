@@ -36,7 +36,7 @@ def _make_checkpoint(directory, ep_size):
     PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token='w0', pad_token='w0').save_pretrained(directory)
 
 
-def _save_initial_snapshot(rank, directory, ep_size):
+def _save_initial_snapshot(rank, directory, ep_size, export_first=False):
     import torch.distributed as dist
     from peft import LoraConfig
     from safetensors.torch import load_file
@@ -50,6 +50,7 @@ def _save_initial_snapshot(rank, directory, ep_size):
         _ep_expert_state_dict_gather_dim,
         _resolve_full_state_source_key,
     )
+    from twinkle.utils.framework import Torch
 
     world_size = 4 if ep_size > 1 else 2
     os.environ.update(RANK=str(rank), LOCAL_RANK='0', WORLD_SIZE=str(world_size))
@@ -59,8 +60,10 @@ def _save_initial_snapshot(rank, directory, ep_size):
     try:
         mesh = DeviceMesh.from_sizes(world_size=world_size, fsdp_size=world_size, device_type='cpu',
                                      ep_size=ep_size, ep_fsdp_size=world_size // ep_size)
+        # Keep device helpers on CPU even when the host has an accelerator.
         with patch.object(Platform, 'get_local_device', return_value='cpu'), \
-                patch.object(Platform, 'device_backend', return_value='gloo'):
+                patch.object(Platform, 'device_backend', return_value='gloo'), \
+                patch.object(Torch, '_device_module', return_value=None):
             initialize(mode='local', global_device_mesh=mesh,
                        groups=[DeviceGroup(name='default', ranks=list(range(world_size)), device_type='cpu')])
             # Ray actors each expose one device, so every actor has LOCAL_RANK=0.
@@ -102,6 +105,13 @@ def _save_initial_snapshot(rank, directory, ep_size):
             # shards; moving all experts first can exceed device memory.
             with patch.object(native_fsdp, '_move_ep_module_to_device',
                               side_effect=AssertionError('EP weights must be sharded before materialization')):
+                if export_first:
+                    # Colocated RL publishes before its first forward or save.
+                    exported = dict(wrapper._get_weight_generator(adapter_name='default', merge_and_sync=True))
+                    assert exported.keys() == checkpoint.keys()
+                    for name, tensor in exported.items():
+                        assert not tensor.is_meta, name
+                        torch.testing.assert_close(tensor, checkpoint[name], rtol=0, atol=0)
                 path = wrapper.save('v0', output_dir=str(Path(directory) / 'snapshots'),
                                     adapter_name='default', save_optimizer=False)
             assert wrapper._model_wrapped
@@ -138,11 +148,12 @@ def _save_initial_snapshot(rank, directory, ep_size):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize('ep_size', [1, 2, 4], ids=['fsdp2', 'fsdp4-ep2-epfsdp2', 'fsdp4-ep4-epfsdp1'])
-def test_initial_adapter_snapshot_materializes_all_ranks(tmp_path, ep_size):
+@pytest.mark.parametrize('ep_size,export_first', [(1, False), (2, False), (4, False), (1, True)],
+                         ids=['fsdp2', 'fsdp4-ep2-epfsdp2', 'fsdp4-ep4-epfsdp1', 'fsdp2-initial-weight-export'])
+def test_initial_adapter_snapshot_materializes_all_ranks(tmp_path, ep_size, export_first):
     _make_checkpoint(tmp_path, ep_size)
     world_size = 4 if ep_size > 1 else 2
-    context = torch.multiprocessing.spawn(_save_initial_snapshot, args=(str(tmp_path), ep_size),
+    context = torch.multiprocessing.spawn(_save_initial_snapshot, args=(str(tmp_path), ep_size, export_first),
                                           nprocs=world_size, join=False)
     try:
         deadline = time.monotonic() + 60
