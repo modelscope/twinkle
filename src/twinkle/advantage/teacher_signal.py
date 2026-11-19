@@ -12,8 +12,6 @@ from typing import List, Literal, Optional, Sequence
 
 import torch
 
-from twinkle import remote_class, remote_function
-
 
 def compute_teacher_logratio(
     teacher_per_token_logps: torch.Tensor,
@@ -120,7 +118,6 @@ def apply_rlsd_reweight(
     return base_bt * reweight.detach() * mask
 
 
-@remote_class(execute='first')
 class TeacherReweight:
     """Per-token advantages from per-sequence ones and a teacher-vs-policy logp lane.
 
@@ -131,7 +128,6 @@ class TeacherReweight:
     result is one per-token row per sample, each as long as its ``old_logps`` row.
     """
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=True)
     def __call__(self,
                  advantages: Sequence[float],
                  old_logps: Sequence[Sequence[float]],
@@ -141,8 +137,7 @@ class TeacherReweight:
                  lam: float = 0.0,
                  clip_range: float = 5.0,
                  negative_only: bool = False,
-                 teacher_kl_coef: float = 0.0,
-                 **kwargs) -> List[List[float]]:
+                 teacher_kl_coef: float = 0.0) -> List[List[float]]:
         if mode not in ('rlsd', 'expand'):
             raise ValueError(f"teacher reweight mode {mode!r} not in ('rlsd', 'expand').")
         if not len(advantages) == len(old_logps) == len(teacher_logps):

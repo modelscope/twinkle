@@ -4,12 +4,9 @@ from typing import Any, List, Literal, Sequence
 
 import torch
 
-from twinkle import remote_class, remote_function
-
 KINDS = ('k1', 'k2', 'k3')
 
 
-@remote_class(execute='first')
 class KLEstimator:
     """KL(policy || reference) from two aligned per-token logp lanes (Schulman's k1 / k2 / k3).
 
@@ -18,14 +15,12 @@ class KLEstimator:
     the per-token rows.
     """
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=True)
     def __call__(self,
                  logps: Sequence[Sequence[float]],
                  ref_logps: Sequence[Sequence[float]],
                  *,
                  kind: Literal['k1', 'k2', 'k3'] = 'k3',
-                 reduce: Literal['mean', 'none'] = 'mean',
-                 **kwargs) -> List[Any]:
+                 reduce: Literal['mean', 'none'] = 'mean') -> List[Any]:
         if kind not in KINDS:
             raise ValueError(f'kl kind {kind!r} not in {KINDS}.')
         if reduce not in ('mean', 'none'):
