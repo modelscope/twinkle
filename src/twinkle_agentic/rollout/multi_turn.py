@@ -50,6 +50,19 @@ def _dump_rollout_rows(episode_id: str, rows: list) -> None:
     os.makedirs(root, exist_ok=True)
     rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
     path = os.path.join(root, f'rows.rank{rank}.jsonl')
+
+    def _grid(value: Any) -> Any:
+        # image_grid_thw / video_grid_thw arrive as a tensor (one row per media item);
+        # the judge re-derives the placeholder-token count from the grid, so dump it as
+        # plain nested ints. Absent on text rows -- leave it None, not an empty grid.
+        if value is None:
+            return None
+        tolist = getattr(value, 'tolist', None)
+        return tolist() if callable(tolist) else value
+
+    def _media_count(value: Any) -> Optional[int]:
+        return len(value) if isinstance(value, (list, tuple)) else None
+
     with open(path, 'a', encoding='utf-8') as handle:
         for seg, row in enumerate(rows):
             messages = row.get('messages') or []
@@ -65,6 +78,13 @@ def _dump_rollout_rows(episode_id: str, rows: list) -> None:
                 'rollout_logps': row.get('rollout_logps'),
                 'messages': messages,
                 'stop_reason': row.get('stop_reason'),
+                # D6 media frame: raw media counts + the processor grid. The judge checks
+                # image-count consistency and the placeholder-token expansion against the grid.
+                'images_count': _media_count(row.get('images')),
+                'videos_count': _media_count(row.get('videos')),
+                'audios_count': _media_count(row.get('audios')),
+                'image_grid_thw': _grid(row.get('image_grid_thw')),
+                'video_grid_thw': _grid(row.get('video_grid_thw')),
             }
             handle.write(json.dumps(rec, default=str) + '\n')
 
