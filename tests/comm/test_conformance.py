@@ -27,6 +27,7 @@ _PORT_RETRIES = 3
 #: backend name -> device type its ranks bind to.
 _BACKEND_DEVICE_TYPES = {
     'gloo': 'cpu',
+    'hccl': 'npu',
     'nccl': 'cuda',
 }
 
@@ -35,6 +36,21 @@ _BROADCAST_DTYPES = (torch.float32, torch.bfloat16, torch.int64, torch.uint8)
 
 def _device_for_rank(device_type: str, rank: int) -> torch.device:
     return torch.device('cpu') if device_type == 'cpu' else torch.device(device_type, rank)
+
+
+def _devices_available(device_type: str, count: int) -> bool:
+    """Whether this box has ``count`` devices of ``device_type``.
+
+    The ``accel`` mark only counts accelerators, whichever kind the box has, so a CUDA box still
+    collects the npu case (and the other way round); each case checks its own device type here.
+    """
+    if device_type == 'npu':
+        try:
+            import torch_npu  # noqa: F401  (registers torch.npu)
+        except ImportError:
+            return False
+    module = getattr(torch, device_type, None)
+    return bool(module is not None and module.is_available() and module.device_count() >= count)
 
 
 def _foreign_device(device: torch.device) -> torch.device:
@@ -232,6 +248,8 @@ def test_conformance(backend, device_type, world_size, tmp_path):
 
     if backend not in available_backends():
         pytest.skip(f'{backend} communicator is not implemented yet')
+    if device_type != 'cpu' and not _devices_available(device_type, world_size):
+        pytest.skip(f'needs {world_size} {device_type} device(s)')
     for attempt in range(_PORT_RETRIES):
         out_dir = tmp_path / f'attempt{attempt}'
         out_dir.mkdir()

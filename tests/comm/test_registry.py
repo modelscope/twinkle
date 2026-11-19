@@ -72,6 +72,23 @@ def test_nccl_is_registered_and_lazily_resolved():
     assert not NCCLCommunicator.supports('barrier')
 
 
+def test_hccl_is_registered_and_lazily_resolved():
+    from twinkle.comm.backends.hccl import HCCLCommunicator
+
+    assert get_communicator_cls('hccl') is HCCLCommunicator
+    assert HCCLCommunicator.supports('all_reduce')
+    assert not HCCLCommunicator.supports('barrier')
+    # Ranks of one HCCL group must agree on their socket port layout (see the backend docstring).
+    assert HCCLCommunicator.supported_options == frozenset({'socket_env'})
+
+
+def test_hccl_rejects_non_npu_device():
+    from twinkle.comm import Rendezvous
+
+    with pytest.raises(ValueError, match='npu device'):
+        create_communicator(Rendezvous('127.0.0.1', 1), 0, 1, 'cpu', backend='hccl')
+
+
 def test_nccl_rejects_non_cuda_device():
     from twinkle.comm import Rendezvous
 
@@ -147,7 +164,8 @@ def test_create_communicator_rejects_unknown_options(isolated_registry):
 
 
 def test_import_needs_no_accelerator_stack():
-    code = ('import sys, twinkle.comm, twinkle.comm.backends.gloo, twinkle.comm.backends.nccl\n'
+    code = ('import sys, twinkle.comm, twinkle.comm.backends.gloo, twinkle.comm.backends.nccl, '
+            'twinkle.comm.backends.hccl\n'
             "leaked = [m for m in ('torch_npu', 'vllm', 'vllm_ascend') if m in sys.modules]\n"
             'assert not leaked, leaked\n')
     subprocess.run([sys.executable, '-c', code], check=True, timeout=120)
