@@ -112,7 +112,7 @@ class LocalEnv(Env):
         return state.workspace
 
     def _run_script(self, state: _LocalSession, source: str, interpreter: str = 'python',
-                    timeout: Optional[float] = None) -> Tuple[int, str]:
+                    timeout: Optional[float] = None, cap_memory: bool = True) -> Tuple[int, str]:
         timeout = self._command_timeout if timeout is None else timeout
         # The script file is never written into the workspace. A workspace gets read back -- by a
         # snapshot, or by a check that lists the directory -- and a stray _script.py in there reads
@@ -133,7 +133,7 @@ class LocalEnv(Env):
                 argv = ['/bin/bash', '-c', source]
             else:
                 return 1, f'unsupported interpreter {interpreter!r}; use python or shell'
-            return self._spawn(state, argv, timeout)
+            return self._spawn(state, argv, timeout, cap_memory)
         finally:
             shutil.rmtree(holder, ignore_errors=True)
 
@@ -208,14 +208,15 @@ class LocalEnv(Env):
             raise ValueError(f'path {path!r} escapes the workspace')
         return target
 
-    def _spawn(self, state: _LocalSession, argv: List[str], timeout: float) -> Tuple[int, str]:
+    def _spawn(self, state: _LocalSession, argv: List[str], timeout: float,
+               cap_memory: bool = True) -> Tuple[int, str]:
         env = dict(os.environ, **_SCRIPT_ENVS, **self._envs)
         # Inherited from the trainer, and a check that imports torch would
         # otherwise take a share of a GPU that is mid-generation.
         env.pop('CUDA_VISIBLE_DEVICES', None)
 
         def _limit():
-            if self._memory_limit_gb:
+            if cap_memory and self._memory_limit_gb:
                 cap = int(self._memory_limit_gb * 1024**3)
                 resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
 

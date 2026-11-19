@@ -191,7 +191,7 @@ class Env(ABC):
     executes already-split ``(tool_name, arguments)`` pairs.
 
     A subclass implements the session hooks: ``_open(traj) -> (state, StepResult)``,
-    ``_step(state, tool_name, arguments)``, ``_run_script(state, source, interpreter, timeout)``,
+    ``_step(state, tool_name, arguments)``, ``_run_script(state, source, interpreter, timeout, cap_memory)``,
     ``_close(state)`` and ``_workspace(state)``; plus :meth:`tools`.
     """
 
@@ -234,7 +234,8 @@ class Env(ABC):
     def _step(self, state: Any, tool_name: str, arguments: Dict[str, Any]) -> StepResult:
         """Run one tool call in the episode."""
 
-    def _run_script(self, state: Any, source: str, interpreter: str, timeout: Optional[float]) -> Tuple[int, str]:
+    def _run_script(self, state: Any, source: str, interpreter: str, timeout: Optional[float],
+                    cap_memory: bool = True) -> Tuple[int, str]:
         raise NotImplementedError(f'{type(self).__name__} cannot run scripts; act through its tools instead.')
 
     def _close(self, state: Any) -> None:
@@ -343,7 +344,8 @@ class Env(ABC):
                    episode_id: str,
                    source: str,
                    interpreter: str = 'python',
-                   timeout: Optional[float] = None) -> Tuple[int, str]:
+                   timeout: Optional[float] = None,
+                   cap_memory: bool = True) -> Tuple[int, str]:
         """Run a whole script in the episode's session; returns ``(exit_code, output)``.
 
         The execution path a *verifier* (or an agent program) takes, as opposed to :meth:`step`,
@@ -355,6 +357,12 @@ class Env(ABC):
             source: the script, not a path.
             interpreter: ``'python'`` or ``'shell'``.
             timeout: seconds; ``None`` means the environment's own default.
+            cap_memory: whether the environment's per-call TOOL-SCRIPT address-space cap applies.
+                The harness's agent program passes ``False``: a real third-party runtime (codex,
+                ms_agent) needs far more address space than a runaway-check budget, and its
+                containment is the harness timeout, not this cap. Under the cap such a runtime
+                stalls silently before its first request. Environments without a host-level cap
+                (sandboxed) contain the program at their sandbox boundary either way.
 
         Returns:
             ``(exit_code, output)``. ``output`` is stdout followed by stderr, so
@@ -366,7 +374,7 @@ class Env(ABC):
         session = self._session(episode_id)
         session.script_inflight = True
         try:
-            return self._run_script(session.state, source, interpreter, timeout)
+            return self._run_script(session.state, source, interpreter, timeout, cap_memory)
         finally:
             session.script_inflight = False
 
