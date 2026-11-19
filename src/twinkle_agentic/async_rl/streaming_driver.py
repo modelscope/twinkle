@@ -709,7 +709,11 @@ class StreamingDriver:
             self._live += len(members)
             self._counters['admitted'] += len(members)
         group.baselines = []
-        for traj in members:
+        for index, traj in enumerate(members):
+            # Positional sample identity within the group: the rollout derives a per-request seed
+            # from (group_key, sample_index) so a group's num_generations samples differ. A constant
+            # seed would collapse them to one identical trajectory and zero the group's advantage.
+            traj['sample_index'] = index
             group.members.append(self._submit(group, traj, ''))
         for traj in baselines:
             group.baselines.append(self._submit(group, traj, _BASELINE))
