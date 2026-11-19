@@ -98,8 +98,10 @@ class _OperationScope:
     tracking and is never serialized through this sequence.
     """
 
-    def __init__(self, operations):
+    def __init__(self, operations, close):
         self.operations = operations
+        self.close = close
+        self._training_releases = {}
         self._lock = threading.RLock()
         self._local = threading.local()
         self.uncertain_errors = []
@@ -140,11 +142,23 @@ class _OperationScope:
         with self._lock:
             return self.operations.run(self._invoke, operation, args, kwargs)
 
-    def close(self):
-        with self._lock:
-            self.operations.close()
-            if self.uncertain_errors:
-                raise BaseExceptionGroup('remote operation settlement is unconfirmed', self.uncertain_errors)
+    def own_training(self, training_id, release):
+        self._training_releases[training_id] = release
+
+    def forget_training(self, training_id):
+        self._training_releases.pop(training_id, None)
+
+    def release_trainings(self):
+        """Release settled handles after the regular operation sequence has drained."""
+        errors = []
+        for release in tuple(self._training_releases.values()):
+            try:
+                # Enter the same guard inline so the cleanup RPC can run after the executor stops.
+                self._invoke(release, (), {})
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise BaseExceptionGroup('training handle release is unconfirmed', errors)
 
 
 def _guarded_operation(operation):

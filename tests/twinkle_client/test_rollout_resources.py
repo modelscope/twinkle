@@ -114,14 +114,19 @@ def test_failed_environment_shutdown_does_not_skip_others_or_replace_primary(fai
     assert not resources._environments
 
 
-def test_failed_rollout_close_still_closes_environments_and_client():
+def test_failed_driver_close_retains_dependent_resources_until_retry():
     events = []
+    resources = scope_for(events)
     with pytest.raises(BaseExceptionGroup, match='resource cleanup'):
-        with scope_for(events) as resources:
-            resources.own_rollout(Rollout(events, close_error=RuntimeError('cleanup diagnostic')))
+        with resources:
+            resources.own_rollout(Rollout(events))
+            driver = resources.own_rollout(Rollout(events, close_error=RuntimeError('still running')))
             resources.own_environment(Environment(events))
-    assert events == ['rollout.close', 'env.shutdown', 'client.close']
-    assert resources.client is None and not resources._environments
+    assert events == ['rollout.close']
+    assert resources.client is not None
+    driver.close_error = None
+    resources.close()
+    assert events == ['rollout.close', 'rollout.close', 'rollout.close', 'env.shutdown', 'client.close']
 
 
 def test_initialization_interrupt_still_closes_returned_client():

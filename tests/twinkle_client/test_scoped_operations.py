@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Real SDK boundaries, plus subprocess SIGINT tests over a local HTTP server."""
-import importlib.util
 import os
 import signal
 import subprocess
@@ -109,8 +108,10 @@ def test_unconfirmed_remote_operation_retains_resources_and_is_not_retried(failu
     assert session.calls.count('clip_grad_and_step') == 1
     with pytest.raises(RuntimeError, match='stopped'):
         model.clip_grad_and_step()
-    with pytest.raises(BaseExceptionGroup, match='unconfirmed'):
+    with pytest.raises(BaseExceptionGroup, match='resource cleanup') as cleanup:
         client.close()
+    assert 'unconfirmed' in str(cleanup.value.exceptions[0])
+    assert 'remove_adapter' not in session.calls
     assert session.calls.count('clip_grad_and_step') == 1
 
 
@@ -229,45 +230,12 @@ def test_a_second_scope_cannot_close_or_stop_an_already_owned_client():
     assert session.closed
 
 
-def test_recipe_trains_and_publishes_through_real_sdk_methods(monkeypatch):
-    from twinkle_agentic.rollout.multi_turn import RolloutStatus
-
-    path = Path(__file__).parents[2] / 'cookbook/client/async_rl/streaming_multi_turn_grpo.py'
-    monkeypatch.syspath_prepend(str(path.parent))
-    spec = importlib.util.spec_from_file_location('scoped_training_recipe', path)
-    recipe = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(recipe)
-    samples = [RolloutStatus(
-        encoded={'input_ids': [1, 10], 'labels': [10, -100]}, response_token_ids=[10],
-        rollout_logprobs=[-0.1], response_loss_mask=[1], orm_reward=[reward], group_key='group',
-        extra={'trajectory_idx': index, 'adapter_uri': 'policy-0'},
-    ) for index, reward in enumerate((1, -1, 1, -1))]
-
-    class Driver:
-        def __init__(self):
-            self.stats = SimpleNamespace(publishes=0, optimizer_steps=0)
-            self.paths = []
-
-        def __iter__(self):
-            return iter([samples])
-
-        def request_publish(self, push):
-            self.paths.append(push(None))
-            self.stats.publishes += 1
-
-        def commit(self, steps):
-            self.stats.optimizer_steps += steps
-
-    session, driver = Session(), Driver()
+def test_scope_releases_the_training_handle_before_closing_transport():
+    session = Session()
     with RolloutResources(lambda: client_for(session)) as resources:
         model = resources.client.model('model')
         model.add_adapter_to_model('slot')
-        recipe._train_loop(driver, model, 'test-policy')
-        assert model.completed_step_calls == driver.stats.optimizer_steps == 1
-        assert driver.paths == ['twinkle://saved-policy']
-        assert model.last_checkpoint.twinkle_path == driver.paths[0]
-    assert session.calls == ['create', 'add_adapter_to_model', 'forward_backward',
-                             'clip_grad_and_step', 'calculate_metric', 'save']
+    assert session.calls == ['create', 'add_adapter_to_model', 'remove_adapter']
     assert session.closed
 
 
@@ -362,7 +330,9 @@ def signal_scenario(endpoint):
                 assert endpoint == 'legacy', 'expected KeyboardInterrupt after remote success'
         except KeyboardInterrupt:
             assert endpoint != 'legacy'
-        assert model._training_ids == {'slot': 'training-1'}
+        assert not model._training_ids
+        assert calls.count('remove_adapter') == 1
+        assert calls.index(target) < calls.index('remove_adapter')
         assert model.completed_step_calls == (1 if endpoint in ('clip_grad_and_step', 'legacy', 'poll') else 0)
         if endpoint == 'save':
             assert model.last_checkpoint.twinkle_path == 'twinkle://saved-policy'

@@ -17,11 +17,11 @@ class RolloutResources:
     Sampling keeps the rollout's concurrent execution path. An interrupted or failed
     managed call stops subsequent managed calls; unscoped clients are unchanged.
 
-    Register the rollout (or the driver running it) with ``own_rollout`` and the Env
-    components it uses with ``own_environment``. This scope closes them if setup fails too.
+    Register the rollout and its driver, in that order, with ``own_rollout``.
+    Register Env components with ``own_environment`` before starting them.
 
-    Exit waits for issued operations, closes the rollout (its episodes and their env
-    sessions), then shuts the environments down and closes the client. Unknown execution
+    Exit waits for issued operations, drains the driver and rollout, then shuts down
+    environments and releases training handles before closing the client. Unknown execution
     or failed closes retain their resource handles on this scope and raise; they are never
     treated as successful release. Cleanup runs off the caller thread so repeated
     interrupts cannot skip later resources.
@@ -29,11 +29,12 @@ class RolloutResources:
 
     def __init__(self, client_factory, **client_kwargs):
         self.operations = SequentialOperations()
-        self._operation_scope = _OperationScope(self.operations)
+        self._operation_scope = _OperationScope(self.operations, self.close)
         self.client = None
+        self._close_client = None
         self._client_factory = client_factory
         self._client_kwargs = client_kwargs
-        self._rollout = None
+        self._rollouts = []
         self._environments = {}
         self._lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -53,6 +54,9 @@ class RolloutResources:
                 if client.transport._operation_scope is not None:
                     raise ValueError('client already belongs to a resource scope')
                 client.transport._operation_scope = self._operation_scope
+                self._close_client = client._close_transport
+            else:
+                self._close_client = lambda: client.close()
             self.client = client
 
         try:
@@ -63,13 +67,12 @@ class RolloutResources:
         return self
 
     def own_rollout(self, rollout):
-        """Transfer the rollout (anything with ``close()``) to this scope; return it."""
+        """Own a rollout or driver. Dependents registered last close first."""
         with self._lock:
             if not self._accepting:
                 raise RuntimeError('resource scope is closing')
-            if self._rollout is not None and self._rollout is not rollout:
-                raise ValueError('use a separate resource scope for each rollout/client')
-            self._rollout = rollout
+            if not any(owned is rollout for owned in self._rollouts):
+                self._rollouts.append(rollout)
         return rollout
 
     def own_environment(self, env):
@@ -86,10 +89,15 @@ class RolloutResources:
                 operation()
             except BaseException as error:
                 issues.append(error)
+                return False
+            return True
 
-        attempt(self.operations.close)
-        if self._rollout is not None:
-            attempt(self._rollout.close)
+        if not attempt(self.operations.close):
+            return
+        while self._rollouts:
+            if not attempt(self._rollouts[-1].close):
+                return
+            self._rollouts.pop()
         if self._operation_scope.uncertain_errors:
             issues.append(BaseExceptionGroup(
                 'remote operation settlement is unconfirmed; environments and client retained',
@@ -104,12 +112,10 @@ class RolloutResources:
                     self._environments.pop(id(env))
 
             attempt(shutdown)
-        if self.client is not None:
-            def close_client():
-                self.client.close()
-                self.client = None
-
-            attempt(close_client)
+        if not attempt(self._operation_scope.release_trainings):
+            return
+        if self.client is not None and attempt(self._close_client):
+            self.client = self._close_client = None
 
     def close(self):
         """Attempt all safe releases, once at a time, despite repeated interrupts."""

@@ -182,6 +182,10 @@ class TwinkleClient:
         scope = self._transport._operation_scope
         if scope is not None:
             scope.close()
+        else:
+            self._close_transport()
+
+    def _close_transport(self) -> None:
         with self._close_lock:
             if self._closed:
                 return
