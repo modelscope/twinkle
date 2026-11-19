@@ -170,26 +170,37 @@ class NCCLCheckpointEngine(CheckpointEngine):
         probe_topic = self.topic + '__wire_probe__'
         deadline = time.monotonic() + timeout
         received = False
-        # [receivers that consumed a probe, abort flag]
-        state = torch.zeros(2, dtype=torch.int32, device=self._comm.device)
+        # [receivers that consumed a probe, rank-0 timeout flag, ranks that hit an error]
+        state = torch.zeros(3, dtype=torch.int32, device=self._comm.device)
         while True:
-            if self.rank == 0:
-                self.socket.send_string(probe_topic, flags=zmq.SNDMORE)
-                send_auth_pyobj(self.socket, {'wire_probe': True}, self.auth_key,
-                                where='rendezvous.send_probe')
-                time.sleep(0.02)
-                state[0], state[1] = 0, int(time.monotonic() > deadline)
-            else:
-                if not received and self.socket.poll(20):
+            # A local failure must still reach the collective below, else the peers block in it
+            # until the communicator timeout instead of aborting together.
+            failure = None
+            try:
+                if self.rank == 0:
+                    self.socket.send_string(probe_topic, flags=zmq.SNDMORE)
+                    send_auth_pyobj(self.socket, {'wire_probe': True}, self.auth_key,
+                                    where='rendezvous.send_probe')
+                    time.sleep(0.02)
+                elif not received and self.socket.poll(20):
                     self.socket.recv_string()
                     recv_auth_pyobj(self.socket, self.auth_key, where='rendezvous.recv_probe')
                     received = True
-                state[0], state[1] = int(received), 0
+            except Exception as e:  # noqa: BLE001 - re-raised after the peers are told
+                failure = e
+            state[0] = int(received) if self.rank > 0 else 0
+            state[1] = int(self.rank == 0 and time.monotonic() > deadline)
+            state[2] = int(failure is not None)
             self._comm.all_reduce(state)
-            ready, abort = state.tolist()
+            ready, timed_out, failed = state.tolist()
+            if failure is not None:
+                raise failure
+            if failed:
+                raise RuntimeError(f'checkpoint rendezvous aborted: {failed} peer rank(s) failed while '
+                                   f'subscribing to the weight-sync PUB socket (world_size={self.world_size}).')
             if ready == self.world_size - 1:
                 return
-            if abort:
+            if timed_out:
                 raise TimeoutError(
                     f'checkpoint rendezvous: {self.world_size - 1 - ready} receiver(s) never subscribed to '
                     f'the weight-sync PUB socket within {timeout:.0f}s (world_size={self.world_size}).')
@@ -371,11 +382,17 @@ class NCCLCheckpointEngine(CheckpointEngine):
                     f'(world_size={world_size}, store={master_metadata.nccl_store_host}:'
                     f'{master_metadata.nccl_store_port}, current_device={torch.cuda.current_device()}, '
                     f'device_count={torch.cuda.device_count()}, comm_device={self._comm.device})')
-        self._comm.barrier()
-
-        # Wait until every receiver's SUB subscription has propagated to the PUB socket before the
-        # first manifest broadcast, else a slow joiner misses it and the first weight sync hangs.
-        self._rendezvous_subscribers()
+        try:
+            self._comm.barrier()
+            # Wait until every receiver's SUB subscription has propagated to the PUB socket before the
+            # first manifest broadcast, else a slow joiner misses it and the first weight sync hangs.
+            self._rendezvous_subscribers()
+        except BaseException:
+            # A half-initialized group must not be picked up by the next init_process_group call,
+            # which may arrive with fresh rendezvous metadata.
+            self._comm.destroy()
+            self._comm = None
+            raise
 
         self._group_initialized = True
         logger.info(f'init_process_group: rank={self.rank}, '

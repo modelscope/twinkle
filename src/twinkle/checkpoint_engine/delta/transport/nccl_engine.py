@@ -80,7 +80,9 @@ class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
         assert self.rank > 0, "Rank 0 should not receive weights."
         applied = 0
         while True:
-            self.socket.recv_string()
+            # Skip wire probes left queued by the subscriber rendezvous (same prefix, other topic).
+            while self.socket.recv_string() != self.topic:
+                self.socket.recv()
             meta = self.socket.recv_pyobj()
             if meta.get("terminal_empty"):
                 break
