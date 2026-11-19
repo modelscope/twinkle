@@ -247,3 +247,18 @@ def test_npu_full_sync_over_hccl(rebuild_group):
     # With rebuild_group the last finalize already tore the group down; otherwise close() does.
     assert out['closed'][0]['held_destroyed'] is (None if rebuild_group else True)
     assert all(state['group'] is None for state in out['closed'].values())
+
+
+@pytest.mark.accel(4)
+def test_npu_full_sync_three_receivers():
+    """One broadcaster fans out to three NPU receivers over a single HCCL group."""
+    if not _npus_available(4):
+        pytest.skip('needs 4 npu devices')
+    rounds = [make_state(7), make_state(8)]
+    out = run(dict(device='npu', n_recv=3, bucket_size=4096, rebuild_group=False, rounds=rounds),
+              timeout=420.0)
+    _assert_rounds(out, rounds, 3)
+    for rank in (1, 2, 3):
+        assert out['recv'][(rank, 0)][1]['group'] is not None
+    assert out['closed'][0]['held_destroyed'] is True
+    assert all(state['group'] is None for state in out['closed'].values())
