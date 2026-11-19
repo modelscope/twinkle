@@ -1,5 +1,6 @@
 """Streaming delivery hands out whole batch_size rows of complete groups; an incomplete tail is dropped, never padded."""
 
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event, current_thread
 
@@ -202,6 +203,102 @@ def test_close_timeout_keeps_the_pending_step_and_stop_owned():
     assert len(stopped) == 1 and driver.stats()['inflight'] == 0
 
 
+@pytest.mark.parametrize('synchronous', [False, True])
+def test_slow_stop_does_not_block_other_episodes(synchronous, monkeypatch):
+    all_submitted, slow_started, fast_stopped = Event(), Event(), Event()
+    steps = [Future() for _ in range(4)]
+    slow_stop = Future()
+    stopped = []
+    stop_workers = set()
+
+    class Rollout:
+        def step(self, traj, *, episode_id, session_wait):
+            prompt = traj['prompt']
+            if prompt == len(steps) - 1:
+                all_submitted.set()
+            return steps[prompt]
+
+        def stop(self, traj, *, episode_id):
+            prompt = traj['prompt']
+            assert steps[prompt].done()
+            stop_workers.add(current_thread())
+            stopped.append(prompt)
+            if prompt == 0:
+                slow_started.set()
+                if synchronous:
+                    slow_stop.result()
+                    return None
+                return slow_stop
+            if len(set(stopped) - {0}) == len(steps) - 1:
+                fast_stopped.set()
+            return _completed(None)
+
+    driver = StreamingDriver([[{'prompt': p} for p in range(len(steps))]], Rollout(), batch_size=len(steps))
+    monkeypatch.setattr(driver, 'CLOSE_STOP_WORKERS', 2)
+    driver._start()
+    assert all_submitted.wait(5)
+    with ThreadPoolExecutor(1) as pool:
+        closing = pool.submit(driver.close, timeout=0.75)
+        try:
+            with driver._lock:
+                assert driver._lock.wait_for(lambda: driver._closed, timeout=5)
+            for prompt, step in enumerate(steps):
+                step.set_result(([{'prompt': prompt}], RolloutStatus(episode_id=str(prompt))))
+            assert slow_started.wait(5)
+            assert fast_stopped.wait(2), 'Other episodes could not stop while the first stop was pending'
+            with pytest.raises(TimeoutError, match='stop for episode'):
+                closing.result(timeout=5)
+            assert not slow_stop.done()
+        finally:
+            for prompt, step in enumerate(steps):
+                if not step.done():
+                    step.set_result(([{'prompt': prompt}], RolloutStatus(episode_id=str(prompt))))
+            slow_stop.set_result(None)
+            driver.close(timeout=5)
+    assert Counter(stopped) == Counter(range(len(steps)))
+    assert len(stop_workers) == 2
+    assert driver.stats()['inflight'] == 0
+
+
+def test_close_drains_slow_scores_from_groups_dropped_for_no_slot(monkeypatch):
+    scores = []
+
+    class Rollout(_Rollout):
+        def step(self, traj, *, episode_id, session_wait):
+            if traj['sample_index'] == 1:
+                return _completed(([traj], RolloutStatus(episode_id=episode_id, no_slot=True)))
+            return super().step(traj, episode_id=episode_id, session_wait=session_wait)
+
+    def slow_orm(_trajs):
+        future = Future()
+        scores.append(future)
+        return future
+
+    prompts = 5
+    rollout = Rollout()
+    driver = StreamingDriver([[{} for _ in range(prompts)]], rollout, batch_size=2, num_generations=2,
+                             max_steps=1, max_no_slot_wait=0, orms=[slow_orm])
+    monkeypatch.setattr(driver, 'NO_SLOT_BASE_DELAY', 0)
+    monkeypatch.setattr(driver, 'NO_SLOT_JITTER', 0)
+    with ThreadPoolExecutor(1) as pool:
+        consuming = pool.submit(list, driver)
+        try:
+            assert consuming.result(timeout=5) == []
+            stats = driver.stats()
+            assert stats['inflight'] == stats['handed'] == 0
+            assert stats['no_slot_dropped'] == len(scores) == prompts
+            assert len(driver._pending) > driver._capacity()
+            with pytest.raises(TimeoutError, match='orm for episode'):
+                driver.close(timeout=0.25)
+            assert set(driver._pending) == set(scores)
+        finally:
+            for future in scores:
+                future.set_result([1.0])
+            driver.close(timeout=5)
+    assert not driver._pending
+    assert rollout.stopped == []
+
+
 def test_close_times_out_while_the_driver_is_blocked_in_admission():
     reading, release = Event(), Event()
     submitted = []
@@ -241,8 +338,9 @@ def test_close_retries_only_episodes_without_a_successful_stop():
             return unfinished[traj['prompt']]
 
         def stop(self, traj, *, episode_id):
-            calls.append(traj['prompt'])
-            if calls == [0, 1]:
+            prompt = traj['prompt']
+            calls.append(prompt)
+            if prompt == 1 and calls.count(1) == 1:
                 raise RuntimeError('missing stop acknowledgement')
 
     driver = StreamingDriver([[{'prompt': 0}, {'prompt': 1}]], Rollout(), batch_size=2)
@@ -261,7 +359,7 @@ def test_close_retries_only_episodes_without_a_successful_stop():
             driver.close(timeout=5)
         stepping.result(timeout=5)
     driver.close(timeout=5)
-    assert calls == [0, 1, 1]
+    assert Counter(calls) == {0: 1, 1: 2}
 
 
 def test_sync_during_reclaim_replaces_stale_batch_before_spending_last_step():

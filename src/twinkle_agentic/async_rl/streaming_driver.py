@@ -229,6 +229,8 @@ class StreamingDriver:
     #: One ``adjust`` call still running past this many seconds is reported as stuck: it hung
     #: inside the adapter holding its lock, so rebalancing is down until the call returns.
     ADJUST_STUCK_TIMEOUT = 300.0
+    #: Bound concurrent stop calls while allowing other episodes to close during a slow stop.
+    CLOSE_STOP_WORKERS = 8
     #: No-slot retry backoff: exponential from NO_SLOT_BASE_DELAY, capped at NO_SLOT_MAX_DELAY, plus
     #: uniform jitter in [0, NO_SLOT_JITTER] so many groups hitting a full pool at once do not retry in
     #: lockstep (a sentinel storm). The wall-clock ceiling is the per-instance max_no_slot_wait.
@@ -568,6 +570,7 @@ class StreamingDriver:
         """Wait up to timeout seconds for cleanup; retry close to confirm settlement."""
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError('close timeout must be finite and positive')
+        deadline = time.monotonic() + timeout
         with self._close_lock:
             drain = self._close_future
             if drain is None or (drain.done() and drain.exception() is not None):
@@ -578,12 +581,17 @@ class StreamingDriver:
                 threading.Thread(target=self._drain_on_close, args=(drain,),
                                  name='twinkle-streaming-close', daemon=True).start()
         try:
-            drain.result(timeout=timeout)
+            drain.result(timeout=max(0.0, deadline - time.monotonic()))
         except TimeoutError:
             if drain.done():
                 drain.result()
             else:
-                raise TimeoutError(f'StreamingDriver.close timed out waiting for {self._close_waiting_on}') from None
+                waiting_on = self._close_waiting_on
+                if waiting_on == 'episode stops':
+                    episode_id = next(iter(self._closing_episodes.copy()), None)
+                    if episode_id is not None:
+                        waiting_on = f'stop for episode {episode_id}'
+                raise TimeoutError(f'StreamingDriver.close timed out waiting for {waiting_on}') from None
 
     def _drain_on_close(self, drain: Future) -> None:
         try:
@@ -603,8 +611,9 @@ class StreamingDriver:
         episodes.update((episode.episode_id, episode) for group in self._groups.values()
                         for episode in group.members + group.baselines if not episode.done)
         # A dropped group can still have a pending call that owns its session.
-        while self._pending:
-            future = next(iter(self._pending))
+        pending = deque(self._pending)
+        while pending:
+            future = pending.popleft()
             kind, episode = self._pending[future]
             episode_id = episode.episode_id
             self._close_waiting_on = f'{kind} for episode {episode_id}'
@@ -627,21 +636,7 @@ class StreamingDriver:
                     episodes.pop(episode_id, None)
             del self._pending[future]
 
-        errors = []
-        for episode_id, episode in list(episodes.items()):
-            self._close_waiting_on = f'stop for episode {episode_id}'
-            try:
-                future = self.rollout.stop(episode.traj or episode.submit_traj or {}, episode_id=episode_id)
-                if future is not None:
-                    future.result()
-            except Exception as error:
-                error.add_note(f'Stopping rollout episode {episode_id}')
-                errors.append(error)
-            else:
-                episode.done = True
-                del episodes[episode_id]
-        if errors:
-            raise ExceptionGroup('could not close rollout episodes', errors)
+        self._stop_remaining_episodes()
         with self._lock:
             self._groups.clear()
             self._ready.clear()
@@ -649,6 +644,57 @@ class StreamingDriver:
             self._ready_rows = self._live = self._inflight = 0
         while not self._events.empty():
             self._events.get_nowait()
+
+    def _stop_remaining_episodes(self) -> None:
+        episodes = self._closing_episodes
+        if not episodes:
+            return
+        self._close_waiting_on = 'episode stops'
+        remaining = deque(episodes.values())
+        outcomes: queue.SimpleQueue[tuple[_Episode, BaseException | None]] = queue.SimpleQueue()
+
+        def stop_episodes() -> None:
+            while True:
+                try:
+                    episode = remaining.popleft()
+                except IndexError:
+                    return
+                try:
+                    future = self.rollout.stop(episode.traj or episode.submit_traj or {},
+                                               episode_id=episode.episode_id)
+                    if future is not None:
+                        future.result()
+                except BaseException as error:
+                    outcomes.put((episode, error))
+                else:
+                    outcomes.put((episode, None))
+
+        count = len(episodes)
+        for index in range(min(count, self.CLOSE_STOP_WORKERS)):
+            try:
+                threading.Thread(target=stop_episodes, name='twinkle-streaming-stop', daemon=True).start()
+            except RuntimeError:
+                if index == 0:
+                    raise
+                # Started workers still own the queue and can finish with fewer threads.
+                break
+
+        errors = []
+        failed = {}
+        for _ in range(count):
+            episode, error = outcomes.get()
+            episode_id = episode.episode_id
+            del episodes[episode_id]
+            if error is None:
+                episode.done = True
+            else:
+                error.add_note(f'Stopping rollout episode {episode_id}')
+                errors.append(error)
+                failed[episode_id] = episode
+        # Retry only stops whose completion could not be confirmed.
+        episodes.update(failed)
+        if errors:
+            raise BaseExceptionGroup('could not close rollout episodes', errors)
 
     # ------------------------------------------------------------------ background loop
 
