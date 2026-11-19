@@ -238,7 +238,7 @@ export TWINKLE_DISTILL_SERVER_STUDENT_PATH=/server/path/to/student-model
 python cookbook/client/twinkle/online_distillation.py --method opd-rl --model distill-student --steps 4
 ```
 
-将方法改为 `gkd` 可运行 GKD。比较 `eval=before` 和 `eval=after` 的同一批题，检查答对数和输出长度。四步用于学会跑流程。比较收益时需要匹配训练样本数和评测设置，并用多个种子复跑。
+将方法改为 `gkd` 可运行 GKD。如果模型服务要求更大的训练批次，用 `--batch-size` 指定服务支持的样本数。GKD 会传输完整词表的分数，批次越大，传输量越高。比较 `eval=before` 和 `eval=after` 的同一批题，检查答对数和输出长度。四步用于学会跑流程。比较收益时需要匹配训练样本数和评测设置，并用多个种子复跑。
 
 (client-async-grpo)=
 ## 客户端异步 GRPO

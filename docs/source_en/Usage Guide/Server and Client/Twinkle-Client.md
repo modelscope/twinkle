@@ -239,7 +239,7 @@ export TWINKLE_DISTILL_SERVER_STUDENT_PATH=/server/path/to/student-model
 python cookbook/client/twinkle/online_distillation.py --method opd-rl --model distill-student --steps 4
 ```
 
-Switch to `--method gkd` to run GKD. Compare accuracy and output length on the same held-out questions in `eval=before` and `eval=after`. Four steps demonstrate the flow. Match the training example count and evaluation settings and use multiple seeds to compare learning.
+Switch to `--method gkd` to run GKD. If the model service requires a larger training batch, set `--batch-size` to the supported size. GKD transfers full vocabulary scores, so a larger batch sends more data. Compare accuracy and output length on the same held-out questions in `eval=before` and `eval=after`. Four steps demonstrate the flow. Match the training example count and evaluation settings and use multiple seeds to compare learning.
 
 (client-async-grpo)=
 ## Client-side Async GRPO

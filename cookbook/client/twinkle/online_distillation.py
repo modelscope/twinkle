@@ -81,7 +81,7 @@ def score_completions(model, prompts, token_rows):
 
 def distillation_signal(method, model, teacher, pairs, sequences, features):
     if method == 'gkd':
-        # Full vocabulary scores. Use one row per step to keep the HTTP payload small.
+        # Full vocabulary scores make the HTTP payload grow with the batch size.
         result = teacher.forward_only(inputs=features, return_logits=True).result
         length = len(features[0]['input_ids'])
         logits = np.asarray(result['logits'], dtype=np.float32)
@@ -124,12 +124,13 @@ def evaluate(sampler, tokenizer, pairs, policy, label, seed):
     }), flush=True)
 
 
-def train(method, steps, eval_size, seed, model_name, student_path=None, teacher_path=None):
+def train(method, steps, eval_size, seed, model_name, student_path=None, teacher_path=None, *, batch_size=None):
     # Use unordered operand pairs so '17 × 23' and '23 × 17' cannot leak across splits.
     pairs = list(combinations_with_replacement(range(11, 30), 2))
     random.Random(seed).shuffle(pairs)
     evaluation, training = pairs[:eval_size], cycle(pairs[eval_size:])
-    batch_size = 1 if method == 'gkd' else 2
+    if batch_size is None:
+        batch_size = 1 if method == 'gkd' else 2
     tokenizer = server_spec = None
     if method != 'opsd':
         from swift.dev.builders.template import build_template_spec
@@ -191,13 +192,17 @@ if __name__ == '__main__':
     parser.add_argument('--eval-size', type=int, default=16)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--model', default=STUDENT_NAME, help='Student model name published by the server')
+    parser.add_argument('--batch-size', type=int, help='Training examples per step (default: 1 for GKD, 2 otherwise)')
     args = parser.parse_args()
     if args.steps < 1 or not 1 <= args.eval_size <= 64:
         parser.error('steps must be positive and eval-size must be between 1 and 64')
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error('batch-size must be positive')
     student_path = os.getenv('TWINKLE_DISTILL_STUDENT_PATH')
     teacher_path = os.getenv('TWINKLE_DISTILL_TEACHER_PATH')
     if args.method != 'opsd' and not student_path:
         parser.error('Set TWINKLE_DISTILL_STUDENT_PATH to the local Qwen3.5-0.8B directory.')
     if args.method != 'opsd' and not teacher_path:
         parser.error('Set TWINKLE_DISTILL_TEACHER_PATH to the local Qwen3.5-2B directory.')
-    train(args.method, args.steps, args.eval_size, args.seed, args.model, student_path, teacher_path)
+    train(args.method, args.steps, args.eval_size, args.seed, args.model, student_path, teacher_path,
+          batch_size=args.batch_size)
