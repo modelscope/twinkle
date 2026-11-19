@@ -167,6 +167,145 @@ def test_close_wakes_the_iterator_and_waits_for_step_and_stop():
     assert driver.stats()['inflight'] == 0
 
 
+def test_close_timeout_keeps_the_pending_step_and_stop_owned():
+    submitted, stopping = Event(), Event()
+    step, stop = Future(), Future()
+    stopped = []
+
+    class Rollout:
+        def step(self, traj, *, episode_id, session_wait):
+            submitted.set()
+            return step
+
+        def stop(self, traj, *, episode_id):
+            stopped.append((episode_id, traj))
+            stopping.set()
+            return stop
+
+    driver = StreamingDriver([[{}]], Rollout(), batch_size=1)
+    driver._start()
+    assert submitted.wait(5)
+    try:
+        with pytest.raises(TimeoutError, match='step for episode'):
+            driver.close(timeout=0.3)
+        assert stopped == []
+        step.set_result(([{'latest': True}], RolloutStatus(episode_id='episode')))
+        assert stopping.wait(5)
+        with pytest.raises(TimeoutError, match='stop for episode'):
+            driver.close(timeout=0.1)
+        assert len(stopped) == 1 and stopped[0][1] == {'latest': True}
+    finally:
+        if not step.done():
+            step.set_result(([{}], RolloutStatus(episode_id='episode')))
+        stop.set_result(None)
+        driver.close(timeout=5)
+    assert len(stopped) == 1 and driver.stats()['inflight'] == 0
+
+
+def test_close_times_out_while_the_driver_is_blocked_in_admission():
+    reading, release = Event(), Event()
+    submitted = []
+
+    class Dataloader:
+        def __iter__(self):
+            reading.set()
+            assert release.wait(5)
+            yield [{}]
+
+    class Rollout(_Rollout):
+        def step(self, *args, **kwargs):
+            submitted.append(True)
+            return super().step(*args, **kwargs)
+
+    driver = StreamingDriver(Dataloader(), Rollout(), batch_size=1)
+    driver._start()
+    try:
+        assert reading.wait(5)
+        with pytest.raises(TimeoutError, match='driver thread'):
+            driver.close(timeout=0.1)
+    finally:
+        release.set()
+        driver.close(timeout=5)
+    assert submitted == []
+
+
+def test_close_retries_only_episodes_without_a_successful_stop():
+    submitted = Event()
+    unfinished = [Future(), Future()]
+    calls = []
+
+    class Rollout:
+        def step(self, traj, *, episode_id, session_wait):
+            if traj['prompt'] == 1:
+                submitted.set()
+            return unfinished[traj['prompt']]
+
+        def stop(self, traj, *, episode_id):
+            calls.append(traj['prompt'])
+            if calls == [0, 1]:
+                raise RuntimeError('missing stop acknowledgement')
+
+    driver = StreamingDriver([[{'prompt': 0}, {'prompt': 1}]], Rollout(), batch_size=2)
+    driver._start()
+    assert submitted.wait(5)
+
+    def finish_steps():
+        with driver._lock:
+            assert driver._lock.wait_for(lambda: driver._closed, timeout=5)
+        for prompt, future in enumerate(unfinished):
+            future.set_result(([{'prompt': prompt}], RolloutStatus(episode_id=str(prompt))))
+
+    with ThreadPoolExecutor(1) as pool:
+        stepping = pool.submit(finish_steps)
+        with pytest.raises(ExceptionGroup, match='could not close rollout episodes'):
+            driver.close(timeout=5)
+        stepping.result(timeout=5)
+    driver.close(timeout=5)
+    assert calls == [0, 1, 1]
+
+
+def test_sync_during_reclaim_replaces_stale_batch_before_spending_last_step():
+    reclaiming, resume = Event(), Event()
+
+    class Checkpoints:
+        current = 0
+
+        def version(self):
+            return self.current
+
+    class Adapter:
+        def lend(self, *args, **kwargs):
+            pass
+
+        def reclaim(self):
+            if not reclaiming.is_set():
+                reclaiming.set()
+                assert resume.wait(5)
+
+        def adjust(self):
+            pass
+
+    checkpoints = Checkpoints()
+    driver = make_driver(1, batch_size=1, max_steps=1, sync_interval=2, checkpoint_manager=checkpoints,
+                         cluster_adapter=Adapter(), max_group_regenerations=1)
+    with ThreadPoolExecutor(1) as pool:
+        consuming = pool.submit(list, driver)
+        try:
+            assert reclaiming.wait(5)
+            with driver._lock:
+                checkpoints.current = 1
+                assert driver._lock.wait_for(lambda: driver._version == 1, timeout=5)
+                assert driver._handed == 0
+            resume.set()
+            [(rows, facts)] = consuming.result(timeout=5)
+            assert len(rows) == 1 and rows[0]['group_attempt'] == 1
+            assert facts['policy_versions'] == [1]
+            assert driver.stats()['handed'] == driver.state_dict()['prompts_drawn'] == 1
+        finally:
+            resume.set()
+            driver.close(timeout=5)
+
+
 def test_stale_group_regeneration_runs_on_the_driver_thread():
     class Rollout(_Rollout):
         def step(self, trajectory, **kwargs):
