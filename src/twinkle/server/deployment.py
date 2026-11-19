@@ -309,7 +309,7 @@ class LazyCleanupMixin:
     Mixed into all four deployment classes so the four copy-pasted
     ``_ensure_state_cleanup_started`` methods collapse into one. The method name
     is preserved so existing call sites (``_on_request_start``,
-    ``_ensure_sticky``, the Gateway cleanup middleware) are unchanged.
+    ``_ensure_resource_cleanup_started``, the Gateway cleanup middleware) are unchanged.
 
     ``_state_cleanup_started`` is declared here with a class-level default so the four
     deployment classes need no ``__init__`` change and the ``getattr`` fallback can go:

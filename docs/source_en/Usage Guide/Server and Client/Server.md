@@ -355,7 +355,7 @@ The difference from the Megatron backend is only in the `backend` parameter of t
 |-------------|-------------|
 | `server` | Central management service, handles training runs and checkpoints |
 | `model` | Model service, hosts base model for training |
-| `processor` | Data preprocessing service, executes tokenization and template conversion on CPU |
+| `processor` | Data preprocessing service, executes tokenization and template conversion on CPU. Each Processor application uses one Serve replica. Configure its CPU worker count with `ncpu_proc_per_node`. |
 | `sampler` | Inference sampling service |
 
 ### Model Backend (backend)

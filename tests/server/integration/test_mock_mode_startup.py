@@ -19,6 +19,7 @@ import httpx
 import os
 import pytest
 import time
+from contextlib import closing
 
 from tests.server.fixtures import MOCK_SERVER_CONFIG, MOCK_SERVER_CONFIG_REDIS
 from twinkle.server.config import ServerConfig
@@ -259,18 +260,22 @@ def _exercise_tinker_client(base: str) -> None:
     """Drive the upstream Tinker SDK against the mock server."""
     pytest.importorskip('tinker')
 
-    import os
-    from tinker import ServiceClient, types
+    from tinker import ServiceClient
 
     from twinkle import init_tinker_client
 
-    # patch_tinker injects Twinkle's auth + Ray Serve multiplex headers and
+    # patch_tinker injects Twinkle's authentication and request ID headers and
     # lifts tinker's ``tml-`` api-key prefix check so EMPTY_TOKEN passes.
-    os.environ['TINKER_BASE_URL'] = base
-    os.environ['TWINKLE_SERVER_TOKEN'] = 'EMPTY_TOKEN'
     init_tinker_client()
 
-    client = ServiceClient()
+    client = ServiceClient(base_url=base, api_key='EMPTY_TOKEN')
+    with closing(client.holder):
+        _exercise_tinker_session(client)
+
+
+def _exercise_tinker_session(client) -> None:
+    from tinker import types
+
     training = client.create_lora_training_client(base_model='mock-model', rank=4)
 
     datum = types.Datum(

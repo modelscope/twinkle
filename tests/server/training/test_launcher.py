@@ -119,7 +119,6 @@ def test_startup_rollback_preserves_startup_error_and_cleans_all_owners(monkeypa
     launcher = ServerLauncher(config)
     calls = []
     error = ValueError('invalid application')
-    monkeypatch.setattr('twinkle.server.launcher.server_launcher.apply_ray_serve_patches', lambda: None)
     monkeypatch.setattr(launcher, '_configure_environment', lambda: None)
     monkeypatch.setattr(launcher, '_init_ray', lambda: None)
     monkeypatch.setattr(launcher, '_start_serve', lambda: None)
@@ -151,7 +150,6 @@ def test_launch_preserves_blocking_policy_and_deploys_on_demand_training(monkeyp
     ]})
     launcher = ServerLauncher(config)
     calls = []
-    monkeypatch.setattr('twinkle.server.launcher.server_launcher.apply_ray_serve_patches', lambda: None)
     monkeypatch.setattr(launcher, '_configure_environment', lambda: calls.append('environment'))
     monkeypatch.setattr(launcher, '_init_ray', lambda: calls.append('ray'))
     monkeypatch.setattr(launcher, '_start_serve', lambda: calls.append('serve'))

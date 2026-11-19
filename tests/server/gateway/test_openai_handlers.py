@@ -159,11 +159,15 @@ class TestChatCompletions:
         assert resp.status_code == 404
         assert resp.json()['error']['type'] == 'model_not_found'
 
-    def test_sticky_headers_injected(self, mock_gateway):
+    @pytest.mark.parametrize('request_id_header', [None, 'x-request-id', 'X-Ray-Serve-Request-Id'])
+    def test_sampler_request_id_and_auth(self, mock_gateway, request_id_header):
         mock_self, app = mock_gateway
         mock_self.proxy.proxy_request.return_value = self._make_sample_response()
 
         client = TestClient(app)
+        headers = {'Authorization': 'Bearer my-key'}
+        if request_id_header:
+            headers[request_id_header] = 'client-id'
         client.post(
             '/chat/completions',
             json={
@@ -173,16 +177,14 @@ class TestChatCompletions:
                     'content': 'Hello'
                 }],
             },
-            headers={'Authorization': 'Bearer my-key'},
+            headers=headers,
         )
 
-        # Check that proxy_request was called with sticky headers
-        call_kwargs = mock_self.proxy.proxy_request.call_args
-        extra_headers = call_kwargs.kwargs.get('extra_headers', {})
-        assert extra_headers['x-request-id'] == 'Qwen/Qwen3.5-4B'
-        assert extra_headers['serve_multiplexed_model_id'] == 'Qwen/Qwen3.5-4B'
-        assert extra_headers['Serve-Multiplexed-Model-Id'] == 'Qwen/Qwen3.5-4B'
-        assert extra_headers['Twinkle-Authorization'] == 'Bearer my-key'
+        forwarded = mock_self.proxy.proxy_request.call_args.kwargs['extra_headers']
+        assert forwarded['x-request-id']
+        if request_id_header:
+            assert forwarded['x-request-id'] == 'client-id'
+        assert forwarded['Twinkle-Authorization'] == 'Bearer my-key'
 
     def test_body_override_is_sample_request(self, mock_gateway):
         mock_self, app = mock_gateway

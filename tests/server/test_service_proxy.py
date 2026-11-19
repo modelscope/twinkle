@@ -12,7 +12,7 @@ from starlette.requests import Request
 from unittest.mock import AsyncMock
 
 from twinkle.server.lifecycle.proxy import ServiceProxy
-from twinkle.protocol.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID
+from twinkle.protocol.headers import H_REQUEST_ID, H_REQUEST_ID_LEGACY
 
 
 def _make_request(headers: list[tuple[bytes, bytes]] | None = None) -> Request:
@@ -40,13 +40,28 @@ def test_build_target_url(route_prefix, host, expected):
     assert proxy._build_target_url('model', 'Qwen', 'tinker/forward') == expected
 
 
-def test_prepare_headers_sets_multiplex_from_request_id():
-    proxy = ServiceProxy(http_options={}, route_prefix='/api/v1')
-    headers = proxy._prepare_headers({H_REQUEST_ID: 'req-1'})
-    assert headers.get(H_MULTIPLEX) == 'req-1'
-    assert headers.get(H_MULTIPLEX_LEGACY) == 'req-1'
-    # ``host`` / ``content-length`` are stripped before forwarding.
-    assert 'host' not in {k.lower() for k in headers}
+@pytest.mark.asyncio
+async def test_forwarding_keeps_request_identity_auth_and_session():
+    proxy = ServiceProxy()
+    legacy = H_REQUEST_ID_LEGACY.lower()
+    request = _make_request([
+        (legacy.encode(), b'req-1'),
+        (b'authorization', b'Bearer owner'),
+        (b'x-twinkle-session-id', b'session'),
+        (b'host', b'original-host'),
+        (b'content-length', b'42'),
+    ])
+    try:
+        headers = proxy._prepare_headers(request.headers)
+    finally:
+        await proxy.close()
+
+    assert headers == {
+        H_REQUEST_ID: 'req-1',
+        legacy: 'req-1',
+        'authorization': 'Bearer owner',
+        'x-twinkle-session-id': 'session',
+    }
 
 
 @pytest.mark.asyncio

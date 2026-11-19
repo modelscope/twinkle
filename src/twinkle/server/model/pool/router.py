@@ -193,7 +193,8 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             ref = await self.schedule_background_task(upload, task_type=endpoint, token=token)
             return envelope_from_record(ref["request_id"], await self.state.get_future(ref["request_id"]))
         session = get_session_id_from_request(request)
-        await self._check_session(session)
+        if not session:
+            raise ResourceNotFoundError("Unknown or expired session")
         if endpoint == "remove_adapter":
             return await self._release(body.training_id, token, session, "twinkle")
         capability = endpoint if endpoint in ("forward", "backward", "calculate_loss") else None

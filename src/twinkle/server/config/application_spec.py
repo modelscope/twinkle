@@ -225,6 +225,22 @@ _ARGS_SCHEMA: dict[str, type[_ArgsBase]] = {
 # ---------- ApplicationSpec ------------------------------------------------ #
 
 
+def validate_processor_replicas(options: dict[str, Any]) -> None:
+    """Ensure locally stored Processor objects always have one owning replica."""
+    replicas = options.get('num_replicas')
+    autoscaling = options.get('autoscaling_config')
+    if replicas is not None and (type(replicas) is not int or replicas != 1):
+        raise ValueError('Processor requires num_replicas: 1')
+    if autoscaling is not None:
+        if isinstance(autoscaling, BaseModel):
+            autoscaling = autoscaling.model_dump()
+        if (replicas is not None or not isinstance(autoscaling, dict)
+                or autoscaling.get('min_replicas', 1) != 1
+                or autoscaling.get('max_replicas', 1) != 1
+                or autoscaling.get('initial_replicas') not in (None, 1)):
+            raise ValueError('Processor autoscaling_config must keep exactly one replica and omit num_replicas')
+
+
 class ApplicationSpec(BaseModel):
     """One application entry under ``ServerConfig.applications``.
 
@@ -248,6 +264,12 @@ class ApplicationSpec(BaseModel):
     # required here — the validator runs first and fills it.
     args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs | DataPlaneArgs
     deployments: list[dict[str, Any]] = Field(default_factory=list, max_length=1)
+
+    @model_validator(mode='after')
+    def _validate_processor_deployment(self) -> ApplicationSpec:
+        if self.import_path == 'processor' and self.deployments:
+            validate_processor_replicas(self.deployments[0])
+        return self
 
     @model_validator(mode='before')
     @classmethod

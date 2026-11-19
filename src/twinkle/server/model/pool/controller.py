@@ -412,10 +412,6 @@ class TrainingController:
                     await self.store.save_training(training)
                 await self._cleanup_user(training)
 
-    async def _expired(self, training: TrainingRecord) -> bool:
-        heartbeat = await self.store.sessions.get_last_heartbeat(training.session_id)
-        return self._expired_with_heartbeat(training, heartbeat)
-
     def _session_expired(self, training: TrainingRecord, heartbeat: float | None) -> bool:
         timeout = self.config.get(training.base_model, training.mode).config.adapter_config.adapter_timeout
         return heartbeat is None or (timeout is not None and time.time() - heartbeat >= timeout)
@@ -433,7 +429,9 @@ class TrainingController:
             return True
         return self.clock() - training.last_activity_at >= spec.config.idle_timeout_s
 
-    async def _authorized(self, training_id: str, token: str, session_id: str | None) -> TrainingRecord:
+    async def _authorized(
+        self, training_id: str, token: str, session_id: str | None
+    ) -> tuple[TrainingRecord, float | None]:
         await self._assert_epoch()
         training = self.trainings.get(training_id)
         if (
@@ -449,15 +447,16 @@ class TrainingController:
         heartbeat = await self.store.sessions.get_last_heartbeat(training.session_id)
         if self._session_expired(training, heartbeat):
             raise TrainingExpiredError("Training session expired; create a new training handle")
-        return training
+        return training, heartbeat
 
     async def admit(
         self, training_id: str, token: str, session_id: str | None, request_id: str, *, renew: bool = True
     ) -> RuntimeOwner:
         async with self._lock:
-            training = await self._authorized(training_id, token, session_id)
-            expired = self._lifetime_expired(training) or (
-                not training.pending_operation_ids and await self._expired(training)
+            training, heartbeat = await self._authorized(training_id, token, session_id)
+            expired = (
+                self._lifetime_expired(training) if training.pending_operation_ids
+                else self._expired_with_heartbeat(training, heartbeat)
             )
             if request_id not in training.pending_operation_ids and expired:
                 training.state = "CLOSING"
@@ -504,12 +503,12 @@ class TrainingController:
 
     async def route(self, training_id: str, token: str, session_id: str | None = None) -> TrainingRoute:
         async with self._lock:
-            training = await self._authorized(training_id, token, session_id)
+            training, _ = await self._authorized(training_id, token, session_id)
             return {"instance_id": training.instance_id, "base_model": training.base_model, "epoch": self.epoch}
 
     async def release(self, training_id: str, token: str, session_id: str | None = None) -> None:
         async with self._lock:
-            training = await self._authorized(training_id, token, session_id)
+            training, _ = await self._authorized(training_id, token, session_id)
             training.state = "CLOSING"
             training.terminal_reason = "released"
             await self.store.save_training(training)

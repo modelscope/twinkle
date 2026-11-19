@@ -8,7 +8,7 @@ import httpx
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
-from twinkle.protocol.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
+from twinkle.protocol.headers import H_REQUEST_ID, H_REQUEST_ID_LEGACY
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.telemetry.tracing import inject_context
@@ -61,11 +61,8 @@ class ServiceProxy:
         headers.pop("host", None)
         headers.pop("content-length", None)
         request_id = request_headers.get(H_REQUEST_ID) or request_headers.get(H_REQUEST_ID_LEGACY)
-        if request_id is not None and not request_headers.get(H_MULTIPLEX_LEGACY):
-            headers[H_MULTIPLEX_LEGACY] = request_id
         if request_id is not None:
             headers.setdefault(H_REQUEST_ID, request_id)
-            headers.setdefault(H_MULTIPLEX, request_id)
         return headers
 
     async def proxy_request(

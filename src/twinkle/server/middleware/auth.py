@@ -15,7 +15,7 @@ async def verify_request_token(request: Request, call_next):
     This middleware:
     1. Extracts the Bearer token from Authorization header
     2. Validates the token
-    3. Extracts x-request-id for sticky sessions (skipped for healthz
+    3. Extracts x-request-id (skipped for healthz
        and OpenAI-compat endpoints)
     4. Stores token and request_id in request.state for later use
 
@@ -32,13 +32,12 @@ async def verify_request_token(request: Request, call_next):
         return JSONResponse(status_code=403, content={'detail': 'Invalid token'})
 
     path = request.url.path
-    skip_sticky = ('/healthz' in path or any(path.endswith(s) for s in _OPENAI_COMPAT_SUFFIXES))
+    skip_request_id = '/healthz' in path or any(path.endswith(s) for s in _OPENAI_COMPAT_SUFFIXES)
 
-    if not skip_sticky:
+    if not skip_request_id:
         request_id = request.headers.get(H_REQUEST_ID)
         if not request_id:
-            return JSONResponse(
-                status_code=400, content={'detail': f'Missing {H_REQUEST_ID} header, required for sticky session'})
+            return JSONResponse(status_code=400, content={'detail': f'Missing {H_REQUEST_ID} header'})
         request.state.request_id = request_id
     else:
         request.state.request_id = request.headers.get(H_REQUEST_ID, '')
