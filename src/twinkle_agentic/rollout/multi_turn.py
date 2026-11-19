@@ -1376,7 +1376,9 @@ class MultiTurnRollout:
             return self._end_agent_truncated(ep, request)
         prompt_tokens = len(ledger.input_feature.get('input_ids') or [])
         prev_wire = ep.last_reply['message']
-        prev_content = ep.merged_content if ep.merged_content is not None else (prev_wire.get('content') or '')
+        # Parse on the ledger's RAW contiguous text: the model generated it as one token
+        # stream, and a call completing across the boundary must read as it was sampled.
+        prev_raw = ledger.messages[-1].get('content') or ''
         try:
             seq = self._generate(ep, ledger, params)
         except APIGenerationError as error:
@@ -1384,12 +1386,18 @@ class MultiTurnRollout:
         ledger.record_continuation(seq)
         ep.stop_reason = seq.stop_reason
         text = ledger.decode_tokens(seq)
-        parsed = ledger.parse_tool_call(prev_content + text)
+        parsed = ledger.parse_tool_call(prev_raw + text)
         message = assistant_message(text, parsed, self.template.clean_tool_call(text) if parsed else text)
         if ep.merged_content is None:
             ep.split_start = len(ep.sent) - 1
-            ep.merged_content = prev_wire.get('content') or ''
-        ep.merged_content += message.get('content') or ''
+            ep.merged_content = (prev_wire.get('content') or '').strip()
+        # The agent's merged view is NOT the raw concatenation: ms-agent strips each stored
+        # message at send time (its _format_input_message mutates content.strip()), so the
+        # boundary whitespace of earlier pieces is gone before the next piece appends.
+        # Track its exact recurrence echo_k = strip(echo_{k-1} + piece_k), or the second
+        # continuation's merged echo reads as a rewrite and re-encodes assistant-ending
+        # (the attempt4 crash, defect110 follow-up).
+        ep.merged_content = (ep.merged_content + (message.get('content') or '')).strip()
         ep.sent = canonical + [_canonical(message)]
         ep.tools_key = tools_key
         ep.last_reply = {
