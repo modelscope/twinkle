@@ -21,7 +21,12 @@ cd $STAGE
 /workspace/npu-ai-env/bin/python review/a2/run_group_yield_probe.py
 /workspace/npu-ai-env/bin/python review/a2/run_npu_resume_probe.py \
   --root $STAGE/results/npu-probe
+/workspace/npu-ai-env/bin/python review/a2/run_npu_checkpoint_kill_probe.py \
+  --root $STAGE/results/npu-checkpoint-kill-20261119 \
+  --train-jsonl $STAGE/data/gsm8k/train.jsonl
 ```
 
 成功标准：父进程观察到第一阶段返回 `-9/137`，第二阶段输出 JSON 中
 `restored_exact=true`、`tool_observation=turn-1-durable`，且两轮 logprob 都是有限值。
+checkpoint 强杀探针的 4 个场景都应满足 `worker_returncode=-9` 和 `report.json`
+中的 `ok=true`。

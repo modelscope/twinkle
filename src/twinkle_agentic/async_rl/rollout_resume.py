@@ -14,6 +14,7 @@ import os
 import pickle
 import threading
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -23,6 +24,44 @@ import json
 
 _ZERO_DIGEST = "0" * 64
 _OBJECT_MAGIC = b"RRS1"
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_path_lock(path: Path) -> threading.Lock:
+    key = str(path.resolve())
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(key, threading.Lock())
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    """Serialize one journal across threads and processes."""
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _thread_path_lock(lock_path):
+        with open(lock_path, "a+b") as stream:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 class ResumeError(RuntimeError):
@@ -112,7 +151,8 @@ class DurableJournal:
         self._next_seq = 0
         self._last_digest = _ZERO_DIGEST
         self._records: list[JournalRecord] = []
-        self._repair_and_scan()
+        with _exclusive_file_lock(self.path):
+            self._repair_and_scan()
 
     def _repair_and_scan(self) -> None:
         if not self.path.exists():
@@ -161,24 +201,40 @@ class DurableJournal:
 
     def append(self, event: JournalEvent, state_key: str, payload: dict[str, Any] | None = None) -> JournalRecord:
         with self._lock:
-            body = {
-                "seq": self._next_seq,
-                "event": event.value,
-                "state_key": state_key,
-                "payload": payload or {},
-                "prev": self._last_digest,
-            }
-            digest = _record_digest(body)
-            line = json.dumps({**body, "digest": digest}, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
-            with open(self.path, "ab") as stream:
-                stream.write(line)
-                stream.flush()
-                os.fsync(stream.fileno())
-            record = JournalRecord(self._next_seq, event, state_key, payload or {}, self._last_digest, digest)
-            self._records.append(record)
-            self._next_seq += 1
-            self._last_digest = digest
-            return record
+            with _exclusive_file_lock(self.path):
+                self._repair_and_scan()
+                old_size = self.path.stat().st_size if self.path.exists() else 0
+                body = {
+                    "seq": self._next_seq,
+                    "event": event.value,
+                    "state_key": state_key,
+                    "payload": payload or {},
+                    "prev": self._last_digest,
+                }
+                digest = _record_digest(body)
+                line = (
+                    json.dumps({**body, "digest": digest}, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
+                )
+                try:
+                    with open(self.path, "ab") as stream:
+                        stream.write(line)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                except BaseException:
+                    try:
+                        with open(self.path, "r+b") as stream:
+                            stream.truncate(old_size)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                    except OSError:
+                        pass
+                    self._repair_and_scan()
+                    raise
+                record = JournalRecord(self._next_seq, event, state_key, payload or {}, self._last_digest, digest)
+                self._records.append(record)
+                self._next_seq += 1
+                self._last_digest = digest
+                return record
 
     def records(self, *, state_key: str | None = None) -> Iterable[JournalRecord]:
         with self._lock:
