@@ -69,11 +69,17 @@ def _ray_node_manager_address() -> str:
     fall back to ``find_node_ip`` only when ray is not initialized (local single-process mode).
     """
     import ray
-    if ray.is_initialized():
-        node_id = ray.get_runtime_context().node_id
+    try:
+        # Ray actor/worker processes connect via the raylet without calling ray.init(), so
+        # ray.is_initialized() is False there even though the runtime context and GCS client
+        # are live. Use the runtime context directly; fall back only if it is unavailable.
+        ctx = ray.get_runtime_context()
+        node_id = ctx.get_node_id() if hasattr(ctx, 'get_node_id') else ctx.node_id
         for node in ray.nodes():
             if node.get('NodeID') == node_id and node.get('Alive'):
                 return node['NodeManagerAddress']
+    except Exception:
+        pass
     from twinkle.utils import find_node_ip
     return find_node_ip()
 
