@@ -45,6 +45,21 @@ def test_journal_refuses_damage_before_a_complete_later_record(tmp_path):
     assert first.seq == 0
 
 
+def test_journal_refuses_a_corrupt_complete_final_commit(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    journal = DurableJournal(path)
+    journal.append(JournalEvent.BATCH_LEASED, "run/batch/0")
+    journal.append(JournalEvent.MODEL_CHECKPOINT_COMMITTED, "run/batch/0", {"checkpoint": "step-1"})
+    lines = path.read_text(encoding="utf-8").splitlines()
+    commit = json.loads(lines[-1])
+    commit["payload"]["checkpoint"] = "corrupted"
+    lines[-1] = json.dumps(commit, sort_keys=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(JournalCorrupt, match="corrupt record at line 2"):
+        DurableJournal(path)
+
+
 def test_resume_store_checks_object_checksum(tmp_path):
     store = ResumeStore(tmp_path, "run")
     store.save_object("episodes", "run/episode/0", {"tokens": [1, 2, 3]})

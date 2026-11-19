@@ -40,10 +40,15 @@ binding 与扁平字段不一致时拒绝恢复。
 启用 `resume_store` 后，driver 在以下稳定边界自动保存快照：
 
 1. prompt 分配并完成成员提交；
-2. 完整组进入 ready 队列；
-3. batch lease 写入后；
-4. `commit_batch()` 完成 checkpoint 关联后；
-5. 组淘汰后。
+2. 每个 rollout turn、ORM/PRM 打分提交及结果返回；
+3. 完整组进入 ready 队列；
+4. batch lease 写入后；
+5. `commit_batch()` 完成 checkpoint 关联后；
+6. 组淘汰后。
+
+PRM 按 segment 保存打分输入；恢复时只补发缺失的分数，并继续遵守 `on_step` 屏障。
+组进入 ready 或被淘汰的安全快照落盘后，其 prompt、episode object 和 LocalEnv workspace
+快照会被回收；journal、driver 快照和未提交 lease 仍保留用于恢复。
 
 调用方不需要在故障前手工调用 `state_dict()`。恢复入口为：
 
@@ -97,8 +102,8 @@ checkpoint 且不再交付该 lease。
 
 故障边界：
 
-- journal 最后一行未写完：移除不完整尾部；
-- 中间记录损坏或 SHA 校验失败：拒绝恢复；
+- journal 最后一行未写完：仅移除没有终止换行的不完整尾部；
+- 任意完整记录损坏或 SHA 校验失败（包括最后一条 commit）：拒绝恢复；
 - 磁盘写入失败：回滚不确定的 append；
 - object 文件不完整：拒绝解码；
 - 旧 lease 已有 commit 记录：恢复时自动退休。
@@ -155,7 +160,9 @@ cookbook/rl/async_rl/durable_multi_turn_grpo.sh
 ```
 
 示例使用官方 GSM8K、Qwen3.5、LoRA、真实多轮 rollout、GRPO 反向传播和 optimizer
-checkpoint，并在每个 batch 后调用 `commit_batch()`。
+checkpoint，并在每个 batch 后调用 `commit_batch()`。每个已提交 step 的训练指标、policy
+version、driver 计数和累计耗时追加到 `TWINKLE_RESUME_ROOT/training-metrics.jsonl`，重启后续写，
+可据此绘制完整训练曲线。
 
 聚焦测试：
 

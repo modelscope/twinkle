@@ -208,6 +208,9 @@ class LocalEnv(Env):
         except BaseException:
             shutil.rmtree(generation_root, ignore_errors=True)
             raise
+        for old in key_root.iterdir():
+            if old.is_dir() and old.name != generation:
+                shutil.rmtree(old, ignore_errors=True)
         return {
             "format": "twinkle.localenv.v1",
             "state_key": state_key,
@@ -244,6 +247,7 @@ class LocalEnv(Env):
             self.close(episode_id)
             raise
 
+    @remote_function(dispatch="all", collect="none", lazy_collect=False)
     def discard_episode_state(self, state_key: str) -> None:
         shutil.rmtree(self._resume_root / self._state_dir_name(state_key), ignore_errors=True)
 

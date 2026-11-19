@@ -227,9 +227,9 @@ class DurableJournal:
                 event = JournalEvent(body["event"])
                 records.append(JournalRecord(seq, event, body["state_key"], body["payload"], prev, digest))
             except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                if data[newline + 1 :].strip():
-                    raise JournalCorrupt(f"{self.path}: corrupt record at line {len(records) + 1}: {exc}") from exc
-                break
+                # A newline proves that a complete record was written. Only a final fragment without
+                # one is repairable; discarding a corrupt complete commit could repeat its optimizer step.
+                raise JournalCorrupt(f"{self.path}: corrupt record at line {len(records) + 1}: {exc}") from exc
             prev = records[-1].digest
             offset = newline + 1
             valid_end = offset

@@ -174,6 +174,9 @@ class _Episode:
     orm_pending: int = 0
     prm: list[list[Any]] | None = None
     prm_turns: list[int] = field(default_factory=list)
+    #: The trajectory at each segment boundary, aligned with ``prm_turns``. Pending scores must be
+    #: reissued against that boundary rather than against whatever turn is latest after a restart.
+    prm_inputs: list[Any] = field(default_factory=list)
     prm_pending: int = 0
     #: The PRM segment the episode waits for before its next step (only with ``on_step``).
     held: int | None = None
@@ -635,6 +638,7 @@ class StreamingDriver:
             episode.counted_inflight = False
             if episode.role != _BASELINE:
                 self._live -= 1
+        self._discard_group_state(group)
 
     @remote_function(execute="first", collect="first", lazy_collect=False)
     def stats(self) -> dict[str, Any]:
@@ -670,6 +674,7 @@ class StreamingDriver:
             "orm_pending": episode.orm_pending,
             "prm": _dump_pending(episode.prm),
             "prm_turns": list(episode.prm_turns),
+            "prm_inputs": list(episode.prm_inputs),
             "prm_pending": episode.prm_pending,
             "held": episode.held,
             "deliver": list(episode.deliver),
@@ -757,6 +762,7 @@ class StreamingDriver:
         episode.orm_pending = int(state.get("orm_pending") or 0)
         episode.prm = _load_pending(state.get("prm"))
         episode.prm_turns = list(state.get("prm_turns") or ())
+        episode.prm_inputs = list(state.get("prm_inputs") or ())
         episode.prm_pending = int(state.get("prm_pending") or 0)
         episode.held = state.get("held")
         episode.deliver = list(state.get("deliver") or ())
@@ -833,17 +839,26 @@ class StreamingDriver:
             for segment, value in enumerate(column):
                 if value is not _PENDING:
                     continue
-                future = self.prms[scorer]([episode.traj])
+                if segment >= len(episode.prm_inputs):
+                    raise UnsafeResume(
+                        f"episode {episode.episode_id!r} has no durable trajectory for pending PRM segment {segment}"
+                    )
+                future = self.prms[scorer]([episode.prm_inputs[segment]])
                 future.add_done_callback(
                     lambda f, episode=episode, key=(segment, scorer): self._events.put(("prm", episode, key, f))
                 )
 
     def _resume_live_episode(self, episode: _Episode) -> None:
-        if episode.finished or episode.lost or episode.done:
-            if not episode.finished and not episode.lost:
-                self._resume_scores(episode)
+        if episode.finished or episode.lost:
+            return
+        self._resume_scores(episode)
+        if episode.done:
             return
         self._counters["resumed_members"] += 1
+        if episode.held is not None:
+            # The segment scorer's completion callback owns the next transition. Continuing here would
+            # bypass on_step and could submit a second generation before that decision.
+            return
         state_key = str((episode.submit_traj or {}).get("state_key") or "")
         if self.resume_store is not None and state_key and self.resume_store.has_object("episodes", state_key):
             self.rollout.restore_episode_from_store(state_key)
@@ -1239,6 +1254,8 @@ class StreamingDriver:
                 ):
                     self._release(episode, segment)
                 self._maybe_finish(episode)
+            if kind != "step":
+                self._persist_snapshot_locked()
             self._lock.notify_all()
 
     def _on_step(self, episode: _Episode, trajs: Any, sample: RolloutStatus) -> None:
@@ -1255,6 +1272,7 @@ class StreamingDriver:
             segment = self._score_prm(episode)
             if self.on_step is not None and not episode.done:
                 episode.held = segment
+                self._persist_snapshot_locked()
                 return
         if episode.done:
             self._consecutive_failures = 0
@@ -1262,12 +1280,16 @@ class StreamingDriver:
             self._score_orm(episode)
         else:
             self._step(episode, trajs[0])
+        # Persist pending score work as well as completed values. Otherwise a restart could skip a
+        # segment's PRM entirely or repeat an ORM that already produced an external side effect.
+        self._persist_snapshot_locked()
 
     def _score_prm(self, episode: _Episode) -> int:
         if episode.prm is None:
             episode.prm = [[] for _ in self.prms]
         segment = len(episode.prm_turns)
         episode.prm_turns.append(int(episode.sample.turns))
+        episode.prm_inputs.append(episode.traj)
         for scorer, prm in enumerate(self.prms):
             episode.prm[scorer].append(_PENDING)
             episode.prm_pending += 1
@@ -1457,6 +1479,23 @@ class StreamingDriver:
                 return
         self._accept(group)
 
+    def _discard_group_state(self, group: _Group) -> None:
+        """Collect terminal episode state after a durable ready/drop snapshot exists."""
+        if self.resume_store is None:
+            return
+        self.resume_store.delete_object("prompts", f"{self.run_id}/prompt/{group.key}")
+        discard = getattr(self.rollout, "discard_episode_state", None)
+        for episode in group.members + group.baselines:
+            state_key = str((episode.submit_traj or {}).get("state_key") or "")
+            if not state_key:
+                continue
+            self.resume_store.delete_object("episodes", state_key)
+            if callable(discard):
+                try:
+                    discard(state_key)
+                except Exception as exc:  # noqa: BLE001 -- terminal training state is already durable
+                    logger.warning(f"discarding environment state for {state_key} failed: {exc}")
+
     def _accept(self, group: _Group) -> None:
         del self._groups[group.key]
         self._ready.append(list(group.members))
@@ -1473,6 +1512,7 @@ class StreamingDriver:
                     "episodes": [episode.episode_id for episode in group.members],
                 },
             )
+            self._discard_group_state(group)
 
     def _drop_group(self, group: _Group) -> None:
         """Give the group up: its counted rows leave the bound, its unfinished episodes stop (under the lock)."""
@@ -1502,6 +1542,7 @@ class StreamingDriver:
                 },
             )
             self._persist_snapshot_locked()
+            self._discard_group_state(group)
 
 
 #: Placeholder for a score whose Future has not completed yet.

@@ -142,3 +142,19 @@ def test_episode_policy_binding_overrides_the_samplers_mutable_default():
     rollout._generate(ep, type("Ledger", (), {"state": None, "input_feature": {}})(), SamplingParams())
 
     assert sampler.adapter_paths == ["/policies/policy-1.adapter"]
+
+
+def test_next_turn_persists_the_completed_generation_boundary(tmp_path):
+    store = ResumeStore(tmp_path, "run")
+    rollout = _rollout(store)
+    episode = _episode(rollout)
+    rollout._episodes[episode.episode_id] = episode
+
+    rows, status = rollout._next_turn(episode)
+
+    assert not status.done
+    assert rows[0]["turns"] == 1
+    durable = store.load_episode(episode.state_key)
+    assert durable["spent"] == 1
+    assert durable["ledger"]["input_feature"]["input_ids"] == [1, 2, 3]
+    assert durable["ledger"]["turns"] == 1

@@ -4,7 +4,7 @@ import time
 import pytest
 
 from twinkle_agentic.async_rl.rollout_resume import GroupPolicyBinding, ResumeStore, UnsafeResume
-from twinkle_agentic.async_rl.streaming_driver import StreamingDriver
+from twinkle_agentic.async_rl.streaming_driver import _PENDING, StreamingDriver
 from twinkle_agentic.rollout.multi_turn import RolloutStatus
 
 
@@ -30,6 +30,7 @@ class _BlockingFuture:
 class _DoneRollout:
     def __init__(self):
         self.calls = []
+        self.discarded = []
 
     def step(self, trajectory, episode_id=None, session_wait=None):
         self.calls.append(episode_id)
@@ -39,6 +40,9 @@ class _DoneRollout:
 
     def stop(self, trajectory, episode_id=None):
         return None
+
+    def discard_episode_state(self, state_key):
+        self.discarded.append(state_key)
 
 
 class _BoundRollout(_DoneRollout):
@@ -313,12 +317,14 @@ def test_invalid_binding_snapshot_fails_closed(tmp_path):
         resume_store=ResumeStore(tmp_path, "run-invalid-binding"),
     )
     with pytest.raises(UnsafeResume, match="invalid group policy binding"):
-        driver._restore_group({
-            "key": "0",
-            "row": _prompts(1)[0],
-            "binding": {"state_key": "", "policy_version": 0, "adapter_path": None},
-            "members": [],
-        })
+        driver._restore_group(
+            {
+                "key": "0",
+                "row": _prompts(1)[0],
+                "binding": {"state_key": "", "policy_version": 0, "adapter_path": None},
+                "members": [],
+            }
+        )
 
 
 def test_conflicting_binding_and_flat_snapshot_fails_closed(tmp_path):
@@ -330,18 +336,20 @@ def test_conflicting_binding_and_flat_snapshot_fails_closed(tmp_path):
         resume_store=ResumeStore(tmp_path, "run-conflict"),
     )
     with pytest.raises(UnsafeResume, match="disagrees"):
-        driver._restore_group({
-            "key": "0",
-            "row": _prompts(1)[0],
-            "binding": {
-                "state_key": "run-conflict/group/0",
-                "policy_version": 1,
-                "adapter_path": "/policies/one.adapter",
-            },
-            "version": 2,
-            "adapter_path": "/policies/two.adapter",
-            "members": [],
-        })
+        driver._restore_group(
+            {
+                "key": "0",
+                "row": _prompts(1)[0],
+                "binding": {
+                    "state_key": "run-conflict/group/0",
+                    "policy_version": 1,
+                    "adapter_path": "/policies/one.adapter",
+                },
+                "version": 2,
+                "adapter_path": "/policies/two.adapter",
+                "members": [],
+            }
+        )
 
 
 def test_explicit_base_model_binding_is_not_rebound_to_an_adapter(tmp_path):
@@ -354,18 +362,20 @@ def test_explicit_base_model_binding_is_not_rebound_to_an_adapter(tmp_path):
         checkpoint_manager=manager,
         resume_store=ResumeStore(tmp_path, "run-base-binding"),
     )
-    group = driver._restore_group({
-        "key": "0",
-        "row": _prompts(1)[0],
-        "binding": {
-            "state_key": "run-base-binding/group/0",
-            "policy_version": 1,
+    group = driver._restore_group(
+        {
+            "key": "0",
+            "row": _prompts(1)[0],
+            "binding": {
+                "state_key": "run-base-binding/group/0",
+                "policy_version": 1,
+                "adapter_path": None,
+            },
+            "version": 1,
             "adapter_path": None,
-        },
-        "version": 1,
-        "adapter_path": None,
-        "members": [],
-    })
+            "members": [],
+        }
+    )
     assert group.binding.adapter_path is None
 
 
@@ -378,18 +388,20 @@ def test_group_binding_state_key_must_match_run_identity(tmp_path):
         resume_store=ResumeStore(tmp_path, "run-identity"),
     )
     with pytest.raises(UnsafeResume, match="does not match"):
-        driver._restore_group({
-            "key": "0",
-            "row": _prompts(1)[0],
-            "binding": {
-                "state_key": "other-run/group/0",
-                "policy_version": 0,
+        driver._restore_group(
+            {
+                "key": "0",
+                "row": _prompts(1)[0],
+                "binding": {
+                    "state_key": "other-run/group/0",
+                    "policy_version": 0,
+                    "adapter_path": None,
+                },
+                "version": 0,
                 "adapter_path": None,
-            },
-            "version": 0,
-            "adapter_path": None,
-            "members": [],
-        })
+                "members": [],
+            }
+        )
 
 
 def test_ready_group_over_staleness_is_dropped_whole(tmp_path):
@@ -522,3 +534,76 @@ def test_delivered_groups_release_the_admission_window(tmp_path):
 def restoration_stats(driver):
     stats = driver.stats()
     return {key: stats[key] for key in ("dropped_stale", "dropped_group", "ready_rows", "live")}
+
+
+def test_resume_reissues_pending_prm_at_its_segment_and_keeps_the_held_barrier(tmp_path):
+    store = ResumeStore(tmp_path, "run-prm")
+    source = StreamingDriver(
+        _prompts(1),
+        _BlockingRollout(),
+        batch_size=1,
+        num_generations=1,
+        prms=[lambda _rows: _BlockingFuture()],
+        on_step=lambda _sample, _scores: True,
+        resume_store=store,
+    )
+    source._admit()
+    episode = source._groups["0"].members[0]
+    episode.traj = {"episode_id": episode.episode_id, "turns": 0, "marker": "latest"}
+    episode.sample = RolloutStatus(episode_id=episode.episode_id, turns=1)
+    segment_input = {"messages": [{"role": "assistant", "content": "segment-boundary"}]}
+    episode.prm = [[_PENDING]]
+    episode.prm_turns = [1]
+    episode.prm_inputs = [segment_input]
+    episode.prm_pending = 1
+    episode.held = 0
+    state = source.state_dict()
+    source.close()
+
+    scored = []
+
+    def prm(rows):
+        scored.append(rows)
+        return _Future([0.5])
+
+    rollout = _BlockingRollout()
+    restored = StreamingDriver(
+        _prompts(1),
+        rollout,
+        batch_size=1,
+        num_generations=1,
+        prms=[prm],
+        on_step=lambda _sample, _scores: True,
+        resume_store=store,
+    )
+    restored.load_state_dict(state)
+
+    assert scored == [[segment_input]]
+    assert rollout.calls == []
+    restored._handle(*restored._events.get_nowait())
+    assert restored._groups["0"].members[0].prm_pending == 0
+    assert len(rollout.calls) == 1
+    restored.close()
+
+
+def test_terminal_group_snapshot_precedes_episode_state_cleanup(tmp_path):
+    store = ResumeStore(tmp_path, "run-cleanup")
+    rollout = _DoneRollout()
+    driver = StreamingDriver(_prompts(1), rollout, batch_size=2, num_generations=2, max_steps=1, resume_store=store)
+    driver._admit()
+    group = driver._groups["0"]
+    state_keys = []
+    for episode in group.members:
+        state_key = episode.submit_traj["state_key"]
+        state_keys.append(state_key)
+        store.save_object("episodes", state_key, {"pending": False})
+        episode.deliver = [dict(episode.submit_traj)]
+
+    assert store.has_object("prompts", "run-cleanup/prompt/0")
+    driver._accept(group)
+
+    assert store.has_object("driver", "run-cleanup")
+    assert not store.has_object("prompts", "run-cleanup/prompt/0")
+    assert all(not store.has_object("episodes", key) for key in state_keys)
+    assert rollout.discarded == state_keys
+    driver.close()

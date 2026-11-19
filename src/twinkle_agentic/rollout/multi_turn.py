@@ -734,6 +734,12 @@ class MultiTurnRollout:
             raise UnsafeResume("no resume store is bound to this rollout")
         return self.restore_episode(self.resume_store.load_episode(state_key))
 
+    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    def discard_episode_state(self, state_key: str) -> None:
+        """Release environment snapshots after the driver has persisted the group's terminal state."""
+        if self.env is not None and env_resume_capability(self.env) != EnvResumeCapability.NONE:
+            self.env.discard_episode_state(state_key)
+
     # ------------------------------------------------------------------ entries
 
     @remote_function(enable_continous_work=True, sticky_key=_episode_key, stash=(0,), lazy_collect=True)
@@ -1306,19 +1312,23 @@ class MultiTurnRollout:
             ep.tool_stop = "stuck"
             self._commit_tool_effect(ep, effect_key, observations)
             if not overflowed and self._grant_followup(ep):
-                return self._next_turn(ep)
+                return self._next_turn(ep, checkpoint=False)
             ep.truncated = True
             return self._finish_tool_episode(ep)
         if overflowed:
             self._commit_tool_effect(ep, effect_key, observations)
             return self._finish_tool_episode(ep)
         self._commit_tool_effect(ep, effect_key, observations)
-        return self._next_turn(ep)
+        return self._next_turn(ep, checkpoint=False)
 
-    def _next_turn(self, ep: _Episode) -> tuple[list, RolloutStatus]:
+    def _next_turn(self, ep: _Episode, *, checkpoint: bool = True) -> tuple[list, RolloutStatus]:
         """Another generation is due -- unless the budget is spent, which ends the episode here."""
         if ep.spent >= ep.budget:
             return self._finish_tool_episode(ep)
+        if checkpoint and self.resume_store is not None:
+            # The start-of-step checkpoint predates the generation just recorded. Save the completed
+            # turn too, so a driver snapshot with pending PRM work resumes from the same boundary.
+            self._checkpoint_episode(ep, allow_busy=True)
         return self._continue(ep)
 
     def _finish_tool_episode(self, ep: _Episode) -> tuple[list, RolloutStatus]:

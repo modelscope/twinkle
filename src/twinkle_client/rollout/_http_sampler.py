@@ -104,9 +104,10 @@ class ClientCheckpointManager:
         return self._version
 
     def adapter_path(self, version: int) -> Optional[str]:
-        """The durable adapter a group sampled from, retained for resume."""
+        """Resolve the driver-visible policy version to its immutable adapter."""
         with self._lock:
-            return self._paths.get(int(version))
+            # version() counts completed syncs, so the adapter saved by sync N is policy N + 1.
+            return self._paths.get(int(version) - 1) if version >= 1 else None
 
 
 def _wire_media(media: Any) -> Dict[str, List[str]]:

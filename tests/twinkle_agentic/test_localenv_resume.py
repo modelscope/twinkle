@@ -16,8 +16,8 @@ if "ray" not in sys.modules:
     ray.is_initialized = lambda: False
     sys.modules["ray"] = ray
 
-from twinkle_agentic.envs.resume import UnsafeCheckpoint  # noqa: E402
 from twinkle_agentic.envs.localenv import LocalEnv  # noqa: E402
+from twinkle_agentic.envs.resume import UnsafeCheckpoint  # noqa: E402
 
 
 def test_localenv_workspace_round_trip_uses_a_new_session(tmp_path):
@@ -26,7 +26,10 @@ def test_localenv_workspace_round_trip_uses_a_new_session(tmp_path):
     source.step("episode-1", "write_file", {"path": "nested/state.txt", "content": "turn-boundary"})
     state_key = "run-1/group-0/episode-1/attempt-0"
 
+    source.checkpoint_episode("episode-1", state_key)
     snapshot = source.checkpoint_episode("episode-1", state_key)
+    key_root = source._resume_root / source._state_dir_name(state_key)
+    assert [path.name for path in key_root.iterdir() if path.is_dir()] == [snapshot["generation"]]
     source.close("episode-1")
 
     restored = LocalEnv(root=str(tmp_path))
