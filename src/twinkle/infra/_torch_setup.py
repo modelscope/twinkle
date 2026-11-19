@@ -74,16 +74,11 @@ def apply_in_worker(fallback: Optional[Dict[str, Any]] = None) -> None:
     """Re-apply the knob set inside a Ray worker (or a driver-hosted local component).
 
     Reads ``EXTRA_TORCH_KWARGS`` first (falling back to *fallback*), does what :func:`apply` does, then
-    pins the worker-only env vars below. Those must land before the model is constructed: the CUDA driver
-    latches ``CUDA_DEVICE_MAX_CONNECTIONS`` when the context is created, so ``setdefault`` (not
-    assignment) leaves room for ``MegatronStrategy.apply_process_env`` to raise it for a sharded
-    data-parallel wrapper while there is still time. It cannot be delegated to the strategy from here --
-    infra sits below the model layer and does not import it.
+    pins the worker-only env vars below. Backend-specific CUDA connection limits belong to the model
+    backend: forcing a single connection here can restrict FSDP communication/compute overlap.
     """
     apply(from_env(fallback))
     if os.environ.get('WORKER_NAME'):
-        # Depress megatron's warnings and cut overhead; a sharded (FSDP) wrapper raises it later.
-        os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
         # Cap the compile thread pool torch would otherwise grow without bound.
         os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
         # Keep tokenizers in its parallel mode.

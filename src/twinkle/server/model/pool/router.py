@@ -72,7 +72,14 @@ TINKER_REQUESTS = {
 
 
 class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
-    async def __init__(self, config, model, namespace, http_options):
+    # __init__ must stay synchronous: Ray Serve's FastAPI ingress wrapper calls the user
+    # constructor synchronously (ASGIIngressWrapper in ray/serve/api.py) -- an async
+    # __init__'s coroutine is never awaited, so none of its body runs and forwarding dies
+    # on a missing attribute. Replica registration and the heartbeat task (needs a
+    # running loop) move to _complete_startup, completed once from check_health -- the
+    # first instance method Serve awaits; a failure there still fails the deployment
+    # loudly, matching the old async-init semantics.
+    def __init__(self, config, model, namespace, http_options):
         self.config = config
         self.model = model
         self.backend = model.backend
@@ -82,8 +89,16 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         self.proxy = ServiceProxy(http_options)
         self.replica_id = "training-router_" + uuid.uuid4().hex
         self._init_task_queue(None, deployment_name="TrainingRouter")
+        self._startup_async_done = False
+
+    async def _complete_startup(self) -> None:
         await self.state.register_replica(self.replica_id, 0)
         self._heartbeat = asyncio.create_task(self._keep_alive())
+
+    async def check_health(self) -> None:
+        if not self._startup_async_done:
+            self._startup_async_done = True
+            await self._complete_startup()
 
     async def _keep_alive(self):
         while True:
@@ -91,11 +106,15 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             await asyncio.sleep(5)
 
     async def shutdown(self):
-        self._heartbeat.cancel()
-        await asyncio.gather(self._heartbeat, return_exceptions=True)
+        # Startup may have failed before registration/heartbeat existed; only
+        # unregister what was registered, and do not mask the startup error.
+        heartbeat = getattr(self, '_heartbeat', None)
+        if heartbeat is not None:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            await self.state.unregister_replica(self.replica_id)
         await self.shutdown_task_queue()
         await self.proxy.close()
-        await self.state.unregister_replica(self.replica_id)
 
     async def _check_session(self, session):
         if not session or await self.state.get_session_last_heartbeat(session) is None:

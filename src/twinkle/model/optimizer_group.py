@@ -53,6 +53,7 @@ class BaseOptimizerGroup:
     _dp_group: Any = None
     _device_mesh: DeviceMesh = None
     _last_grad_norm: float = 0.0
+    _last_lrs: Any = None
     pending_backward: bool = False
     pending_failed: bool = False
     pending_loss: float = 0.0
@@ -145,7 +146,7 @@ class BaseOptimizerGroup:
         loss_key = forward_kwargs.pop('_metric_loss_key', None)
         return {
             **forward_kwargs,
-            'lr': self._get_lr(),
+            'lr': self._last_lrs if self._last_lrs is not None else self._get_lr(),
             'step': self.cur_step - 1 if metric_step is None else metric_step,
             'gradient_accumulation_steps': self.gradient_accumulation_steps,
             'grad_norm': self._last_grad_norm,

@@ -5,7 +5,10 @@ import asyncio
 from copy import deepcopy
 
 from twinkle.server.config.application_spec import SamplerArgs
+from twinkle.utils.logger import get_logger
 from .controller import SamplerController
+
+logger = get_logger()
 
 
 def create_controller_actor():
@@ -45,9 +48,46 @@ def create_sampler_controller(spec, namespace, budgets, env):
     runtime_env["env_vars"] = {**env, **runtime_env.get("env_vars", {}), "TWINKLE_STATE_RAY_NAMESPACE": namespace}
     pool_id = sampling_pool_id(spec.route_prefix)
     name = sampler_controller_name(namespace, pool_id)
+    # Detached: a `--detach` driver exits once Serve reports RUNNING, and a named
+    # non-detached actor dies with its owner job ("all references removed including
+    # lineage ref count") -- the router's get_actor handle cannot keep it alive.
+    # The controller must outlive the driver until `stop_sampler_controller` kills it.
     controller = (
         create_controller_actor()
-        .options(name=name, namespace=namespace, runtime_env=runtime_env)
+        .options(name=name, namespace=namespace, lifetime="detached", runtime_env=runtime_env)
         .remote(spec.args.model_dump(), namespace, pool_id, options, budgets)
     )
     return controller, options, pool_id
+
+
+def stop_sampler_controller(namespace, route_prefix, *, timeout_s=60):
+    """Stop the pool controller named for ``route_prefix`` (``--stop`` on a detached deploy).
+
+    ``serve.delete`` only removes the router application. The detached controller owns
+    the sampling instances, engine deployments and placement groups -- its ``shutdown``
+    releases them, then the actor itself is killed by name. Returns whether a controller
+    was found; the resources default ``shutdown_timeout_s`` bounds the wait.
+    """
+    import ray
+
+    from .controller import sampler_controller_name, sampling_pool_id
+
+    name = sampler_controller_name(namespace, sampling_pool_id(route_prefix))
+    try:
+        controller = ray.get_actor(name, namespace=namespace)
+    except ValueError:
+        return False
+    try:
+        ray.get(controller.shutdown.remote(), timeout=timeout_s)
+    except ray.exceptions.ActorDiedError:
+        pass  # already dead; the kill below is then just name bookkeeping
+    except ray.exceptions.GetTimeoutError:
+        # shutdown stuck (the case where cleanup matters most): kill anyway so
+        # --stop converges -- aborting here would leave BOTH the controller and
+        # the router app behind. A half-done shutdown may leave engine
+        # deployments / placement groups alive; say so loudly for manual check.
+        logger.warning(f'sampler controller {name!r} shutdown timed out after {timeout_s}s; '
+                       'killing it anyway -- engine deployments / placement groups may survive, '
+                       'check `ray list actors` / serve status if devices stay occupied.')
+    ray.kill(controller, no_restart=True)
+    return True

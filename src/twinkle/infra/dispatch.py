@@ -526,6 +526,39 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
             Perf.disable_process(getattr(self, '_profiler', None))
             self._profiler = None
 
+        def close(self):
+            """Terminate THIS handle's remote workers: the constructor's counterpart.
+
+            Driver-side, idempotent, best-effort (never raises). Without it a
+            dropped handle leaves its named workers behind, and the next
+            construction at the same call site dies with 'actor already taken'.
+            Pool handles also deregister their replicas so the registry keeps
+            no stale ACTIVE entries. Local mode holds no workers: a no-op."""
+            actors = getattr(self, '_actors', None)
+            if not actors:
+                return
+            import ray
+            from ._ray import RayHelper
+            for actor in actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:  # noqa
+                    pass
+            try:
+                RayHelper._created_actors[:] = [a for a in RayHelper._created_actors
+                                                if a not in actors]
+            except Exception:  # noqa
+                pass
+            if RayHelper._registry is not None:
+                try:
+                    from .continuous_work import worker_id_of
+
+                    ray.get(RayHelper._registry.remove_actors.remote(
+                        [worker_id_of(actor) for actor in actors]))
+                except Exception:  # noqa
+                    pass
+            self._actors = []
+
         if not hasattr(cls, 'perf_on'):
             cls.perf_on = remote_function(dispatch='all', execute=execute, collect='none',
                                           lazy_collect=False)(perf_on)
@@ -537,6 +570,10 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
         if not hasattr(cls, 'perf_off'):
             cls.perf_off = remote_function(dispatch='all', execute=execute, collect='none',
                                            lazy_collect=False)(perf_off)
+        # close must NOT go through remote_function: it kills the driver-side
+        # handle's own workers, so it runs HERE, on the handle, not on a worker.
+        if not hasattr(cls, 'close'):
+            cls.close = close
 
         cls.__init__ = new_init
         return cls
@@ -656,7 +693,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                     timeout: Optional[float] = None,
                     enable_continous_work: bool = False,
                     sticky_key: Optional[Union[str, Callable]] = None,
-                    stash: Optional[Union[bool, Sequence[Union[int, str]]]] = None):
+                    stash: Optional[Union[bool, Sequence[Union[int, str]]]] = None,
+                    offload_blocking: bool = False):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -709,6 +747,16 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             container, and the next remote call dereferences the stashed references at its worker.
             Local mode has no remote path, so the natural value passes through untouched. Declared
             on ``__iter__``, it applies to every batch ``__next__`` yields.
+        offload_blocking: Run the worker body in the instance's thread pool instead of the actor's
+            event loop, for a sync method that blocks for a long time (a weight receive waiting on
+            a transport). Ray makes a class with any ``async def`` an asyncio actor and runs its
+            sync methods ON the default concurrency-group loop (``async_compat.sync_to_async``); a
+            blocking body there monopolizes that loop, so every other call in the same group --
+            notably ``resume_generation`` in a weight sync's ``finally`` -- queues forever behind
+            it (defect88). With this flag the caller routes to the method's awaitable companion
+            (``_WORKER_ASYNC_PREFIX``), which offloads the body to ``_worker_executor`` and awaits
+            it, so the loop stays free to dispatch while the body blocks in a thread. Only the ray
+            remote path is rerouted: local mode calls the plain sync method unchanged.
     """ # noqa
     if sticky_key is not None and not enable_continous_work:
         raise ValueError('remote_function(sticky_key=...) requires enable_continous_work=True.')
@@ -827,7 +875,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                                      for index, worker in enumerate(workers)]
             else:
                 _workers_and_args = _dispatch_args(workers, _dispatch, execute, _mesh, args, kwargs)
-            result = execute_method(func.__name__, _workers_and_args)
+            # offload_blocking: call the awaitable companion so the blocking body runs in a worker
+            # thread instead of monopolizing the actor's default event loop (defect88).
+            _method_name = (_WORKER_ASYNC_PREFIX + func.__name__) if offload_blocking else func.__name__
+            result = execute_method(_method_name, _workers_and_args)
             # This is a result future, call it to get the actual result
             result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result, _mesh, timeout=_rgt)
             if func.__name__ == '__iter__':
@@ -963,9 +1014,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         wrapper._enable_continous_work = enable_continous_work
         wrapper._sticky_key = sticky_key
         wrapper._stash = stash
-        if enable_continous_work:
-            # Attached to the class by remote_class, and called instead of this
-            # method when the caller routes requests replica by replica.
+        if enable_continous_work or offload_blocking:
+            # Attached to the class by remote_class under _WORKER_ASYNC_PREFIX. continuous_work
+            # routes requests to it replica by replica; offload_blocking routes a dispatch='all'
+            # call to it so the blocking body runs in a worker thread, not the actor's event loop.
             wrapper._worker_async_companion = _make_worker_async_companion(func, _worker_entry)
         return wrapper
 

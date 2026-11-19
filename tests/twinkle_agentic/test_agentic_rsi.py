@@ -34,12 +34,16 @@ class RecordingEnv(Env):
     """
 
     def __init__(self):
+        super().__init__()
         self.batches = []
 
-    def step(self, tool_name, arguments):
-        return self.step_batch([(tool_name, arguments)])[0]
+    def _open(self, trajectory):
+        return None, StepResult()
 
-    def step_batch(self, calls):
+    def _step(self, state, tool_name, arguments):
+        return StepResult(observation=f'ran {tool_name}')
+
+    def step_batch(self, episode_id, calls):
         calls = [(name, args or {}) for name, args in calls]
         self.batches.append(calls)
         return [StepResult(observation=f'ran {name}') for name, _ in calls]
@@ -140,17 +144,18 @@ class ToolBridgeTest(unittest.TestCase):
 
     def setUp(self):
         self.env = RecordingEnv()
+        self.env.reset('ep1')
         self.schemas = [
             {'type': 'function', 'function': {'name': 'read_file', 'parameters': {}}},
             {'type': 'function', 'function': {'name': 'shell_executor', 'parameters': {}}},
         ]
 
     def test_from_schemas_binds_every_declared_tool(self):
-        manager = ToolManager(EnvTool.from_schemas(self.env, self.schemas))
+        manager = ToolManager(EnvTool.from_schemas(self.env, 'ep1', self.schemas))
         self.assertEqual(sorted(manager.names()), ['read_file', 'shell_executor'])
 
     def test_declared_tools_collapse_into_one_step_batch(self):
-        manager = ToolManager(EnvTool.from_schemas(self.env, self.schemas))
+        manager = ToolManager(EnvTool.from_schemas(self.env, 'ep1', self.schemas))
         calls = [
             {'id': '1', 'type': 'function',
              'function': {'name': 'read_file', 'arguments': '{"path": "a"}'}},
@@ -168,7 +173,7 @@ class ToolBridgeTest(unittest.TestCase):
 
     def test_nameless_schema_is_refused(self):
         with self.assertRaises(ValueError):
-            EnvTool.from_schemas(self.env, [{'type': 'function', 'function': {}}])
+            EnvTool.from_schemas(self.env, 'ep1', [{'type': 'function', 'function': {}}])
 
 
 class ProblemStatementParseTest(unittest.TestCase):

@@ -225,11 +225,12 @@ class TestResumeSkip:
         texts = [item['text'] for batch in batches for item in batch]
         assert texts[0] == 'Another example'
 
-    def test_dataloader_warns_when_skip_requested_for_iterable_dataset(self, recwarn):
+    def test_dataloader_fast_forwards_when_skip_requested_for_iterable_dataset(self):
         dataset = _InMemoryIterableDataset(_build_resume_rows())
         dataloader = DataLoader(dataset=dataset, batch_size=2, num_workers=0)
 
         dataloader.skip_consumed_samples(2)
-        next(iter(dataloader))
+        batches = list(dataloader)
 
-        assert 'does not support consumed-data skipping' in str(recwarn.pop(UserWarning).message)
+        texts = [item['text'] for batch in batches for item in batch]
+        assert texts[0] == 'Another example'

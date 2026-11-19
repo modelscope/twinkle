@@ -14,7 +14,7 @@ Both handle tinker (Datum-based I/O) via /tinker/* endpoints and twinkle-native
 """
 from tinker import types
 
-from twinkle import remote_class, remote_function
+from twinkle import DeviceMesh, remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.model import MultiLoraTransformersModel, SpectralHybridTransformersModel
 from twinkle.model.transformers import TransformersModel
@@ -133,3 +133,9 @@ class TwinkleCompatFullTransformersModel(_TransformersTinkerCompatMixin, Transfo
     target the empty-string default optimizer group created by
     ``TransformersModel.__init__``.
     """
+
+    def __init__(self, *args, device_mesh: DeviceMesh = None, task=None, num_labels=None,
+                 task_head_loader=None, **kwargs):
+        super().__init__(*args, device_mesh=device_mesh, **kwargs)
+        if task is not None or task_head_loader is not None:
+            self._add_task_head('', task or 'decision', task_head_loader, num_labels)

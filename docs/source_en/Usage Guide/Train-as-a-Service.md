@@ -64,6 +64,8 @@ for epoch in range(2):
     print(f'Saved checkpoint for epoch {epoch} to {result.path}')
 ```
 
+On the Transformers backend, finish the current gradient accumulation, optimizer update, and gradient clearing (`zero_grad`) before saving a training checkpoint with Tinker's `save_state()` or Twinkle's `save(..., save_optimizer=True)`. Weights-only exports do not have this restriction.
+
 With the code above, you can train a self-cognition LoRA based on `Qwen/Qwen3.8-27B`. This LoRA will change the model's name and creator to the names specified during training. To perform inference using this LoRA:
 
 ```python

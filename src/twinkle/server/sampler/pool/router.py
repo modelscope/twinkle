@@ -18,7 +18,11 @@ from .controller import sampler_controller_name
 
 
 class SamplerRouter:
-    async def __init__(self, namespace, pool_id):
+    # __init__ must stay synchronous: Ray Serve's FastAPI ingress wrapper calls the user
+    # constructor synchronously (ASGIIngressWrapper in ray/serve/api.py) -- an async
+    # __init__'s coroutine is never awaited, so none of its body runs and forwarding dies
+    # on a missing attribute. Both operations here are plain sync calls anyway.
+    def __init__(self, namespace, pool_id):
         import ray
 
         self.state = get_server_state()

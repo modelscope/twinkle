@@ -87,6 +87,12 @@ class SamplerArgs(_ArgsBase):
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     data_plane_url: str | None = None
     template: dict[str, Any] | None = None
+    #:
+    #: Deployed LoRA adapters as ``{public name: adapter path}``: requests whose
+    #: ``adapter_name`` hits a key get that path resolved as their ``adapter_uri``
+    #: (paths must be readable on the sampler worker node). Leave ``None`` for a
+    #: plain base-model deployment.
+    adapters: dict[str, str] | None = None
     min_replicas: int = Field(default=1, ge=0, strict=True)
     max_replicas: int = Field(default=1, gt=0, strict=True)
     idle_timeout_s: float = Field(default=600, gt=0, allow_inf_nan=False)

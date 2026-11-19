@@ -13,6 +13,11 @@ class SupportedModel(BaseModel):
     plain base -- the strict/ignore split applies to what crosses the wire as a whole.
     """
     model_name: str
+    #:
+    #: Non-``None`` marks an adapter entry: ``model_name`` is a deployed LoRA adapter's
+    #: public name and requests for it route to ``base_model``'s sampler (the adapter
+    #: path itself rides the sampler's ``adapters`` mapping, not the gateway).
+    base_model: str | None = None
 
 
 class ClientFeatures(ResponseModel):

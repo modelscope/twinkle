@@ -4,6 +4,7 @@ import os
 import threading
 import uuid
 from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import replace as _replace
 from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional
@@ -290,7 +291,8 @@ class CheckpointEngineManager:
             self._merge_and_sync = merge_and_sync
             if self.sync_backend == 'delta_sharded':
                 # The delta session holds and releases generation itself (begin/publish).
-                self._sync_delta_weights(merge_and_sync)
+                with self._delta_rpc_timeouts():
+                    self._sync_delta_weights(merge_and_sync)
             elif self.mode == 'colocate':
                 self._sync_colocate(merge_and_sync)
             else:
@@ -553,7 +555,23 @@ class CheckpointEngineManager:
         """Release delta snapshots and communicators; keep rollout paused until a new full seed."""
         with self._sync_lock:
             if self.sync_backend == 'delta_sharded':
-                self._close_delta_session()
+                with self._delta_rpc_timeouts():
+                    self._close_delta_session()
+
+    @contextmanager
+    def _delta_rpc_timeouts(self):
+        missing = object()
+        previous = [(actor, getattr(actor, '_ray_get_timeout', missing)) for actor in (self.model, self.sampler)]
+        try:
+            for actor, _ in previous:
+                actor._ray_get_timeout = self.delta_config.timeout_seconds
+            yield
+        finally:
+            for actor, timeout in previous:
+                if timeout is missing:
+                    object.__delattr__(actor, '_ray_get_timeout')
+                else:
+                    actor._ray_get_timeout = timeout
 
     def _close_delta_session(self):
         errors = []

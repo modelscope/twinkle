@@ -644,7 +644,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, SGLangDeltaSamplerMixin):
             return 0.0
         return len(self._inflight_request_ids) / capacity
 
-    @remote_function(dispatch='all', lazy_collect=True)
+    @remote_function(dispatch='all', lazy_collect=True, offload_blocking=True)
     @timed
     def receive_weights(
         self,

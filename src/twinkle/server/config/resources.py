@@ -23,6 +23,13 @@ SHARED_WORKER_ENV_KEYS: tuple[str, ...] = (
     "TWINKLE_TELEMETRY_ENDPOINT",
     "TWINKLE_TELEMETRY_INTERVAL",
     "TWINKLE_MODEL_ID_ALIASES",
+    # Must reach every backend worker (RayRuntime.deployment_options), not just the
+    # deployment replica: run_worker_setup_hook reads it to register startup plugins.
+    "TWINKLE_WORKER_SETUP_HOOK",
+    # Server-side perf instruments (checkpoint_manager save_training/save_sampler disk-write
+    # latency) gate on this in the BACKEND worker's os.environ, so it must propagate there too;
+    # without it the instruments stay silent even when the client sets TWINKLE_PERF=1.
+    "TWINKLE_PERF",
 )
 
 

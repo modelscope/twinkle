@@ -559,6 +559,7 @@ def ensure_default_process_group(force: bool = False, should_bind_device_id=None
     this call initialised the group.
     """
     import os
+    from datetime import timedelta
 
     import torch
     import torch.distributed as dist
@@ -589,6 +590,12 @@ def ensure_default_process_group(force: bool = False, should_bind_device_id=None
         'init_method': 'env://',
         'rank': Platform.get_rank(),
         'world_size': Platform.get_world_size(),
+        # Same knob and default as the accelerate strategy's InitProcessGroupKwargs: this PG is
+        # created FIRST on the local launcher path, so accelerate's timeout never applies to it
+        # (it skips an already-initialized PG). Without it the torch default 600s watchdog kills
+        # ranks whose checkpoint-load I/O skew exceeds ten minutes on slow storage.
+        'timeout': timedelta(
+            seconds=int(os.environ.get('TWINKLE_DIST_TIMEOUT_SECONDS', '7200'))),
     }
     bind = (should_bind_device_id(backend) if should_bind_device_id is not None
             else Platform.get_platform().binds_device_id_to_process_group())

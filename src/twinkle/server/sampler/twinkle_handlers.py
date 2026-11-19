@@ -243,6 +243,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 from twinkle.server.checkpoint import create_checkpoint_manager
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+            else:
+                # No explicit uri: the OpenAI-gateway shape carries only the adapter's public
+                # name -- resolve it against the deployment's static name->path mapping.
+                resolved_uri = self.deploy_adapters.get(adapter_name)
 
             # Parse inputs (shared seam; batch form)
             inputs = to_backend_inputs(body.inputs)
@@ -477,6 +481,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             from twinkle.server.checkpoint import create_checkpoint_manager
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
+        else:
+            # Same as /twinkle/sample: no explicit uri, fall back to the deployment's mapping.
+            resolved_uri = self.deploy_adapters.get(adapter_name)
 
         # Streaming accepts exactly one input; the shared seam enforces that and
         # returns a single parsed object. Its ValueError maps to the same 400 this

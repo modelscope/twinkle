@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from twinkle.data_format import InputFeature, Trajectory, is_encoded
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.types.base import FieldRole, fields_with_role
-from twinkle.protocol.types.data import export_batch
+from twinkle.protocol.types.data import VLM_TENSOR_FIELDS, export_batch
 from twinkle.protocol.types.lifecycle import TaskEnvelope
 from twinkle.protocol.types.model import (AdapterRequest, DataPlaneForwardRequest, ForwardBackwardTaskRequest,
                                           TrainingRequest)
@@ -46,8 +46,8 @@ def to_backend_inputs(inputs: Any, *, single: bool = False) -> Any:
 
     With ``single=True`` exactly one object is returned (the streaming path accepts
     only one input) and a batch of any other size is a ``ValueError``. Plain dicts pass
-    through unchanged: the data-plane path resolves rows itself and never goes through
-    the wire schema.
+    through with their encoded media tensors restored: JSON lists cannot be passed to
+    a template's tensor collator, nor concatenated row-wise without losing shape.
     """
     entries = export_batch(inputs) if isinstance(inputs, list) else inputs
     if single:
@@ -67,7 +67,16 @@ def to_backend_inputs(inputs: Any, *, single: bool = False) -> Any:
 
 def _as_backend_entry(entry: dict[str, Any]) -> Any:
     """One exported entry as its ``TypedDict`` shape."""
-    return InputFeature(**entry) if is_encoded(entry) else Trajectory(**entry)
+    if not is_encoded(entry):
+        return Trajectory(**entry)
+    result = InputFeature(**entry)
+    media = VLM_TENSOR_FIELDS.intersection(result)
+    if media:
+        import torch
+        for key in media:
+            if result[key] is not None and not isinstance(result[key], torch.Tensor):
+                result[key] = torch.as_tensor(result[key])
+    return result
 
 
 def backend_kwargs(body: Any) -> dict[str, Any]:

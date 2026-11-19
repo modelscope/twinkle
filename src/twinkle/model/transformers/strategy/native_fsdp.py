@@ -24,6 +24,15 @@ PEFT_BASE_PREFIX = 'base_model.model.'
 PEFT_BASE_LAYER_SEGMENT = 'base_layer'
 
 
+def _shard_fp32_modules(model, *, mesh, reshard_after_forward):
+    # FSDP parameter groups require one storage dtype; keep FP32 modules separate from the BF16 group.
+    for module in model.modules():
+        if (not getattr(module, 'keep_fp32', False) or isinstance(module, FSDPModule)
+                or next(module.parameters(), None) is None):
+            continue
+        fully_shard(module, mesh=mesh, reshard_after_forward=reshard_after_forward, mp_policy=_build_mp_policy('no'))
+
+
 class NativeFSDPStrategy(TransformerStrategyBase):
 
     def __init__(self,
@@ -193,6 +202,8 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             world_size = self.device_mesh.world_size
             ep_fsdp_mesh_1d = self.ep_fsdp_device_mesh['ep_fsdp'] if ep_enabled else None
 
+            _shard_fp32_modules(model, mesh=fsdp_mesh, reshard_after_forward=reshard_after_forward)
+
             for layer_mod, experts_mod in layer_pairs:
                 layer_mod._fsdp_modules = []
 
@@ -253,11 +264,23 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             if ep_enabled:
                 _rebuild_ep_param_groups(model)
 
-            # Initialize dtype bookkeeping while trainable adapters are enabled.
-            # A first reference forward under PEFT disable_adapter() temporarily
-            # freezes them, otherwise caching no trainable parameter dtype.
-            if isinstance(model, FSDPModule):
-                model._get_fsdp_state()._lazy_init()
+            # Initialize FSDP2 dtype bookkeeping while trainable adapters are ENABLED (defect78-s2).
+            # torch FSDP2 captures each param group's _orig_dtype/_reduce_dtype ONCE at the first
+            # forward (_lazy_init's _is_root guard is never reset) from the requires_grad-filtered
+            # trainable params. A first reference forward under PEFT disable_adapter() flips lora
+            # requires_grad=False, so every lora-bearing group would capture trainable=0 ->
+            # _orig_dtype=None; the later training backward then reduce-scatters in the autograd
+            # dtype (bf16) and, with _orig_dtype=None, skips the cast back to the fp32 storage dtype,
+            # assigning a bf16 grad into a grad_dtype=Float sharded param -> torch raises. Pre-running
+            # the ROOT state's _lazy_init here makes that first forward's _lazy_init a no-op and keeps
+            # _orig_dtype=fp32. The top `model` may be a wrapper (e.g. a multimodal PeftModel) that is
+            # not itself an FSDPModule instance, so locate the outermost FSDP-managed module in the
+            # tree rather than relying on isinstance(model, FSDPModule) alone (which silently skipped
+            # this initialization for the real LoRA model).
+            fsdp_root = model if isinstance(model, FSDPModule) else next(
+                (m for m in model.modules() if isinstance(m, FSDPModule)), None)
+            if fsdp_root is not None:
+                fsdp_root._get_fsdp_state()._lazy_init()
 
         return (model, *(_rebind_optimizer(optimizer, model) if optimizer is not None else None
                          for optimizer in optimizers))
@@ -293,6 +316,10 @@ class NativeFSDPStrategy(TransformerStrategyBase):
             options=self._prepare_optimizer_state_dict_options(for_load=False),
         )
         if Platform.is_master():
+            # DCP requires an entry for every optimizer parameter; Adam leaves unused parameters uninitialized.
+            for group in optim_state['param_groups']:
+                for name in group['params']:
+                    optim_state['state'].setdefault(name, {})
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
             torch.save(optim_state, output_path)
 
@@ -311,15 +338,25 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
         optim_state = {}
+        empty_states = None
         if Platform.is_master():
             optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
+            empty_states = {name for name, value in optim_state['state'].items() if not value}
+        if dist.is_initialized():
+            payload = [empty_states]
+            dist.broadcast_object_list(payload, src=0)
+            empty_states = payload[0]
         set_optimizer_state_dict(
             model,
             optimizer,
             optim_state,
             options=self._prepare_optimizer_state_dict_options(for_load=True),
         )
+        # DCP initializes every Adam slot before loading; explicitly empty snapshots remain lazy.
+        parameters = dict(model.named_parameters())
+        for name in empty_states:
+            optimizer.state.pop(parameters[name], None)
 
     def get_ep_clip_kwargs(self, model) -> Dict[str, Any]:
         """Return EP-aware kwargs for normalize_and_clip_grad_norm."""

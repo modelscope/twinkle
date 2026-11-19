@@ -96,7 +96,7 @@ def test_frozen_parameters_are_not_digested():
 def test_an_empty_local_shard_keeps_its_key_and_digests_as_zeros():
     digest = DigestHarness(model_with(empty=torch.zeros(0), whole=torch.ones(2)))._digest_parameters('param')
     assert set(digest) == {'empty', 'whole'}
-    assert digest['empty'] == {'agg': [0.0, 0.0, 0.0], 'bits': [0, 0], 'numel': 0}
+    assert digest['empty'] == {'agg': [0.0, 0.0, 0.0], 'bits': [0, 0], 'numel': 0, 'dtype': 'torch.float32'}
 
 
 def test_a_narrow_dtype_parameter_is_fingerprinted_in_its_own_dtype():
@@ -104,6 +104,7 @@ def test_a_narrow_dtype_parameter_is_fingerprinted_in_its_own_dtype():
     entry = DigestHarness(model_with(w=value))._digest_parameters('param')['w']
     assert entry['bits'] == bits_fingerprint(value.flatten())
     assert entry['agg'][0] == float(value.double().sum())
+    assert entry['dtype'] == 'torch.bfloat16'
 
 
 def test_the_fingerprint_does_not_depend_on_element_order():

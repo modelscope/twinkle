@@ -166,6 +166,8 @@ def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: L
                 # not kept; the attempt index is what tells a resampled-then-exhausted group from one
                 # the admission kept outright, which a reward column alone cannot distinguish.
                 'group_attempt': before.get('group_attempt'),
+                'group_key': before.get('group_key'),
+                'turns': before.get('turns'),
                 'targets': added,
             }, default=str) + '\n')
             if token_root:
@@ -404,6 +406,14 @@ class Advantage:
                         ref_out: Optional[ModelOutput], teacher_out: Optional[ModelOutput],
                         old_out: Optional[ModelOutput], global_step: int
                         ) -> Tuple[List[Trajectory], Dict[str, Any]]:
+        # defect73 (candidate b): a collect batch may carry inert DP pad rows (run_grpo pads the
+        # segment-row count up to a multiple of data_world_size so the fixed-micro-batch forward lanes
+        # split evenly). Estimate the real rows only and re-append the pads with advantage=0; with no
+        # pad row this dispatch is skipped and the path below is byte-for-byte the original.
+        pad_mask = [bool(traj.get('_dp_pad')) for traj in trajs]
+        if any(pad_mask):
+            return self._estimate_group_padded(
+                trajs, rollout_logps, scores, ref_out, teacher_out, old_out, global_step, pad_mask)
         from .estimate import compute_advantages
 
         # The pre-update policy lane replaces the sampler's logps when importance sampling or the
@@ -440,7 +450,7 @@ class Advantage:
         # An episode delivered as several rows (collected segments) counts ONCE in the group
         # statistics -- its reward entering the mean per row would weight compacted episodes by
         # their segment count -- and the per-episode advantage is broadcast back to every row.
-        folded, owner = self._episode_fold(trajs, matrix_rows)
+        folded, owner = self._episode_fold(trajs)
         if folded is None:
             reward_matrix = torch.tensor(matrix_rows, dtype=torch.float32)
             response_lengths = [len(traj['response_token_ids']) for traj in trajs]
@@ -547,10 +557,64 @@ class Advantage:
             summary['rollout_correction'] = self._correction(old_logps, rollout_logps)
         return new_trajs, summary
 
+    def _estimate_group_padded(self, trajs: List[Trajectory], rollout_logps: List[List[float]],
+                               scores: List[Dict[str, Any]], ref_out: Optional[ModelOutput],
+                               teacher_out: Optional[ModelOutput], old_out: Optional[ModelOutput],
+                               global_step: int, pad_mask: List[bool]
+                               ) -> Tuple[List[Trajectory], Dict[str, Any]]:
+        """Estimate a batch carrying inert DP pad rows (defect73 candidate b).
+
+        The pad rows ride the forward lanes (their logps are computed so the per-rank micro-batch
+        counts agree) but must NOT enter the group statistics. Filter them out, estimate the real rows
+        through the ordinary path on row-sliced lane outputs, then re-append each pad row with
+        advantage=0 so the returned batch stays row-aligned with the caller's padded input. run_grpo
+        strips the pads before training, so they never reach the loss, the group normalization, or the
+        training-row count. The summary is the real rows' own (pads excluded from every metric).
+        """
+        real_idx = [i for i, pad in enumerate(pad_mask) if not pad]
+        pad_idx = [i for i, pad in enumerate(pad_mask) if pad]
+        real_trajs = [trajs[i] for i in real_idx]
+        real_scores = [scores[i] for i in real_idx]
+        real_rollout = [rollout_logps[i] for i in real_idx]
+
+        def slice_lane(out: Optional[ModelOutput]) -> Optional[ModelOutput]:
+            if out is None:
+                return None
+            sliced = dict(out)
+            for field in ('logps', 'values', 'embeddings', 'episode_ids', 'response_token_ids'):
+                rows = out.get(field)
+                if isinstance(rows, (list, tuple)) and len(rows) == len(trajs):
+                    sliced[field] = [rows[i] for i in real_idx]
+            return sliced
+
+        real_new, summary = self._estimate_group(
+            real_trajs, real_rollout, real_scores,
+            slice_lane(ref_out), slice_lane(teacher_out), slice_lane(old_out), global_step)
+        old_rows = old_out.get('logps') if old_out is not None else None
+        ref_rows = ref_out.get('logps') if ref_out is not None else None
+        teacher_rows = teacher_out.get('logps') if teacher_out is not None else None
+        pad_new: Dict[int, Trajectory] = {}
+        for i in pad_idx:
+            merged = dict(trajs[i])
+            width = len(merged['response_token_ids'])
+            merged['advantages'] = [0.0] * width
+            merged['old_logps'] = old_rows[i] if old_rows is not None else rollout_logps[i]
+            if ref_rows is not None:
+                merged['ref_logps'] = ref_rows[i]
+            if teacher_rows is not None:
+                merged['teacher_logps'] = teacher_rows[i]
+            validate_trajectory(merged)
+            pad_new[i] = merged
+        merged_trajs: List[Trajectory] = []
+        real_iter = iter(real_new)
+        for i in range(len(trajs)):
+            merged_trajs.append(pad_new[i] if i in pad_new else next(real_iter))
+        return merged_trajs, summary
+
     # ---------------------------------------------------------------------- helpers
 
     @staticmethod
-    def _episode_fold(trajs: List[Trajectory], matrix_rows: List[List[float]]) -> Tuple[Optional[List[int]], List[int]]:
+    def _episode_fold(trajs: List[Trajectory]) -> Tuple[Optional[List[int]], List[int]]:
         """Fold the batch's rows to one per episode: ``(folded, owner)``.
 
         An episode delivered as several rows (collected segments under

@@ -104,7 +104,8 @@ def test_task_batches_match_the_wire_contract(task):
 
 
 @pytest.mark.parametrize('task,width', [('seq_cls', 3), ('reranker', 1), ('value', 1)])
-def test_transformers_backend_preserves_validated_head_contract(monkeypatch, task, width):
+@pytest.mark.parametrize('mode', ['lora', 'full'])
+def test_transformers_backend_preserves_validated_head_contract(monkeypatch, task, width, mode):
     from transformers import AutoConfig
     from twinkle.hub import HubOperation
     from twinkle.server.model import app
@@ -114,8 +115,125 @@ def test_transformers_backend_preserves_validated_head_contract(monkeypatch, tas
     monkeypatch.setattr(AutoConfig, 'from_pretrained', lambda *a, **kw: SimpleNamespace(
         architectures=['Qwen2ForCausalLM']))
     received = {}
-    monkeypatch.setattr(transformers_model, 'TwinkleCompatTransformersModel', lambda **kwargs: received.update(kwargs))
-    kwargs = {'model_id': 'unused', 'task_type': task, 'num_labels': width}
+    model_class = 'TwinkleCompatFullTransformersModel' if mode == 'full' else 'TwinkleCompatTransformersModel'
+    monkeypatch.setattr(transformers_model, model_class, lambda **kwargs: received.update(kwargs))
+    kwargs = {'model_id': 'unused', 'task_type': task, 'num_labels': width, 'train_mode': mode}
     app._validate_model_task(kwargs)
     app._make_transformers_model(kwargs)
     assert received == {'model_id': 'unused', 'task': task, 'num_labels': width}
+
+
+def test_full_persisted_head_does_not_forward_num_labels_to_hf(monkeypatch):
+    from twinkle.server.model import app
+    from twinkle.server.model.backends import transformers_model
+
+    received = {}
+    monkeypatch.setattr(transformers_model, 'TwinkleCompatFullTransformersModel',
+                        lambda **kwargs: received.update(kwargs))
+    app._make_transformers_model({'model_id': 'persisted-classifier', 'train_mode': 'full',
+                                 'num_labels': 3, 'max_loras': 2})
+    assert received == {'model_id': 'persisted-classifier'}
+
+
+def test_full_model_attaches_head_and_preserves_device_mesh(monkeypatch):
+    import inspect
+
+    from twinkle import DeviceMesh
+    from twinkle.infra.dispatch import _get_device_mesh_param_name
+    from twinkle.server.model.backends import transformers_model
+
+    mesh = DeviceMesh.from_sizes(dp_size=2, device_type='cpu')
+    received = {}
+    monkeypatch.setattr(transformers_model.TransformersModel, '__init__',
+                        lambda self, **kwargs: received.update(kwargs))
+    attached = []
+    monkeypatch.setattr(transformers_model.TransformersModel, '_add_task_head',
+                        lambda self, *args: attached.append(args))
+    model_class = transformers_model.TwinkleCompatFullTransformersModel
+    inspect.unwrap(model_class.__init__)(
+        object.__new__(model_class), model_id='causal-backbone', device_mesh=mesh, task='seq_cls', num_labels=3)
+    assert attached == [('', 'seq_cls', None, 3)]
+    assert received['device_mesh'] is mesh
+    assert _get_device_mesh_param_name(
+        transformers_model.TwinkleCompatFullTransformersModel.__init__) == 'device_mesh'
+
+
+def test_full_custom_model_class_uses_compat_dispatch(monkeypatch):
+    from twinkle.server.model import app
+
+    marker = type('CustomModel', (), {})
+    received = {}
+    monkeypatch.setattr(app, '_resolve_model_cls', lambda spec: marker)
+    monkeypatch.setattr(app, '_make_model_class',
+                        lambda base: lambda **kwargs: received.update(base=base, kwargs=kwargs))
+    app._make_transformers_model({'model_id': 'st-model', 'train_mode': 'full',
+                                  'model_cls': 'worker_only.encoder:Model'})
+    assert received['base'] is marker
+    assert received['kwargs'] == {'model_id': 'st-model'}
+
+
+def test_embedding_deployment_accepts_explicit_task(monkeypatch):
+    from transformers import AutoConfig
+
+    from twinkle.hub import HubOperation
+
+    args = TrainingArguments(task_type='embedding')
+    monkeypatch.setattr(HubOperation, 'download_model', lambda path: path)
+    monkeypatch.setattr(AutoConfig, 'from_pretrained', lambda *a, **kw: SimpleNamespace(
+        architectures=['Qwen2ForCausalLM']))
+    kwargs = {'model_id': 'causal-backbone', 'task_type': args.task_type}
+    _validate_model_task(kwargs)
+    assert kwargs == {'model_id': 'causal-backbone'}
+
+
+def test_decision_requires_a_family_head_factory():
+    with pytest.raises(ValueError, match='family model_loader'):
+        _validate_model_task({'task_type': 'decision', 'model_loader': SimpleNamespace()})
+    with pytest.raises(ValidationError, match='model_loader'):
+        TrainingArguments(task_type='decision')
+
+
+@pytest.mark.parametrize('mode', ['lora', 'full'])
+def test_transformers_decision_uses_loader_architecture(monkeypatch, mode):
+    from twinkle.server.model import app
+    from twinkle.server.model.backends import transformers_model
+
+    received = {}
+    for name in ('TwinkleCompatFullTransformersModel', 'TwinkleCompatTransformersModel'):
+        monkeypatch.setattr(transformers_model, name, lambda **kw: received.update(kw))
+    loader = SimpleNamespace(task_type='decision', task_head_loader=lambda: ('family', 'Loader'),
+                             model_arch=SimpleNamespace(
+        language_model=['model.language_model'], vision_tower=['model.visual'],
+        aligner=['model.visual.merger'], lm_head='lm_head'))
+    args = TrainingArguments(task_type='decision', model_loader='family:build')
+    kwargs = {'model_id': 'decision-backbone', 'train_mode': mode,
+              'task_type': args.task_type, 'model_loader': loader}
+    app._validate_model_task(kwargs)
+    app._make_transformers_model(kwargs)
+    assert received['model_arch']['vision_tower'] == ['model.visual']
+    if mode == 'full':
+        assert 'task' not in received and 'task_head_loader' not in received
+    else:
+        assert received['task'] == 'decision'
+        assert received['task_head_loader'] == ('family', 'Loader')
+
+
+@pytest.mark.parametrize('model_cls', [None, 'swift.dev.model.sentence_transformer_model:SentenceTransformerModel'])
+def test_native_st_guard_uses_resolved_directory(tmp_path, monkeypatch, model_cls):
+    from transformers import AutoConfig
+    from twinkle.hub import HubOperation
+
+    (tmp_path / 'modules.json').write_text('[]')
+    monkeypatch.setattr(HubOperation, 'download_model', lambda path: str(tmp_path))
+    config_reads = []
+    monkeypatch.setattr(AutoConfig, 'from_pretrained',
+                        lambda *a, **kw: config_reads.append(a) or SimpleNamespace(architectures=['BertModel']))
+    kwargs = {'model_id': 'ms://sentence-transformers/LaBSE', 'task_type': 'embedding'}
+    if model_cls is not None:
+        kwargs['model_cls'] = model_cls
+        _validate_model_task(kwargs)
+        assert config_reads
+    else:
+        with pytest.raises(ValueError, match='native sentence-transformers checkpoint requires model_cls'):
+            _validate_model_task(kwargs)
+        assert not config_reads

@@ -1,5 +1,6 @@
 """CPU-only coverage for the device-neutral parts of the IPC checkpoint engine."""
 
+import pickle
 from unittest.mock import Mock
 
 import pytest
@@ -85,8 +86,8 @@ def test_buffer_and_flush_use_framework_device_and_sync_helpers(monkeypatch):
         def send(self, payload):
             self.payload = payload
 
-        def recv(self):
-            return b'ack'
+        def recv(self, copy=True):
+            return pickle.dumps('ack')
 
     engine.socket = Socket()
     synchronize = Mock()

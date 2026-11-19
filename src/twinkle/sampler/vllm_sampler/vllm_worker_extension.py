@@ -291,7 +291,8 @@ class TwinkleWorkerExtension:
         if independent:
             tp_size = 1
         is_driver = independent or (tp_rank == 0)
-        borrow_bucket = (independent and not use_shm and not (peft_config and base_sync_done)
+        # Shared TP receivers also finish loading and barrier before acknowledging reuse.
+        borrow_bucket = (not use_shm and not (peft_config and base_sync_done)
                          and getattr(self, '_quant_reload_state', None) is None
                          and not getattr(self, '_moe_reload_active', False))
 
@@ -546,7 +547,7 @@ class TwinkleWorkerExtension:
                 except BufferError as e:
                     logger.warning(f'SharedMemory close skipped due to exported pointers: {e}')
             del shm
-        if not independent:
+        if not independent and not borrow_bucket:
             gc.collect()
             Torch.empty_cache()
         Torch.ipc_collect()

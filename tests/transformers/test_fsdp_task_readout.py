@@ -32,6 +32,7 @@ def _value_forward(model, inputs):
     # Exercise both the legacy per-token patch and the attached-head readout
     # through the same entry point that TransformersModel's value task uses.
     wrapper = SimpleNamespace(model=model)
+    wrapper._strip_encoder_position_ids = TransformersModel._strip_encoder_position_ids.__get__(wrapper)
     with get_task_spec_obj('value').transformers_context(model):
         return TransformersModel._forward_with_task_readout(
             wrapper, model, 'value', {'inputs_embeds': inputs})['logits']
