@@ -48,8 +48,9 @@ class HTTPSampler:
 
     def _sample_one(self, item: Any, sampling_params: Any, adapter_uri: Optional[str]) -> SampleResponse:
         media = getattr(item, 'media', None)
+        wire_media = _wire_media(media) if media else {}
         if media:
-            entry = {'input_ids': list(item.engine_input_ids), **_wire_media(media)}
+            entry = {'input_ids': list(item.engine_input_ids), **wire_media}
         else:
             entry = dict(getattr(item, 'feature', item))
         responses = self.sampler.sample(
@@ -57,6 +58,9 @@ class HTTPSampler:
         if len(responses) != 1:
             raise RuntimeError(f'the server returned {len(responses)} responses for one prompt.')
         response = responses[0]
+        if media and response.prompt_token_ids != list(item.feature['input_ids']):
+            raise ValueError('Remote sampler prompt_token_ids do not match the expanded training prompt. '
+                             'Check that the training and sampler media processors use the same settings.')
         sequences = []
         for seq in response.sequences:
             tokens = list(seq.tokens)
@@ -64,7 +68,8 @@ class HTTPSampler:
                 completion = self.template.append_completion(item, tokens)
                 sequences.append(SampledSequence(
                     stop_reason=seq.stop_reason, tokens=tokens, logprobs=seq.logprobs,
-                    decoded=self.template.decode(tokens), new_input_feature=dict(completion.state.feature),
+                    decoded=self.template.decode(tokens),
+                    new_input_feature={**completion.state.feature, **wire_media},
                     new_state=completion.state))
             else:
                 sequences.append(SampledSequence(
