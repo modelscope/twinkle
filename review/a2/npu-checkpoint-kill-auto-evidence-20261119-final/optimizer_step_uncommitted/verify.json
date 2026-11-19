@@ -13,7 +13,7 @@
     "transformers": "5.20.2"
   },
   "device": "npu:0",
-  "expected_checkpoint": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-final/optimizer_step_uncommitted/checkpoints/step-0",
+  "expected_checkpoint": "/workspace/rollout-resume-20261118-r6/results/npu-checkpoint-kill-auto-20261119-merged/optimizer_step_uncommitted/checkpoints/step-0",
   "expected_lora_digest": "5713e04c38bc858ef33ae52dd4fcd72a7e1ca9fa9548fd653d735e44a869190d",
   "expected_optimizer_steps": [],
   "format": "twinkle.npu-checkpoint-kill-verify.v1",
