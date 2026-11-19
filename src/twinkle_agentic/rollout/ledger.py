@@ -32,11 +32,10 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
-from twinkle.data_format import Trajectory
+from twinkle.data_format import Trajectory, turn_token_spans, validate_trajectory
 from twinkle.data_format import last_assistant_text as _traj_last_assistant_text
-from twinkle.data_format import turn_token_spans, validate_trajectory
-from twinkle.data_format.trajectory import _trainable_positions
 from twinkle.data_format.sampling import SampledSequence
+from twinkle.data_format.trajectory import _trainable_positions
 from twinkle.template.base import Template
 from twinkle.template.contract import RolloutState, coerce_tool_call_arguments
 from twinkle_agentic.utils.token_utils import _to_plain, append_ids
@@ -120,29 +119,29 @@ class TurnLedger:
         """
         self.audit()
         return {
-            'format': 'twinkle.turn-ledger.v1',
-            'input_feature': copy.deepcopy(self._pif),
-            'state': copy.deepcopy(self._state),
-            'logprobs': copy.deepcopy(self._logprobs),
-            'sampling_masks': copy.deepcopy(self._sampling_masks),
-            'turns': self._turns,
+            "format": "twinkle.turn-ledger.v1",
+            "input_feature": copy.deepcopy(self._pif),
+            "state": copy.deepcopy(self._state),
+            "logprobs": copy.deepcopy(self._logprobs),
+            "sampling_masks": copy.deepcopy(self._sampling_masks),
+            "turns": self._turns,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         """Replace the mutable account with a previously exported one."""
-        if state.get('format') != 'twinkle.turn-ledger.v1':
-            raise ValueError('unsupported TurnLedger checkpoint format')
-        input_feature = state.get('input_feature')
-        logprobs = state.get('logprobs')
-        turns = state.get('turns')
-        if not isinstance(input_feature, dict) or 'input_ids' not in input_feature:
-            raise ValueError('TurnLedger checkpoint is missing input_feature.input_ids')
+        if state.get("format") != "twinkle.turn-ledger.v1":
+            raise ValueError("unsupported TurnLedger checkpoint format")
+        input_feature = state.get("input_feature")
+        logprobs = state.get("logprobs")
+        turns = state.get("turns")
+        if not isinstance(input_feature, dict) or "input_ids" not in input_feature:
+            raise ValueError("TurnLedger checkpoint is missing input_feature.input_ids")
         if not isinstance(logprobs, list) or not isinstance(turns, int) or turns < 0:
-            raise ValueError('TurnLedger checkpoint has invalid logprobs or turns')
+            raise ValueError("TurnLedger checkpoint has invalid logprobs or turns")
         self._pif = copy.deepcopy(input_feature)
-        self._state = copy.deepcopy(state.get('state'))
+        self._state = copy.deepcopy(state.get("state"))
         self._logprobs = copy.deepcopy(logprobs)
-        self._sampling_masks = copy.deepcopy(state.get('sampling_masks'))
+        self._sampling_masks = copy.deepcopy(state.get("sampling_masks"))
         self._turns = turns
         self.audit()
 
@@ -319,12 +318,12 @@ class TurnLedger:
             self._state = completion.state
         self._pif = sampled_feature
         if len(self.messages) < len(messages) + 1:
-            current_messages = messages + [{'role': 'assistant', 'content': seq.decoded or ''}]
-            self._pif['messages'] = current_messages
+            current_messages = messages + [{"role": "assistant", "content": seq.decoded or ""}]
+            self._pif["messages"] = current_messages
             if self._state is not None:
                 self._state = replace(self._state, messages=tuple(current_messages))
         if not self.tools and tools:
-            self._pif['tools'] = tools
+            self._pif["tools"] = tools
             if self._state is not None:
                 self._state = replace(self._state, tools=tuple(tools))
         self._turns += 1
@@ -676,4 +675,4 @@ class MessageLedger:
         return
 
 
-__all__ = ['MessageLedger', 'TurnLedger', 'turn_token_spans']
+__all__ = ["MessageLedger", "TurnLedger", "turn_token_spans"]

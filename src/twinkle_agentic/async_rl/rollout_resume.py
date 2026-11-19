@@ -108,9 +108,7 @@ class GroupPolicyBinding:
             raise ValueError("group policy_version must be an integer")
         if self.policy_version < 0:
             raise ValueError("group policy_version must be >= 0")
-        if self.adapter_path is not None and (
-            not isinstance(self.adapter_path, str) or not self.adapter_path.strip()
-        ):
+        if self.adapter_path is not None and (not isinstance(self.adapter_path, str) or not self.adapter_path.strip()):
             raise ValueError("group adapter_path must be a non-empty string when provided")
 
     def to_dict(self) -> dict[str, Any]:
