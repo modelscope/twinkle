@@ -213,33 +213,38 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 
 | 场景 | 示例 |
 |---|---|
-| 单轮数学问答（GSM8K） | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
-| 工具多轮 Blackjack（StreamingDriver，显式同步训练循环） | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
-| E2B sandbox 中的 Blackjack（复用相同训练循环） | [e2b_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/e2b_multi_turn_grpo.py) |
+| 单轮数学问答（GSM8K） | `cookbook/client/async_rl/client_orchestrated_grpo.py` |
+| 工具多轮 Blackjack（StreamingDriver，显式同步训练循环） | `cookbook/client/async_rl/streaming_multi_turn_grpo.py` |
+| E2B sandbox 中的 Blackjack（复用相同训练循环） | `cookbook/client/async_rl/e2b_multi_turn_grpo.py` |
 
 ### 1. 启动服务端
 
 示例使用 Qwen3.5-4B，训练后端为 Transformers，采样后端为 vLLM，需要两张 GPU。准备好本地模型目录后，在仓库根目录执行：
 
 ```bash
-pip install -e '.[async-rl,client,server]'
+pip install -e '.[server,rl]'
 export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3.5-4B
 export CUDA_VISIBLE_DEVICES=0,1
 bash cookbook/client/async_rl/run_server.sh
 ```
 
-服务默认监听 `http://127.0.0.1:8000`。如果已有可用的服务端，可以跳过启动步骤；服务配置见 [server_config.yaml](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/server_config.yaml)。
+服务默认监听 `http://127.0.0.1:8000`。如果已有可用的服务端，可以跳过启动步骤；服务配置见 `cookbook/client/async_rl/server_config.yaml`。
 
-### 2. 运行单轮数学任务
+### 2. 在 GSM8K 上运行单轮 GRPO
 
-保持服务端运行，在另一个终端中从仓库根目录执行：
+使用已提供 Qwen3.5-4B 训练和采样的服务。在仓库根目录安装客户端，设置服务地址和令牌。客户端需要匹配的 Swift 模板契约（`swift.dev.template_contract`）及 tokenizer 和模板文件。若已有本地文件，可用 `TWINKLE_TEMPLATE_MODEL_ID` 指定目录。
 
 ```bash
 export TWINKLE_SERVER_URL=http://127.0.0.1:8000
 export TWINKLE_SERVER_TOKEN=EMPTY_TOKEN
-export TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B
-python cookbook/client/async_rl/client_orchestrated_grpo.py
+pip install -e '.[client]'
+
+# 先运行同步版，再试流式版。
+TWINKLE_MAX_STEPS=6 python cookbook/client/twinkle/short_math_grpo.py
+TWINKLE_MAX_STEPS=6 python cookbook/client/async_rl/client_orchestrated_grpo.py
 ```
+
+建议先读同步版，看看奖励如何变成优势。答对得 1 分，正确且简短最多再得 0.25 分。比如同组奖励为 `[1.25, 1, 0, 0]`，前两条回复的优势为正，后两条为负。再跑流式版：它只按答案正确性评分，由 `StreamingDriver` 在训练当前组的同时准备下一组。`TWINKLE_MAX_STEPS` 限制一次运行处理的批次数；组内奖励相同则跳过更新。
 
 示例默认下载 GSM8K 数据集。离线运行时，额外设置 `TWINKLE_DATASET_ID=/absolute/path/to/gsm8k`；连接已有服务端时，将地址和令牌换成对应配置。模板目录应与服务端模型匹配。
 
@@ -277,7 +282,7 @@ python -c "from twinkle.template import Qwen3_5Template"
 
 `RolloutResources` 会自动为该客户端的模型操作、sampler 创建和配置绑定中断保护，示例直接调用 `model.forward_backward(...)`、`model.clip_grad_and_step()`、`model.save(...)`。主线程在等待期间中断时，SDK 等待已发出的调用返回，完成训练句柄及成功结果登记，再传播中断；受管操作失败或中断后不再接受后续受管操作。它不会自动重发训练操作。`model.completed_step_calls` 记录该 model 对象收到成功回复的 step/clip_grad_and_step 调用次数（不是设备参数变化的证明），`model.last_checkpoint` 保留最近成功的 save 回复，便于中断后查看。采样仍由 rollout 并发执行，不经过训练操作的串行等待器。不在该作用域内的客户端维持原有调用行为。超时、断线或任务失败状态不能证明远端物理执行结束；无法确认时保留相关资源并报告，不自动复用，也不提供远端强制取消。
 
-脚本固定 `temperature=1`、`top_p=1`、`top_k=-1`、`repetition_penalty=1`，使共享配置的 processed logprobs 与训练侧概率口径一致。共享 `server_config.yaml` 仍部署 DataPlane，服务端仍需 `[async-rl]` 依赖。
+脚本固定 `temperature=1`、`top_p=1`、`top_k=-1`、`repetition_penalty=1`，使共享配置的 processed logprobs 与训练侧概率口径一致。
 
 ### 4. 在 E2B 官方 sandbox 中运行同一任务（可选）
 

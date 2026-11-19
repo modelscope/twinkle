@@ -214,33 +214,38 @@ The client can train while sampling continues. After [installing Twinkle](../Ins
 
 | Task | Example |
 |---|---|
-| Single-turn math questions (GSM8K) | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
-| Blackjack with tools (StreamingDriver, explicit synchronous training loop) | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
-| Blackjack in E2B sandboxes (same training loop) | [e2b_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/e2b_multi_turn_grpo.py) |
+| Single-turn math questions (GSM8K) | `cookbook/client/async_rl/client_orchestrated_grpo.py` |
+| Blackjack with tools (StreamingDriver, explicit synchronous training loop) | `cookbook/client/async_rl/streaming_multi_turn_grpo.py` |
+| Blackjack in E2B sandboxes (same training loop) | `cookbook/client/async_rl/e2b_multi_turn_grpo.py` |
 
 ### 1. Start the Server
 
 The example uses Qwen3.5-4B with Transformers for training and vLLM for sampling, requiring two GPUs. Prepare a local model directory, then run these commands from the repository root:
 
 ```bash
-pip install -e '.[async-rl,client,server]'
+pip install -e '.[server,rl]'
 export TWINKLE_LOCAL_MODEL_PATH=/absolute/path/to/Qwen3.5-4B
 export CUDA_VISIBLE_DEVICES=0,1
 bash cookbook/client/async_rl/run_server.sh
 ```
 
-The server listens on `http://127.0.0.1:8000` by default. Skip this step if you already have a suitable server; see [server_config.yaml](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/server_config.yaml) for its configuration.
+The server listens on `http://127.0.0.1:8000` by default. Skip this step if you already have a suitable server; see `cookbook/client/async_rl/server_config.yaml` for its configuration.
 
-### 2. Run the Math Example
+### 2. Run Single-turn GRPO on GSM8K
 
-Keep the server running and use another terminal, also at the repository root:
+Use a server that offers Qwen3.5-4B for training and sampling. From the repository root, install the client and set the service URL and token. The client needs the matching Swift template contract (`swift.dev.template_contract`), as well as tokenizer and template assets. If those assets are already local, point `TWINKLE_TEMPLATE_MODEL_ID` to their directory.
 
 ```bash
 export TWINKLE_SERVER_URL=http://127.0.0.1:8000
 export TWINKLE_SERVER_TOKEN=EMPTY_TOKEN
-export TWINKLE_TEMPLATE_MODEL_ID=/absolute/path/to/Qwen3.5-4B
-python cookbook/client/async_rl/client_orchestrated_grpo.py
+pip install -e '.[client]'
+
+# Start with the synchronous loop; then try the streaming version.
+TWINKLE_MAX_STEPS=6 python cookbook/client/twinkle/short_math_grpo.py
+TWINKLE_MAX_STEPS=6 python cookbook/client/async_rl/client_orchestrated_grpo.py
 ```
+
+Start with the synchronous example to see how rewards become advantages. Correct answers earn 1 point and up to 0.25 extra for brevity. With rewards of `[1.25, 1, 0, 0]`, the first two replies get positive advantages and the others get negative ones. Then try the streaming example: it scores correctness only and uses `StreamingDriver` to prepare the next group while you train on the current one. `TWINKLE_MAX_STEPS` limits batches examined; groups with equal rewards do not update the model.
 
 The example downloads GSM8K by default. For offline use, also set `TWINKLE_DATASET_ID=/absolute/path/to/gsm8k`. When connecting to an existing server, use its address and authentication token. The template directory must match the server's model.
 
@@ -278,7 +283,7 @@ Each `train()` invocation generates its own checkpoint name prefix automatically
 
 `RolloutResources` automatically binds interrupt protection to this client's model operations, sampler creation and configuration. The recipe calls `model.forward_backward(...)`, `model.clip_grad_and_step()` and `model.save(...)` directly. If the waiting thread is interrupted, the SDK waits for the issued call to return, registers training handles and successful results, then propagates the interrupt. A failed or interrupted managed call stops subsequent managed calls; training operations are never automatically resubmitted. `model.completed_step_calls` counts successful step/clip_grad_and_step replies on that model object, not proof of device parameter changes. `model.last_checkpoint` retains the latest successful save response. Sampling remains concurrent under rollout execution and bypasses the training-operation sequence. Clients outside the scope retain their existing behavior. Timeouts, lost connections and failed task records do not prove physical completion: unconfirmed resources are retained and reported, never automatically reused. This does not provide remote force-cancellation.
 
-Sampling stays at `temperature=1`, `top_p=1`, `top_k=-1` and `repetition_penalty=1` to match processed logprobs to raw training logits. The shared `server_config.yaml` still deploys DataPlane and requires the server's `[async-rl]` dependencies.
+Sampling stays at `temperature=1`, `top_p=1`, `top_k=-1` and `repetition_penalty=1` to match processed logprobs to raw training logits.
 
 ### 4. Run the Same Task in Official E2B Sandboxes (Optional)
 

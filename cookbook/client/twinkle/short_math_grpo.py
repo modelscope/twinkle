@@ -6,9 +6,9 @@
 # and passes the checkpoint path to the sampler as adapter_uri.
 #
 # Flow:
-#   1. Prepare Countdown dataset (client-side)
+#   1. Prepare GSM8K prompts and answer keys (client-side)
 #   2. Initialize Twinkle client, model, and sampler
-#   3. Configure model with GRPOLoss, optimizer, LR scheduler
+#   3. Configure the model with GRPOLoss and an optimizer
 #   4. Training loop:
 #      a. Every SYNC_INTERVAL steps: model.save() → get twinkle_path
 #      b. sampler.sample(inputs, sampling_params=SamplingParams(num_samples=N), adapter_uri=twinkle_path)
@@ -19,65 +19,38 @@
 # The server must be running first (see server.py and server_config.yaml).
 # Requires both model and sampler services to be configured.
 
-import dotenv
 import gc
 import os
-import re
-import swanlab
-from peft import LoraConfig
 from typing import Any, Dict, List, Tuple
+
+import dotenv
+from peft import LoraConfig
 
 from twinkle import get_logger
 from twinkle import init_twinkle_client
-from twinkle.advantage import GRPOAdvantage
+from twinkle.advantage import compute_advantages
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
 from twinkle.preprocessor.llm import GSM8KProcessor
-from twinkle.reward import GSM8KAccuracyReward
-from twinkle.reward.base import Reward
+from twinkle.reward import GSM8KAccuracyReward, GSM8KBrevityReward
+from twinkle_agentic.rollout.ledger import sampled_token_logprobs
+from twinkle_client.resources import RolloutResources
 
 dotenv.load_dotenv('.env')
 logger = get_logger()
 
 
-class GSM8KBrevityReward(Reward):
-    """Brevity reward: rewards shorter completions that contain a valid answer.
-
-    Returns 0.0 if no valid answer format (\\boxed{} or ####).
-    Otherwise returns higher score for shorter completions (1.0 at <=200 chars).
-    """
-
-    def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
-        rewards = []
-        for traj in trajectories:
-            messages = traj.get('messages', [])
-            completion = ''
-            for msg in reversed(messages):
-                if msg.get('role') == 'assistant':
-                    completion = msg.get('content', '')
-                    break
-
-            has_answer = bool(re.search(r'\\boxed\{[^}]+\}', completion) or re.search(r'####\s*[\-\d,\.]+', completion))
-
-            if not has_answer:
-                rewards.append(0.0)
-            else:
-                length = len(completion)
-                if length <= 200:
-                    rewards.append(1.0)
-                else:
-                    rewards.append(max(0.0, 1.0 - (length - 200) / 3000))
-        return rewards
-
-
 # ========== Configuration ==========
-BASE_MODEL = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
-MODEL_ID = f'ms://{BASE_MODEL}'
+MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'Qwen/Qwen3.5-4B')
+if '://' not in MODEL_ID:
+    MODEL_ID = f'ms://{MODEL_ID}'
+TEMPLATE_MODEL_ID = os.environ.get('TWINKLE_TEMPLATE_MODEL_ID', MODEL_ID)
+DATASET_ID = os.environ.get('TWINKLE_DATASET_ID', 'ms://modelscope/gsm8k')
 NUM_GENERATIONS = 4
 MAX_NEW_TOKENS = 1024
 LEARNING_RATE = 2e-5
-MAX_STEPS = 100
+MAX_STEPS = int(os.environ.get('TWINKLE_MAX_STEPS', '100'))
 BATCH_SIZE = 2
 TEMPERATURE = 1.0
 SYNC_INTERVAL = 1  # Save weights for sampler every N steps
@@ -94,26 +67,32 @@ SYSTEM_PROMPT = ('You are a helpful math assistant. Solve the problem with minim
 
 def create_gsm8k_dataset():
     dataset = Dataset(
-        DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train', data_slice=range(DATA_NUM)))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=2048, enable_thinking=False)
+        DatasetMeta(DATASET_ID, subset_name='main', split='train', data_slice=range(DATA_NUM)))
+    dataset.set_template('Qwen3_5Template', model_id=TEMPLATE_MODEL_ID, max_length=2048, enable_thinking=False)
     dataset.map(GSM8KProcessor(system=SYSTEM_PROMPT))
     dataset.encode(add_generation_prompt=True)
     return dataset
 
 
-def compute_rewards(trajectories: List[Dict[str, Any]], ) -> Tuple[List[float], List[float], List[float]]:
-    accuracy_reward_fn = GSM8KAccuracyReward()
-    brevity_reward_fn = GSM8KBrevityReward()
-
-    accuracy_rewards = accuracy_reward_fn(trajectories)
-    brevity_rewards = brevity_reward_fn(trajectories)
-    total_rewards = [a + b for a, b in zip(accuracy_rewards, brevity_rewards)]
+def compute_rewards(trajectories: List[Dict[str, Any]]) -> Tuple[List[float], List[float], List[float]]:
+    accuracy_rewards = GSM8KAccuracyReward()(trajectories)
+    # Correctness earns 1 point. Only correct answers can earn the brevity bonus.
+    brevity_scores = GSM8KBrevityReward(full_reward_length=200)(trajectories)
+    brevity_rewards = [0.25 * correct * brevity for correct, brevity in zip(accuracy_rewards, brevity_scores)]
+    total_rewards = [correct + bonus for correct, bonus in zip(accuracy_rewards, brevity_rewards)]
     return total_rewards, brevity_rewards, accuracy_rewards
 
 
 def train():
+    with RolloutResources(init_twinkle_client) as resources:
+        train_with_client(resources.client)
+
+
+def train_with_client(client):
     # Step 0: Initialize SwanLab if enabled
     if USE_SWANLAB:
+        import swanlab
+
         swanlab.login(api_key=os.environ.get('SWANLAB_API_KEY', ''))
         swanlab.init(
             project=SWANLAB_PROJECT,
@@ -132,17 +111,11 @@ def train():
         )
         logger.info('SwanLab initialized')
 
-    # Step 1: Initialize the Twinkle client
-    client = init_twinkle_client(
-        base_url=os.environ.get('TWINKLE_SERVER_URL', 'http://localhost:8000'),
-        api_key=os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN'),
-    )
-
-    # Step 2: Prepare dataset and dataloader
+    # Prepare dataset and dataloader
     dataset = create_gsm8k_dataset()
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, num_workers=0)
 
-    # Step 3: Configure the training model
+    # Configure the training model
     model = client.model(MODEL_ID)
 
     lora_config = LoraConfig(
@@ -160,31 +133,23 @@ def train():
     # Set GRPO loss (the key difference from SFT training)
     model.set_loss('GRPOLoss', epsilon=0.2, beta=0.0)
 
-    # Set optimizer and LR scheduler
     model.set_optimizer('Adam', lr=LEARNING_RATE)
-    # Set LR scheduler (if server use megatron, don't support set self.lr_scheduler)
-    # model.set_lr_scheduler(
-    #     'CosineWarmupScheduler',
-    #     num_warmup_steps=500,
-    #     num_training_steps=MAX_STEPS,
-    # )
 
     # Set processor and template for encoding inputs
     model.set_processor('InputProcessor')
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
+    model.set_template('Qwen3_5Template', enable_thinking=False)
 
-    # Step 4: Configure the sampler
+    # Configure the sampler
     sampler = client.sampler(MODEL_ID)
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
+    sampler.set_template('Qwen3_5Template', enable_thinking=False)
 
-    # Step 5: Setup metrics and advantage function
-    advantage_fn = GRPOAdvantage()
+    # Set up metrics and sampling
     metrics = CompletionRewardMetric()
 
     sampling_params = {
         'max_tokens': MAX_NEW_TOKENS,
         'temperature': TEMPERATURE,
-        'top_p': 0.95,
+        'top_p': 1.0,
         'num_samples': NUM_GENERATIONS,
         'logprobs': 1,
     }
@@ -201,13 +166,11 @@ def train():
         prompts = batch if isinstance(batch, list) else [batch]
 
         # ========== 1. Save weights and update adapter_uri ==========
-        # Instead of sync_weights, save the model checkpoint and pass
-        # the resulting path to the sampler as adapter_uri
-        # Use is_sampler=True to delete old sampler weights and keep only the latest
+        # An unnamed sampler snapshot gets a fresh URI and replaces the previous latest snapshot.
         if step % SYNC_INTERVAL == 0:
             logger.info(f'Step {step}: Saving weights for sampler...')
             result = model.save(
-                name='grpo-sampler-weights',
+                name=None,
                 save_optimizer=False,
                 is_sampler=True,
             )
@@ -222,18 +185,28 @@ def train():
         )
 
         all_input_data: List[Dict[str, Any]] = []
+        reward_inputs: List[Dict[str, Any]] = []
         all_old_logps: List[List[float]] = []
         all_completion_lengths: List[int] = []
 
-        for sample_response in sample_responses:
+        for prompt, sample_response in zip(prompts, sample_responses, strict=True):
+            if len(sample_response.sequences) != NUM_GENERATIONS:
+                raise RuntimeError('GRPO requires all candidates for each prompt.')
             for sequence in sample_response.sequences:
                 all_input_data.append(sequence.new_input_feature)
-                all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
+                logps = sampled_token_logprobs(sequence.tokens, sequence.logprobs)
+                if not logps or len(logps) != len(sequence.tokens):
+                    raise RuntimeError('Expected one logprob per sampled token.')
+                all_old_logps.append(logps)
                 all_completion_lengths.append(len(sequence.tokens))
+                reward_inputs.append({
+                    'messages': [{'role': 'assistant', 'content': sequence.decoded}],
+                    'user_data': prompt.get('user_data'),
+                })
 
         # ========== 3. Compute rewards ==========
 
-        total_rewards, brevity_rewards, accuracy_rewards = compute_rewards(all_input_data)
+        total_rewards, brevity_rewards, accuracy_rewards = compute_rewards(reward_inputs)
         metrics.accumulate(
             completion_lengths=all_completion_lengths,
             rewards={
@@ -244,13 +217,12 @@ def train():
         )
 
         # ========== 4. Compute advantages ==========
-        advantages = advantage_fn(
-            total_rewards,
-            num_generations=NUM_GENERATIONS,
-            scale='group',
-        ).tolist()
+        advantages = compute_advantages(total_rewards, NUM_GENERATIONS)
 
-        frac_zero_std = (1.0 if all(abs(a) < 1e-8 for a in advantages) else 0.0)
+        zero_groups = sum(
+            all(abs(value) < 1e-8 for value in advantages[start:start + NUM_GENERATIONS])
+            for start in range(0, len(advantages), NUM_GENERATIONS))
+        frac_zero_std = zero_groups / len(prompts)
         if frac_zero_std == 1.0:
             logger.info(f'Step {step}: All advantages are zero, skipping training')
             step += 1
@@ -284,7 +256,7 @@ def train():
         metrics.reset()
 
     # Save final checkpoint
-    result = model.save(name='grpo-countdown-final', save_optimizer=True)
+    result = model.save(name='grpo-gsm8k-final', save_optimizer=True)
     logger.info(f'Saved final checkpoint: {result}')
 
 

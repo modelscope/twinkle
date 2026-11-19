@@ -44,6 +44,6 @@ vLLMSampler uses the vLLM engine for efficient inference, supporting high-throug
 
 See: [vLLMSampler](vLLMSampler.md)
 
-Server configurations use `sampler_type: vllm` for standard sampling or `vllm_async` for async RL. `mock` is for tests. The former [TorchSampler](TorchSampler.md) example is unavailable.
+Use `sampler_type: vllm` for standard sampling, including the {ref}`client-side streaming GRPO examples <client-async-grpo>`. The client-side `StreamingDriver` schedules rollouts and training. `mock` is for tests. The former [TorchSampler](TorchSampler.md) example is unavailable.
 
 > In RLHF training, samplers are typically separated from the Actor model, using different hardware resources to avoid interference between inference and training.
