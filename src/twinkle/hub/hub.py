@@ -220,7 +220,6 @@ class HubOperation:
 
 
 class MSHub(HubOperation):
-    ms_token = None
 
 
     @classmethod
@@ -244,14 +243,13 @@ class MSHub(HubOperation):
 
         if not cls.try_login(token):
             raise ValueError('Please specify a token by `--hub_token` or `MODELSCOPE_API_TOKEN=xxx`')
-        cls.ms_token = token
         visibility = ModelVisibility.PRIVATE if private else ModelVisibility.PUBLIC
         api = HubApi()
         if '/' not in repo_id:
             user_name = ModelScopeConfig.get_user_info()[0]
             assert isinstance(user_name, str)
         try:
-            api.create_model(repo_id, visibility)
+            api.create_model(repo_id, visibility=visibility)
         except HTTPError:
             # The remote repository has been created
             pass
@@ -285,7 +283,8 @@ class MSHub(HubOperation):
                     ignore_patterns: Optional[Union[List[str], str]] = None,
                     **kwargs):
         requires('modelscope')
-        cls.create_model_repo(repo_id, token, private)
+        # ModelScope creates the repository as part of the upload. Use that API
+        # directly so uploading does not require a separate Git checkout.
         from modelscope import push_to_hub
         commit_message = commit_message or 'Upload folder using api'
         if commit_description:
@@ -306,8 +305,8 @@ class MSHub(HubOperation):
             result = push_to_hub(
                 repo_id,
                 folder_path,
-                token or cls.ms_token,
-                private,
+                token=token,
+                private=private,
                 commit_message=commit_message,
                 ignore_file_pattern=ignore_patterns,
                 revision=revision,
