@@ -58,6 +58,26 @@ def _cuda_visible_device(device: torch.device) -> str:
     return selectors[device_index]
 
 
+def _ray_node_manager_address() -> str:
+    """The ray node address of the worker's node, as ``ray.nodes()`` reports it.
+
+    The delta receiver placement (``checkpoint_engine/delta/rollout/mixin.py``) looks the
+    worker's node up by ``ray.nodes()[...]['NodeManagerAddress']``. Reporting an independently
+    discovered interface IP (``find_node_ip`` picks the alphabetically-first non-virtual NIC)
+    diverges from ray's address on multi-NIC hosts -- ray binds the default-route NIC -- and the
+    lookup raises ``KeyError`` (defect111). Use ray's own address so the two sides always agree;
+    fall back to ``find_node_ip`` only when ray is not initialized (local single-process mode).
+    """
+    import ray
+    if ray.is_initialized():
+        node_id = ray.get_runtime_context().node_id
+        for node in ray.nodes():
+            if node.get('NodeID') == node_id and node.get('Alive'):
+                return node['NodeManagerAddress']
+    from twinkle.utils import find_node_ip
+    return find_node_ip()
+
+
 # Constants for the RL training LoRA adapter identity.
 VLLM_LORA_INT_ID = 111
 VLLM_LORA_NAME = 'twinkle_lora'
@@ -152,9 +172,8 @@ class TwinkleWorkerExtension:
         return self._delta_ipc_endpoint
 
     def delta_receiver_metadata(self) -> 'DeltaWorkerMetadata':
-        from twinkle.utils import find_node_ip
         return {
-            'node_ip': find_node_ip(),
+            'node_ip': _ray_node_manager_address(),
             'device_uuid': str(torch.cuda.get_device_properties(self.device).uuid),
             'cuda_visible_device': _cuda_visible_device(self.device),
             'zmq_handle': self.delta_ipc_endpoint(),
