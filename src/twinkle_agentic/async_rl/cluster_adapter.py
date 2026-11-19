@@ -572,6 +572,19 @@ class ClusterAdapter:
         self._lend_duration = 0.0
         self._lock = threading.Lock()
 
+    def __getstate__(self):
+        # The adapter is pickled into the remote StreamingDriver actor (ray argument serialization).
+        # Every operand it holds is a ray proxy (model, sampler roles, manager.warm bound method) and
+        # pickles fine; only this process-local lock cannot cross the boundary. Drop it and rebuild on
+        # the receiving side -- the actor copy's concurrent adjust/lend/reclaim still need guarding.
+        state = self.__dict__.copy()
+        state.pop('_lock', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
     def adjust(self) -> None:
         """Read the roles' pressure and move at most one replica's devices to the busiest role."""
         with self._lock:
