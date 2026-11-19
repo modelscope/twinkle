@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .dequantizer import Fp8Dequantizer, MxFp4Dequantizer
 from .device_mesh import DeviceGroup, DeviceMesh, is_last_rank, is_master
+from .exceptions import FullWeightLoadError
 from .framework import Framework as framework_util
 from .framework import Torch as torch_util
 from .import_utils import exists, requires
