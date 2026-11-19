@@ -33,6 +33,42 @@ from .ledger import MessageLedger, TurnLedger
 
 logger = get_logger()
 
+
+def _dump_rollout_rows(episode_id: str, rows: list) -> None:
+    """Write each delivered training row's contract arrays when ``TWINKLE_ROLLOUT_TRAJ_DUMP`` names a dir.
+
+    An independent depth oracle for the rollout trajectory contract (G28). The producer already
+    asserts ``validate_trajectory`` at ``ledger.merge``, but a self-consistent encoding can still
+    pass its own check; dumping the arrays lets an offline judge re-derive the shifted-labels,
+    logps-alignment and mask-count contracts from the numbers themselves, and compare an episode's
+    segments for prefix-extension. Write-only and env-gated: a no-op (zero cost) when unset.
+    """
+    import os
+    root = os.environ.get('TWINKLE_ROLLOUT_TRAJ_DUMP')
+    if not root:
+        return
+    os.makedirs(root, exist_ok=True)
+    rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+    path = os.path.join(root, f'rows.rank{rank}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        for seg, row in enumerate(rows):
+            messages = row.get('messages') or []
+            rec = {
+                'episode_id': episode_id,
+                'segment_index': row.get('segment_index', seg),
+                'rank': rank,
+                'input_ids': row.get('input_ids') or [],
+                'labels': row.get('labels') or [],
+                'completion_mask': row.get('completion_mask'),
+                'response_token_ids': row.get('response_token_ids') or [],
+                'response_positions': row.get('response_positions') or [],
+                'rollout_logps': row.get('rollout_logps'),
+                'messages': messages,
+                'stop_reason': row.get('stop_reason'),
+            }
+            handle.write(json.dumps(rec, default=str) + '\n')
+
+
 # Termination reasons surfaced via ``trajectory['stop_reason']``. The sampler
 # path takes the first three from the sampler itself; the API path has to name
 # them, and one vocabulary for both is what lets a consumer read either.
@@ -737,6 +773,7 @@ class MultiTurnRollout:
             # the episode, and every row of it carries the same one.
             row['rewards'] = dict(row.get('rewards') or {}, env=env_reward)
         rows = list(ep.closed_rows) + [traj]
+        _dump_rollout_rows(ep.episode_id, rows)
         extra = {
             key: traj[key]
             for key in ('stuck_stop', 'tool_stop', 'followups', 'segments', 'agent_exit_code', 'error') if key in traj
