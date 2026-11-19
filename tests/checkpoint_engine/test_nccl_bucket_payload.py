@@ -29,11 +29,10 @@ def test_nccl_broadcast_uses_payload_length(monkeypatch, sizes, broadcast_sizes)
             assert payload.shape == bucket.shape
             bucket.copy_(payload)
 
-    monkeypatch.setattr(nccl, '_pg_broadcast', broadcast)
-
     def engine(rank):
         engine = nccl.NCCLCheckpointEngine(bucket_size=16)
-        engine.rank = engine._pg = rank
+        engine.rank = rank
+        engine._group_broadcast = lambda bucket: broadcast(rank, bucket, src=0)
         engine.send_buf = torch.empty(16, dtype=torch.uint8)
         engine.recv_buf = torch.empty_like(engine.send_buf)
         engine.socket = SimpleNamespace(send_string=lambda *args, **kwargs: None, recv_string=lambda: engine.topic)
@@ -66,11 +65,10 @@ def _protocol_engine(monkeypatch, sizes):
         else:
             bucket.copy_(payloads.popleft())
 
-    monkeypatch.setattr(nccl, '_pg_broadcast', broadcast)
-
     def engine(rank):
         e = nccl.NCCLCheckpointEngine(bucket_size=16)
-        e.rank = e._pg = rank
+        e.rank = rank
+        e._group_broadcast = lambda bucket: broadcast(rank, bucket, src=0)
         e.send_buf = torch.empty(16, dtype=torch.uint8)
         e.recv_buf = torch.empty_like(e.send_buf)
         e.socket = SimpleNamespace(send_string=lambda *a, **k: None, recv_string=lambda: e.topic)

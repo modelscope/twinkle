@@ -9,7 +9,7 @@ from collections.abc import Iterator
 
 import torch
 
-from ...nccl_checkpoint_engine import MasterMetadata, NCCLCheckpointEngine, _pg_broadcast
+from ...nccl_checkpoint_engine import MasterMetadata, NCCLCheckpointEngine
 from twinkle.utils.network import find_free_port
 # Re-exported for callers that import the pipeline internals from this module.
 from .pipeline import (  # noqa: F401
@@ -31,7 +31,7 @@ class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
     The transport-agnostic pipeline (``send_weights`` state machine, bucketing,
     gather batching, flush assembly) comes from :class:`DeltaSyncMixin`; this class
     is the NCCL transport: it reuses NCCLCheckpointEngine's group/zmq machinery,
-    implements the four transport hooks on top of ``_pg_broadcast`` and holds the
+    implements the four transport hooks on top of its communicator and holds the
     rollout-side ``receive_weights``.
     """
 
@@ -53,8 +53,7 @@ class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
         self.finalize()
 
     def _broadcast(self, tensor):
-        if tensor.numel():
-            _pg_broadcast(self._pg, tensor)
+        self._group_broadcast(tensor)
 
     # ---- transport hooks ----
     @property
