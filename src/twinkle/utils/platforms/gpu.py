@@ -23,6 +23,10 @@ class GPU(Platform):
         return 'nccl'
 
     @staticmethod
+    def communicator_backend() -> str:
+        return 'nccl'
+
+    @staticmethod
     def get_vllm_device_uuid(device_id: int = 0) -> str:
         from vllm.platforms import current_platform
         return current_platform.get_device_uuid(device_id)
