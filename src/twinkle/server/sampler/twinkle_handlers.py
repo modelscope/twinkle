@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
+else:
+    # Runtime annotation resolution must not import .app (a circular dependency).
+    # Depends(self_fn) supplies the actual replica instance.
+    SamplerManagement = Any
 
 import numpy as np
 

@@ -13,10 +13,14 @@ import traceback
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
 from tinker import types
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
+else:
+    # Runtime annotation resolution must not import .app (a circular dependency).
+    # Depends(self_fn) supplies the actual replica instance.
+    SamplerManagement = Any
 
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager

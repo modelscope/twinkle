@@ -24,6 +24,10 @@ from twinkle.server.lifecycle.envelope import envelope_from_record
 
 if TYPE_CHECKING:
     from .app import GatewayServer
+else:
+    # Runtime annotation resolution must not import .app (a circular dependency).
+    # Depends(self_fn) supplies the actual replica instance.
+    GatewayServer = Any
 
 import httpx
 

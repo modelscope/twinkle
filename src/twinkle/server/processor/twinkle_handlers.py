@@ -14,10 +14,14 @@ import importlib
 import uuid
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import ProcessorManagement
+else:
+    # Runtime annotation resolution must not import .app (a circular dependency).
+    # Depends(self_fn) supplies the actual replica instance.
+    ProcessorManagement = Any
 
 import twinkle.protocol.types as types
 from twinkle.protocol.serialize import deserialize_object

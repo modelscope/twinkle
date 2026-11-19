@@ -15,10 +15,14 @@ import torch
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, HTTPException, Request
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import ModelManagement
+else:
+    # Runtime annotation resolution must not import .app (a circular dependency).
+    # Depends(self_fn) supplies the actual replica instance.
+    ModelManagement = Any
 
 import twinkle.protocol.types as types
 from twinkle.protocol.serialize import deserialize_object

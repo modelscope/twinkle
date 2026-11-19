@@ -14,6 +14,10 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import GatewayServer
+else:
+    # Runtime annotation resolution must not import .app (a circular dependency).
+    # Depends(self_fn) supplies the actual replica instance.
+    GatewayServer = Any
 
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager

@@ -13,10 +13,14 @@ from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
 from functools import partial
 from tinker import types
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import ModelManagement
+else:
+    # Runtime annotation resolution must not import .app (a circular dependency).
+    # Depends(self_fn) supplies the actual replica instance.
+    ModelManagement = Any
 
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.exceptions import RequestRejectedError
