@@ -38,8 +38,19 @@ class GAEAdvantage(Advantage):
         ref_logps = self._lane('ref_out', ref_out, 'logps', trajs)
         old_values = self._lane('value_out', value_out, 'values', trajs)
         kl_rows = self._kl(old_logps, ref_logps, kind=self.kl_kind, reduce='none')
-        rm_scores = [weighted_score(self._orm_row(score), self.reward_weights) for score in scores]
-        # A row whose every ORM scorer failed folds to nan: it carries no outcome signal, so it must
+        # The env-family rewards (the rollout's own ``rewards.env`` / ``rewards.check``, read off
+        # the trajectories -- the driver's score entry never carries them) fold into the same
+        # per-row outcome scalar at env_reward_weight; without them the row is exactly the ORM
+        # fold it always was.
+        env_keys, env_rows = self._env_family_rows(trajs)
+        fold_weights = self.reward_weights
+        if env_keys:
+            fold_weights = list(fold_weights or [1.0] * len(self._orm_row(scores[0]))) + \
+                [self.env_reward_weight] * len(env_keys)
+        rm_scores = [weighted_score(list(self._orm_row(score)) + list(env), fold_weights)
+                     for score, env in zip(scores, env_rows)]
+        # A row whose every reward lane failed (ORM and env-family both, or no lane at all) folds
+        # to nan: it carries no outcome signal, so it must
         # not bootstrap a value target either. Zero it before shaping and drop its advantage/return
         # afterwards -- a nan left in the reward would spread through the GAE recursion to every
         # earlier token of the row, and a fake 0 would train it as a genuine zero reward.
@@ -77,6 +88,14 @@ class GAEAdvantage(Advantage):
                    for index, row in enumerate(returns)]
         new_trajs = self._write_back(trajs, {'advantages': advantages, 'returns': returns,
                                              'old_logps': old_logps, 'old_values': old_values})
+        # The env-family lanes report beside the ORM half so each source stays observable.
+        env_summary = {}
+        for key_index, key in enumerate(env_keys):
+            values = [row[key_index] for row in env_rows]
+            valid = [float(value) for value in values if value is not None and value == value]
+            env_summary[f'mean_{key}_reward'] = sum(valid) / len(valid) if valid else 0.0
+            env_summary[f'unscored_{key}_rows'] = sum(
+                1 for value in values if value is None or value != value)
         return new_trajs, {'estimator': type(self).__name__, 'num_rows': len(trajs),
                            'unscored_rows': sum(unscored),
                            # Per-row form of the same count: the caller re-indexes the lane when a
@@ -85,7 +104,8 @@ class GAEAdvantage(Advantage):
                            'mean_advantage': _mean(advantages), 'mean_return': _mean(returns),
                            'absmean_advantage': _absmean(advantages),
                            'zero_advantage_rows': _zero_row_fraction(advantages),
-                           'reward_totals': [float(sum(row)) for row in token_rewards]}
+                           'reward_totals': [float(sum(row)) for row in token_rewards],
+                           **env_summary}
 
     @remote_function(dispatch='all', collect='first', lazy_collect=True)
     def token_advantages(
