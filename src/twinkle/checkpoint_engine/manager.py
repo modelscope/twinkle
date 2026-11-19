@@ -248,10 +248,15 @@ class CheckpointEngineManager:
     def _close_checkpoint_channel(self, receiver: Any = None, channel: Optional[str] = None) -> None:
         receiver = self.sampler if receiver is None else receiver
         channel = channel or self.channel
-        try:
-            self.model.reset_checkpoint_engine(channel, self.backend)
-        finally:
-            receiver.reset_checkpoint_engine(channel, self.backend)
+        # NCCL comm teardown is a rendezvous: dropping the model rank0 PG runs
+        # ProcessGroupNCCL::~ProcessGroupNCCL -> abort() -> waitForFutureOrTimeout, which blocks
+        # until the receiver peers abort too. Resetting the model first and the receiver only in
+        # the finally deadlocks -- the model waits for peers that are never told to reset (the
+        # receiver call cannot run until the blocked model call returns). Dispatch both sides
+        # side by side, like the init/send/receive rendezvous in _transfer.
+        _together(
+            lambda: self.model.reset_checkpoint_engine(channel, self.backend),
+            lambda: receiver.reset_checkpoint_engine(channel, self.backend))
 
     @remote_function(collect='first', lazy_collect=False)
     def close(self) -> None:

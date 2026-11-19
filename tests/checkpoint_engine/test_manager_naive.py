@@ -208,6 +208,36 @@ def test_abandon_channel_reset_error_does_not_propagate():
     assert manager.base_sync_done is False
 
 
+def test_close_checkpoint_channel_resets_both_sides_concurrently():
+    # defect116: NCCL comm teardown is a rendezvous -- dropping the model rank0 PG runs
+    # ProcessGroupNCCL::~ProcessGroupNCCL -> abort() -> waitForFutureOrTimeout, which blocks until
+    # the receiver peers abort too. The old sequential `model.reset(); receiver.reset()` deadlocked:
+    # model.reset waits for a receiver that is only reset after model.reset returns (D3 adaptive
+    # switch hung at step18, native stack confirmed). Model the rendezvous with a 2-party barrier
+    # each reset must reach: sequential code leaves model waiting alone -> BrokenBarrierError on
+    # timeout (RED); the concurrent _together dispatch passes both sides (GREEN).
+    import threading
+
+    barrier = threading.Barrier(2, timeout=5)
+    reset_calls = []
+
+    class _RendezvousRole:
+        _actors = [object()]
+        device_mesh = _Mesh()
+
+        def reset_checkpoint_engine(self, channel, backend):
+            reset_calls.append((channel, backend))
+            barrier.wait()  # blocks until BOTH sides enter reset, like the NCCL abort rendezvous
+
+    manager = object.__new__(CheckpointEngineManager)
+    manager.model = _RendezvousRole()
+    manager.sampler = _RendezvousRole()
+    manager.backend = 'nccl'
+    manager.channel = 'default'
+    manager._close_checkpoint_channel()  # must complete: both resets rendezvous side by side
+    assert sorted(reset_calls) == [('default', 'nccl'), ('default', 'nccl')]
+
+
 def test_mixed_deployment_shape_fails_at_initialization():
     model = _Model([])
     sampler = _Sampler()
