@@ -350,9 +350,7 @@ class LocalEnv(Env):
             raise ValueError(f"path {path!r} escapes the workspace")
         return target
 
-    def _spawn(
-        self, state: _LocalSession, argv: list[str], timeout: float, cap_memory: bool = True
-    ) -> tuple[int, str]:
+    def _spawn(self, state: _LocalSession, argv: list[str], timeout: float, cap_memory: bool = True) -> tuple[int, str]:
         env = dict(os.environ, **_SCRIPT_ENVS, **self._envs)
         # Inherited from the trainer, and a check that imports torch would
         # otherwise take a share of a GPU that is mid-generation.
