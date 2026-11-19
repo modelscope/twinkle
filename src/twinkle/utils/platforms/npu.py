@@ -240,6 +240,10 @@ class NPU(Platform):
         return True
 
     @staticmethod
+    def communicator_backend() -> str:
+        return 'hccl'
+
+    @staticmethod
     def ray_resources():
         # Ray cannot autodetect Ascend NPUs; register them as a custom
         # resource so placement groups can request them.

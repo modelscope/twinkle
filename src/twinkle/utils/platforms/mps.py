@@ -38,6 +38,10 @@ class MPS(Platform):
         return 'gloo'
 
     @staticmethod
+    def communicator_backend() -> str:
+        return 'gloo'
+
+    @staticmethod
     def get_vllm_device_uuid(device_id: int = 0) -> str:
         raise NotImplementedError
 
