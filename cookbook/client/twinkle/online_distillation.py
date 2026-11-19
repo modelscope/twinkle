@@ -83,12 +83,14 @@ def distillation_signal(method, model, teacher, pairs, sequences, features):
     if method == 'gkd':
         # Full vocabulary scores make the HTTP payload grow with the batch size.
         result = teacher.forward_only(inputs=features, return_logits=True).result
-        length = len(features[0]['input_ids'])
+        batch_size = len(features)
+        length = max(len(feature['input_ids']) for feature in features)
         logits = np.asarray(result['logits'], dtype=np.float32)
         if logits.ndim == 2:
             logits = logits[None, ...]
-        if logits.ndim != 3 or logits.shape[:2] != (1, length):
-            raise RuntimeError(f'Expected teacher logits shaped [1, {length}, vocab_size], got {logits.shape}.')
+        if logits.ndim != 3 or logits.shape[:2] != (batch_size, length):
+            raise RuntimeError(
+                f'Expected teacher logits shaped [{batch_size}, {length}, vocab_size], got {logits.shape}.')
         return {'teacher_logits': logits.tolist()}
 
     if method == 'opd-rl':
