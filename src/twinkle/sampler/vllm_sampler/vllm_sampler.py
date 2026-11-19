@@ -13,7 +13,7 @@ from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.checkpoint_engine.delta.rollout.mixin import VLLMDeltaSamplerMixin
 from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
                                  SamplingParams, Trajectory)
-from twinkle.exceptions import FullWeightLoadError
+from twinkle.utils import FullWeightLoadError
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights

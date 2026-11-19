@@ -306,10 +306,48 @@ class MegatronStrategy:
             for m in model:
                 if not hasattr(m, 'ddp_config'):
                     m.ddp_config = ddp_config
+            self._enable_text_vision_skip(model)
             return model
 
         self._check_device_mesh()
-        return self._wrap_with_megatron_ddp(model, self.use_distributed_optimizer, self.ddp_config)
+        wrapped = self._wrap_with_megatron_ddp(model, self.use_distributed_optimizer, self.ddp_config)
+        self._enable_text_vision_skip(model)
+        return wrapped
+
+    def _enable_text_vision_skip(self, model: List[nn.Module]) -> None:
+        """Let multimodal chunks skip the tower on all-text micro-batches, when safe.
+
+        The tower then runs no forward for the step, so its parameters carry no gradients.
+        Synchronous Megatron DDP reduces every pre-allocated grad buffer (the untouched tower
+        buffers ride along as zeros), so collectives stay aligned across DP ranks; under FSDP,
+        the distributed optimizer, grad/param overlap, or CUDA graphs the sync is hook- or
+        graph-driven instead, and an unused tower would stall or corrupt it -- those
+        deployments keep the fabricated-zero path.
+        """
+        cores = []
+        for chunk in model:
+            core = chunk
+            while hasattr(core, 'module'):  # unwrap DDP / Float16Module down to the mcore model
+                core = core.module
+            if getattr(core, 'visual', None) is not None:
+                cores.append(core)
+        if not cores:
+            return
+        blocked = []
+        if self.uses_fsdp(self.ddp_config):
+            blocked.append('fsdp')
+        if self.use_distributed_optimizer:
+            blocked.append('distributed optimizer')
+        if self.ddp_config['overlap_grad_reduce'] or self.ddp_config['overlap_param_gather']:
+            blocked.append('grad/param overlap')
+        if getattr(self.config, 'cuda_graph_impl', 'none') != 'none':
+            blocked.append('cuda graph')
+        if blocked:
+            logger.warning('text-vision skip stays off (%s): all-text micro-batches keep running '
+                           'the vision tower on fabricated zero inputs.', ', '.join(blocked))
+            return
+        for core in cores:
+            core.enable_text_vision_skip = True
 
     def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP

@@ -13,10 +13,26 @@ teacher forward and publishes the encoded rows one by one.
 import copy
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+import torch
+
 from twinkle import remote_class, remote_function
 
 from twinkle.data_format import Trajectory, ground_truth, turn_token_spans, validate_trajectory
-from twinkle.signals import response_positions
+
+
+def response_positions(feature: Dict[str, Any]) -> List[int]:
+    """Indices of the trainable (response) tokens in ``feature``, i.e. where ``labels != -100``.
+
+    This is the exact frame the loss mask uses, so scores extracted at these positions (a teacher's
+    log-probs, a critic's values) align one-to-one with the policy's per-token loss.
+    """
+    labels = feature.get('labels')
+    if labels is None:
+        return []
+    if isinstance(labels, torch.Tensor):
+        return torch.nonzero(labels.reshape(-1) != -100, as_tuple=True)[0].tolist()
+    return np.flatnonzero(np.asarray(labels) != -100).tolist()
 
 
 def batch_summary(trajs: Sequence[Trajectory]) -> Dict[str, Any]:
