@@ -320,6 +320,7 @@ class UploadToHubRequest(StrictRequest):
     checkpoint_dir: str | dict[str, Any]
     hub_model_id: str
     hub_token: str | None = None
+    client_upload_id: str | None = Field(default=None, min_length=1, max_length=128)
 
     @field_validator('checkpoint_dir', mode='before')
     @classmethod

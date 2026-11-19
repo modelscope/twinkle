@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 import asyncio
+import hashlib
+import hmac
 import uuid
 from types import SimpleNamespace
 
@@ -175,7 +177,15 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             )
             return envelope_from_record(ref["request_id"], await self.state.get_future(ref["request_id"]))
         if endpoint == "upload_to_hub":
-            request_id = f"req_{uuid.uuid4().hex}"
+            fingerprint = None
+            if body.client_upload_id is None:
+                request_id = f"req_{uuid.uuid4().hex}"
+            else:
+                # Scope the stable ID to the caller across sessions and replicas.
+                identity = hmac.digest(token.encode(), body.client_upload_id.encode(), "sha256")
+                request_id = f"req_upload_{identity.hex()}"
+                payload = json.dumps([body.checkpoint_dir, body.hub_model_id])
+                fingerprint = hashlib.sha256(payload.encode()).hexdigest()
 
             async def upload():
                 manager = create_checkpoint_manager(token, client_type="twinkle")
@@ -201,8 +211,17 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
                 return native.UploadToHubResponse(
                     repo_id=HubOperation.remove_source_type(body.hub_model_id), revision=revision)
 
-            ref = await self.schedule_background_task(upload, task_type=endpoint, token=token, request_id=request_id)
-            return envelope_from_record(ref["request_id"], await self.state.get_future(ref["request_id"]))
+            record = await self.state.get_future(request_id) if fingerprint is not None else None
+            if record is None:
+                await self.schedule_background_task(
+                    upload, task_type=endpoint, token=token, request_id=request_id, submission_fingerprint=fingerprint)
+                record = await self.state.get_future(request_id)
+            if fingerprint is not None and record is not None:
+                if record.get("owner_token") != token:
+                    raise ResourceNotFoundError("Unknown future")
+                if record.get("submission_fingerprint") != fingerprint:
+                    raise RequestRejectedError("client_upload_id is already bound to a different checkpoint or repository")
+            return envelope_from_record(request_id, record)
         session = get_session_id_from_request(request)
         if not session:
             raise ResourceNotFoundError("Unknown or expired session")

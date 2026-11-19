@@ -356,6 +356,7 @@ class TaskQueueMixin:
         task_type: str | None = None,
         request_id: str | None = None,
         execution_scope: ExecutionScope | None = None,
+        submission_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         """Schedule a compute task that runs now instead of in serial order.
 
@@ -372,7 +373,7 @@ class TaskQueueMixin:
         # Decision_Boundary: raises RequestRejectedError before any state write.
         await self._perform_preflight_checks(model_id=model_id, token=token, input_tokens=input_tokens)
 
-        await self._compute_worker.submit_detached(
+        started = await self._compute_worker.submit_detached(
             QueuedTask(
                 request_id=request_id,
                 coro_factory=coro_factory,
@@ -384,9 +385,11 @@ class TaskQueueMixin:
                 execution_scope=execution_scope),
             self._queue_key(model_id=model_id, token=token),
             replica_id=getattr(self, 'replica_id', None),
-            absolute_deadline=self._future_deadline())
-        logger.info(f'[TaskQueue] Task {request_id} started concurrently, type={task_type or "unknown"}, '
-                    f'model_id={model_id}, input_tokens={input_tokens}')
+            absolute_deadline=self._future_deadline(),
+            submission_fingerprint=submission_fingerprint)
+        if started:
+            logger.info(f'[TaskQueue] Task {request_id} started concurrently, type={task_type or "unknown"}, '
+                        f'model_id={model_id}, input_tokens={input_tokens}')
         return {'request_id': request_id, 'model_id': model_id}
 
     # Poll cadence *inside* the Inline_Fast_Path window. Much smaller than the window
@@ -461,14 +464,26 @@ class TaskQueueMixin:
         token: str | None = None,
         *,
         request_id: str | None = None,
+        submission_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         """Run pure I/O outside serial compute, with the same supervised lifecycle.
 
         Capacity, timeout, cancellation and shutdown are owned by ComputeWorker;
         background jobs must not create a second unsupervised execution path.
         """
-        return await self.schedule_concurrent_task(
-            coro_factory, model_id=model_id, task_type=task_type, token=token, request_id=request_id)
+        admission = self.schedule_concurrent_task(
+            coro_factory, model_id=model_id, task_type=task_type, token=token, request_id=request_id,
+            submission_fingerprint=submission_fingerprint)
+        if submission_fingerprint is None:
+            return await admission
+        # A lost submit response must not interrupt registration and startup.
+        submission = asyncio.create_task(admission)
+        try:
+            return await asyncio.shield(submission)
+        except asyncio.CancelledError:
+            self._queue_tasks.add(submission)
+            submission.add_done_callback(self._queue_task_done)
+            raise
 
     async def _fail_queue_tasks_async(self, queue_key: str, reason: str) -> None:
         await self._compute_worker.fail_queue_tasks(queue_key, reason)

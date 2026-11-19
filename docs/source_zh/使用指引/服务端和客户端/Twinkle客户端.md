@@ -184,6 +184,8 @@ for epoch in range(3):
 
 可传入 `on_progress` 回调，在自己的界面显示已传字节、总量、已提交字节和提交状态。ModelScope 在文件传完或批次提交后更新进度。Hub 去重时，已传字节可能小于已提交字节。服务端通过 `server` 安装选项获取上传依赖。
 
+如果需要断线后继续查询，调用 `model.upload_to_hub(..., client_upload_id=upload_id)` 前先保存一个唯一标识，例如 UUID。重连时使用相同的 Twinkle 凭据、标识、检查点和目标仓库。服务端仍保留该任务时，SDK 会继续等待，任务已完成则返回原来的提交版本。
+
 Twinkle Client 场景下，推荐的断点续训流程是：
 
 1. 先通过 `client.list_checkpoints(...)` 或 `client.get_latest_checkpoint_path(...)` 获取已有 checkpoint 路径。

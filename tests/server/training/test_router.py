@@ -13,17 +13,17 @@ from tests.server.training.helpers import settle
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.gateway.use_cases import poll_future
-from twinkle.server.exceptions import ResourceNotFoundError
+from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
 from twinkle.server.state import ServerState
 from twinkle.server.model.pool.router import TrainingRouter
 from twinkle.server.config.training import TrainingConfig
 
 
-def http_request(body):
+def http_request(body, token='owner'):
     async def receive():
         return {'type': 'http.request', 'body': json.dumps(body).encode(), 'more_body': False}
     request = Request({'type': 'http', 'method': 'POST', 'path': '/upload_to_hub', 'headers': []}, receive)
-    request.state.token = 'owner'
+    request.state.token = token
     request.state.session_id = ''
     return request
 
@@ -79,6 +79,81 @@ async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(m
         assert (await router.state.get_future(response.request_id))['owner_token'] == 'owner'
         assert not await router.state._backend.keys('model::*')
     finally:
+        finish.set()
+        await router.shutdown_task_queue()
+
+
+@pytest.mark.asyncio
+async def test_keyed_upload_reconnects_to_original_task(monkeypatch, tmp_path):
+    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    checkpoint = create_checkpoint_manager('owner', client_type='twinkle').training_run_manager.get_base_dir() / 'saved'
+    checkpoint.mkdir(parents=True)
+    first_claim, allow_first_claim = asyncio.Event(), asyncio.Event()
+    registered, continue_submission = asyncio.Event(), asyncio.Event()
+
+    class PausedBackend(FakeBackend):
+        async def set_nx(self, key, value, ttl=None):
+            keyed_upload = key.startswith('future::req_upload_') and value['owner_token'] == 'owner'
+            if keyed_upload and not first_claim.is_set():
+                first_claim.set()
+                await allow_first_claim.wait()
+            created = await super().set_nx(key, value, ttl)
+            if keyed_upload and created:
+                registered.set()
+                await continue_submission.wait()
+            return created
+
+    router = TrainingRouter.__new__(TrainingRouter)
+    router.state = ServerState(backend=PausedBackend())
+    router.replica_id = 'router'
+    router._init_task_queue()
+    finish = threading.Event()
+
+    def transfer(*, report, **_):
+        report(stage='uploading', uploaded_bytes=5, total_bytes=10)
+        assert finish.wait(5)
+        return 'commit-sha'
+
+    upload = Mock(side_effect=transfer)
+    monkeypatch.setattr(HubOperation, 'upload_checkpoint', upload)
+    body = {'checkpoint_dir': str(checkpoint), 'hub_model_id': 'owner/saved', 'client_upload_id': 'operation-1'}
+
+    async def submit(*, token='owner', **changes):
+        return await router.native_request(http_request({**body, **changes}, token), 'upload_to_hub')
+
+    try:
+        raced = asyncio.create_task(submit())
+        await asyncio.wait_for(first_claim.wait(), 3)
+        first = asyncio.create_task(submit())
+        await asyncio.wait_for(registered.wait(), 3)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        allow_first_claim.set()
+        retry = await asyncio.wait_for(raced, 3)
+        assert retry.status == 'pending'
+        assert (await submit()).request_id == retry.request_id
+        with pytest.raises(RequestRejectedError, match='different checkpoint or repository'):
+            await submit(hub_model_id='owner/other')
+        with pytest.raises(ResourceNotFoundError):
+            await poll_future(router.state, retry.request_id, owner_token='another-tenant')
+        other = await submit(token='another-tenant')
+        assert other.request_id != retry.request_id
+        assert (await settle(router.state, other.request_id))['status'] == 'failed'
+
+        continue_submission.set()
+        await asyncio.wait_for(poll_future(router.state, retry.request_id, after_progress=1), 3)
+        assert (await submit()).request_id == retry.request_id
+        finish.set()
+        await settle(router.state, retry.request_id)
+        completed = await submit()
+        assert completed.request_id == retry.request_id
+        assert completed.status == 'completed'
+        assert completed.result == {'repo_id': 'owner/saved', 'revision': 'commit-sha'}
+        upload.assert_called_once()
+    finally:
+        allow_first_claim.set()
+        continue_submission.set()
         finish.set()
         await router.shutdown_task_queue()
 

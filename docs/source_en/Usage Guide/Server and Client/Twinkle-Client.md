@@ -184,6 +184,8 @@ for epoch in range(3):
 
 Pass an `on_progress` callback to display transferred bytes, total bytes, committed bytes, and commit status. ModelScope reports updates as files finish transferring or batches are committed. Deduplication can make transferred bytes lower than committed bytes. Install the server with the `server` extra to include the upload dependency.
 
+To reconnect after a client disconnect, save a unique `client_upload_id` (for example, a UUID) before calling `model.upload_to_hub(..., client_upload_id=upload_id)`. Repeat the call with the same Twinkle credentials, ID, checkpoint, and destination. While the server retains the task, the SDK resumes waiting or returns the original revision if the upload already finished.
+
 For checkpoint resumption, the recommended client-side flow is:
 
 1. Query the server for an existing checkpoint path with `client.list_checkpoints(...)` or `client.get_latest_checkpoint_path(...)`.

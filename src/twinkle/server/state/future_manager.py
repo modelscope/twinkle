@@ -141,6 +141,11 @@ class FutureManager(BaseManager[FutureRecord]):
 
     # ----- Future-specific operations -----
 
+    async def create_pending(self, request_id: str, **fields: Any) -> bool:
+        """Register a deterministically named future without overwriting another submitter's record."""
+        record = FutureRecord(status='pending', **fields)
+        return await self._backend.set_nx(self._make_key(request_id), record.model_dump())
+
     async def store_status(
         self,
         request_id: str,

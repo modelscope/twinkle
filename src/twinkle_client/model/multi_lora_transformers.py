@@ -461,6 +461,7 @@ class MultiLoraTransformersModel:
         hub_model_id: str,
         hub_token: str | None = None,
         *,
+        client_upload_id: str | None = None,
         on_progress: Callable[[UploadProgress], None] | None = None,
     ) -> model_types.UploadToHubResponse | None:
         """Upload model checkpoint to hub.
@@ -472,6 +473,9 @@ class MultiLoraTransformersModel:
             checkpoint_dir: The directory path of the checkpoint to upload.
             hub_model_id: The hub model id.
             hub_token: The hub token (optional).
+            client_upload_id: Save a unique ID before submitting to reconnect
+                after a client disconnect. Repeat the same call with that ID
+                and the same checkpoint and destination while the task is retained.
             on_progress: Receive the latest upload snapshots on the calling thread.
                 By default the SDK logs those snapshots.
 
@@ -491,6 +495,7 @@ class MultiLoraTransformersModel:
             on_progress=on_progress if on_progress is not None else log_progress,
             checkpoint_dir=checkpoint_dir,
             hub_model_id=hub_model_id,
-            hub_token=hub_token)
+            hub_token=hub_token,
+            client_upload_id=client_upload_id)
         logger.info('[upload_to_hub] upload completed successfully.')
         return model_types.UploadToHubResponse.model_validate(result) if result is not None else None
