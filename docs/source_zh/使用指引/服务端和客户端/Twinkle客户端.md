@@ -245,43 +245,38 @@ python cookbook/client/async_rl/client_orchestrated_grpo.py
 
 ### 3. 运行 Blackjack 流式多轮示例（可选）
 
-`streaming_multi_turn_grpo.py` 复用已有多轮示例的 Blackjack（21 点）任务：模型调用 `play(hit/stand)`，环境返回手牌和最终奖励，再按完整组计算 GRPO 优势、训练并发布新策略。OpenEnv/OpenSpiel 在客户端进程中运行，无需启动环境服务，也不执行模型生成的代码。
+`streaming_multi_turn_grpo.py` 用 Blackjack（21 点）演示客户端多轮异步 GRPO：模型调用 `play(hit/stand)`，环境返回手牌和终局奖励，完整样本组进入训练。本地环境直接调用 `blackjack_game.py` 中的 OpenSpiel 游戏，无需环境服务或 OpenEnv 适配包。
 
-`ClientMultiTurnRollout` 控制每条任务的模型/工具对话，`StreamingDriver` 调度并发任务并收集完整训练组；本例没有额外的 Agent harness。进程内 OpenEnv、远程 OpenEnvClient 和 AgentENV 都适配统一的 `Env` 接口，进程/OS 隔离能力取决于具体环境后端及其部署。
+客户端运行 `StreamingDriver` 和 `MultiTurnRollout`：Driver 调度 episode 并交付完整组，Rollout 管理多轮交互和环境会话，`HTTPSampler` 将每轮生成请求发给服务端。训练调用同样通过客户端模型接口发往服务端。
 
-安装客户端环境依赖后，沿用上面的 Twinkle 服务和客户端配置：
+沿用上面的 Twinkle 服务和客户端配置，安装本地游戏依赖后运行：
 
 ```bash
-pip install 'openenv==0.11.0' 'open_spiel==2.0.2'
-pip install 'openenv-openspiel-env @ git+https://github.com/huggingface/OpenEnv.git@9c6376390489f28e0e545cf74a277064e7edd52f#subdirectory=envs/openspiel_env'
+pip install 'open_spiel==2.0.2'
 python cookbook/client/async_rl/streaming_multi_turn_grpo.py
 ```
 
-运行前需要配置与当前分支匹配的 Swift 模板依赖（提供 `swift.dev.template_contract`），并使用与服务端一致的 tokenizer/template。可先检查模板是否能导入；该命令不创建模型或 sandbox：
+客户端需要与当前分支匹配的 Swift 模板依赖（提供 `swift.dev.template_contract`），并使用与服务端一致的 tokenizer/template。可先检查：
 
 ```bash
 python -c "from twinkle.template import Qwen3_5Template"
 ```
 
-如果提示缺少模板契约，应先补齐匹配的 Swift 环境；`[client,e2b]` 选项负责客户端和 E2B 连接依赖，不代替 Swift 环境配置。
+同组成员使用相同的环境 seed，各自持有独立动作历史；模型采样不固定 seed。环境实现会话式 `Env` 的 `_open/_step`，由 Rollout 自动调用 `reset/step/close`。牌局结束状态在会话关闭前读取，累计奖励保存在轨迹的 `rewards.env` 中；未完成或截断的成员使整组在交付前被丢弃。
 
-同组使用相同的环境 seed、独立环境和不同的模型采样 seed。未结束的牌局和整组同分的数据会跳过训练；脚本不保证短运行一定产生更新或 reward 上升。训练循环在 `_train_loop` 中直接展示，每个完整组执行一步；顶部常量控制组大小、缓冲组数和更新预算。
+先读 `train()` 的组装，再读 `_train_loop()`：`for rows, facts in driver` 取完整组 → 将环境奖励接入命名 scores → `GRPOAdvantage` 生成 `advantages/old_logps` → `forward_backward` → `clip_grad_and_step` → `ClientCheckpointManager.sync_weights()`。整组同分时跳过参数更新；短运行不保证产生更新或 reward 上升。
 
-先读 `train()` 的连接和初始化，再读 `_train_loop()` 的完整组 → 优势计算 → `forward_backward` → `clip_grad_and_step` → 请求发布 → `commit`。`commit(0)` 表示本次没有更新，不消耗训练步数；发布请求在 driver 恢复推进后执行。更换任务时再看 `_build_driver()` 的环境和奖励适配。资源由 SDK 的 `RolloutResources` 作用域管理，示例不需要编写异常收尾逻辑。
+本例每消费一个 batch 就发布一次快照，包括零 advantage 的 batch，以推进 Driver 的采样额度。因此发布版本数与实际更新次数分别统计：`MAX_STEPS` 限制已确认的 optimizer 更新，Driver 的 `max_steps` 则是交付批次数，本例不设置后者。每次运行自动生成检查点名称前缀，避免覆盖其他运行的快照。
 
-`twinkle_client.rollout.training_groups(samples, num_generations=..., drop_truncated=True)` 提供已评分 streaming 批次的通用分组和校验：保留组内样本顺序，跳过不完整或策略混合的组，检查成员、response token/mask/logprob 对齐和有限奖励。返回任何组前会检查整个批次的 rollout 失败，避免失败被跳过规则或更新预算掩盖。`drop_truncated` 默认 `False`；Blackjack 显式设为 `True`，只训练终局牌局。SDK 不负责计算优势、判断零优势或执行更新。批量多轮示例使用 Trajectory 字典和同步批次，继续保留其训练入口，并复用 `RolloutResources` 管理资源。
+`ClientCheckpointManager` 保存服务端 LoRA 并切换 `HTTPSampler` 默认 URI。已发出的请求继续使用原 URI，后续请求读取新 URI；同一条多轮轨迹可以跨发布版本。Rollout 不设置固定 `adapter_path`。
 
-每次调用 `train()` 都自动生成独立的检查点名称前缀，避免重复运行覆盖 `policy-0` 等快照，无需用户配置。此前缀只用于文件命名，不提供租户隔离，也不控制随机种子或断点恢复。
+退出时先关闭 Driver，脚本中的 `_RolloutTasks` 等待已提交的 step/stop Future 返回，然后 `RolloutResources` 关闭 Rollout、环境组件和客户端。这个辅助类只管理待结束的调用，多轮交互仍由通用 Rollout 执行。模型训练和保存操作继续使用 SDK 的中断保护；`model.completed_step_calls` 记录成功收到回复的更新次数。等待本地调用结束不等同于远端强制取消。
 
-`rollout.streaming(driver)` 负责关闭批量和 streaming 任务入口、广播停止、尝试排干全部调用，再等待 driver 退出。应使用专用 rollout 实例；退出后该实例不再接受新任务。底层 rollout 默认借用环境，不自动关闭调用方资源；本例在 `RolloutResources(init_twinkle_client, base_url=..., api_key=...)` 中显式传入连接参数；值读取自 `.env` 的 `TWINKLE_SERVER_URL` 和 `TWINKLE_SERVER_TOKEN`。作用域把客户端、rollout 和环境交给 SDK 管理。`own_rollout()` 登记专用 rollout，`own_environment()` 在 `reset()` 前登记环境，初始化失败也可收尾；收集完成后用 `close_environment()` 提前释放该轨迹的环境。退出作用域时 SDK 等待调用、排干 rollout、关闭剩余环境和客户端，处理重复中断并保留原异常。执行状态未确认时保留资源句柄并报告错误，不能按“已经关闭”处理。
-
-`RolloutResources` 会自动为该客户端的模型操作、sampler 创建和配置绑定中断保护，示例直接调用 `model.forward_backward(...)`、`model.clip_grad_and_step()`、`model.save(...)`。主线程在等待期间中断时，SDK 等待已发出的调用返回，完成训练句柄及成功结果登记，再传播中断；受管操作失败或中断后不再接受后续受管操作。它不会自动重发训练操作。`model.completed_step_calls` 记录该 model 对象收到成功回复的 step/clip_grad_and_step 调用次数（不是设备参数变化的证明），`model.last_checkpoint` 保留最近成功的 save 回复，便于中断后查看。采样仍由 rollout 并发执行，不经过训练操作的串行等待器。不在该作用域内的客户端维持原有调用行为。超时、断线或任务失败状态不能证明远端物理执行结束；无法确认时保留相关资源并报告，不自动复用，也不提供远端强制取消。
-
-脚本固定 `temperature=1`、`top_p=1`、`top_k=-1`、`repetition_penalty=1`，使共享配置的 processed logprobs 与训练侧概率口径一致。共享 `server_config.yaml` 仍部署 DataPlane，服务端仍需 `[async-rl]` 依赖。
+采样固定 `temperature=1`、`top_p=1`、`top_k=-1`、`repetition_penalty=1`，保证采样 logprobs 与训练侧概率口径一致。共享 `server_config.yaml` 仍部署 DataPlane，服务端仍需 `[async-rl]` 依赖。
 
 ### 4. 在 E2B 官方 sandbox 中运行同一任务（可选）
 
-`e2b_multi_turn_grpo.py` 用 `AgentEnv` 连接 E2B 官方服务，每条轨迹独占一个 sandbox；游戏历史、发牌和奖励都在 sandbox 中计算。模型仍只看到 `play(hit/stand)`，由相同的 `ClientMultiTurnRollout` 和 `StreamingDriver` 编排。训练循环直接复用上一例的 `train(env_factory=...)`，没有另建训练框架或评分器，也没有额外的 Agent harness。
+`e2b_multi_turn_grpo.py` 用 `AgentEnv` 连接 E2B 官方服务，每条正在执行的 episode 独占一个 sandbox 会话；游戏历史、发牌和奖励都在 sandbox 中计算。模型仍只看到 `play(hit/stand)`，由通用 `MultiTurnRollout`、`HTTPSampler` 和 `StreamingDriver` 编排。训练循环直接复用上一例的 `train(env_factory=...)`，没有另建训练框架或评分器，也没有额外的 Agent harness。
 
 先按 [AgentEnv 官方 E2B 连通检查](../../组件/Agentic/Envs.md) 验证创建、执行和释放。这一步不需要训练服务，可以先排除密钥、模板和网络问题。
 
@@ -303,35 +298,35 @@ pip install -e '.[client,e2b]'
 python cookbook/client/async_rl/e2b_multi_turn_grpo.py
 ```
 
-默认使用 E2B 的 `base` 模板，在可写的 `/home/user/blackjack` 中安装 `open_spiel==2.0.2` 并上传同目录的 `blackjack_game.py`。客户端无需安装 OpenEnv/OpenSpiel。可通过 `E2B_TEMPLATE` 指定已预装该版本 OpenSpiel 的自定义模板，减少每条轨迹的初始化耗时。默认缓冲最多 12 条轨迹，应与账户的 sandbox 并发额度匹配。
+默认使用 E2B 的 `base` 模板，在可写的 `/home/user/blackjack` 中安装 `open_spiel==2.0.2` 并上传同目录的 `blackjack_game.py`。客户端无需安装 OpenEnv/OpenSpiel。可通过 `E2B_TEMPLATE` 指定已预装该版本 OpenSpiel 的自定义模板，减少每条轨迹的初始化耗时。环境默认最多同时持有 `(MAX_STALENESS + 1) × NUM_GENERATIONS = 8` 个会话，应与账户的 sandbox 并发额度匹配。
 
 读代码时，按下面三个文件的职责看即可：
 
-直接运行入口即可，示例会组装 rollout 和 driver，首次使用无需手动创建这些组件；环境提供 `system_prompt` 和标准 `Env.tools()` 工具定义，更换任务时再查看 `_build_driver()` 中的 `submit/collect` 两个接缝。
+直接运行入口即可，示例会组装 rollout 和 driver。任务提示词和工具来自 `BlackjackTask`；更换任务时修改环境会话 hooks、任务输入和奖励接入。
 
 | 文件 | 负责什么 |
 | --- | --- |
-| `streaming_multi_turn_grpo.py` | `train()` 连接服务并建立 rollout/driver；`_train_loop()` 展示优势、反向传播、optimizer step 和策略发布。从环境读取任务提示词和 `tools()`，不定义 Blackjack 规则。 |
-| `e2b_multi_turn_grpo.py` | `E2BBlackjackEnv` 把标准 `reset/step/close` 接口接到 E2B，最后用 `train(env_factory=E2BBlackjackEnv)` 切换环境。 |
+| `streaming_multi_turn_grpo.py` | `train()` 连接服务并建立 rollout/driver；`_train_loop()` 展示优势、反向传播、optimizer step 和策略发布。组装任务提示词、环境会话和 `tools()`，游戏规则由 OpenSpiel 提供。 |
+| `e2b_multi_turn_grpo.py` | `E2BBlackjackEnv` 实现会话式 `_open/_step` hooks，由 `AgentEnv` 管理 sandbox，最后用 `train(env_factory=E2BBlackjackEnv)` 切换环境。 |
 | `blackjack_game.py` | 两个环境共用的 Blackjack 任务定义（`BlackjackTask.system_prompt` / `tools()`），同时也是上传到 sandbox 的游戏程序，调用 OpenSpiel；在 sandbox 的 `game.json` 保存 seed/动作历史，返回手牌、奖励和终态。它不参与训练。 |
 
-运行时：driver 提交独立牌局 → rollout 请求远端 sampler → 模型调用 `play` → AgentEnv 在 E2B 中执行游戏 → 完整组计算优势并训练 → 发布的新 URI 用于后续牌局。同组 seed 相同、环境独立；每条轨迹固定使用同一个策略 URI。
+运行时：driver 提交独立牌局 → rollout 请求远端 sampler → 模型调用 `play` → AgentEnv 在 E2B 中执行游戏 → 完整组计算优势并训练 → 发布的新 URI 用于后续生成请求。同组 seed 相同、环境会话独立；同一条轨迹的后续轮次可以使用新版本。
 
-`env_factory` 用于切换同一 Blackjack 任务的本地或 E2B 执行后端；两个后端共用提示词、`play` 工具和奖励规则。修改任务时，先定义环境的提示词、工具与奖励，再调整 `_build_driver()` 的 `submit/collect`，训练主循环可以保留。此示例明确要求一个 `play` 工具；空工具、额外工具或不同工具名会报错，避免静默忽略工具。SDK 的 `ClientMultiTurnRollout` / `ToolManager` 仍支持多工具任务，不受此示例限制。
+`env_factory(max_sessions=...)` 每次训练创建一个环境组件，组件为每条 episode 建立独立会话。两个后端共用提示词、`play` 工具、终局检查和奖励规则。更换任务时，实现新的环境 hooks，并调整 `_build_driver()` 的任务输入和 `_train_loop()` 的 scores；通用 `MultiTurnRollout` 支持多个工具。
 
-上手只需先改服务连接配置。需要调节规模时，再改共享训练脚本顶部的 `NUM_GENERATIONS`、`BUFFER_GROUPS`、`MAX_GROUPS`、`MAX_STEPS`：分别控制每组轨迹数、缓冲组数、有限尝试组数、最多更新次数。示例每次拉取一个完整组；整组同分会跳过，因此 `MAX_STEPS` 是上限。缩小 `BUFFER_GROUPS` 可以减少同时持有的 sandbox，代价是较少的采样/训练重叠。
+规模由 `NUM_GENERATIONS`、`MAX_STALENESS`、`MAX_GROUPS`、`MAX_STEPS` 控制：每组 episode 数、允许落后的发布版本数、有限任务组数和最多实际更新次数。示例每批交付一个完整组、每批发布一次。减小 `MAX_STALENESS` 会缩小初始采样窗口及环境会话上限，同时减少可用于重叠的后续工作。
 
-轨迹收集完成后立即关闭其 sandbox；退出时先停止并排干 rollout，再关闭尚未收集的环境。取消采用协作停止，已发出的命令需等待返回。未确认执行结束时保留句柄并报错，sandbox 的 600 秒超时作为兜底，不宣称即时远端中止。该例演示真实 sandbox 工具调用，不执行模型生成的代码。
+episode 完成后关闭会话；`AgentEnv` 清理工作目录并保留健康 sandbox 供后续会话复用。退出时先停止 Driver 并等待已提交的调用，再关闭 Rollout、环境会话和空闲 sandbox。示例执行固定游戏工具，不执行模型生成的代码，也不提供即时远端强制取消。
 
 游戏进程失败或返回损坏结果时会中止训练，不会作为零奖励或普通未完成牌局跳过。模型给出无效工具参数则返回提示，允许其纠正。
 
 | 现象 | 先检查什么 |
 | --- | --- |
 | E2B 鉴权或模板错误 | `.env` 中的 `E2B_API_KEY`、`E2B_TEMPLATE` 和端点覆盖；先单独重跑连通检查。官方默认模板为 `base`。 |
-| sandbox 数量/额度不足 | 调小 `BUFFER_GROUPS`；默认预算为 `3 × 4 = 12` 条轨迹，并检查账户额度。 |
-| 初始化慢 | 默认每条轨迹创建 sandbox 并检查/安装 OpenSpiel；可使用预装依赖且支持该工作目录的 `E2B_TEMPLATE`。 |
+| sandbox 数量/额度不足 | 调小 `MAX_STALENESS` 或 `NUM_GENERATIONS`；默认会话上限为 `2 × 4 = 8`，并检查账户额度。 |
+| 初始化慢 | 新会话创建或复用 sandbox，并检查/安装 OpenSpiel；可使用预装依赖且支持该工作目录的 `E2B_TEMPLATE`。 |
 | 连通检查成功，训练连接失败 | 检查 `TWINKLE_SERVER_URL/TOKEN`、服务端模型和本地模板目录；E2B 连通不代表训练服务就绪。 |
-| 运行了牌局但没有 optimizer 更新 | 检查日志中的 `zero advantage` / `truncated`；不要把有限尝试内的合法跳过当作连接失败。 |
+| 运行了牌局但没有 optimizer 更新 | 检查日志中的 `zero advantage` 和 Driver 的 `dropped_sample/dropped_group` 统计；不要把有限尝试内的合法跳过当作连接失败。 |
 
 ### 修改为自己的任务
 
@@ -339,18 +334,8 @@ python cookbook/client/async_rl/e2b_multi_turn_grpo.py
 - 流式工具任务：从 Blackjack 示例的环境、工具和环境 reward 接缝替换任务，保留完整组、优势、训练和发布流程。
 - 先使用示例默认训练参数；需要调整时，再修改脚本顶部的配置。训练日志会输出奖励和指标，并保存 LoRA 检查点。
 
-## 可训练多轮 Rollout（ClientMultiTurnRollout）
+## 客户端多轮 Rollout
 
-需要自行编写多轮训练循环时，可使用 `twinkle_client.rollout.ClientMultiTurnRollout`。它支持纯文本工具调用，返回可直接用于训练的完整轨迹。
+当前 CS 模式使用 `twinkle_agentic.rollout.MultiTurnRollout` 搭配 `twinkle_client.rollout.HTTPSampler`，权重发布使用 `ClientCheckpointManager`。旧的 `ClientMultiTurnRollout` 和 `training_groups` 已删除。
 
-在已创建 rollout、轨迹、工具和策略检查点的异步训练循环中：
-
-```python
-rolled = await rollout.acall(
-    trajectories,
-    tool_manager=tool_managers,
-    adapter_uri=policy_uri,
-)
-```
-
-同步调用使用 `rollout(...)`，参数和结果相同。每条轨迹使用独立环境对应的 `ToolManager`；rollout 不会关闭你传入的环境。完整同步示例见 [multi_turn_rollout.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/twinkle/multi_turn_rollout.py)。
+需要自定义多轮异步训练时，从上面的 [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) 开始：保留 Driver 和 HTTP 连接，替换任务输入、环境和奖励。`MultiTurnRollout.step()` 推进一轮交互，Driver 在完整组就绪后交付训练。

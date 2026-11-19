@@ -330,7 +330,7 @@ Additional capabilities:
 
 **Concurrency**: `AgentEnv` is not a `@remote_class`; sandbox scheduling belongs to the connected provider. Give each concurrent trajectory its own instance. Do **not** put it in `EnvPool`, which serves embedded OpenEnv instances. `reset()` is a synchronous network call; account for initialization time as control-thread overhead rather than model-generation time.
 
-Capacity depends on the scheduler's in-flight/buffer budget and the provider's concurrency, memory and billing quotas. The E2B streaming example defaults to `BUFFER_GROUPS × NUM_GENERATIONS = 12` sandboxes. Self-hosted AgentENV also requires checking template memory settings; see [Agentic RL Deployment and Training](../../Usage%20Guide/Agentic-RL-Deployment-and-Training.md).
+Capacity depends on the scheduler's in-flight/buffer budget and the provider's concurrency, memory and billing quotas. The E2B streaming example defaults to `(MAX_STALENESS + 1) × NUM_GENERATIONS = 8` environment sessions, with healthy sandboxes reused across sessions. Self-hosted AgentENV also requires checking template memory settings; see [Agentic RL Deployment and Training](../../Usage%20Guide/Agentic-RL-Deployment-and-Training.md).
 
 ## EnvPool: Distributed Environment Pool
 

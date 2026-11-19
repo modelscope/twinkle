@@ -47,21 +47,19 @@ def test_streaming_blackjack_trains_and_samples_published_policy(monkeypatch, re
         env_spec.loader.exec_module(env_recipe)
 
         class TracedE2BEnv(env_recipe.E2BBlackjackEnv):
-            def __init__(self, seed):
-                super().__init__(seed)
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
                 e2b_envs.append(self)
 
-            def reset(self, trajectory=None):
-                result = super().reset(trajectory)
-                e2b_sandboxes.append(self.sandbox)
-                return result
+            def _create(self):
+                state = super()._create()
+                e2b_sandboxes.append(state.sandbox)
+                return state
 
         monkeypatch.setattr(recipe, 'BlackjackEnv', TracedE2BEnv)
-        recipe.BUFFER_GROUPS = 2
         recipe.MAX_GROUPS = 8  # Bound cloud usage; passing still requires updates, publication and new-policy sampling.
-    # Leave an update beyond the first bufferful so stopping cannot skip publication.
-    recipe.MAX_STEPS = recipe.BUFFER_GROUPS + 1
-    saved, requests, training = [], [], []
+    recipe.MAX_STEPS = recipe.MAX_STALENESS + 2
+    saved, saved_steps, requests, training = [], [], [], []
     steps = 0
     lock = threading.Lock()
     original_save = MultiLoraTransformersModel.save
@@ -72,6 +70,7 @@ def test_streaming_blackjack_trains_and_samples_published_policy(monkeypatch, re
     def save(model, *args, **kwargs):
         result = original_save(model, *args, **kwargs)
         saved.append(result)
+        saved_steps.append(steps)
         return result
 
     def sample(sampler, *args, **kwargs):
@@ -106,24 +105,27 @@ def test_streaming_blackjack_trains_and_samples_published_policy(monkeypatch, re
     recipe.train()
 
     if e2b_envs:
-        assert all(env.sandbox_id is None for env in e2b_envs), 'A trajectory retained its E2B sandbox'
+        assert all(not env._sessions and not env._idle for env in e2b_envs), 'An Env retained a session or idle sandbox'
         assert all(not sandbox.is_running() for sandbox in e2b_sandboxes), 'An E2B sandbox is still running'
         record_property('released_e2b_sandboxes', len(e2b_sandboxes))
 
     assert steps > 0, 'No nonzero-advantage group completed an optimizer update'
     assert steps <= recipe.MAX_STEPS
-    assert len(saved) >= 2, 'No trained policy was published'
+    trained = [checkpoint for checkpoint, count in zip(saved, saved_steps, strict=True) if count > 0]
+    assert trained, 'No trained policy was published'
     initial_uri = saved[0].twinkle_path
     published = {checkpoint.twinkle_path for checkpoint in saved[1:]}
     assert initial_uri not in published
     assert len(published) == len(saved) - 1
-    new_requests = [request for request in requests if request[0] in published]
-    assert new_requests, 'No successful sampling call used a published policy'
+    trained_uris = {checkpoint.twinkle_path for checkpoint in trained}
+    new_requests = [request for request in requests if request[0] in trained_uris]
+    assert new_requests, 'No successful sampling call used a trained policy'
     assert any(start < end_train and start_train < end
                for _, start, end in requests for start_train, end_train in training), 'No HTTP sampling/training overlap'
 
-    assert all(checkpoint.checkpoint_dir for checkpoint in saved[:2]), 'Server did not return checkpoint directories'
-    paths = [Path(checkpoint.checkpoint_dir) / 'adapter_model.safetensors' for checkpoint in saved[:2]]
+    compared = [saved[0], trained[0]]  # Skipped batches may publish unchanged weights before the first update.
+    assert all(checkpoint.checkpoint_dir for checkpoint in compared), 'Server did not return checkpoint directories'
+    paths = [Path(checkpoint.checkpoint_dir) / 'adapter_model.safetensors' for checkpoint in compared]
     assert all(path.is_file() for path in paths), 'Run on the server host with access to its checkpoint files'
     before, after = (load_file(str(path)) for path in paths)
     assert before and before.keys() == after.keys()

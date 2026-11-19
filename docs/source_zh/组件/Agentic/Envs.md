@@ -330,7 +330,7 @@ env.register_tool(submit_schema, _submit)      # 两者均返回 self，可链�
 
 **并发**：`AgentEnv` 不使用 `@remote_class`；沙箱的调度由所连接的 provider 服务管理。每条并发轨迹使用独立实例，**不要**放入只服务嵌入式 OpenEnv 的 `EnvPool`。`reset()` 是同步网络调用，初始化耗时应计入控制线程开销；不要把它计作模型生成时间。
 
-容量取决于调度器的在途/缓冲预算及 provider 的并发、内存和费用额度。E2B 流式示例默认预算为 `BUFFER_GROUPS × NUM_GENERATIONS = 12` 个 sandbox；自建 AgentENV 则还需核对模板的内存配置。自建部署步骤见[Agentic RL 部署与训练](../../使用指引/Agentic%20RL部署与训练.md)。
+容量取决于调度器的在途/缓冲预算及 provider 的并发、内存和费用额度。E2B 流式示例默认预算为 `(MAX_STALENESS + 1) × NUM_GENERATIONS = 8` 个环境会话，健康 sandbox 可跨会话复用；自建 AgentENV 则还需核对模板的内存配置。自建部署步骤见[Agentic RL 部署与训练](../../使用指引/Agentic%20RL部署与训练.md)。
 
 ## EnvPool：分布式环境池
 

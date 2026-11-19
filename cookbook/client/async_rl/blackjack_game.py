@@ -25,6 +25,11 @@ class BlackjackTask:
             },
         }]
 
+    def episode_outcome(self, episode_id):
+        """Read the game's result before MultiTurnRollout closes its Env session."""
+        result = self._session(episode_id).state.last_result
+        return {'game_done': bool(result.done), 'error': result.info.get('error')}
+
 
 def play(seed, actions):
     from open_spiel.python.rl_environment import ChanceEventSampler, Environment
