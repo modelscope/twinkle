@@ -4,10 +4,7 @@ from typing import Dict, Optional, Sequence
 
 import torch
 
-from twinkle import remote_class, remote_function
 
-
-@remote_class(execute='first')
 class RolloutCorrection:
     """The ``rollout_correction/*`` diagnostics from a training-side and a sampler-side logp lane.
 
@@ -18,11 +15,9 @@ class RolloutCorrection:
     token- and sequence-level chi-square divergences. Returns ``{}`` when no pair is comparable.
     """
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def __call__(self,
                  training_logps: Sequence[Optional[Sequence[float]]],
-                 rollout_logps: Sequence[Optional[Sequence[float]]],
-                 **kwargs) -> Dict[str, float]:
+                 rollout_logps: Sequence[Optional[Sequence[float]]]) -> Dict[str, float]:
         train_rows, rollout_rows = [], []
         for train, rollout in zip(training_logps, rollout_logps):
             if train is None or rollout is None:

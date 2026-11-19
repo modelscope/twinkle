@@ -4,6 +4,7 @@ from .device_mesh import DeviceGroup, DeviceMesh, is_last_rank, is_master
 from .framework import Framework as framework_util
 from .framework import Torch as torch_util
 from .import_utils import exists, requires
+from .kl import KLEstimator
 from .loader import Plugin, construct_class, load_module
 from .logger import get_logger
 from .network import find_free_port, find_node_ip, is_valid_ipv6_address

@@ -12,6 +12,7 @@ returns ``(updated_trajs, summary)`` like every trajectory transform. Each CONCR
 carries ``@remote_class`` itself: the worker's class identity is the decorated class, so an
 undecorated base keeps the math constructible and runnable wherever it is called.
 """
+import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -19,7 +20,7 @@ import torch
 from twinkle.data_format import ModelOutput, Trajectory, turn_token_spans, validate_trajectory
 from twinkle.metric import RolloutCorrection
 from twinkle.reward import RewardShape
-from twinkle.signals import KLEstimator, SignalCombine
+from twinkle.utils import KLEstimator
 
 from .teacher_signal import TeacherReweight
 
@@ -88,6 +89,76 @@ def _check_unit(name: str, value: float) -> float:
     if not 0.0 <= value <= 1.0:
         raise ValueError(f'{name} must be in [0, 1]')
     return value
+
+
+def _as_rows(values: Any) -> List[Any]:
+    """A lane as a list of rows (a tensor lane is converted; ``None`` is an empty lane)."""
+    if values is None:
+        return []
+    if hasattr(values, 'tolist'):
+        values = values.tolist()
+    return list(values) if isinstance(values, (list, tuple)) else [values]
+
+
+def _blend(terms: List[Tuple[float, float]], mode: str) -> float:
+    """``sum_k w_k v_k / sum_k w_k``, or ``logsumexp_k(log w_k + v_k)``, over ``(value, weight)`` terms."""
+    if mode == 'probability_mixture':
+        logs = [math.log(max(weight, 1e-12)) + value for value, weight in terms]
+        top = max(logs)
+        return top + math.log(sum(math.exp(value - top) for value in logs))
+    total = sum(weight for _, weight in terms)
+    return sum(weight * value for value, weight in terms) / total if total else 0.0
+
+
+_MODES = ('weighted_sum', 'probability_mixture')
+
+
+def _combine_lanes(signals: Sequence[Any], weights: Optional[Sequence[float]] = None,
+                   mode: str = 'weighted_sum') -> List[Any]:
+    """Blend aligned lanes row by row: a weighted mean, or a probability mixture.
+
+    ``signals`` is a list of lanes with one value per row; a row is a scalar or a token sequence.
+    ``weighted_sum`` is ``sum_k w_k v_k / sum_k w_k`` (the weights are mixture coefficients, so
+    scaling them all leaves the result unchanged); ``probability_mixture`` is
+    ``logsumexp_k(log w_k + v_k)`` (logps lanes mix in probability space). A scalar row blended with
+    token rows is broadcast over the tokens; token rows blend position by position over the lanes
+    that have the position (a position no lane has reads 0.0). ``None`` drops out of its row; a row
+    with no value left is ``None``. ``weights`` defaults to uniform.
+    """
+    if mode not in _MODES:
+        raise ValueError(f'combine mode {mode!r} not in {_MODES}.')
+    lanes = [_as_rows(lane) for lane in signals]
+    if not lanes:
+        raise ValueError('lane combination needs at least one lane.')
+    weights = [1.0 / len(lanes)] * len(lanes) if weights is None else [float(weight) for weight in weights]
+    if len(weights) != len(lanes):
+        raise ValueError(f'{len(weights)} weights for {len(lanes)} lanes.')
+    if any(weight < 0 for weight in weights) or sum(weights) <= 0:
+        raise ValueError('combine weights must be non-negative with a positive sum.')
+    counts = {len(lane) for lane in lanes}
+    if len(counts) != 1:
+        raise ValueError(f'the lanes carry different row counts {sorted(counts)}; they must be aligned.')
+    out: List[Any] = []
+    for index in range(counts.pop()):
+        terms = [(lane[index], weight) for lane, weight in zip(lanes, weights) if lane[index] is not None]
+        if not terms:
+            out.append(None)
+            continue
+        tokens = [value for value, _ in terms if isinstance(value, (list, tuple))]
+        if not tokens:
+            out.append(_blend([(float(value), weight) for value, weight in terms], mode))
+            continue
+        row = []
+        for position in range(max(len(value) for value in tokens)):
+            present = []
+            for value, weight in terms:
+                if not isinstance(value, (list, tuple)):
+                    present.append((float(value), weight))
+                elif position < len(value) and value[position] is not None:
+                    present.append((float(value[position]), weight))
+            row.append(_blend(present, mode) if present else 0.0)
+        out.append(row)
+    return out
 
 
 def _record_advantage_probe(global_step: int, trajs: List[Trajectory], scores: List[Dict[str, Any]],
@@ -331,7 +402,6 @@ class Advantage:
         # Pure math, instantiated locally: the subclass is the remote boundary, these run in it.
         self._kl = KLEstimator()
         self._shape = RewardShape()
-        self._combine = SignalCombine()
         self._teacher = TeacherReweight()
         self._correction = RolloutCorrection()
 
@@ -514,7 +584,7 @@ class Advantage:
             # weight the row loses its signal entirely rather than training on a fabricated blend.
             prm_unscored = [any(value != value for value in row) for row in process]
             process = [[0.0 if value != value else value for value in row] for row in process]
-            advantages = self._combine([process, advantages], weights=[mix, 1.0 - mix])
+            advantages = _combine_lanes([process, advantages], weights=[mix, 1.0 - mix])
             if mix != 0.0:
                 advantages = [[0.0] * len(row) if prm_unscored[index] else row
                               for index, row in enumerate(advantages)]
