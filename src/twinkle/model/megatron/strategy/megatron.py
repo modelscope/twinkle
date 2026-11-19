@@ -309,7 +309,17 @@ class MegatronStrategy:
             return model
 
         self._check_device_mesh()
-        return self._wrap_with_megatron_ddp(model, self.use_distributed_optimizer, self.ddp_config)
+        wrapped = self._wrap_with_megatron_ddp(model, self.use_distributed_optimizer, self.ddp_config)
+        # Synchronous DDP reduces zero-filled gradient buffers for unused vision parameters.
+        # With sharding, overlap or CUDA graphs, the vision hooks may be part of the schedule.
+        from ..bridge.mcore import MCoreBridgeBackend
+
+        if (isinstance(self._backend, MCoreBridgeBackend) and not self.uses_fsdp(self.ddp_config)
+                and not self.ddp_config['overlap_grad_reduce'] and not self.ddp_config['overlap_param_gather']
+                and getattr(self.config, 'cuda_graph_impl', 'none') == 'none'):
+            for chunk in model:
+                self._backend.enable_text_vision_skip(chunk)
+        return wrapped
 
     def unwrap_model(self, model: List[nn.Module]) -> List[nn.Module]:
         from megatron.core.distributed import DistributedDataParallel as MegatronDDP

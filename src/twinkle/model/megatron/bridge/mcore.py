@@ -78,3 +78,26 @@ class MCoreBridgeBackend:
             bridge = config.bridge
             bridge.load_weights(mg_models, model_dir)
         return models
+
+    @staticmethod
+    def enable_text_vision_skip(model: Any) -> None:
+        if getattr(model.config, 'hf_model_type', None) not in ('qwen3_5', 'qwen3_5_moe'):
+            return
+        visual = getattr(model, 'visual', None)
+        if visual is None:
+            return
+        import torch
+
+        get_inputs_embeds = visual.get_inputs_embeds
+
+        def embed(inputs_embeds, **kwargs):
+            if kwargs.get('pixel_values') is not None or kwargs.get('pixel_values_videos') is not None:
+                return get_inputs_embeds(inputs_embeds, **kwargs)
+            token_types = kwargs.get('mm_token_type_ids')
+            if token_types is not None:
+                if token_types.shape != kwargs['input_ids'].shape:
+                    raise ValueError('mm_token_type_ids must match input_ids for vision embedding.')
+                torch._assert_async((token_types == 0).all(), 'Vision placeholders require pixel values.')
+            return inputs_embeds
+
+        visual.get_inputs_embeds = embed
