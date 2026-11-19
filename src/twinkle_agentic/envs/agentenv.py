@@ -417,13 +417,14 @@ class AgentEnv(Env):
             return StepResult(observation=f'Error: {e}', info={'error': str(e)})
 
     def _run_script(self, state: AgentSandbox, source: str, interpreter: str = 'python',
-                    timeout: Optional[float] = None) -> Tuple[int, str]:
+                    timeout: Optional[float] = None, cap_memory: bool = True) -> Tuple[int, str]:
         """Run a whole script in the workspace; returns ``(exit_code, output)``.
 
         A python script is uploaded and run by path rather than passed to
         ``python -c``: a traceback then carries real line numbers, and nothing
         has to survive shell quoting. A sandbox that has gone away comes back as
-        a non-zero exit like any other failure.
+        a non-zero exit like any other failure. ``cap_memory`` names LocalEnv's
+        host-level rlimit; here the sandbox boundary contains the program either way.
         """
         timeout = self._command_timeout if timeout is None else timeout
         if interpreter == 'python':

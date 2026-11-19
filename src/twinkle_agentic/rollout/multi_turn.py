@@ -1162,7 +1162,11 @@ class MultiTurnRollout:
 
         def run() -> None:
             try:
-                ep.exit = self.env.run_script(ep.episode_id, command, interpreter='shell', timeout=self.harness.timeout)
+                # The agent program is a full third-party runtime, not a model-written tool
+                # script: the tool-script address-space cap would strangle it before its first
+                # request (defect108). Its containment is the harness timeout passed here.
+                ep.exit = self.env.run_script(ep.episode_id, command, interpreter='shell',
+                                              timeout=self.harness.timeout, cap_memory=False)
             except BaseException as error:  # noqa # reported by the step that reads the exit
                 ep.exit = (None, f'{type(error).__name__}: {error}')
             finally:
