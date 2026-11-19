@@ -200,12 +200,45 @@ PYTHONPATH="$PWD/src" python -m pytest \
 46.875%、45.3125%；durable 的差值为 +1.5625pp，但 McNemar 双侧 `p=1.0`，不构成
 统计显著的质量提升证据。完整逐 step 曲线由四组 `training-metrics.jsonl` 生成。
 
+### 长程多工具故障恢复对照
+
+在相同单卡环境上使用 Qwen3-4B-Instruct-2507 进一步运行真实 vLLM 多工具 GRPO。每组实验包含
+10 个 optimizer steps，每个 batch 有 2 个 prompt 组、每组 2 条采样；每条完整 episode 执行 6 个
+订单工具阶段并生成最终回复。在 policy 0、3、6 的旧组仍在 rollout、且新 policy 已提交时终止进程，
+三种实现均经历 3 次重启，最终 `history_steps` 都完整为 `[1, ..., 10]`。
+
+实验使用真实模型生成和 `ToolManager` 调用，工具副作用写入持久化审计日志。`cursor-restart` 仅恢复
+数据游标并重新运行未提交工作；`naive-episode-resume` 是反例基线，恢复 episode 但重新绑定最新 policy，
+不属于推荐实现。
+
+| 指标 | durable | cursor-restart | naive-episode-resume |
+|---|---:|---:|---:|
+| 墙钟时间（秒） | 943 | 970 | 910 |
+| 实际 generation 次数 | 449 | 495 | 458 |
+| 实际生成 response tokens | 13018 | 14455 | 13349 |
+| 跨重启重复 generation 次数 | 1 | 326 | 0 |
+| 跨重启重复 response tokens | 14 | 9557 | 0 |
+| 跨重启重复工具调用 | 0 | 76 | 0 |
+| 其中重复非幂等工具调用 | 0 | 32 | 0 |
+| episode 中途切换 policy 的数量 | 0 | 不适用（整组重启） | 26 |
+| 错误重绑定产生的 generation / tokens | 0 / 0 | 不适用 | 65 / 1868 |
+
+durable 相对 cursor 的总生成 token 减少 9.941%，跨重启重复 token 减少 99.854%，并避免 76 次重复
+工具调用。只有一次 14-token generation 在故障边界重做，不能把该结果写成绝对零重复采样。单组墙钟
+差异不足以证明通用提速。
+
+naive 的 26 条混采 episode 最终被 staleness 规则淘汰，交付 optimizer 的混采组为 0；因此本实验证明
+durable 消除了恢复时的错误 policy 切换，但不宣称已经量化混采对模型质量的损害。训练曲线和逐次生成、
+工具、lease、journal 原始记录均已留存。
+
 尚未覆盖：
 
 - 可写 NFS 或对象存储上的 lease、journal 和 adapter 故障矩阵；
-- 多卡 HCCL/FSDP2 和大模型验证；
+- 多卡 HCCL/FSDP2 与多节点验证；
+- vLLM-Ascend 0.23.0 在 CaMem sleep/wake 后激活多 policy LoRA 的稳定性；上述 4B 对照使用无 sleep
+  colocate 路径；
 - 无法 checkpoint 的远端 agent harness；
 - 所有外部工具协议都具备幂等结果查询。
 
 因此该机制的主要结论是进程重启时保持 GRPO 组语义、事务一致性、固定预算下的有效训练量，
-并减少重复采样，不宣称所有故障率下无条件提升模型质量或缩短墙钟时间。
+并减少重复工具副作用和重复采样，不宣称所有故障率下无条件提升模型质量或缩短墙钟时间。
