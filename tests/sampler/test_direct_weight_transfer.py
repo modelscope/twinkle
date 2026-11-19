@@ -84,7 +84,7 @@ def receive(rank, rendezvous, endpoints, directory, independent=False, device_ty
     worker = Receiver()
     worker.rank = worker.local_rank = rank
     worker.device = torch.device(device_type, rank)
-    worker.model_runner = NS(parallel_config=NS(tensor_parallel_size=2))
+    worker.model_runner = NS(model=torch.nn.Module(), parallel_config=NS(tensor_parallel_size=2))
     device_ipc = Platform.get_platform().supports_device_ipc()
     pointers = []
     try:

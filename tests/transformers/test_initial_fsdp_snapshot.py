@@ -50,6 +50,7 @@ def _save_initial_snapshot(rank, directory, ep_size, export_first=False):
         _ep_expert_state_dict_gather_dim,
         _resolve_full_state_source_key,
     )
+    from twinkle.utils.framework import Torch
 
     world_size = 4 if ep_size > 1 else 2
     os.environ.update(RANK=str(rank), LOCAL_RANK='0', WORLD_SIZE=str(world_size))
@@ -59,8 +60,10 @@ def _save_initial_snapshot(rank, directory, ep_size, export_first=False):
     try:
         mesh = DeviceMesh.from_sizes(world_size=world_size, fsdp_size=world_size, device_type='cpu',
                                      ep_size=ep_size, ep_fsdp_size=world_size // ep_size)
+        # Keep device helpers on CPU even when the host has an accelerator.
         with patch.object(Platform, 'get_local_device', return_value='cpu'), \
-                patch.object(Platform, 'device_backend', return_value='gloo'):
+                patch.object(Platform, 'device_backend', return_value='gloo'), \
+                patch.object(Torch, '_device_module', return_value=None):
             initialize(mode='local', global_device_mesh=mesh,
                        groups=[DeviceGroup(name='default', ranks=list(range(world_size)), device_type='cpu')])
             # Ray actors each expose one device, so every actor has LOCAL_RANK=0.
