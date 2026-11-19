@@ -78,6 +78,16 @@ class SGLangDeltaSamplerMixin:
                                'before reseeding')
         changed = bool(flushes)
 
+        # Env-gated transport fingerprint at the trainer->sampler RPC boundary: pair each received
+        # flush's weight payload against the collect engine's published bytes by (name, occurrence).
+        import os
+        from twinkle.checkpoint_engine.weight_keys import record_delta_flush_fingerprint
+        seq = getattr(self, '_delta_fp_recv_seq', 0)
+        for named, _is_last in flushes:
+            record_delta_flush_fingerprint('recv', seq, named, os.getpid())
+            seq += 1
+        self._delta_fp_recv_seq = seq
+
         async def receive():
             await self.engine.update_weights_delta(flushes)
             if changed:

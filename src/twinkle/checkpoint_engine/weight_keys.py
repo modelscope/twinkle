@@ -97,3 +97,16 @@ def record_weight_fingerprint(via: str, side: str, seq: int, name: str, tensor, 
             'dtype': str(tensor.dtype),
             'bits': bits_fingerprint(tensor),
         }) + '\n')
+
+
+def record_delta_flush_fingerprint(side: str, seq: int, named, rank) -> None:
+    """Fingerprint one delta flush's weight payload for transport reconciliation (env-gated).
+
+    The collect transport (SGLang) hands the rollout a ``(named_tensors, is_last)`` stream rather
+    than broadcasting per-param tensors, so the reconciler pairs send/recv by (name, flush
+    occurrence): the k-th ``__values__`` on each side is the k-th flush's weight bytes. Only the
+    weight payload is fingerprinted -- ``__delta_spec__`` is the manifest, not the weights.
+    """
+    for name, tensor in named:
+        if name in ('__values__', '__positions__'):
+            record_weight_fingerprint('delta', side, seq, name, tensor, tag=f'rank{rank}')
