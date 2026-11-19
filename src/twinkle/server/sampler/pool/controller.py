@@ -157,10 +157,11 @@ class SamplerController:
         if endpoint == "twinkle/set_template":
             return (endpoint,)
         if endpoint == "twinkle/add_adapter_to_sampler":
-            # Adapter names are scoped by the caller's token in the handler.
+            # Match the session scope used by resolve_twinkle_adapter_name.
             headers = {key.lower(): value for key, value in action["headers"]}
             owner = headers.get(b"twinkle-authorization") or headers.get(b"authorization")
-            return endpoint, owner, json.loads(action["body"])["adapter_name"]
+            session = headers.get(b"x-twinkle-session-id") or headers.get(b"x-request-id")
+            return endpoint, owner, session, json.loads(action["body"])["adapter_name"]
         return None
 
     def _remember(self, action):
