@@ -527,6 +527,11 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         send_buf, recv_buf = self.send_buf, self.recv_buf
         total_bytes, total_params = 0, 0
+        # Receive-side transport fingerprint (env-gated, no-op unless TWINKLE_WEIGHT_SYNC_FINGERPRINT):
+        # mirrors the publisher's mixin._fingerprint_published so offline reconciliation can pair
+        # send/recv by (name, occurrence). side='recv' is the field the reconciler reads.
+        from twinkle.checkpoint_engine.weight_keys import record_weight_fingerprint
+        fp_seq = 0
 
         # Receive first bucket
         start_time = time.time()
@@ -563,6 +568,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 dtype, shape = meta['dtype'], meta['shape']
                 size = dtype.itemsize * shape.numel()
                 tensor = send_buf[meta['offset']:meta['offset'] + size].view(dtype=dtype).view(shape)
+                record_weight_fingerprint('engine', 'recv', fp_seq, name, tensor, tag=f'rank{self.rank}')
+                fp_seq += 1
                 yield name, tensor
 
             # 3. Wait for next bucket
@@ -579,6 +586,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
             dtype, shape = meta['dtype'], meta['shape']
             size = dtype.itemsize * shape.numel()
             tensor = send_buf[meta['offset']:meta['offset'] + size].view(dtype=dtype).view(shape)
+            record_weight_fingerprint('engine', 'recv', fp_seq, name, tensor, tag=f'rank{self.rank}')
+            fp_seq += 1
             yield name, tensor
 
         elapsed = time.time() - start_time
