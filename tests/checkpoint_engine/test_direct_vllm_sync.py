@@ -33,7 +33,6 @@ def manager(devices=None, targets=None, failure=False):
     state._model_keys = ['weight']
     state.base_sync_done = False
     state._peft_config = None
-    state.colocate_trainer_ranks = None
     state.model = NS(direct_weight_sync_device=lambda: devices,
                      send_weights_to_vllm=lambda *args, **kwargs: submit('send', *args, **kwargs))
     state.sampler = NS(direct_weight_sync_metadata=lambda: targets,
@@ -98,7 +97,7 @@ def test_explicit_subset_is_paired_by_uuid():
     assert submitted['send'][1][0] == [{'device_uuid': 'gpu3', 'endpoint': 'c'}]
 
 
-def test_each_tp_worker_has_a_local_sender_and_explicit_leaders_still_match():
+def test_each_tp_worker_has_a_local_sender():
     targets = [[{'device_uuid': f'gpu{rank}', 'endpoint': str(rank)} for rank in (0, 1)],
                [{'device_uuid': f'gpu{rank}', 'endpoint': str(rank)} for rank in (2, 3)]]
     state, events = manager(targets=targets)
@@ -153,3 +152,57 @@ def test_non_sender_drains_the_entire_export():
     state = NS(direct_weight_sync_device=lambda: 'idle', _get_weight_generator=weights)
     CheckpointEngineMixin.send_weights_to_vllm(state, [{'device_uuid': 'gpu0', 'endpoint': 'a'}])
     assert visited == ['first', 'second', 'third']
+
+
+def test_sorted_npu_tp_masks_pair_every_worker_by_physical_uuid():
+    # Trainer rank order can differ from the sorted device masks of its TP replicas.
+    devices = ['npu6', 'npu13', 'npu8', 'npu9', 'npu10', 'npu11', 'npu7', 'npu12']
+    targets = [[{'device_uuid': f'npu{rank}', 'endpoint': str(rank)} for rank in group]
+               for group in ((6, 8, 9, 13), (7, 10, 11, 12))]
+    state, events = manager(devices=devices, targets=targets)
+    assert state._sync_weights_direct_vllm(True)
+    sent = next(row for row in events if row[0] == 'send')[1][0]
+    assert {target['device_uuid'] for target in sent} == set(devices)
+    assert len(sent) == 8
+
+
+@pytest.mark.parametrize('direct', [False, True])
+def test_colocate_releases_trainer_cache_before_waking_sampler(direct):
+    """A sampler process cannot allocate from blocks still cached by the trainer."""
+    state, _ = manager()
+    events = []
+    memory = {'free': 1, 'cached': 7}
+    state.sleep_level = 1
+    state.offload_kwargs = {'offload_model': True, 'offload_optimizer': True}
+
+    def empty_cache():
+        events.append('release_submitted')
+
+        def collect():
+            memory['free'] += memory.pop('cached', 0)
+            events.append('release_completed')
+
+        return collect  # The manager must wait for every rank's lazy call.
+
+    def wake_up(*, tags):
+        if tags == ['weights']:
+            if memory['free'] < 4:
+                raise RuntimeError('sampler OOM on wake_up')
+            memory['free'] -= 4
+        events.append(tuple(tags))
+
+    state.model.empty_cache = empty_cache
+    state.model.offload_to_cpu = lambda **kwargs: events.append('offload')
+    state.sampler.wake_up = wake_up
+
+    def sync(merge):
+        events.append('direct' if direct else 'fallback')
+        return direct
+
+    state._sync_weights_direct_vllm = sync
+    state._sync_channel = lambda merge: events.append('channel')
+    state._sync_colocate(True)
+    assert events == [
+        'release_submitted', 'release_completed', ('weights',),
+        'direct' if direct else 'fallback', *([] if direct else ['channel']),
+        'offload', ('kv_cache',)]

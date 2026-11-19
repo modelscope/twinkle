@@ -312,6 +312,9 @@ class CheckpointEngineManager:
 
     def _sync_colocate(self, merge_and_sync):
         """Weights in, trainer out, KV cache in: the sampler is ready to generate when this returns."""
+        # Backward's freed blocks are still reserved by the trainer's allocator. The
+        # sampler is another process: return those blocks before it restores its weights.
+        _wait(self.model.empty_cache())
         self._wake_sampler(['weights'])
         if not self._sync_weights_direct_vllm(merge_and_sync):
             self._sync_channel(merge_and_sync)
@@ -393,9 +396,9 @@ class CheckpointEngineManager:
     def _sync_weights_direct_vllm(self, merge_and_sync):
         """Colocated trainer bucket -> vLLM TP workers, for both full and LoRA-only syncs.
 
-        Non-CUDA platforms and other sampler backends retain the checkpoint-engine
+        CUDA and NPU share this path; other sampler backends retain the checkpoint-engine
         protocol. Physical UUIDs, rather than inferred rank strides, pair each receiver
-        with its trainer device.
+        with its trainer device. NPU uses SHM buckets if device IPC is unavailable.
         """
         if (os.environ.get('TWINKLE_DISABLE_DIRECT_VLLM_SYNC', '0') == '1'
                 or not hasattr(self.sampler, 'direct_weight_sync_metadata')

@@ -6,10 +6,12 @@ CheckpointEngine (检查点引擎) 是用于在训练器和推理进程之间同
 
 - `auto`：本地对象使用 `naive`；Ray actor handler 使用 `standalone`。
 - `naive`：模型的权重生成器直接流式传入本地 sampler，不创建 CheckpointEngine。
-- `colocate`：共享 GPU 的 Ray actors 通过 CUDA IPC 同步。
+- `colocate`：共享物理设备的 Ray actors 通过设备 IPC 同步；NPU 不支持设备 IPC 时使用共享内存桶。
 - `standalone`：分离部署的 Ray actors 在 GPU 上使用 NCCL，在 NPU 上使用 HCCL。
 
 `auto` 不会推断 `colocate`，因为 driver 无法可靠判断 actor 的实际设备放置。
+
+在 CUDA 或昇腾 NPU 上使用 vLLM 时，同卡同步按物理设备 UUID 将每个 vLLM TP worker 与训练 worker 配对，两者直接传输权重，sampler actor 只负责控制调用。NPU actor 的可见设备列表排序不会改变这种配对。设置 `TWINKLE_DISABLE_DIRECT_VLLM_SYNC=1` 可保留检查点引擎路径；其他 sampler 后端也使用该路径。
 
 ## 基本接口
 

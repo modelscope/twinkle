@@ -8,6 +8,7 @@ from typing import List
 from twinkle import Platform, get_logger, remote_function
 from twinkle.checkpoint_engine.base import CheckpointEngine
 from twinkle.perf import timed
+from twinkle.utils.framework import Torch
 
 logger = get_logger()
 
@@ -204,11 +205,10 @@ class CheckpointEngineMixin:
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def direct_weight_sync_device(self):
         """Physical identity used to pair a colocated sender with a vLLM receiver."""
-        import torch
-
-        if not torch.cuda.is_available():
+        platform = Platform.get_platform()
+        if platform.device_prefix() not in ('cuda', 'npu') or platform.device_module() is None:
             return None
-        return Platform.get_vllm_device_uuid(torch.cuda.current_device())
+        return Platform.get_vllm_device_uuid(Torch.get_current_device())
 
     @remote_function(dispatch='all', lazy_collect=True)
     @timed
@@ -238,7 +238,7 @@ class CheckpointEngineMixin:
         if senders is None:
             senders = self._direct_vllm_senders = {}
         sender = senders.setdefault(channel, VLLMWeightSender())
-        transfer_device = torch.device('cuda', torch.cuda.current_device())
+        transfer_device = torch.device(Platform.device_prefix(), Torch.get_current_device())
 
         # A Ray actor already has an asyncio loop. Keep the streaming exporter
         # and its bucket handshakes on a dedicated thread, as send_weights does.
@@ -246,6 +246,8 @@ class CheckpointEngineMixin:
 
         def send():
             try:
+                # Accelerator device selection is thread-local, including on Ascend.
+                Torch.set_device(transfer_device)
                 asyncio.run(sender.update_weights(
                     weights, peft_config=peft_config, base_sync_done=base_sync_done,
                     zmq_handle=target['endpoint'], auth_key=auth_key, device=transfer_device,
