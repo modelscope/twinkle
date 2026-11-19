@@ -170,12 +170,14 @@ class MultiLoraTransformersModel:
         adapter_name: str,
         config: LoraConfig | Mapping[str, Any] | None = None,
         **kwargs,
-    ) -> None:
-        """Add a new adapter to the model.
+    ) -> str | None:
+        """Add a new adapter to the model and return the server-side training id.
 
         Pass a peft ``LoraConfig`` (or its dict form) for LoRA training against a
         LoRA-mode deployment. Pass ``config=None`` for full-parameter training
-        against a ``train_mode: full`` deployment.
+        against a ``train_mode: full`` deployment. The returned id names the
+        server-side run (checkpoint store, training-run API, explicit stop);
+        ``None`` only when a future schema stops carrying it.
         """
         if isinstance(config, Mapping):
             from peft import LoraConfig
@@ -203,6 +205,7 @@ class MultiLoraTransformersModel:
             with self._training_lock:
                 self._training_ids[adapter_name] = result.training_id
                 self.adapter_name = adapter_name
+            return result.training_id
         finally:
             with self._training_lock:
                 self._creating.discard(adapter_name)

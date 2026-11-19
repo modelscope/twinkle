@@ -28,10 +28,28 @@ from twinkle_agentic.envs.base import NoSlot
 from twinkle_agentic.envs.env_tool import EnvTool
 from twinkle_agentic.protocol.api_sampler import APIGenerationError
 from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_agentic.verifier.result_check import CheckContext, checks_from_dicts, run_checks
 from .endpoint import ENDPOINTS, EndpointRequest, PolicyEndpoint, assistant_message
 from .ledger import MessageLedger, TurnLedger
 
 logger = get_logger()
+
+
+def _final_answer(traj: Trajectory) -> str:
+    """The last assistant turn's text -- what the ``answer_*`` checks read; '' when there is none.
+
+    Multimodal content is a part list; the text parts concatenate in order.
+    """
+    content = None
+    for message in reversed(traj.get('messages') or []):
+        if message.get('role') == 'assistant':
+            content = message.get('content')
+            break
+    if content is None:
+        return ''
+    if isinstance(content, list):
+        return ''.join(str(part.get('text') or '') for part in content if isinstance(part, dict))
+    return str(content or '')
 
 
 def _dump_rollout_rows(episode_id: str, rows: list) -> None:
@@ -786,20 +804,58 @@ class MultiTurnRollout:
         episode_end = None
         if self.on_episode_end is not None:
             episode_end = self.on_episode_end(traj, self.env, ep.episode_id)
-        env_reward = 0.0
+        # Terminal checks run inside the episode's env session, BEFORE ``close`` ends it: they
+        # must see exactly the state the agent left behind (the session -- and for LocalEnv its
+        # workspace -- dies with close). The score lands as the rollout's own ``rewards.check``
+        # key beside ``rewards.env``; a row that declares no checks carries no key. Checks that
+        # need to run something (shell / python) ride ``ctx.env``, so episodes run and score in
+        # the same sandbox; ``env=None`` (a tools-only local episode) falls back to a LocalEnv
+        # over the row's own ``workspace`` column.
+        check_score: Optional[float] = None
+        if traj.get('checks') is not None:
+            if self.env is not None and not ep.env_open:
+                raise EpisodeError(
+                    f'episode {ep.episode_id!r}: its env session is already closed, so its terminal '
+                    'checks cannot see the state the agent left behind.')
+            try:
+                checks = checks_from_dicts(traj.get('checks'))
+            except Exception as exc:
+                raise EpisodeError(
+                    f'episode {ep.episode_id!r}: malformed checks column: {exc}') from exc
+            workspace = (self.env.workspace(ep.episode_id) if self.env is not None
+                         else str(traj.get('workspace') or ''))
+            report = run_checks(
+                checks,
+                CheckContext(workspace=workspace, final_answer=_final_answer(traj),
+                             env=self.env, episode_id=ep.episode_id))
+            check_score = float(report.score)
+        env_reward: Optional[float] = None
         if self.env is not None and ep.env_open:
-            env_reward = float(self.env.close(ep.episode_id) or 0.0)
+            env_reward = self.env.close(ep.episode_id)
             ep.env_open = False
         self._discard(ep.episode_id)
-        # ``rewards.env`` is the one reward key the rollout itself owns; the scorer
-        # columns (orm / baseline) are the driver's to name when it hands the batch out.
-        traj['rewards'] = dict(traj.get('rewards') or {}, env=env_reward)
+        # ``rewards.env`` / ``rewards.check`` are the reward keys the rollout itself owns; the
+        # scorer columns (orm / baseline) are the driver's to name when it hands the batch out.
+        # ``rewards.env`` lands only when the env session actually scored (``close`` returns None
+        # for a sandbox used only for its tools: its constant zero is "no reward", not a score),
+        # so an absent env key never fabricates one.
+        rewards = dict(traj.get('rewards') or {})
+        if env_reward is not None:
+            rewards['env'] = float(env_reward)
+        if check_score is not None:
+            rewards['check'] = check_score
+        traj['rewards'] = rewards
         if episode_end is not None:
             traj['episode_end'] = episode_end
         for row in ep.closed_rows:
-            # The frozen rows carry the episode's env reward too: the reward key belongs to
-            # the episode, and every row of it carries the same one.
-            row['rewards'] = dict(row.get('rewards') or {}, env=env_reward)
+            # The frozen rows carry the episode's env reward too: the reward keys belong to
+            # the episode, and every row of it carries the same ones.
+            row_rewards = dict(row.get('rewards') or {})
+            if env_reward is not None:
+                row_rewards['env'] = float(env_reward)
+            if check_score is not None:
+                row_rewards['check'] = check_score
+            row['rewards'] = row_rewards
         rows = list(ep.closed_rows) + [traj]
         _dump_rollout_rows(ep.episode_id, rows)
         extra = {
@@ -835,7 +891,7 @@ class MultiTurnRollout:
             truncated=bool(ep.truncated),
             token_lengths=(prompt_tokens, response_tokens) if coded else None,
             routing_exported=traj.get('routed_experts') is not None,
-            env_reward=env_reward,
+            env_reward=float(env_reward) if env_reward is not None else 0.0,
             extra=extra,
         )
         return rows, sample
