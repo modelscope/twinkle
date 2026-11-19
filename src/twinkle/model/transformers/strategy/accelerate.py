@@ -258,7 +258,7 @@ class AccelerateStrategy(TransformerStrategyBase):
         if duplicates and fsdp2:
             self._untie_shared_weights(model, [obj for obj in args if isinstance(obj, torch.optim.Optimizer)],
                                        duplicates)
-        if fsdp2 and not any(isinstance(obj, torch.optim.Optimizer) for obj in args):
+        if fsdp2 and self.accelerator.is_fsdp2 and not any(isinstance(obj, torch.optim.Optimizer) for obj in args):
             # A frozen forward-only model (the separate KL reference) never has an optimizer, and
             # Accelerator.prepare's FSDP2 guard refuses model-only calls. _prepare_fsdp2 is the same
             # preparation with every optimizer step conditional, so model-only is exact there.
