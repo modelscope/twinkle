@@ -126,7 +126,7 @@ class MultiLoraTransformersModel:
         return {**values, 'adapter_name': name, 'training_id': training_id}
 
     @_guarded_operation
-    def _submit(self, endpoint: str, model_cls, response_cls, **values):
+    def _submit(self, endpoint: str, model_cls, response_cls, *, on_outcome_unknown=None, **values):
         """Validate once, then send with a stable handle and retry identity."""
         if issubclass(model_cls, model_types.TrainingRequest):
             values = self._training_values(values)
@@ -134,10 +134,19 @@ class MultiLoraTransformersModel:
             if 'seq_id' in values:
                 raise TypeError('seq_id is managed by the client')
             values['seq_id'] = self._next_seq_id()
+        if endpoint == 'save' and on_outcome_unknown is not None:
+            values['client_save_id'] = str(uuid.uuid4())
         body = build_request(model_cls, **values)
         self._ensure_created()
-        response = self._transport.post_model(f'{self.server_url}/{endpoint}', body)
-        result = self._await_task(response, response_cls)
+        url = f'{self.server_url}/{endpoint}'
+        if on_outcome_unknown is None:
+            response = self._transport.post_model(url, body)
+            result = self._await_task(response, response_cls)
+        else:
+            from twinkle_client._future import submit_tracked_task
+            request_id = body.tracked_request_id() if isinstance(body, model_types.SaveRequest) else None
+            result = submit_tracked_task(
+                self._transport, url, body, response_cls, on_outcome_unknown, request_id=request_id)
         with self._training_lock:
             if endpoint in {'step', 'clip_grad_and_step'}:
                 self._completed_step_calls += 1

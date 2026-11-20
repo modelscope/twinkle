@@ -81,6 +81,7 @@ class vLLMSampler:
         session_id: Optional[str] = None,
         num_samples: int = 1,
         token_only: bool = False,
+        on_outcome_unknown=None,
     ) -> List[SampleResponseModel]:
         """Sample from the model.
 
@@ -106,15 +107,14 @@ class vLLMSampler:
         """
         if adapter_uri is None:
             adapter_uri = adapter_path if adapter_path is not None else getattr(self, 'adapter_uri', None)
-        response = self._transport.post_model(
-            f'{self.server_url}/sample',
-            build_request(
-                SampleRequest,
-                inputs=_json_safe(inputs),
-                sampling_params=self._sampling_params(sampling_params, num_samples),
-                adapter_name=adapter_name,
-                adapter_uri=adapter_uri,
-                token_only=token_only))
+        url = f'{self.server_url}/sample'
+        body = build_request(
+            SampleRequest, inputs=_json_safe(inputs), sampling_params=self._sampling_params(sampling_params, num_samples),
+            adapter_name=adapter_name, adapter_uri=adapter_uri, token_only=token_only)
+        if on_outcome_unknown is not None:
+            from twinkle_client._future import submit_tracked_task
+            return submit_tracked_task(self._transport, url, body, SampleResponseModelList, on_outcome_unknown).samples
+        response = self._transport.post_model(url, body)
         return self._await_task(response, SampleResponseModelList).samples
 
     @staticmethod

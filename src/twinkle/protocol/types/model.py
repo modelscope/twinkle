@@ -19,7 +19,8 @@ user-supplied argument.
 """
 from __future__ import annotations
 
-from pydantic import Field, JsonValue, field_validator, model_validator
+from hashlib import sha256
+from pydantic import UUID4, Field, JsonValue, field_validator, model_validator
 from typing import Any, Dict, List, Optional, Union
 
 from .base import ResponseModel, StrictRequest, backend_kwarg, backend_only, passthrough
@@ -275,10 +276,17 @@ class ApplyPatchRequest(TrainingRequest):
 
 class SaveRequest(TrainingRequest):
     name: str | None = None
+    client_save_id: UUID4 | None = None
     save_optimizer: bool = False
     is_sampler: bool = False  # If True, delete existing sampler weights before saving
     consumed_train_samples: int | None = backend_kwarg(default=None, ge=0)
     merge_lora: bool | None = backend_only('megatron', default=None)
+
+    def tracked_request_id(self) -> str | None:
+        if self.client_save_id is None:
+            return None
+        digest = sha256(f'{self.training_id}:{self.client_save_id.hex}'.encode()).hexdigest()
+        return f'req_{digest}'
 
 
 class LoadRequest(TrainingRequest):
