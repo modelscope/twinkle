@@ -1,12 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """defect117 permanent gate: lend must graceful-skip on CUDA OOM, not crash the trainer.
 
-In disaggregated mode the shared_sampler is resident on the trainer ranks; lend offloads only the
-trainer, so a grown engine's warm reserve (util x total) plus the resident sampler can exceed free
-GPU memory. v13 (util0.9) crashed: add_workers -> warm -> torch.OutOfMemoryError propagated out of
-lend and killed the run. The fix detects OOM through the ray-wrapped cause chain, retires the
-half-built replica, reloads the trainer, warns, and returns (``_lent`` stays None so training
-continues); non-OOM errors still raise (original semantics).
+Lend offloads only the trainer's weights, but the trainer process's residual CUDA footprint
+(staging buffers, NCCL groups, context) stays on its ranks, so a grown engine's warm reserve
+(util x the whole card) plus that residual can exceed the free GPU memory. v13 (util0.9) crashed:
+add_workers -> warm -> torch.OutOfMemoryError propagated out of lend and killed the run. The fix
+detects OOM through the ray-wrapped cause chain, retires the half-built replica, reloads the
+trainer, warns, and returns (``_lent`` stays None so training continues); non-OOM errors still
+raise (original semantics).
 
 PLAN (case | input | expected | failure it kills):
 1 oom_typed_skip | add_workers raises torch.OutOfMemoryError | lend returns; _lent None;
