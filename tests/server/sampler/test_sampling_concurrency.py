@@ -15,12 +15,12 @@ from starlette.requests import Request
 from tinker import types as tinker_types
 
 from twinkle.data_format import SampledSequence, SampleResponse
-from twinkle.exceptions import FullWeightLoadError
 from twinkle.protocol.types import SampleRequest
 from twinkle.server.sampler.app import SamplerManagement
 from twinkle.server.sampler.concurrency import SamplerConcurrency
 from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
 from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
+from twinkle.utils import FullWeightLoadError
 from twinkle.server.task_queue.backend_gate import BackendGate
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.exceptions import BackendBusyError

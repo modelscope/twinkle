@@ -254,10 +254,18 @@ class AccelerateStrategy(TransformerStrategyBase):
 
         duplicates = self._duplicate_names(model)
         plugin = self._get_fsdp_plugin()
-        if duplicates and plugin is not None and getattr(plugin, 'fsdp_version', 1) == 2:
+        fsdp2 = plugin is not None and getattr(plugin, 'fsdp_version', 1) == 2
+        if duplicates and fsdp2:
             self._untie_shared_weights(model, [obj for obj in args if isinstance(obj, torch.optim.Optimizer)],
                                        duplicates)
-        result = self.accelerator.prepare(model, *args)
+        if fsdp2 and self.accelerator.is_fsdp2 and not any(isinstance(obj, torch.optim.Optimizer) for obj in args):
+            # A frozen forward-only model (the separate KL reference) never has an optimizer, and
+            # Accelerator.prepare's FSDP2 guard refuses model-only calls. _prepare_fsdp2 is the same
+            # preparation with every optimizer step conditional, so model-only is exact there.
+            result = self.accelerator._prepare_fsdp2(model, *args)[0]
+            result._is_accelerate_prepared = True
+        else:
+            result = self.accelerator.prepare(model, *args)
         # ``Accelerator.prepare`` ends with ``return result if len(result) > 1 else result[0]``, and
         # ``result`` is a list, so the container's type says nothing about what was prepared and a
         # lone argument comes back bare. Testing for a tuple here silently skipped the repair.

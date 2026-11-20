@@ -248,10 +248,15 @@ class CheckpointEngineManager:
     def _close_checkpoint_channel(self, receiver: Any = None, channel: Optional[str] = None) -> None:
         receiver = self.sampler if receiver is None else receiver
         channel = channel or self.channel
-        try:
-            self.model.reset_checkpoint_engine(channel, self.backend)
-        finally:
-            receiver.reset_checkpoint_engine(channel, self.backend)
+        # NCCL comm teardown is a rendezvous: dropping the model rank0 PG runs
+        # ProcessGroupNCCL::~ProcessGroupNCCL -> abort() -> waitForFutureOrTimeout, which blocks
+        # until the receiver peers abort too. Resetting the model first and the receiver only in
+        # the finally deadlocks -- the model waits for peers that are never told to reset (the
+        # receiver call cannot run until the blocked model call returns). Dispatch both sides
+        # side by side, like the init/send/receive rendezvous in _transfer.
+        _together(
+            lambda: self.model.reset_checkpoint_engine(channel, self.backend),
+            lambda: receiver.reset_checkpoint_engine(channel, self.backend))
 
     @remote_function(collect='first', lazy_collect=False)
     def close(self) -> None:
@@ -432,6 +437,56 @@ class CheckpointEngineManager:
                     len(targets))
         return True
 
+    @staticmethod
+    def _is_colocated(replicas: Any, devices: Any) -> bool:
+        """True when every new replica worker shares exactly one trainer GPU (lend colocation).
+
+        ``replicas`` is the per-replica metadata from ``direct_weight_sync_metadata`` (each
+        replica a list of TP-worker targets, or a single target); ``devices`` is the trainer's
+        per-rank GPU UUIDs. A flex replica on a distinct GPU returns False (NCCL is correct);
+        a colocated replica on a trainer GPU returns True (NCCL would duplicate the device).
+        """
+        if not isinstance(replicas, list) or not replicas or any(t is None for t in replicas):
+            return False
+        targets = [t for r in replicas for t in (r if isinstance(r, list) else [r])]
+        if not devices:
+            return False
+        receiver_devices = [t['device_uuid'] for t in targets]
+        if len(set(receiver_devices)) != len(receiver_devices):
+            return False
+        return all(devices.count(d) == 1 for d in receiver_devices)
+
+    def _warm_colocated_ipc(self, sub: Any, channel: str) -> bool:
+        """Warm colocated new replicas via direct IPC; return False to fall through to NCCL.
+
+        Lend grows sampler replicas onto the trainer's GPUs while the trainer is offloaded
+        (defect118). The NCCL checkpoint PG would assign trainer rank 0 and the new replica
+        rank 1 to the same CUDA device -> "Duplicate GPU detected" -> actor death. Direct IPC
+        pairs by device UUID and streams weights bucket-by-bucket, so it handles same-GPU and
+        an offloaded model (CPU -> GPU per bucket). Reclaim retires the lent replicas before
+        the next sync_weights, so the main NCCL channel never sees a colocated replica.
+        """
+        if not hasattr(sub, 'direct_weight_sync_metadata') or not hasattr(self.model, 'direct_weight_sync_device'):
+            return False
+        replicas = sub.direct_weight_sync_metadata()
+        devices = self.model.direct_weight_sync_device()
+        if not self._is_colocated(replicas, devices):
+            return False
+        targets = [t for r in replicas for t in (r if isinstance(r, list) else [r])]
+        self._ensure_model_keys()
+        steps = (False, True) if (not self._merge_and_sync and self.base_sync_done) else (False,)
+        for base_sync_done in steps:
+            peft_config = self._adapter_config(base_sync_done, self._merge_and_sync)
+            _together(
+                lambda b=base_sync_done, p=peft_config: self.model.send_weights_to_vllm(
+                    targets, channel=channel, auth_key=self._auth_key,
+                    base_sync_done=b, merge_and_sync=self._merge_and_sync,
+                    peft_config=p, model_keys=self._model_keys),
+                lambda b=base_sync_done, p=peft_config: sub.receive_weights_direct(
+                    targets, auth_key=self._auth_key, base_sync_done=b, peft_config=p))
+        logger.info('Warm via direct colocated IPC: %s new vLLM workers (defect118).', len(targets))
+        return True
+
     # ── New replicas ─────────────────────────────────────────────────────────
 
     @remote_function(collect='first', lazy_collect=False)
@@ -441,6 +496,10 @@ class CheckpointEngineManager:
         ``sub`` is a handle holding only the new replicas (``add_workers`` passes it to its
         ``warmup``). The transfer runs on a channel of its own, closed afterwards; the next
         :meth:`sync_weights` rebuilds the main channel for the grown replica set.
+
+        Colocated new replicas (adaptive lend onto the trainer's GPUs) take the direct IPC
+        path: NCCL cannot place the trainer rank 0 and a new replica on the same CUDA device
+        ("Duplicate GPU detected", defect118). Flex growth on distinct GPUs keeps NCCL.
         """
         if self.mode != 'standalone' or self.sync_backend != 'full':
             raise NotImplementedError(
@@ -449,6 +508,8 @@ class CheckpointEngineManager:
                 'and the delta session has a fixed replica set.')
         with self._sync_lock:
             channel = f'{self.channel}-warm-{uuid.uuid4().hex[:8]}'
+            if self._warm_colocated_ipc(sub, channel):
+                return
             try:
                 count = len(self._activate_checkpoint_channel(sub, channel))
                 # LoRA-only syncs need the base first, then the current adapter on top of it.

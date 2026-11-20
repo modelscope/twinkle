@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import traceback
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
 
-import twinkle_client.resources as resource_module
+import twinkle_client.operations as operation_module
 from twinkle_client.resources import RolloutResources
 
 
@@ -33,20 +34,21 @@ def scope_for(events):
     return RolloutResources(lambda: client)
 
 
-def interrupt_waits(operations):
-    original = operations._executor.submit
-
-    class Wait:
-        def __init__(self, future):
-            self.future, self.remaining = future, 2
+def interrupt_next_wait(monkeypatch):
+    class InterruptedWait(Future):
+        remaining = 2
 
         def result(self):
             if self.remaining:
                 self.remaining -= 1
                 raise KeyboardInterrupt('caller interrupted')
-            return self.future.result()
+            return super().result()
 
-    operations._executor.submit = lambda *a, **k: Wait(original(*a, **k))
+    def next_outcome():
+        monkeypatch.setattr(operation_module, 'Future', Future)
+        return InterruptedWait()
+
+    monkeypatch.setattr(operation_module, 'Future', next_outcome)
 
 
 def test_scope_closes_rollout_before_environments_and_client():
@@ -131,10 +133,10 @@ def test_failed_close_does_not_skip_other_resources_or_replace_primary(failure):
     assert not resources._environments
 
 
-def test_initialization_interrupt_still_closes_returned_client():
+def test_initialization_interrupt_still_closes_returned_client(monkeypatch):
     events = []
     resources = scope_for(events)
-    interrupt_waits(resources.operations)
+    interrupt_next_wait(monkeypatch)
     with pytest.raises(KeyboardInterrupt, match='caller interrupted'):
         with resources:
             pytest.fail('interrupted initialization must not enter the body')
@@ -145,19 +147,12 @@ def test_initialization_interrupt_still_closes_returned_client():
 def test_repeated_cleanup_interrupts_wait_for_every_release(monkeypatch):
     events = []
     resources = scope_for(events)
-    original = resource_module.SequentialOperations
-
-    def cleanup_operations():
-        operations = original()
-        interrupt_waits(operations)
-        return operations
-
     with pytest.raises(BaseExceptionGroup, match='resource cleanup'):
         with resources:
             resources.own_rollout(Rollout(events))
             resources.own_environment(Environment(events, 'a'))
             resources.own_environment(Environment(events, 'b'))
-            monkeypatch.setattr(resource_module, 'SequentialOperations', cleanup_operations)
+            interrupt_next_wait(monkeypatch)
     assert events == ['rollout.close', 'a.shutdown', 'b.shutdown', 'client.close']
     assert resources.client is None and not resources._environments
 

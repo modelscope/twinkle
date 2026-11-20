@@ -56,6 +56,7 @@ NATIVE_REQUESTS = {
     "load": native.LoadRequest,
     "resume_from_checkpoint": native.ResumeFromCheckpointRequest,
     "remove_adapter": native.AdapterRequest,
+    "stop_training": native.AdapterRequest,
     "add_adapter_to_model": native.AddAdapterRequest,
     "upload_to_hub": native.UploadToHubRequest,
     "create": native.CreateRequest,
@@ -222,9 +223,16 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
                 if record.get("submission_fingerprint") != fingerprint:
                     raise RequestRejectedError("client_upload_id is already bound to a different checkpoint or repository")
             return envelope_from_record(request_id, record)
+        if endpoint == "stop_training":
+            # Owner-side explicit stop by training id: the webui kills the local driver, so
+            # the driver's session dies with it and cannot release the training itself.
+            # The token that owns the run releases it WITHOUT a session -- the same
+            # authority level as the gateway's checkpoint deletion (delete-by-id with the
+            # owner token). A training whose session heartbeat already expired reports
+            # "unknown/expired handle" here, which is idempotent: the reaper released it.
+            return await self._release(body.training_id, token, None, "twinkle")
         session = get_session_id_from_request(request)
-        if not session:
-            raise ResourceNotFoundError("Unknown or expired session")
+        await self._check_session(session)
         if endpoint == "remove_adapter":
             return await self._release(body.training_id, token, session, "twinkle")
         capability = endpoint if endpoint in ("forward", "backward", "calculate_loss") else None
@@ -270,7 +278,9 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         return await self.proxy.proxy_request(request, f"tinker/{endpoint}", route["instance_id"], "training-runtime")
 
     async def _release(self, training_id, token, session, client_type):
-        await self.controller.route.remote(training_id, token, session)
+        route = await self.controller.route.remote(training_id, token, session, for_release=True)
+        if route["base_model"] != self.model.name:
+            raise ResourceNotFoundError("Training handle belongs to another model endpoint")
 
         async def release():
             await self.controller.release.remote(training_id, token, session)

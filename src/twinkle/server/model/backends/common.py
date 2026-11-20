@@ -14,7 +14,7 @@ from typing import Any, List
 
 from twinkle import DeviceMesh, remote_function
 from twinkle.data_format.encoding import is_encoded
-from twinkle.signals import response_positions
+from twinkle.processor.trajectory import response_positions
 from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.template import Template

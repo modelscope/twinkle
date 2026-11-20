@@ -9,7 +9,7 @@ import pytest
 from starlette.requests import Request
 
 from tests.server.state.fake_backend import FakeBackend
-from tests.server.training.helpers import settle
+from tests.server.training.helpers import create, settle, setup
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.gateway.use_cases import poll_future
@@ -192,6 +192,42 @@ async def test_native_lora_admission_does_not_import_peft(monkeypatch, rank):
         router.controller.create.remote.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_owner_can_retry_release_after_the_first_response_is_lost():
+    controller, state, runtime, _ = await setup(backend=FakeBackend())
+    identity = await create(controller, state, 'first')
+    other = await create(controller, state, 'other')
+    router = TrainingRouter.__new__(TrainingRouter)
+    router.state = state
+    router.replica_id = 'release-router'
+    await state.register_replica(router.replica_id, 0)
+    router.model = SimpleNamespace(name='small')
+    router.controller = SimpleNamespace(route=SimpleNamespace(remote=controller.route),
+                                        release=SimpleNamespace(remote=controller.release))
+    router._init_task_queue()
+
+    async def release(endpoint, *, token='owner', session=''):
+        request = http_request({'training_id': identity, 'adapter_name': 'same'}, token)
+        request.state.session_id = session
+        return await router.native_request(request, endpoint)
+
+    try:
+        # Web UI stops the run without its session. Discard the reply to model a lost response.
+        original = await release('stop_training')
+        assert (await settle(state, original.request_id))['status'] == 'completed'
+        with pytest.raises(ResourceNotFoundError):
+            await release('stop_training', token='another-tenant')
+        await state.create_session({'session_id': 'other-session'})
+        with pytest.raises(ResourceNotFoundError):
+            await release('remove_adapter', session='other-session')
+        retry = await release('remove_adapter', session='session')
+        assert (await settle(state, retry.request_id))['status'] == 'completed'
+        assert identity not in runtime.users and other in runtime.users
+    finally:
+        await router.shutdown_task_queue()
+        await controller.shutdown()
+
+
 def test_router_schemas_match_model_runtime_routes():
     from fastapi import FastAPI
     from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
@@ -204,4 +240,5 @@ def test_router_schemas_match_model_runtime_routes():
     for protocol, schemas in [('twinkle', NATIVE_REQUESTS), ('tinker', TINKER_REQUESTS)]:
         endpoints = {route.path.rsplit('/', 1)[-1] for route in app.routes
                      if route.path.startswith(f'/{protocol}/') and 'POST' in route.methods}
-        assert endpoints == set(schemas)
+        # stop_training is handled by the pool and never forwarded to the runtime.
+        assert endpoints == set(schemas) - {'stop_training'}

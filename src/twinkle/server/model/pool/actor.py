@@ -136,9 +136,9 @@ class TrainingControllerActor:
         await self.initialize()
         return await self.core.create(CreateTraining.model_validate(request))
 
-    async def route(self, *args):
+    async def route(self, *args, **kwargs):
         await self.initialize()
-        return await self.core.route(*args)
+        return await self.core.route(*args, **kwargs)
 
     async def admit(self, *args, **kwargs):
         await self.initialize()

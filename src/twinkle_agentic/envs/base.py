@@ -158,11 +158,15 @@ class NoSlot:
 
 
 class _Session:
-    __slots__ = ('state', 'reward', 'touched', 'script_inflight')
+    __slots__ = ('state', 'reward', 'rewarded', 'touched', 'script_inflight')
 
     def __init__(self, state: Any):
         self.state = state
         self.reward = 0.0
+        #: Whether any step ever carried a reward. A sandbox used only for its tools never
+        #: scores, and its constant 0.0 sum is "no reward", not a genuine zero -- ``close`` tells
+        #: the two apart so a caller does not fold an absent signal as a real score.
+        self.rewarded = False
         self.touched = time.monotonic()
         #: A whole script (agent program / verifier) is executing in this session right now. Such a
         #: session is alive even when it makes no env calls for a long time, so idle reaping must
@@ -191,7 +195,7 @@ class Env(ABC):
     executes already-split ``(tool_name, arguments)`` pairs.
 
     A subclass implements the session hooks: ``_open(traj) -> (state, StepResult)``,
-    ``_step(state, tool_name, arguments)``, ``_run_script(state, source, interpreter, timeout)``,
+    ``_step(state, tool_name, arguments)``, ``_run_script(state, source, interpreter, timeout, cap_memory)``,
     ``_close(state)`` and ``_workspace(state)``; plus :meth:`tools`.
     """
 
@@ -234,7 +238,8 @@ class Env(ABC):
     def _step(self, state: Any, tool_name: str, arguments: Dict[str, Any]) -> StepResult:
         """Run one tool call in the episode."""
 
-    def _run_script(self, state: Any, source: str, interpreter: str, timeout: Optional[float]) -> Tuple[int, str]:
+    def _run_script(self, state: Any, source: str, interpreter: str, timeout: Optional[float],
+                    cap_memory: bool = True) -> Tuple[int, str]:
         raise NotImplementedError(f'{type(self).__name__} cannot run scripts; act through its tools instead.')
 
     def _close(self, state: Any) -> None:
@@ -322,7 +327,9 @@ class Env(ABC):
     def step(self, episode_id: str, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> StepResult:
         session = self._session(episode_id)
         result = self._step(session.state, tool_name, arguments or {})
-        session.reward += float(result.reward or 0.0)
+        if result.reward is not None:
+            session.rewarded = True
+            session.reward += float(result.reward)
         _record_tool_exec(episode_id, 1)
         return result
 
@@ -333,7 +340,9 @@ class Env(ABC):
         results = []
         for name, args in calls:
             result = self._step(session.state, name, args or {})
-            session.reward += float(result.reward or 0.0)
+            if result.reward is not None:
+                session.rewarded = True
+                session.reward += float(result.reward)
             results.append(result)
         _record_tool_exec(episode_id, len(results))
         return results
@@ -343,7 +352,8 @@ class Env(ABC):
                    episode_id: str,
                    source: str,
                    interpreter: str = 'python',
-                   timeout: Optional[float] = None) -> Tuple[int, str]:
+                   timeout: Optional[float] = None,
+                   cap_memory: bool = True) -> Tuple[int, str]:
         """Run a whole script in the episode's session; returns ``(exit_code, output)``.
 
         The execution path a *verifier* (or an agent program) takes, as opposed to :meth:`step`,
@@ -355,6 +365,12 @@ class Env(ABC):
             source: the script, not a path.
             interpreter: ``'python'`` or ``'shell'``.
             timeout: seconds; ``None`` means the environment's own default.
+            cap_memory: whether the environment's per-call TOOL-SCRIPT address-space cap applies.
+                The harness's agent program passes ``False``: a real third-party runtime (codex,
+                ms_agent) needs far more address space than a runaway-check budget, and its
+                containment is the harness timeout, not this cap. Under the cap such a runtime
+                stalls silently before its first request. Environments without a host-level cap
+                (sandboxed) contain the program at their sandbox boundary either way.
 
         Returns:
             ``(exit_code, output)``. ``output`` is stdout followed by stderr, so
@@ -366,7 +382,7 @@ class Env(ABC):
         session = self._session(episode_id)
         session.script_inflight = True
         try:
-            return self._run_script(session.state, source, interpreter, timeout)
+            return self._run_script(session.state, source, interpreter, timeout, cap_memory)
         finally:
             session.script_inflight = False
 
@@ -395,22 +411,25 @@ class Env(ABC):
             skip=self.snapshot_skip)
 
     @remote_function(enable_continous_work=True, sticky_key='episode_id')
-    def close(self, episode_id: str) -> float:
+    def close(self, episode_id: str) -> Optional[float]:
         """End the episode's session and return its reward (the sum of its step rewards).
 
-        Closing an episode with no session returns 0.0.
+        ``None`` when the session never scored (no step ever carried a reward) or there was no
+        session at all: the caller keeps "no reward" apart from a genuine 0.0 score -- a sandbox
+        used only for its tools has no reward of its own, and folding its constant zero as one
+        would fabricate signal.
         """
         with self._sessions_lock:
             session = self._sessions.pop(episode_id, None)
         if session is None:
-            return 0.0
+            return None
         try:
             self._close(session.state)
         except Exception:  # noqa
             logger.warning(f'{type(self).__name__}: closing session {episode_id!r} failed.', exc_info=True)
         finally:
             self._session_slots.release()
-        return session.reward
+        return session.reward if session.rewarded else None
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def shutdown(self) -> None:

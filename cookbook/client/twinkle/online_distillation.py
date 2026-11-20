@@ -14,7 +14,7 @@ from uuid import uuid4
 import numpy as np
 from twinkle import init_twinkle_client
 from twinkle.data_format import SamplingParams
-from twinkle.signals import response_positions, response_token_scores
+from twinkle.processor.trajectory import response_positions
 
 STUDENT_NAME = 'distill-student'
 TEACHER_NAME = 'distill-teacher'
@@ -56,18 +56,10 @@ def training_feature(feature, tokens):
     return {key: feature[key] for key in ('input_ids', 'labels', 'attention_mask', 'completion_mask') if key in feature}
 
 
-def response_scores(model, features):
-    scores = response_token_scores(model.forward_only(inputs=features).result, features)
-    for feature, row in zip(features, scores, strict=True):
-        if len(row) != len(response_positions(feature)) or not np.isfinite(row).all():
-            raise RuntimeError('Expected one finite logprob per response token.')
-    return scores
-
-
-def score_completions(model, prompts, token_rows):
-    inputs = [dict(prompt, episode_id=str(index)) for index, prompt in enumerate(prompts)]
-    result = model.forward_only(
-        inputs=inputs, continuation_token_ids=token_rows, output_fields=['logps'], output_frame='response').result
+def response_scores(model, rows, token_rows, **kwargs):
+    inputs = [dict(row, episode_id=str(index), response_token_ids=tokens)
+              for index, (row, tokens) in enumerate(zip(rows, token_rows, strict=True))]
+    result = model.forward_only(inputs=inputs, output_fields=['logps'], output_frame='response', **kwargs).result
     if (result.get('episode_ids') != [row['episode_id'] for row in inputs]
             or result.get('response_token_ids') != token_rows
             or (result.get('field_frames') or {}).get('logps') != 'response'):
@@ -93,11 +85,12 @@ def distillation_signal(method, model, teacher, pairs, sequences, features):
                 f'Expected teacher logits shaped [{batch_size}, {length}, vocab_size], got {logits.shape}.')
         return {'teacher_logits': logits.tolist()}
 
+    token_rows = [seq.tokens for seq in sequences]
     if method == 'opd-rl':
         from twinkle_agentic.rollout.ledger import sampled_token_logprobs
 
         old_logps = [sampled_token_logprobs(seq.tokens, seq.logprobs) for seq in sequences]
-        teacher_logps = response_scores(teacher, features)
+        teacher_logps = response_scores(teacher, features, token_rows)
         # Pure OPD-RL: base task advantage is zero, so A_t = teacher_logp - rollout_logp.
         advantages = [[target - old for target, old in zip(target_row, old_row, strict=True)]
                       for target_row, old_row in zip(teacher_logps, old_logps, strict=True)]
@@ -107,7 +100,7 @@ def distillation_signal(method, model, teacher, pairs, sequences, features):
     prompts = [question(pair) for pair in pairs]
     for prompt, pair in zip(prompts, pairs, strict=True):
         prompt['messages'][-1]['content'] += f'\nReference solution: {worked_solution(pair)}'
-    return {'teacher_logps': score_completions(model, prompts, [seq.tokens for seq in sequences])}
+    return {'teacher_logps': response_scores(model, prompts, token_rows, continuation_token_ids=token_rows)}
 
 
 def evaluate(sampler, tokenizer, pairs, policy, label, seed):

@@ -9,7 +9,7 @@ from collections.abc import Iterator
 
 import torch
 
-from ...nccl_checkpoint_engine import MasterMetadata, NCCLCheckpointEngine, _pg_broadcast
+from ...nccl_checkpoint_engine import MasterMetadata, NCCLCheckpointEngine, _pg_broadcast, recv_delta_manifest
 from twinkle.utils.network import find_free_port
 # Re-exported for callers that import the pipeline internals from this module.
 from .pipeline import (  # noqa: F401
@@ -55,7 +55,8 @@ class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
                 self._nccl_store_port = find_free_port()
             self._prepared = True
         if self.is_master:
-            return MasterMetadata(self.ip, self.listen_port, self._nccl_store_host, self._nccl_store_port)
+            return MasterMetadata(self.ip, self.listen_port, self._nccl_store_host, self._nccl_store_port,
+                                  auth_key=self.auth_key)
         return None
 
     def close(self):
@@ -94,8 +95,7 @@ class DeltaShardedCheckpointEngine(DeltaSyncMixin, NCCLCheckpointEngine):
         applied = 0
         fp_recv_seq = 0
         while True:
-            self.socket.recv_string()
-            meta = self.socket.recv_pyobj()
+            meta = recv_delta_manifest(self.socket, self.topic, self.auth_key, where='delta.recv.manifest')
             if meta.get("terminal_empty"):
                 break
 

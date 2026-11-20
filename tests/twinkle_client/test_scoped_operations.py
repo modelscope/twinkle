@@ -130,8 +130,9 @@ def test_known_rejection_does_not_quarantine_settled_client(reject_locally):
     assert session.calls[-1] == 'remove_adapter'
 
 
-def test_scope_releases_other_handles_and_retains_failed_release_until_retry():
-    class RejectFirstRelease(Session):
+@pytest.mark.parametrize('lose_response', [False, True], ids=['rejected', 'response-lost'])
+def test_scope_releases_other_handles_and_retains_failed_release_until_retry(lose_response):
+    class FailFirstRelease(Session):
         def __init__(self):
             super().__init__()
             self.releases = []
@@ -147,16 +148,18 @@ def test_scope_releases_other_handles_and_retains_failed_release_until_retry():
                 training_id = json.loads(kwargs['data'])['training_id']
                 self.releases.append(training_id)
                 if self.reject and training_id == 'training-a':
+                    if lose_response:
+                        raise requests.Timeout('release response lost')
                     return Response({'detail': 'release temporarily rejected'}, 429)
             return super().post(url, **kwargs)
 
-    session = RejectFirstRelease()
+    session = FailFirstRelease()
     resources = RolloutResources(lambda: client_for(session))
     with pytest.raises(BaseExceptionGroup, match='resource cleanup'):
         with resources:
             model = resources.client.model('model')
-            model.add_adapter_to_model('a')
-            model.add_adapter_to_model('b')
+            assert model.add_adapter_to_model('a') == 'training-a'
+            assert model.add_adapter_to_model('b') == 'training-b'
     assert session.releases == ['training-a', 'training-b']
     assert model._training_ids == {'a': 'training-a'} and not session.closed
     session.reject = False

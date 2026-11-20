@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Sequential blocking calls whose results remain owned across caller interrupts."""
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any
@@ -45,17 +45,39 @@ class SequentialOperations:
     def run(self, operation, *args, on_result=None, **kwargs):
         if self._stopped:
             raise RuntimeError('operation sequence is stopped')
-        try:
-            future = self._executor.submit(_invoke, operation, args, kwargs, on_result, self._worker)
-        except BaseException as error:
-            # An interrupt may land AFTER submit enqueues the work but BEFORE it
-            # returns its Future. Shutdown still owns and drains that queued work.
-            try:
-                self.close()
-            except BaseException as cleanup_error:
-                raise error from cleanup_error
-            raise
+        future = Future()
+        start_lock = threading.Lock()
+
+        def execute():
+            # A submit interrupted during thread startup may already have queued this call.
+            with start_lock:
+                if future.running() or future.done() or not future.set_running_or_notify_cancel():
+                    return
+            future.set_result(_invoke(operation, args, kwargs, on_result, self._worker))
+
         control_error = None
+        while True:
+            try:
+                self._executor.submit(execute)
+                break
+            except (KeyboardInterrupt, SystemExit) as error:
+                self._stopped = True
+                if control_error is None:
+                    control_error = error
+                if future.running() or future.done():
+                    break
+            except BaseException as error:
+                self._stopped = True
+                if future.cancel():
+                    try:
+                        self.close()
+                    except BaseException as cleanup_error:
+                        raise error from cleanup_error
+                    raise
+                if control_error is None:
+                    control_error = error
+                break
+
         while True:
             try:
                 outcome = future.result()
@@ -110,7 +132,7 @@ class _OperationScope:
         if getattr(self._local, 'active', False):
             self._local.request_path = path
 
-    def _invoke(self, operation, args, kwargs):
+    def _invoke(self, operation, args, kwargs, *, track_uncertainty=True):
         from requests import HTTPError
 
         from .exceptions import TaskCancelledError
@@ -127,7 +149,7 @@ class _OperationScope:
             path = self._local.request_path
             rejected = (path is not None and 400 <= (status or 0) < 500 and status not in (408, 499)
                         and not path.rstrip('/').endswith('/retrieve_future'))
-            if path is not None and not rejected and not isinstance(error, TaskCancelledError):
+            if track_uncertainty and path is not None and not rejected and not isinstance(error, TaskCancelledError):
                 self.uncertain_errors.append(error)
             raise
         finally:
@@ -153,8 +175,8 @@ class _OperationScope:
         errors = []
         for release in tuple(self._training_releases.values()):
             try:
-                # Enter the same guard inline so the cleanup RPC can run after the executor stops.
-                self._invoke(release, (), {})
+                # The owned handle stays registered on failure. Retrying its release is safe.
+                self._invoke(release, (), {}, track_uncertainty=False)
             except BaseException as error:
                 errors.append(error)
         if errors:

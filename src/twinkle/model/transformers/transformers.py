@@ -68,6 +68,22 @@ logger = get_logger()
 CHECKPOINT_ADAPTER_NAME = 'default'
 
 
+def _tied_duplicate_names(config, model) -> set:
+    """State-dict names repeated because they share one tensor (tie_word_embeddings).
+
+    Keyed off the config rather than runtime storage identity: the sharing can be broken apart
+    mid-run (an optimizer step or an FSDP all-gather may materialise the head as its own tensor).
+    The flag can sit on a nested ``text_config`` for multimodal shells, so check both. Drop the
+    head, keep the embedding: the receiver's traversal reaches the nested embedding first.
+    """
+    tied = getattr(config, 'tie_word_embeddings', None)
+    if tied is None:
+        tied = getattr(getattr(config, 'text_config', None), 'tie_word_embeddings', None)
+    if not tied:
+        return set()
+    return {name for name in model.state_dict() if name.split('.')[-2:-1] == ['lm_head']}
+
+
 def _no_sync_context(model, should_sync):
     partition_gradients = getattr(model, "zero_optimization_partition_gradients", None)
     if callable(partition_gradients) and partition_gradients():
@@ -3437,32 +3453,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 tensor = tensor.to(Torch.get_device(None), non_blocking=True)
             return Torch.to_local_tensor(tensor)
 
-        def _tied_duplicate_names() -> set:
-            """Names the HF state_dict repeats because they share one tensor, which must not be sent.
-
-            With ``tie_word_embeddings`` the LM head and the input embedding are the SAME tensor, so
-            the state_dict lists it twice (``lm_head.weight`` and ``*.embed_tokens.weight``). vLLM
-            loads only the name its module traversal reaches first and records the other as a skipped
-            alias, then asserts the canonical one did load
-            (``AutoWeightsLoader._check_skipped_aliases``). Sending both makes that check fail, and
-            the duplicate is redundant anyway because one write covers both.
-
-            Keyed off the config rather than runtime storage identity: the sharing can be broken
-            apart mid-run (an optimizer step or an FSDP all-gather may materialise the head as its
-            own tensor), which would make a storage probe stop matching after the first sync. The
-            flag can sit on a nested ``text_config`` for multimodal shells, so check both.
-            """
-            config = getattr(self, 'hf_config', None)
-            if config is None:
-                return set()
-            tied = getattr(config, 'tie_word_embeddings', None)
-            if tied is None:
-                tied = getattr(getattr(config, 'text_config', None), 'tie_word_embeddings', None)
-            if not tied:
-                return set()
-            # Drop the head, keep the embedding: vLLM's traversal reaches the nested embedding first,
-            # making it the canonical name that ``_check_skipped_aliases`` wants to see loaded.
-            return {name for name in model.state_dict() if name.split('.')[-2:-1] == ['lm_head']}
+        def _local_tied_names() -> set:
+            return _tied_duplicate_names(getattr(self, 'hf_config', None), model)
 
         # ZeRO-3 partitions parameters, so every branch below would otherwise read an empty local
         # shard: the base sync walks state_dict(), the LoRA-only sync walks the adapter state dict,
@@ -3476,7 +3468,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if gather is not None:
             gather(self.model, list(model.parameters()))
 
-        _tied_duplicates = _tied_duplicate_names()
+        _tied_duplicates = _local_tied_names()
 
         if base_sync_done and adapter_name:
             if merge_and_sync:
@@ -3566,8 +3558,38 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """
         from twinkle.utils.framework import Torch
         model = self.strategy.unwrap_model(self.model)
+        if isinstance(model, PeftModel):
+            yield from self._local_lora_merged_generator(model)
+            return
         for name, tensor in model.state_dict().items():
             yield name, Torch.to_local_tensor(tensor)
+
+    def _local_lora_merged_generator(self, model):
+        """LoRA merge for paired EMA onto a bare (non-PEFT) reference.
+
+        The reference's state dict carries canonical names and no adapter tensors, so yielding
+        PEFT-prefixed names (or lora_A/lora_B) KeyErrors on the receiver's first lookup. Fold the
+        adapter into the base weight and yield canonical names. The merge runs in the transport's
+        tensor space: ``Torch.to_local_tensor`` gathers a DTensor to its full tensor (the same call
+        the receiver's ``_get_local_state_dict`` makes), so W, A and B are gathered consistently and
+        ``W + (B @ A) * scaling`` is the ordinary full-model merge. Out-of-place: the live policy
+        parameters must stay unmerged for continued training.
+        """
+        from twinkle.utils.framework import Torch
+        tied = _tied_duplicate_names(getattr(self, 'hf_config', None), model)
+        for name, tensor in model.state_dict().items():
+            if is_lora_key(name) or name in tied:
+                continue
+            if name.endswith('.base_layer.weight'):
+                module = model.get_submodule(name[:-len('.base_layer.weight')])
+                merged = Torch.to_local_tensor(tensor)
+                for adapter in module.lora_A:
+                    a = Torch.to_local_tensor(module.lora_A[adapter].weight)
+                    b = Torch.to_local_tensor(module.lora_B[adapter].weight)
+                    merged = merged + (b @ a) * module.scaling[adapter]
+            else:
+                merged = Torch.to_local_tensor(tensor)
+            yield normalize_param_name(name, keep_base_layer=False), merged
 
     def _get_local_state_dict(self):
         """Return {name: param} for this rank's local shard (used by EMA receiver and naive sync)."""
