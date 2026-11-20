@@ -58,6 +58,13 @@ def _record_driver_probe(event: str, episode_id: str = '', **fields: Any) -> Non
     step future resolved, whether its completion reached the event queue, and whether the loop
     that drains the queue is still turning. Without it the two possible causes -- a future that
     never resolves and a queue that is never drained -- are indistinguishable from outside.
+
+    Beyond that hand-off the same stream is the driver's seam event log: admission rounds
+    (``admit``), queue completions (``event_dequeued`` / ``handle``), score submissions and
+    arrivals (``score_submitted``; ``handle`` kind=orm/prm), a group becoming ready
+    (``group_ready``) and a batch handed to the trainer (``batch_handed``) -- the within-step
+    ordering the slow-injection efficiency oracles assert on, with ``t`` stamps from the same
+    monotonic clock.
     """
     import json
     import os
@@ -464,6 +471,7 @@ class StreamingDriver:
             self._lock.notify_all()
         self._returned_at = time.monotonic()
         self._wait_time = self._returned_at - started
+        _record_driver_probe('batch_handed', rows=len(trajs), handed=self._handed, waited=self._wait_time)
         return trajs, _sample_facts(samples, scores, version_spans)
 
     def _wait_for_batch(self) -> bool:
@@ -974,6 +982,7 @@ class StreamingDriver:
             episode.prm_pending += 1
             future = prm([episode.traj])
             self._track(future, 'prm', episode, (segment, scorer))
+        _record_driver_probe('score_submitted', episode.episode_id, kind='prm', segment=segment)
         return segment
 
     def _release(self, episode: _Episode, segment: int) -> None:
@@ -992,6 +1001,7 @@ class StreamingDriver:
         for index, orm in enumerate(self.orms):
             future = orm([episode.traj])
             self._track(future, 'orm', episode, index)
+        _record_driver_probe('score_submitted', episode.episode_id, kind='orm')
         self._maybe_finish(episode)
 
     def _fail(self, episode: _Episode, exc: BaseException) -> None:
@@ -1148,6 +1158,8 @@ class StreamingDriver:
         del self._groups[group.key]
         self._ready.append(list(group.members))
         self._ready_rows += sum(len(episode.deliver) for episode in group.members)
+        _record_driver_probe('group_ready', group.members[0].episode_id if group.members else '',
+                             group=group.key, ready_rows=self._ready_rows)
 
     def _drop_group(self, group: _Group) -> None:
         """Give the group up: its counted rows leave the bound, its unfinished episodes stop (under the lock)."""

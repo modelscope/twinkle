@@ -465,14 +465,25 @@ class TwinkleWorkerExtension:
                     else:
                         tensor = raw_u8.view(dtype=dtype).view(shape)
                         if not borrow_bucket:
-                            tensor = tensor.clone()
+                            try:
+                                tensor = tensor.clone()
+                            except torch.OutOfMemoryError:
+                                tensor = tensor.to('cpu', copy=True)
                     weights.append((name, tensor))
                     continue
 
                 state = partial_tensors.get(name)
                 if state is None:
+                    # Colocated low-headroom sync: the full-tensor assembly buffer can exceed the
+                    # free GPU memory left after the trainer + engine weights (defect117). Fall back
+                    # to CPU so the receive completes instead of crashing the EngineCore; the bucket
+                    # copy_ below already crosses devices, and _load_weights stages onto the target.
+                    try:
+                        assembly = torch.empty(total_nbytes, dtype=torch.uint8, device=buffer.device)
+                    except torch.OutOfMemoryError:
+                        assembly = torch.empty(total_nbytes, dtype=torch.uint8, device='cpu')
                     state = {
-                        'buffer': torch.empty(total_nbytes, dtype=torch.uint8, device=buffer.device),
+                        'buffer': assembly,
                         'dtype': dtype,
                         'shape': shape,
                         'total': total_nbytes,
@@ -498,8 +509,13 @@ class TwinkleWorkerExtension:
                     assembled = state['buffer'].view(dtype=state['dtype']).view(state['shape'])
                     if use_shm:
                         tensor = assembled
+                    elif borrow_bucket:
+                        tensor = assembled
                     else:
-                        tensor = assembled if borrow_bucket else assembled.clone()
+                        try:
+                            tensor = assembled.clone()
+                        except torch.OutOfMemoryError:
+                            tensor = assembled.to('cpu', copy=True)
                     weights.append((name, tensor))
                     del partial_tensors[name]
 
