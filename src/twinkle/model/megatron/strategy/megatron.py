@@ -298,16 +298,15 @@ class MegatronStrategy:
         model: List[nn.Module],
     ) -> List[nn.Module]:
         if self.device_mesh.world_size <= 1:
-            from megatron.core.distributed import DistributedDataParallelConfig
-            ddp_config = DistributedDataParallelConfig(
-                grad_reduce_in_fp32=True,
-                use_distributed_optimizer=False,
-            )
-            for m in model:
-                if not hasattr(m, 'ddp_config'):
-                    m.ddp_config = ddp_config
-            self._enable_text_vision_skip(model)
-            return model
+            # Single-card still needs the MegatronDDP grad buffer: TE layers built with
+            # gradient_accumulation_fusion=True read weight.main_grad in backward, and returning
+            # the raw model left them without it (defect125). Wrap exactly like the world>1 path
+            # (dp1: no sharding or DP communication) so main_grad is allocated and the optimizer
+            # stays the distributed kind the checkpoint sharded_state_dict save expects.
+            wrapped = self._wrap_with_megatron_ddp(
+                model, self.use_distributed_optimizer, {'grad_reduce_in_fp32': True})
+            self._enable_text_vision_skip(wrapped)
+            return wrapped
 
         self._check_device_mesh()
         wrapped = self._wrap_with_megatron_ddp(model, self.use_distributed_optimizer, self.ddp_config)
