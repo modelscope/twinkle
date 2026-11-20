@@ -28,6 +28,25 @@ _SWITCH_COST_WINDOW = 3
 _SWITCH_COST_FALLBACK_S = 10.0
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """True if ``exc`` or its ray-wrapped cause chain is a CUDA out-of-memory error.
+
+    ray flattens the worker's ``torch.OutOfMemoryError`` into a ``RayTaskError`` whose message carries
+    the original text; detect by class name or message so this module need not import torch.
+    """
+    seen: set = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ == 'OutOfMemoryError':
+            return True
+        text = str(cur)
+        if 'CUDA out of memory' in text or 'OutOfMemoryError' in text:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 @dataclass(frozen=True)
 class RolePlacement:
     """Immutable physical placement of one complete model role."""
@@ -624,12 +643,25 @@ class ClusterAdapter:
                 return
             started = time.monotonic()
             self.model.offload_to_cpu()
+            lend_targets = list(self.lend_ranks[:count * width])
             try:
-                self.roles[name].add_workers(
-                    count, warmup=self.warmups.get(name), ranks=list(self.lend_ranks[:count * width]))
-            except BaseException:
+                self.roles[name].add_workers(count, warmup=self.warmups.get(name), ranks=lend_targets)
+            except BaseException as exc:
+                if not _is_cuda_oom(exc):
+                    self.model.reload_to_gpu()
+                    raise
+                # defect117: a colocated shared_sampler leaves too little free GPU memory for the grown
+                # engine's warm reserve. Retire the half-built replica, reload the trainer, and skip the
+                # lend (training continues) instead of crashing; lowering util enables it.
+                try:
+                    self.roles[name].remove_workers(ranks=lend_targets)
+                except BaseException:
+                    logger.warning(f'ClusterAdapter: lend cleanup remove_workers failed on {lend_targets}.')
                 self.model.reload_to_gpu()
-                raise
+                logger.warning(
+                    f'ClusterAdapter: lend skipped on ranks {lend_targets}: insufficient GPU headroom '
+                    f'({exc}); lower --vllm_gpu_memory_utilization to enable lending.')
+                return
             self._lend_duration = time.monotonic() - started
             self._lent = name
             logger.info(f'ClusterAdapter: lent trainer ranks {list(self.lend_ranks[:count * width])} to {name}.')
