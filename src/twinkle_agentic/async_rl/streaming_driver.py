@@ -21,7 +21,6 @@ All the waiting happens through completion callbacks: every step / score Future 
 queue when it finishes, and the driver's thread only reads that queue, so its cost does not grow
 with the number of episodes in flight.
 """
-
 from __future__ import annotations
 import copy
 import math
@@ -31,9 +30,8 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import user_data_get
@@ -43,16 +41,16 @@ from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutStatus
 
 logger = get_logger()
 
-__all__ = ["StreamingDriver", "PRM_SEGMENT_TURNS"]
+__all__ = ['StreamingDriver', 'PRM_SEGMENT_TURNS']
 
 #: The ``RolloutStatus.extra`` key recording each PRM segment's end: the episode's ``turns`` when the
 #: segment closed, one per column of ``prm_rewards``.
-PRM_SEGMENT_TURNS = "prm_segment_turns"
+PRM_SEGMENT_TURNS = 'prm_segment_turns'
 
-_BASELINE = "baseline"
+_BASELINE = 'baseline'
 
 
-def _record_driver_probe(event: str, episode_id: str = "", **fields: Any) -> None:
+def _record_driver_probe(event: str, episode_id: str = '', **fields: Any) -> None:
     """Append one driver event per call when ``TWINKLE_DRIVER_PROBE`` names a directory.
 
     The rollout-side dispatch probe shows an episode's opening step returning and then no
@@ -71,20 +69,18 @@ def _record_driver_probe(event: str, episode_id: str = "", **fields: Any) -> Non
     import os
 
     import json
-
-    root = os.environ.get("TWINKLE_DRIVER_PROBE")
+    root = os.environ.get('TWINKLE_DRIVER_PROBE')
     if not root:
         return
     os.makedirs(root, exist_ok=True)
-    path = os.path.join(root, f"driver.{os.getpid()}.jsonl")
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps({"t": time.monotonic(), "event": event, "episode_id": episode_id, **fields}, default=str) + "\n"
-        )
+    path = os.path.join(root, f'driver.{os.getpid()}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps({'t': time.monotonic(), 'event': event, 'episode_id': episode_id,
+                                 **fields}, default=str) + '\n')
 
 
 def _is_episode_error(exc: BaseException) -> bool:
-    return isinstance(exc, EpisodeError) or isinstance(getattr(exc, "cause", None), EpisodeError)
+    return isinstance(exc, EpisodeError) or isinstance(getattr(exc, 'cause', None), EpisodeError)
 
 
 def _role_of(traj: Any) -> str:
@@ -93,15 +89,14 @@ def _role_of(traj: Any) -> str:
     The group verdict returns baseline rows to the driver before they are submitted; those rows
     may carry either spelling, so both are read -- writing is top-level only.
     """
-    role = traj.get("role")
+    role = traj.get('role')
     if role is None:
-        role = user_data_get(traj.get("user_data"), "role")
-    return str(role or "")
+        role = user_data_get(traj.get('user_data'), 'role')
+    return str(role or '')
 
 
-def _sample_facts(
-    samples: Sequence[RolloutStatus], scores: Sequence[dict[str, Any]], version_spans: Sequence[int]
-) -> dict[str, Any]:
+def _sample_facts(samples: Sequence[RolloutStatus], scores: Sequence[Dict[str, Any]],
+                   version_spans: Sequence[int]) -> Dict[str, Any]:
     """The delivery facts of one batch, off the samples -- never the trajectories.
 
     The rows are never opened for this (under ray they are references): the lengths /
@@ -109,8 +104,8 @@ def _sample_facts(
     columns arrive row-aligned in ``scores`` -- the one payload-adjacent lane, which the advantage
     estimator and the reward metrics consume without materialising a trajectory.
     """
-    prompt_lengths: list[int] = []
-    response_lengths: list[int] = []
+    prompt_lengths: List[int] = []
+    response_lengths: List[int] = []
     for sample in samples:
         tokens = sample.token_lengths
         # None means the episode never produced an encoded frame (an empty prompt); a delivered
@@ -119,26 +114,25 @@ def _sample_facts(
         response_lengths.append(tokens[1] if tokens else 0)
     truncated = [bool(sample.truncated) for sample in samples]
     return {
-        "num_rows": len(samples),
-        "episode_ids": [sample.episode_id for sample in samples],
-        "prompt_lengths": prompt_lengths,
-        "response_lengths": response_lengths,
-        "response_length_min": min(response_lengths) if response_lengths else 0,
-        "response_length_max": max(response_lengths) if response_lengths else 0,
-        "response_length_sum": sum(response_lengths),
-        "policy_versions": sorted({sample.policy_version for sample in samples}),
-        "truncated": truncated,
-        "num_truncated": sum(truncated),
-        "turns": [sample.turns for sample in samples],
-        "version_spans": list(version_spans),
-        "scores": list(scores),
+        'num_rows': len(samples),
+        'episode_ids': [sample.episode_id for sample in samples],
+        'prompt_lengths': prompt_lengths,
+        'response_lengths': response_lengths,
+        'response_length_min': min(response_lengths) if response_lengths else 0,
+        'response_length_max': max(response_lengths) if response_lengths else 0,
+        'response_length_sum': sum(response_lengths),
+        'policy_versions': sorted({sample.policy_version for sample in samples}),
+        'truncated': truncated,
+        'num_truncated': sum(truncated),
+        'turns': [sample.turns for sample in samples],
+        'version_spans': list(version_spans),
+        'scores': list(scores),
     }
 
 
 @dataclass
 class _Group:
     """One prompt row's episodes: the current attempt's members and the baseline episodes it waits for."""
-
     key: str
     row: Any
     #: Fixed for the group's whole lifetime. Recovery and replacement members must use this
@@ -146,9 +140,9 @@ class _Group:
     binding: GroupPolicyBinding
     attempt: int = 0
     #: The current attempt's member trajectories, aligned with ``members`` (a lost one is redone from here).
-    source: list[Any] = field(default_factory=list)
-    members: list[_Episode] = field(default_factory=list)
-    baselines: list[_Episode] = field(default_factory=list)
+    source: List[Any] = field(default_factory=list)
+    members: List['_Episode'] = field(default_factory=list)
+    baselines: List['_Episode'] = field(default_factory=list)
     #: Members of the current attempt that will not produce a sample (failed, stopped, dropped).
     missing: int = 0
 
@@ -161,7 +155,7 @@ class _Group:
         return self.binding.policy_version
 
     @property
-    def adapter_path(self) -> str | None:
+    def adapter_path(self) -> Optional[str]:
         return self.binding.adapter_path
 
 
@@ -172,12 +166,12 @@ class _Episode:
     role: str
     version: int
     traj: Any = None
-    sample: RolloutStatus | None = None
+    sample: Optional[RolloutStatus] = None
     done: bool = False
     #: Set once the episode has no further work: scored (``finished``) or given up (``lost``).
     finished: bool = False
     lost: bool = False
-    orm: list[Any] | None = None
+    orm: Optional[List[Any]] = None
     orm_pending: int = 0
     prm: list[list[Any]] | None = None
     prm_turns: list[int] = field(default_factory=list)
@@ -186,17 +180,17 @@ class _Episode:
     prm_inputs: list[Any] = field(default_factory=list)
     prm_pending: int = 0
     #: The PRM segment the episode waits for before its next step (only with ``on_step``).
-    held: int | None = None
+    held: Optional[int] = None
     #: The episode's training rows as the last step returned them (one, or one per collected
     #: segment); an unfinished episode holds none.
-    deliver: list[Any] = field(default_factory=list)
+    deliver: List[Any] = field(default_factory=list)
     #: The trajectory this episode was submitted with, kept so a no-slot retry can resubmit the same
     #: member slot without touching group_attempt or the quality-regeneration budget.
     submit_traj: Any = None
     #: No-slot retry state (scheduling delay, not failure): when to retry next, the wall-clock deadline
     #: after which the group is dropped, and how many no-slot returns this member has accumulated.
-    no_slot_retry_at: float | None = None
-    no_slot_deadline: float | None = None
+    no_slot_retry_at: Optional[float] = None
+    no_slot_deadline: Optional[float] = None
     no_slot_attempts: int = 0
     #: Whether this episode currently contributes 1 to ``_inflight``. True from submission until it
     #: finishes, is lost, or returns no-slot (the call returned, the member waits to retry). Lets
@@ -205,7 +199,7 @@ class _Episode:
     counted_inflight: bool = False
 
 
-@remote_class(execute="first", max_concurrency=8)
+@remote_class(execute='first', max_concurrency=8)
 class StreamingDriver:
     """Stream episodes through ``rollout`` and hand out scored groups; iterate it for training batches.
 
@@ -268,53 +262,48 @@ class StreamingDriver:
     NO_SLOT_MAX_DELAY = 15.0
     NO_SLOT_JITTER = 0.5
 
-    def __init__(
-        self,
-        dataloader: Any,
-        rollout: Any,
-        *,
-        batch_size: int,
-        num_generations: int = 1,
-        num_epochs: float = 1.0,
-        max_steps: int | None = None,
-        max_staleness: int = 0,
-        sync_interval: int = 1,
-        checkpoint_manager: Any = None,
-        orms: Sequence[Any] = (),
-        orm_names: Sequence[str] | None = None,
-        prms: Sequence[Any] = (),
-        prm_names: Sequence[str] | None = None,
-        prm_segment: Callable[[RolloutStatus, Any], bool] | None = None,
-        on_step: Callable[[RolloutStatus, list[Any]], bool] | None = None,
-        on_sample: Callable[[RolloutStatus], bool | None] | None = None,
-        on_group: Callable[[Any, list[RolloutStatus], int], list[Any]] | None = None,
-        max_group_regenerations: int = 0,
-        cluster_adapter: Any = None,
-        max_no_slot_wait: float = 1800.0,
-        resume_store: ResumeStore | None = None,
-        run_id: str | None = None,
-    ):
+    def __init__(self,
+                 dataloader: Any,
+                 rollout: Any,
+                 *,
+                 batch_size: int,
+                 num_generations: int = 1,
+                 num_epochs: float = 1.0,
+                 max_steps: Optional[int] = None,
+                 max_staleness: int = 0,
+                 sync_interval: int = 1,
+                 checkpoint_manager: Any = None,
+                 orms: Sequence[Any] = (),
+                 orm_names: Optional[Sequence[str]] = None,
+                 prms: Sequence[Any] = (),
+                 prm_names: Optional[Sequence[str]] = None,
+                 prm_segment: Optional[Callable[[RolloutStatus, Any], bool]] = None,
+                 on_step: Optional[Callable[[RolloutStatus, List[Any]], bool]] = None,
+                 on_sample: Optional[Callable[[RolloutStatus], Optional[bool]]] = None,
+                 on_group: Optional[Callable[[Any, List[RolloutStatus], int], List[Any]]] = None,
+                 max_group_regenerations: int = 0,
+                 cluster_adapter: Any = None,
+                 max_no_slot_wait: float = 1800.0,
+                 resume_store: Optional[ResumeStore] = None,
+                 run_id: Optional[str] = None):
         if num_generations < 1 or batch_size < 1 or batch_size % num_generations:
-            raise ValueError(
-                f"batch_size ({batch_size}) must be a positive multiple of num_generations "
-                f"({num_generations}): a batch holds whole groups."
-            )
+            raise ValueError(f'batch_size ({batch_size}) must be a positive multiple of num_generations '
+                             f'({num_generations}): a batch holds whole groups.')
         if num_epochs <= 0:
-            raise ValueError(f"num_epochs must be > 0, got {num_epochs}.")
+            raise ValueError(f'num_epochs must be > 0, got {num_epochs}.')
         if max_staleness < 0 or sync_interval < 1:
-            raise ValueError(
-                f"max_staleness must be >= 0 and sync_interval >= 1, got {max_staleness} / {sync_interval}."
-            )
+            raise ValueError(f'max_staleness must be >= 0 and sync_interval >= 1, got {max_staleness} / '
+                             f'{sync_interval}.')
         if on_step is not None and not prms:
-            raise ValueError("on_step reads PRM scores; pass prms= or drop on_step.")
+            raise ValueError('on_step reads PRM scores; pass prms= or drop on_step.')
         self.orms = list(orms)
-        self.orm_names = list(orm_names) if orm_names is not None else [f"orm_{i}" for i in range(len(self.orms))]
+        self.orm_names = list(orm_names) if orm_names is not None else [f'orm_{i}' for i in range(len(self.orms))]
         if len(self.orm_names) != len(self.orms):
-            raise ValueError(f"orm_names ({len(self.orm_names)}) must name every ORM ({len(self.orms)}).")
+            raise ValueError(f'orm_names ({len(self.orm_names)}) must name every ORM ({len(self.orms)}).')
         self.prms = list(prms)
-        self.prm_names = list(prm_names) if prm_names is not None else [f"prm_{i}" for i in range(len(self.prms))]
+        self.prm_names = list(prm_names) if prm_names is not None else [f'prm_{i}' for i in range(len(self.prms))]
         if len(self.prm_names) != len(self.prms):
-            raise ValueError(f"prm_names ({len(self.prm_names)}) must name every PRM ({len(self.prms)}).")
+            raise ValueError(f'prm_names ({len(self.prm_names)}) must name every PRM ({len(self.prms)}).')
         self.dataloader = dataloader
         self.rollout = rollout
         self.batch_size = batch_size
@@ -333,23 +322,23 @@ class StreamingDriver:
         self.resume_store = resume_store
         self.run_id = run_id or (resume_store.run_id if resume_store is not None else uuid.uuid4().hex)
         if resume_store is not None and run_id is not None and run_id != resume_store.run_id:
-            raise ValueError(f"run_id {run_id!r} does not match resume store run {resume_store.run_id!r}")
+            raise ValueError(f'run_id {run_id!r} does not match resume store run {resume_store.run_id!r}')
         #: Wall-clock ceiling on how long one member may keep retrying a full session pool before its
         #: group is loudly dropped. Scheduling delay is not quality regeneration: it never spends
         #: max_group_regenerations or increments group_attempt, but it must still be bounded.
         self.max_no_slot_wait = max_no_slot_wait
 
         self._lock = threading.Condition()
-        self._events: queue.Queue[tuple[Any, ...]] = queue.Queue()
+        self._events: 'queue.Queue[tuple[Any, ...]]' = queue.Queue()
         self._ready: deque = deque()
         self._ready_rows = 0
-        self._thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
         self._closed = False
         self._exhausted = False
-        self._error: BaseException | None = None
-        self._rows: Iterator[Any] | None = None
+        self._error: Optional[BaseException] = None
+        self._rows: Optional[Iterator[Any]] = None
         self._prompt_seq = 0
-        self._groups: dict[str, _Group] = {}
+        self._groups: Dict[str, _Group] = {}
         #: Member rows admitted and not dropped (baselines excluded): what the version bound caps.
         self._live = 0
         self._inflight = 0
@@ -358,18 +347,10 @@ class StreamingDriver:
         self._base_version = 0
         self._failures: deque = deque(maxlen=self.FAILURE_WINDOW)
         self._consecutive_failures = 0
-        self._counters: dict[str, int] = {
-            "admitted": 0,
-            "dropped_stale": 0,
-            "dropped_sample": 0,
-            "dropped_group": 0,
-            "episode_errors": 0,
-            "stopped": 0,
-            "regenerated": 0,
-            "no_slot": 0,
-            "no_slot_dropped": 0,
-            "resumed_groups": 0,
-            "resumed_members": 0,
+        self._counters: Dict[str, int] = {
+            'admitted': 0, 'dropped_stale': 0, 'dropped_sample': 0, 'dropped_group': 0, 'episode_errors': 0,
+            'stopped': 0, 'regenerated': 0, 'no_slot': 0, 'no_slot_dropped': 0,
+            'resumed_groups': 0, 'resumed_members': 0,
         }
         self._adjusting = False
         #: monotonic stamps: when the running ``adjust`` started, and when its being stuck was last reported.
@@ -382,35 +363,33 @@ class StreamingDriver:
         #: the lend->reclaim cycle now in flight (the thread, until the reclaim in ``_next_batch``'s
         #: finally completes): while it runs the adapter's lock is legitimately held
         self._lending = None
-        self._returned_at: float | None = None
+        self._returned_at: Optional[float] = None
         self._idle_ratio = 0.0
         self._iter_started = False
         #: The one batch whose model update may or may not have committed. It survives a process
         #: restart and is handed out again until ``commit_batch`` records the model checkpoint.
-        self._lease: dict[str, Any] | None = None
+        self._lease: Optional[Dict[str, Any]] = None
         self._lease_returned = False
 
     # ------------------------------------------------------------------ iteration
 
-    @remote_function(execute="first", collect="first", lazy_collect=False, stash=(0,))
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=(0,))
     def __iter__(self):
         """Iterate the driver once: ``(rows, facts)`` per batch, delivered together."""
         if self._iter_started:
-            raise RuntimeError(
-                "StreamingDriver serves ONE iteration per run; a second one would re-read "
-                "the dataloader from an unrelated position. Wrap the single iterator instead."
-            )
+            raise RuntimeError('StreamingDriver serves ONE iteration per run; a second one would re-read '
+                               'the dataloader from an unrelated position. Wrap the single iterator instead.')
         self._iter_started = True
         return self._batches()
 
-    def _batches(self) -> Iterator[list[Any]]:
+    def _batches(self) -> Iterator[List[Any]]:
         while True:
             batch = self._next_batch()
             if batch is None:
                 return
             yield batch
 
-    def _next_batch(self) -> tuple | None:
+    def _next_batch(self) -> Optional[tuple]:
         """Wait for ``batch_size`` rows of complete, fresh groups; ``None`` once nothing more will come.
 
         A delivery is ``(rows, facts)``: the rows exactly as they travel (a reference under ray,
@@ -425,12 +404,10 @@ class StreamingDriver:
                 self._lease_returned = False
             elif not self._lease_returned:
                 self._lease_returned = True
-                return self._lease["rows"], self._lease["facts"]
+                return self._lease['rows'], self._lease['facts']
             else:
-                raise UnsafeResume(
-                    f"batch lease {self._lease['lease_id']!r} is still open; "
-                    "call commit_batch() after the model checkpoint is durable"
-                )
+                raise UnsafeResume(f'batch lease {self._lease["lease_id"]!r} is still open; '
+                                   'call commit_batch() after the model checkpoint is durable')
         self._start()
         started = time.monotonic()
         waited = 0.0
@@ -447,7 +424,7 @@ class StreamingDriver:
         # the trainer waits from here on: its devices may be lent until the batch is ready
         lending = None
         if self.cluster_adapter is not None and short:
-            lending = threading.Thread(target=self._lend, args=(waited,), name="twinkle-cluster-lend", daemon=True)
+            lending = threading.Thread(target=self._lend, args=(waited,), name='twinkle-cluster-lend', daemon=True)
             lending.start()
         #: mirrors ``lending`` from its start until the reclaim below completes -- an ``adjust``
         #: queued behind that cycle is not stuck, so the watchdog stays quiet while it runs
@@ -491,45 +468,36 @@ class StreamingDriver:
                     versions = [episode.version for episode in members]
                     if versions and max(versions) - min(versions) > self.max_staleness:
                         raise RuntimeError(
-                            f"ready group spans {max(versions) - min(versions)} policy versions "
-                            f"({min(versions)}..{max(versions)}), more than max_staleness="
-                            f"{self.max_staleness}; per-member staleness left an over-age member."
-                        )
-            trajs: list[Any] = []
-            samples: list[RolloutStatus] = []
-            scores: list[dict[str, Any]] = []
-            version_spans: list[int] = []
+                            f'ready group spans {max(versions) - min(versions)} policy versions '
+                            f'({min(versions)}..{max(versions)}), more than max_staleness='
+                            f'{self.max_staleness}; per-member staleness left an over-age member.')
+            trajs: List[Any] = []
+            samples: List[RolloutStatus] = []
+            scores: List[Dict[str, Any]] = []
+            version_spans: List[int] = []
             while len(trajs) < self.batch_size and self._ready:
                 ready_group = self._ready.popleft()
                 self._live -= sum(1 for episode in ready_group if episode.deliver)
                 for episode in ready_group:
                     episode.sample.version_span = self._version - episode.sample.policy_version
                     score = self._score_update(episode)
-                    lengths = (episode.sample.extra or {}).get("row_token_lengths")
+                    lengths = (episode.sample.extra or {}).get('row_token_lengths')
                     if len(episode.deliver) == 1 or not lengths:
                         # The identity path: one row carries the episode's own facts verbatim.
                         row_samples = [episode.sample] * len(episode.deliver)
                     else:
                         if len(lengths) != len(episode.deliver):
                             raise RuntimeError(
-                                f"episode {episode.sample.episode_id!r}: {len(episode.deliver)} delivered rows "
-                                f"but {len(lengths)} row lengths on its status."
-                            )
+                                f'episode {episode.sample.episode_id!r}: {len(episode.deliver)} delivered rows '
+                                f'but {len(lengths)} row lengths on its status.')
                         # A collected episode's rows carry their own length facts: the episode
                         # totals would repeat on every row and weigh the metrics by row count.
-                        extra = {
-                            key: value
-                            for key, value in (episode.sample.extra or {}).items()
-                            if key != "row_token_lengths"
-                        }
+                        extra = {key: value for key, value in (episode.sample.extra or {}).items()
+                                 if key != 'row_token_lengths'}
                         row_samples = [
-                            replace(
-                                episode.sample,
-                                token_lengths=tuple(map(int, pair)),
-                                extra=dict(extra, segment_index=index),
-                            )
-                            for index, pair in enumerate(lengths)
-                        ]
+                            replace(episode.sample, token_lengths=tuple(map(int, pair)),
+                                    extra=dict(extra, segment_index=index))
+                            for index, pair in enumerate(lengths)]
                     for row, row_sample in zip(episode.deliver, row_samples, strict=True):
                         trajs.append(row)
                         samples.append(row_sample)
@@ -538,32 +506,32 @@ class StreamingDriver:
             self._ready_rows -= len(trajs)
             batch_index = self._handed
             facts = _sample_facts(samples, scores, version_spans)
-            lease_id = f"{self.run_id}/batch/{batch_index}"
+            lease_id = f'{self.run_id}/batch/{batch_index}'
             self._lease = {
-                "lease_id": lease_id,
-                "batch": batch_index,
-                "policy_versions": list(facts["policy_versions"]),
-                "rows": trajs,
-                "facts": facts,
+                'lease_id': lease_id,
+                'batch': batch_index,
+                'policy_versions': list(facts['policy_versions']),
+                'rows': trajs,
+                'facts': facts,
             }
             self._lease_returned = True
             self._handed += 1
             if self.resume_store is not None:
-                self.resume_store.save_object("leases", lease_id, self._lease)
+                self.resume_store.save_object('leases', lease_id, self._lease)
                 # The snapshot must point at the lease before the journal makes
                 # it durable.  A crash in between re-delivers this same lease;
                 # the reverse order could strand the lease object unreferenced.
                 self._persist_snapshot_locked()
                 self.resume_store.journal.append(
-                    JournalEvent.BATCH_LEASED, lease_id, {"batch": batch_index, "rows": len(trajs), "object": lease_id}
-                )
+                    JournalEvent.BATCH_LEASED, lease_id,
+                    {'batch': batch_index, 'rows': len(trajs), 'object': lease_id})
             self._lock.notify_all()
         self._returned_at = time.monotonic()
         self._wait_time = self._returned_at - started
         _record_driver_probe("batch_handed", rows=len(trajs), handed=self._handed, waited=self._wait_time)
         return trajs, facts
 
-    def _score_update(self, episode: _Episode) -> dict[str, Any]:
+    def _score_update(self, episode: _Episode) -> Dict[str, Any]:
         """One row's light score entry, off the private bookkeeping -- never written onto the row.
 
         The entry mirrors the row's column contract (``rewards.orm`` / ``rewards.baseline`` map
@@ -575,35 +543,24 @@ class StreamingDriver:
         ``rewards.env`` stays on the row, where its producer wrote it.
         """
         sample = episode.sample
-        rewards: dict[str, Any] = {
-            "orm": {
-                name: (None if value is None else float(value))
-                for name, value in zip(self.orm_names, episode.orm or (), strict=True)
-            },
+        rewards: Dict[str, Any] = {
+            'orm': {name: (None if value is None else float(value))
+                    for name, value in zip(self.orm_names, episode.orm or (), strict=True)},
         }
         if sample.baseline is not None:
-            rows = (
-                sample.baseline
-                if (sample.baseline and isinstance(sample.baseline[0], (list, tuple)))
+            rows = sample.baseline if (sample.baseline and isinstance(sample.baseline[0], (list, tuple))) \
                 else [sample.baseline]
-            )
             if len(rows) != 1:
-                raise RuntimeError(
-                    f"episode {episode.episode_id} carries {len(rows)} baseline rows; the named "
-                    "baseline column carries one. Return a single baseline per group."
-                )
-            rewards["baseline"] = {
-                name: (None if value is None else float(value))
-                for name, value in zip(self.orm_names, rows[0], strict=True)
-            }
-        score: dict[str, Any] = {"rewards": rewards}
+                raise RuntimeError(f'episode {episode.episode_id} carries {len(rows)} baseline rows; the named '
+                                   'baseline column carries one. Return a single baseline per group.')
+            rewards['baseline'] = {name: (None if value is None else float(value))
+                                   for name, value in zip(self.orm_names, rows[0], strict=True)}
+        score: Dict[str, Any] = {'rewards': rewards}
         if episode.prm is not None:
-            score["prm_segments"] = {
-                "end_turns": [int(turns) for turns in episode.prm_turns],
-                "scores": {
-                    name: [(None if value is None else float(value)) for value in column]
-                    for name, column in zip(self.prm_names, episode.prm, strict=True)
-                },
+            score['prm_segments'] = {
+                'end_turns': [int(turns) for turns in episode.prm_turns],
+                'scores': {name: [(None if value is None else float(value)) for value in column]
+                           for name, column in zip(self.prm_names, episode.prm, strict=True)},
             }
         return score
 
@@ -630,8 +587,8 @@ class StreamingDriver:
     def _retire_stale_group(self, group: _Group) -> None:
         """Drop one group atomically after its pinned policy leaves the staleness window."""
         self._groups.pop(group.key, None)
-        self._counters["dropped_stale"] += len(group.members)
-        self._counters["dropped_group"] += 1
+        self._counters['dropped_stale'] += len(group.members)
+        self._counters['dropped_group'] += 1
         if self.resume_store is not None:
             self._persist_snapshot_locked()
             self.resume_store.journal.append(
@@ -648,25 +605,18 @@ class StreamingDriver:
                 self._live -= 1
         self._discard_group_state(group)
 
-    @remote_function(execute="first", collect="first", lazy_collect=False)
-    def stats(self) -> dict[str, Any]:
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def stats(self) -> Dict[str, Any]:
         """Counters of the run so far (small; for logging)."""
         with self._lock:
-            return dict(
-                self._counters,
-                version=self._version,
-                handed=self._handed,
-                inflight=self._inflight,
-                live=self._live,
-                ready_rows=self._ready_rows,
-                train_idle_ratio=self._idle_ratio,
-            )
+            return dict(self._counters, version=self._version, handed=self._handed, inflight=self._inflight,
+                        live=self._live, ready_rows=self._ready_rows, train_idle_ratio=self._idle_ratio)
 
     def _loader_state(self) -> Any:
-        getter = getattr(self.dataloader, "state_dict", None) or getattr(self.dataloader, "get_state", None)
+        getter = getattr(self.dataloader, 'state_dict', None) or getattr(self.dataloader, 'get_state', None)
         return copy.deepcopy(getter()) if callable(getter) else None
 
-    def _episode_state(self, episode: _Episode) -> dict[str, Any]:
+    def _episode_state(self, episode: _Episode) -> Dict[str, Any]:
         now = time.monotonic()
         return {
             "episode_id": episode.episode_id,
@@ -697,36 +647,36 @@ class StreamingDriver:
             "counted_inflight": episode.counted_inflight,
         }
 
-    def _group_state(self, group: _Group) -> dict[str, Any]:
+    def _group_state(self, group: _Group) -> Dict[str, Any]:
         return {
-            "key": group.key,
-            "row": group.row,
-            "binding": group.binding.to_dict(),
+            'key': group.key,
+            'row': group.row,
+            'binding': group.binding.to_dict(),
             # Flat fields keep snapshots readable by earlier draft readers.
-            "version": group.version,
-            "adapter_path": group.adapter_path,
-            "attempt": group.attempt,
-            "source": list(group.source),
-            "members": [self._episode_state(episode) for episode in group.members],
-            "baselines": [self._episode_state(episode) for episode in group.baselines],
-            "missing": group.missing,
+            'version': group.version,
+            'adapter_path': group.adapter_path,
+            'attempt': group.attempt,
+            'source': list(group.source),
+            'members': [self._episode_state(episode) for episode in group.members],
+            'baselines': [self._episode_state(episode) for episode in group.baselines],
+            'missing': group.missing,
         }
 
-    def _snapshot(self) -> dict[str, Any]:
+    def _snapshot(self) -> Dict[str, Any]:
         return {
-            "format": "twinkle.streaming-driver.v1",
-            "run_id": self.run_id,
-            "handed": self._handed,
-            "prompts_drawn": self._prompt_seq,
-            "version": self._version,
-            "base_version": self._base_version,
-            "exhausted": self._exhausted,
-            "counters": dict(self._counters),
-            "loader_state": self._loader_state(),
-            "groups": [self._group_state(group) for group in self._groups.values()],
-            "ready": [[self._episode_state(episode) for episode in members] for members in self._ready],
-            "ready_groups": [self._group_state(members[0].group) for members in self._ready if members],
-            "lease": self._lease,
+            'format': 'twinkle.streaming-driver.v1',
+            'run_id': self.run_id,
+            'handed': self._handed,
+            'prompts_drawn': self._prompt_seq,
+            'version': self._version,
+            'base_version': self._base_version,
+            'exhausted': self._exhausted,
+            'counters': dict(self._counters),
+            'loader_state': self._loader_state(),
+            'groups': [self._group_state(group) for group in self._groups.values()],
+            'ready': [[self._episode_state(episode) for episode in members] for members in self._ready],
+            'ready_groups': [self._group_state(members[0].group) for members in self._ready if members],
+            'lease': self._lease,
         }
 
     def _persist_snapshot_locked(self) -> None:
@@ -738,10 +688,10 @@ class StreamingDriver:
         uses it to retire a lease even when the following snapshot was torn.
         """
         if self.resume_store is not None:
-            self.resume_store.save_object("driver", self.run_id, self._snapshot())
+            self.resume_store.save_object('driver', self.run_id, self._snapshot())
 
-    @remote_function(execute="first", collect="first", lazy_collect=False)
-    def state_dict(self) -> dict[str, Any]:
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def state_dict(self) -> Dict[str, Any]:
         """Snapshot prompts, complete groups, ready groups and the open batch lease.
 
         Live episodes are paired with their last durable rollout turn checkpoint. A checkpoint taken
@@ -751,10 +701,10 @@ class StreamingDriver:
         with self._lock:
             state = self._snapshot()
         if self.resume_store is not None:
-            self.resume_store.save_object("driver", self.run_id, state)
+            self.resume_store.save_object('driver', self.run_id, state)
         return state
 
-    def _restore_episode(self, state: dict[str, Any], group: _Group) -> _Episode:
+    def _restore_episode(self, state: Dict[str, Any], group: _Group) -> _Episode:
         episode = _Episode(
             episode_id=str(state["episode_id"]),
             group=group,
@@ -776,62 +726,60 @@ class StreamingDriver:
         episode.deliver = list(state.get("deliver") or ())
         episode.submit_traj = state.get("submit_traj")
         now = time.monotonic()
-        if state.get("no_slot_retry_in") is not None:
-            episode.no_slot_retry_at = now + float(state["no_slot_retry_in"])
-        if state.get("no_slot_deadline_in") is not None:
-            episode.no_slot_deadline = now + float(state["no_slot_deadline_in"])
-        episode.no_slot_attempts = int(state.get("no_slot_attempts") or 0)
-        episode.counted_inflight = bool(state.get("counted_inflight"))
+        if state.get('no_slot_retry_in') is not None:
+            episode.no_slot_retry_at = now + float(state['no_slot_retry_in'])
+        if state.get('no_slot_deadline_in') is not None:
+            episode.no_slot_deadline = now + float(state['no_slot_deadline_in'])
+        episode.no_slot_attempts = int(state.get('no_slot_attempts') or 0)
+        episode.counted_inflight = bool(state.get('counted_inflight'))
         return episode
 
-    def _restore_group(self, state: dict[str, Any]) -> _Group:
-        members = state.get("members") or ()
-        member_version = next((int(item.get("version") or 0) for item in members if item.get("version") is not None), 0)
-        version = int(state.get("version") if state.get("version") is not None else member_version)
-        adapter_path = state.get("adapter_path")
-        raw_binding = state.get("binding")
+    def _restore_group(self, state: Dict[str, Any]) -> _Group:
+        members = state.get('members') or ()
+        member_version = next(
+            (int(item.get('version') or 0) for item in members if item.get('version') is not None), 0)
+        version = int(state.get('version') if state.get('version') is not None else member_version)
+        adapter_path = state.get('adapter_path')
+        raw_binding = state.get('binding')
         if raw_binding is not None:
             try:
                 binding = GroupPolicyBinding.from_dict(raw_binding)
             except (TypeError, ValueError) as exc:
-                raise UnsafeResume(f"invalid group policy binding: {exc}") from exc
-            if state.get("version") is not None and int(state["version"]) != binding.policy_version:
+                raise UnsafeResume(f'invalid group policy binding: {exc}') from exc
+            if state.get('version') is not None and int(state['version']) != binding.policy_version:
                 raise UnsafeResume(
-                    f"group binding version {binding.policy_version} disagrees with snapshot version {state['version']}"
-                )
-            if "adapter_path" in state and state.get("adapter_path") != binding.adapter_path:
-                raise UnsafeResume("group binding adapter_path disagrees with the flat snapshot field")
+                    f'group binding version {binding.policy_version} disagrees with snapshot version '
+                    f'{state["version"]}')
+            if 'adapter_path' in state and state.get('adapter_path') != binding.adapter_path:
+                raise UnsafeResume('group binding adapter_path disagrees with the flat snapshot field')
             version = binding.policy_version
             adapter_path = binding.adapter_path
         else:
             binding = GroupPolicyBinding(
-                state_key=str(state.get("state_key") or f"{self.run_id}/group/{state.get('key')}"),
+                state_key=str(state.get('state_key') or f'{self.run_id}/group/{state.get("key")}'),
                 policy_version=version,
                 adapter_path=adapter_path,
             )
-        expected_state_key = f"{self.run_id}/group/{state.get('key')}"
+        expected_state_key = f'{self.run_id}/group/{state.get("key")}'
         if binding.state_key != expected_state_key:
-            raise UnsafeResume(f"group binding state_key {binding.state_key!r} does not match {expected_state_key!r}")
+            raise UnsafeResume(
+                f'group binding state_key {binding.state_key!r} does not match {expected_state_key!r}')
         # A legacy flat snapshot had no binding, so the manager may upgrade its
         # missing adapter path.  An explicit binding with adapter_path=None
         # means the base model and must not be silently rebound to an adapter.
         if raw_binding is None and adapter_path is None and self.checkpoint_manager is not None:
-            lookup = getattr(self.checkpoint_manager, "adapter_path", None)
+            lookup = getattr(self.checkpoint_manager, 'adapter_path', None)
             if callable(lookup):
                 adapter_path = lookup(version)
                 if adapter_path is None:
-                    raise UnsafeResume(f"policy version {version} has no resolvable adapter path")
+                    raise UnsafeResume(f'policy version {version} has no resolvable adapter path')
                 binding = replace(binding, adapter_path=adapter_path)
         group = _Group(
-            key=str(state["key"]),
-            row=state.get("row"),
-            binding=binding,
-            attempt=int(state.get("attempt") or 0),
-            source=list(state.get("source") or ()),
-            missing=int(state.get("missing") or 0),
-        )
-        group.members = [self._restore_episode(item, group) for item in state.get("members") or ()]
-        group.baselines = [self._restore_episode(item, group) for item in state.get("baselines") or ()]
+            key=str(state['key']), row=state.get('row'), binding=binding,
+            attempt=int(state.get('attempt') or 0),
+            source=list(state.get('source') or ()), missing=int(state.get('missing') or 0))
+        group.members = [self._restore_episode(item, group) for item in state.get('members') or ()]
+        group.baselines = [self._restore_episode(item, group) for item in state.get('baselines') or ()]
         return group
 
     def _resume_scores(self, episode: _Episode) -> None:
@@ -841,8 +789,7 @@ class StreamingDriver:
                 continue
             future = self.orms[index]([episode.traj])
             future.add_done_callback(
-                lambda f, episode=episode, index=index: self._events.put(("orm", episode, index, f))
-            )
+                lambda f, episode=episode, index=index: self._events.put(('orm', episode, index, f)))
         for scorer, column in enumerate(episode.prm or ()):
             for segment, value in enumerate(column):
                 if value is not _PENDING:
@@ -853,8 +800,7 @@ class StreamingDriver:
                     )
                 future = self.prms[scorer]([episode.prm_inputs[segment]])
                 future.add_done_callback(
-                    lambda f, episode=episode, key=(segment, scorer): self._events.put(("prm", episode, key, f))
-                )
+                    lambda f, episode=episode, key=(segment, scorer): self._events.put(('prm', episode, key, f)))
 
     def _resume_live_episode(self, episode: _Episode) -> None:
         if episode.finished or episode.lost:
@@ -871,56 +817,55 @@ class StreamingDriver:
         if self.resume_store is not None and state_key and self.resume_store.has_object("episodes", state_key):
             self.rollout.restore_episode_from_store(state_key)
             route = dict(episode.traj or episode.submit_traj or {})
-            route.setdefault("turns", 0)
+            route.setdefault('turns', 0)
             self._step(episode, route)
         else:
             # No turn boundary committed yet: opening the episode again repeats no external tool call.
             self._step(episode, episode.submit_traj)
 
-    @remote_function(execute="first", collect="first", lazy_collect=False)
-    def load_state_dict(self, state: dict[str, Any] | None = None) -> None:
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def load_state_dict(self, state: Optional[Dict[str, Any]] = None) -> None:
         """Rebuild a fresh driver from a snapshot, or from the store's latest snapshot."""
         if state is None:
             if self.resume_store is None:
-                raise UnsafeResume("load_state_dict() without state needs a resume store")
-            state = self.resume_store.load_object("driver", self.run_id)
-        if state.get("format") != "twinkle.streaming-driver.v1":
-            raise UnsafeResume("unsupported StreamingDriver checkpoint format")
-        if str(state.get("run_id")) != self.run_id:
-            raise UnsafeResume(f"driver snapshot belongs to run {state.get('run_id')!r}, not {self.run_id!r}")
+                raise UnsafeResume('load_state_dict() without state needs a resume store')
+            state = self.resume_store.load_object('driver', self.run_id)
+        if state.get('format') != 'twinkle.streaming-driver.v1':
+            raise UnsafeResume('unsupported StreamingDriver checkpoint format')
+        if str(state.get('run_id')) != self.run_id:
+            raise UnsafeResume(f'driver snapshot belongs to run {state.get("run_id")!r}, not {self.run_id!r}')
         observed_version = int(self.checkpoint_manager.version()) if self.checkpoint_manager is not None else 0
         with self._lock:
             if self._thread is not None or self._iter_started:
-                raise UnsafeResume("load_state_dict must run before the driver starts")
+                raise UnsafeResume('load_state_dict must run before the driver starts')
             self._groups = {}
-            for item in state.get("groups") or ():
+            for item in state.get('groups') or ():
                 group = self._restore_group(item)
                 self._groups[group.key] = group
-            ready_groups = {
-                group.key: group for group in (self._restore_group(item) for item in state.get("ready_groups") or ())
-            }
+            ready_groups = {group.key: group for group in
+                            (self._restore_group(item) for item in state.get('ready_groups') or ())}
             self._ready = deque()
-            for members in state.get("ready") or ():
+            for members in state.get('ready') or ():
                 restored = []
                 for item in members:
-                    key = str(item.get("group_key"))
+                    key = str(item.get('group_key'))
                     group = ready_groups.get(key)
                     if group is None:
-                        raise UnsafeResume(f"ready episode references unknown group {key!r}")
+                        raise UnsafeResume(f'ready episode references unknown group {key!r}')
                     restored.append(self._restore_episode(item, group))
                 self._ready.append(restored)
             self._ready_rows = sum(len(episode.deliver) for members in self._ready for episode in members)
-            self._handed = int(state.get("handed") or 0)
-            self._prompt_seq = int(state.get("prompts_drawn") or 0)
-            self._version = max(int(state.get("version") or 0), observed_version)
-            self._base_version = int(state.get("base_version") or 0)
-            self._exhausted = bool(state.get("exhausted"))
-            self._counters = dict(state.get("counters") or self._counters)
-            lease = state.get("lease")
+            self._handed = int(state.get('handed') or 0)
+            self._prompt_seq = int(state.get('prompts_drawn') or 0)
+            self._version = max(int(state.get('version') or 0), observed_version)
+            self._base_version = int(state.get('base_version') or 0)
+            self._exhausted = bool(state.get('exhausted'))
+            self._counters = dict(state.get('counters') or self._counters)
+            lease = state.get('lease')
             if lease is not None and self.resume_store is not None:
                 last = self.resume_store.journal.last(
-                    str(lease["lease_id"]), events=(JournalEvent.BATCH_LEASED, JournalEvent.MODEL_CHECKPOINT_COMMITTED)
-                )
+                    str(lease['lease_id']), events=(JournalEvent.BATCH_LEASED,
+                                                     JournalEvent.MODEL_CHECKPOINT_COMMITTED))
                 if last is not None and last.event == JournalEvent.MODEL_CHECKPOINT_COMMITTED:
                     lease = None
             self._lease = lease
@@ -929,7 +874,8 @@ class StreamingDriver:
             for group in list(self._groups.values()):
                 if self.checkpoint_manager is not None and self._version - group.version > self.max_staleness:
                     self._retire_stale_group(group)
-            self._live = sum(not episode.lost for group in self._groups.values() for episode in group.members)
+            self._live = sum(not episode.lost for group in self._groups.values()
+                             for episode in group.members)
             self._live += sum(not episode.lost for members in self._ready for episode in members)
             self._inflight = sum(
                 episode.counted_inflight
@@ -946,7 +892,7 @@ class StreamingDriver:
         )
         if loader_state is not None:
             if not callable(loader):
-                raise UnsafeResume("snapshot has DataLoader state but the dataloader cannot load it")
+                raise UnsafeResume('snapshot has DataLoader state but the dataloader cannot load it')
             loader(loader_state)
         for episode in live:
             self._resume_live_episode(episode)
@@ -955,52 +901,46 @@ class StreamingDriver:
                 self._settle(group)
             self._lock.notify_all()
 
-    @remote_function(execute="first", collect="first", lazy_collect=False)
-    def commit_batch(self, checkpoint_ref: str = "", manifest: dict[str, Any] | None = None) -> str | None:
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def commit_batch(self, checkpoint_ref: str = '', manifest: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Mark the open lease trained after its model checkpoint is durable."""
         with self._lock:
             lease = self._lease
             if lease is None:
                 return None
             if self.resume_store is not None and not checkpoint_ref:
-                raise UnsafeResume("commit_batch() needs the durable model checkpoint reference")
-            lease_id = str(lease["lease_id"])
+                raise UnsafeResume('commit_batch() needs the durable model checkpoint reference')
+            lease_id = str(lease['lease_id'])
             if self.resume_store is not None:
                 self.resume_store.journal.append(
-                    JournalEvent.MODEL_CHECKPOINT_COMMITTED,
-                    lease_id,
+                    JournalEvent.MODEL_CHECKPOINT_COMMITTED, lease_id,
                     {
-                        "checkpoint": str(checkpoint_ref),
-                        "batch": lease["batch"],
-                        "policy_versions": list(lease.get("policy_versions") or ()),
-                        "manifest": dict(manifest or {}),
-                    },
-                )
-                self.resume_store.delete_object("leases", lease_id)
+                        'checkpoint': str(checkpoint_ref),
+                        'batch': lease['batch'],
+                        'policy_versions': list(lease.get('policy_versions') or ()),
+                        'manifest': dict(manifest or {}),
+                    })
+                self.resume_store.delete_object('leases', lease_id)
             self._lease = None
             self._lease_returned = False
             self._persist_snapshot_locked()
             self._lock.notify_all()
             return lease_id
 
-    @remote_function(execute="first", collect="first", lazy_collect=False)
+    @remote_function(execute='first', collect='first', lazy_collect=False)
     def close(self) -> None:
         """Stop admitting, stop the episodes in flight and end the background thread."""
         with self._lock:
             self._closed = True
-            episodes = [
-                episode
-                for group in self._groups.values()
-                for episode in group.members + group.baselines
-                if not episode.finished
-            ]
+            episodes = [episode for group in self._groups.values()
+                        for episode in group.members + group.baselines if not episode.finished]
             self._lock.notify_all()
         for episode in episodes:
             if not episode.done:
                 try:
                     self.rollout.stop(episode.traj or {}, episode_id=episode.episode_id)
                 except Exception as exc:  # noqa: BLE001 -- best effort on the way out
-                    logger.warning(f"StreamingDriver.close: stopping {episode.episode_id} failed: {exc}")
+                    logger.warning(f'StreamingDriver.close: stopping {episode.episode_id} failed: {exc}')
         if self._thread is not None:
             self._thread.join(timeout=10)
 
@@ -1013,7 +953,7 @@ class StreamingDriver:
             self._version = self._read_version()
             # the bound counts versions from here: a manager synced before the run starts above 0
             self._base_version = self._version
-            self._thread = threading.Thread(target=self._run, name="twinkle-streaming-driver", daemon=True)
+            self._thread = threading.Thread(target=self._run, name='twinkle-streaming-driver', daemon=True)
             self._thread.start()
 
     def _run(self) -> None:
@@ -1030,9 +970,8 @@ class StreamingDriver:
                     self._admit()
                     self._retry_no_slot_due()
                     self._lock.notify_all()
-                _record_driver_probe(
-                    "admit", live=self._live, capacity=self._capacity(), qsize=self._events.qsize(), version=version
-                )
+                _record_driver_probe('admit', live=self._live, capacity=self._capacity(),
+                                     qsize=self._events.qsize(), version=version)
                 if version != adjusted:
                     adjusted = version
                     self._maybe_adjust()
@@ -1040,7 +979,7 @@ class StreamingDriver:
                     event = self._events.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                _record_driver_probe("event_dequeued", event[1].episode_id, kind=event[0])
+                _record_driver_probe('event_dequeued', event[1].episode_id, kind=event[0])
                 while event is not None:
                     self._handle(*event)
                     try:
@@ -1048,8 +987,8 @@ class StreamingDriver:
                     except queue.Empty:
                         event = None
         except BaseException as exc:  # noqa
-            _record_driver_probe("run_stopped", error=f"{type(exc).__name__}: {exc}")
-            logger.error(f"StreamingDriver stopped: {type(exc).__name__}: {exc}")
+            _record_driver_probe('run_stopped', error=f'{type(exc).__name__}: {exc}')
+            logger.error(f'StreamingDriver stopped: {type(exc).__name__}: {exc}')
             with self._lock:
                 self._error = exc
                 self._lock.notify_all()
@@ -1077,11 +1016,9 @@ class StreamingDriver:
             stuck = now - self._adjust_started
             if stuck >= self.ADJUST_STUCK_TIMEOUT and now - self._adjust_reported >= self.ADJUST_STUCK_TIMEOUT:
                 self._adjust_reported = now
-                logger.warning(
-                    f"cluster adapter adjust has been running for {stuck:.0f}s "
-                    "(a large weight warm takes this long too and a stuck RPC looks "
-                    "the same); rebalancing is paused until it returns"
-                )
+                logger.warning(f'cluster adapter adjust has been running for {stuck:.0f}s '
+                               '(a large weight warm takes this long too and a stuck RPC looks '
+                               'the same); rebalancing is paused until it returns')
             return
         self._adjusting = True
         self._adjust_started = time.monotonic()
@@ -1090,18 +1027,18 @@ class StreamingDriver:
             try:
                 self.cluster_adapter.adjust()
             except Exception as exc:  # noqa: BLE001 -- rebalancing is an optimisation, never fatal
-                logger.warning(f"cluster adapter adjust failed: {type(exc).__name__}: {exc}")
+                logger.warning(f'cluster adapter adjust failed: {type(exc).__name__}: {exc}')
             finally:
                 self._adjusting = False
 
-        threading.Thread(target=_adjust, name="twinkle-cluster-adjust", daemon=True).start()
+        threading.Thread(target=_adjust, name='twinkle-cluster-adjust', daemon=True).start()
 
     def _lend(self, waited: float) -> None:
         """Run ``lend`` while the trainer waits; ``reclaim`` joins this thread before undoing it."""
         try:
             self.cluster_adapter.lend(self._idle_ratio, waited=waited)
         except Exception as exc:  # noqa: BLE001 -- lending is an optimisation, never fatal
-            logger.warning(f"cluster adapter lend failed: {type(exc).__name__}: {exc}")
+            logger.warning(f'cluster adapter lend failed: {type(exc).__name__}: {exc}')
 
     # ------------------------------------------------------------------ admission
 
@@ -1129,15 +1066,14 @@ class StreamingDriver:
             version = self._version
             adapter_path = None
             if self.checkpoint_manager is not None:
-                lookup = getattr(self.checkpoint_manager, "adapter_path", None)
+                lookup = getattr(self.checkpoint_manager, 'adapter_path', None)
                 if callable(lookup):
                     adapter_path = lookup(version)
                     if adapter_path is None:
                         raise UnsafeResume(
-                            f"checkpoint manager has no adapter path for admitted policy version {version}"
-                        )
+                            f'checkpoint manager has no adapter path for admitted policy version {version}')
             binding = GroupPolicyBinding(
-                state_key=f"{self.run_id}/group/{key}",
+                state_key=f'{self.run_id}/group/{key}',
                 policy_version=version,
                 adapter_path=adapter_path,
             )
@@ -1145,14 +1081,12 @@ class StreamingDriver:
             self._groups[key] = group
             self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
             if self.resume_store is not None:
-                prompt_key = f"{self.run_id}/prompt/{key}"
-                self.resume_store.save_object("prompts", prompt_key, row)
+                prompt_key = f'{self.run_id}/prompt/{key}'
+                self.resume_store.save_object('prompts', prompt_key, row)
                 self._persist_snapshot_locked()
                 self.resume_store.journal.append(
-                    JournalEvent.PROMPT_ASSIGNED,
-                    prompt_key,
-                    {"group_key": key, "object": prompt_key, "binding": binding.to_dict()},
-                )
+                    JournalEvent.PROMPT_ASSIGNED, prompt_key,
+                    {'group_key': key, 'object': prompt_key, 'binding': binding.to_dict()})
 
     def _next_row(self) -> Any:
         # TODO: rows are drawn here, ahead of training; see state_dict for what a resume skips.
@@ -1162,7 +1096,7 @@ class StreamingDriver:
 
     def _iter_rows(self) -> Iterator[Any]:
         for epoch in range(max(1, math.ceil(self.num_epochs))):
-            set_epoch = getattr(self.dataloader, "set_epoch", None)
+            set_epoch = getattr(self.dataloader, 'set_epoch', None)
             if set_epoch is not None:
                 set_epoch(epoch)
             for batch in self.dataloader:
@@ -1171,7 +1105,7 @@ class StreamingDriver:
                 else:
                     yield batch
 
-    def _start_attempt(self, group: _Group, trajectories: list[Any]) -> None:
+    def _start_attempt(self, group: _Group, trajectories: List[Any]) -> None:
         """Submit one attempt's trajectories: the non-baseline ones replace the members (under the lock)."""
         members = [traj for traj in trajectories if _role_of(traj) != _BASELINE]
         baselines = [traj for traj in trajectories if _role_of(traj) == _BASELINE]
@@ -1180,34 +1114,29 @@ class StreamingDriver:
             group.members = []
             group.missing = 0
             self._live += len(members)
-            self._counters["admitted"] += len(members)
+            self._counters['admitted'] += len(members)
         group.baselines = []
         for index, traj in enumerate(members):
             # Positional sample identity within the group: the rollout derives a per-request seed
             # from (group_key, sample_index) so a group's num_generations samples differ. A constant
             # seed would collapse them to one identical trajectory and zero the group's advantage.
-            traj["sample_index"] = index
-            group.members.append(self._submit(group, traj, "", index))
+            traj['sample_index'] = index
+            group.members.append(self._submit(group, traj, '', index))
         for index, traj in enumerate(baselines):
             group.baselines.append(self._submit(group, traj, _BASELINE, index))
 
     def _submit(self, group: _Group, traj: Any, role: str, slot: int) -> _Episode:
-        kind = "baseline" if role == _BASELINE else "member"
-        episode_id = f"{self.run_id}:g{group.key}:a{group.attempt}:{kind}:{slot}"
+        kind = 'baseline' if role == _BASELINE else 'member'
+        episode_id = f'{self.run_id}:g{group.key}:a{group.attempt}:{kind}:{slot}'
         episode = _Episode(episode_id=episode_id, group=group, role=role, version=group.version)
         # The identity travels on top of the trajectory: episode / group / role / the admission
         # version. The rollout reads the episode id to route its steps back to this episode.
         traj = dict(traj)
-        traj.update(
-            episode_id=episode.episode_id,
-            group_key=group.key,
-            role=role,
-            policy_version=group.version,
-            group_attempt=group.attempt,
-            state_key=f"{self.run_id}/group/{group.key}/attempt/{group.attempt}/{kind}/{slot}",
-        )
+        traj.update(episode_id=episode.episode_id, group_key=group.key, role=role,
+                    policy_version=group.version, group_attempt=group.attempt,
+                    state_key=f'{self.run_id}/group/{group.key}/attempt/{group.attempt}/{kind}/{slot}')
         if group.adapter_path is not None:
-            traj["adapter_path"] = group.adapter_path
+            traj['adapter_path'] = group.adapter_path
         episode.submit_traj = traj
         self._inflight += 1
         episode.counted_inflight = True
@@ -1218,30 +1147,30 @@ class StreamingDriver:
         # session_wait=0: the admission loop never blocks on a full session pool -- a no-slot status
         # comes back along the return channel and the member is retried later (see _no_slot).
         future = self.rollout.step(traj, episode_id=episode.episode_id, session_wait=0)
-        _record_driver_probe("step_submitted", episode.episode_id)
+        _record_driver_probe('step_submitted', episode.episode_id)
 
         def _done(f, episode=episode):
-            _record_driver_probe("step_future_done", episode.episode_id)
-            self._events.put(("step", episode, None, f))
+            _record_driver_probe('step_future_done', episode.episode_id)
+            self._events.put(('step', episode, None, f))
 
         future.add_done_callback(_done)
 
     # ------------------------------------------------------------------ completions
 
-    def _handle(self, kind: str, episode: _Episode, index: int | None, future: Any) -> None:
-        _record_driver_probe("handle", episode.episode_id, kind=kind)
+    def _handle(self, kind: str, episode: _Episode, index: Optional[int], future: Any) -> None:
+        _record_driver_probe('handle', episode.episode_id, kind=kind)
         exc = future.exception()
         with self._lock:
             if self._closed:
                 return
             if episode.lost:
-                if kind == "step" and exc is None and not future.result()[1].done:
+                if kind == 'step' and exc is None and not future.result()[1].done:
                     # dropped while this step ran: release its rollout state now
                     self.rollout.stop(future.result()[0][0], episode_id=episode.episode_id)
                 return
-            if exc is not None and not (kind == "step" and _is_episode_error(exc)):
+            if exc is not None and not (kind == 'step' and _is_episode_error(exc)):
                 raise exc
-            if kind == "step":
+            if kind == 'step':
                 if exc is not None:
                     self._fail(episode, exc)
                 else:
@@ -1253,7 +1182,7 @@ class StreamingDriver:
                         self._no_slot(episode)
                     else:
                         self._on_step(episode, rows, sample)
-            elif kind == "orm":
+            elif kind == 'orm':
                 episode.orm[index] = future.result()[0]
                 episode.orm_pending -= 1
                 self._maybe_finish(episode)
@@ -1262,8 +1191,7 @@ class StreamingDriver:
                 episode.prm[scorer][segment] = future.result()[0]
                 episode.prm_pending -= 1
                 if episode.held == segment and not any(
-                    episode.prm[k][segment] is _PENDING for k in range(len(self.prms))
-                ):
+                        episode.prm[k][segment] is _PENDING for k in range(len(self.prms))):
                     self._release(episode, segment)
                 self._maybe_finish(episode)
             if kind != "step":
@@ -1276,11 +1204,8 @@ class StreamingDriver:
         episode.done = bool(sample.done)
         if episode.done:
             episode.deliver = list(trajs)
-        if (
-            self.prms
-            and episode.role != _BASELINE
-            and (episode.done or self.prm_segment is None or self.prm_segment(sample, trajs[0]))
-        ):
+        if self.prms and episode.role != _BASELINE and (episode.done or self.prm_segment is None
+                                                         or self.prm_segment(sample, trajs[0])):
             segment = self._score_prm(episode)
             if self.on_step is not None and not episode.done:
                 episode.held = segment
@@ -1318,7 +1243,7 @@ class StreamingDriver:
         if self.on_step(episode.sample, [column[segment] for column in episode.prm]):
             self._step(episode, episode.traj)
             return
-        self._counters["stopped"] += 1
+        self._counters['stopped'] += 1
         self.rollout.stop(episode.traj, episode_id=episode.episode_id)
         self._lose(episode)
 
@@ -1334,18 +1259,15 @@ class StreamingDriver:
         self._maybe_finish(episode)
 
     def _fail(self, episode: _Episode, exc: BaseException) -> None:
-        self._counters["episode_errors"] += 1
+        self._counters['episode_errors'] += 1
         self._consecutive_failures += 1
         self._failures.append(True)
-        logger.warning(f"episode {episode.episode_id} skipped: {exc}")
+        logger.warning(f'episode {episode.episode_id} skipped: {exc}')
         if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES or (
-            len(self._failures) == self.FAILURE_WINDOW
-            and sum(self._failures) > self.MAX_FAILURE_RATE * self.FAILURE_WINDOW
-        ):
-            raise RuntimeError(
-                f"too many episodes fail ({self._consecutive_failures} in a row, "
-                f"{sum(self._failures)} of the last {len(self._failures)}); last: {exc}"
-            ) from exc
+                len(self._failures) == self.FAILURE_WINDOW
+                and sum(self._failures) > self.MAX_FAILURE_RATE * self.FAILURE_WINDOW):
+            raise RuntimeError(f'too many episodes fail ({self._consecutive_failures} in a row, '
+                               f'{sum(self._failures)} of the last {len(self._failures)}); last: {exc}') from exc
         self._lose(episode)
 
     def _lose(self, episode: _Episode) -> None:
@@ -1372,7 +1294,7 @@ class StreamingDriver:
         """
         self._inflight -= 1
         episode.counted_inflight = False
-        self._counters["no_slot"] += 1
+        self._counters['no_slot'] += 1
         now = time.monotonic()
         if episode.no_slot_deadline is None:
             episode.no_slot_deadline = now + self.max_no_slot_wait
@@ -1397,12 +1319,10 @@ class StreamingDriver:
                     if episode.no_slot_retry_at is None or episode.no_slot_retry_at > now:
                         continue
                     if episode.no_slot_deadline is not None and now > episode.no_slot_deadline:
-                        self._counters["no_slot_dropped"] += 1
-                        logger.warning(
-                            f"group {group.key} dropped: member {episode.episode_id} could not get "
-                            f"a session slot within {self.max_no_slot_wait:.0f}s "
-                            f"({episode.no_slot_attempts} no-slot retries)"
-                        )
+                        self._counters['no_slot_dropped'] += 1
+                        logger.warning(f'group {group.key} dropped: member {episode.episode_id} could not get '
+                                       f'a session slot within {self.max_no_slot_wait:.0f}s '
+                                       f'({episode.no_slot_attempts} no-slot retries)')
                         self._drop_group(group)
                         break
                     episode.no_slot_retry_at = None
@@ -1431,7 +1351,7 @@ class StreamingDriver:
             sample.prm_rewards = [list(column) for column in episode.prm]
             sample.extra = dict(sample.extra or {}, **{PRM_SEGMENT_TURNS: list(episode.prm_turns)})
         if episode.role != _BASELINE and self.on_sample is not None and self.on_sample(sample) is False:
-            self._counters["dropped_sample"] += 1
+            self._counters['dropped_sample'] += 1
             self._lose(episode)
             return
         episode.finished = True
@@ -1455,14 +1375,14 @@ class StreamingDriver:
                 self._drop_group(group)
                 return
             group.attempt += 1
-            self._counters["regenerated"] += 1
+            self._counters['regenerated'] += 1
             # the lost members are redone from their trajectories; the scored ones stay
             self._live += group.missing
-            self._counters["admitted"] += group.missing
+            self._counters['admitted'] += group.missing
             group.missing = 0
             for index, episode in enumerate(group.members):
                 if episode.lost:
-                    group.members[index] = self._submit(group, copy.deepcopy(group.source[index]), "", index)
+                    group.members[index] = self._submit(group, copy.deepcopy(group.source[index]), '', index)
             return
         if group.baselines:
             rows = [list(e.sample.orm_reward) for e in group.baselines]
@@ -1476,14 +1396,12 @@ class StreamingDriver:
             trajectories = list(self.on_group(group.row, [e.sample for e in group.members], group.attempt) or [])
             regenerate = [t for t in trajectories if _role_of(t) != _BASELINE]
             if regenerate and len(regenerate) != self.num_generations:
-                raise ValueError(
-                    f"on_group returned {len(regenerate)} trajectories to replace a group of "
-                    f"{self.num_generations}; a group is always num_generations rows."
-                )
+                raise ValueError(f'on_group returned {len(regenerate)} trajectories to replace a group of '
+                                 f'{self.num_generations}; a group is always num_generations rows.')
             if regenerate and group.attempt < self.max_group_regenerations:
                 # baselines returned alongside wait: the replaced group is offered to on_group again
                 self._live -= len(group.members)
-                self._counters["regenerated"] += 1
+                self._counters['regenerated'] += 1
                 group.attempt += 1
                 self._start_attempt(group, regenerate)
                 return
@@ -1538,7 +1456,7 @@ class StreamingDriver:
         """Give the group up: its counted rows leave the bound, its unfinished episodes stop (under the lock)."""
         if self._groups.pop(group.key, None) is None:
             return
-        self._counters["dropped_group"] += 1
+        self._counters['dropped_group'] += 1
         for episode in group.members + group.baselines:
             if episode.lost:
                 continue
@@ -1567,7 +1485,7 @@ class StreamingDriver:
 
 #: Placeholder for a score whose Future has not completed yet.
 _PENDING = object()
-_PENDING_KEY = "__twinkle_streaming_pending__"
+_PENDING_KEY = '__twinkle_streaming_pending__'
 
 
 def _dump_pending(value: Any) -> Any:

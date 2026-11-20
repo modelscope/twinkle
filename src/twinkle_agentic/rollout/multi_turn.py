@@ -7,8 +7,8 @@ episode opens it (its env session, its tools, its agent); the step that ends it 
 merged, trainable trajectory and releases everything. A caller that drives many episodes (the
 streaming driver) interleaves their steps; a caller that wants whole episodes uses ``__call__``.
 """
-
 import hashlib
+import json
 import queue
 import re
 import threading
@@ -19,8 +19,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
-import json
-
 from twinkle.data_format import Trajectory, user_data_get
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import remote_class, remote_function
@@ -29,8 +27,8 @@ from twinkle.template.base import Template
 from twinkle.utils import get_logger
 from twinkle_agentic.async_rl.rollout_resume import ResumeStore, UnsafeResume
 from twinkle_agentic.envs.base import NoSlot
-from twinkle_agentic.envs.env_tool import EnvTool
 from twinkle_agentic.envs.resume import EnvResumeCapability, env_resume_capability
+from twinkle_agentic.envs.env_tool import EnvTool
 from twinkle_agentic.protocol.api_sampler import APIGenerationError
 from twinkle_agentic.tools.tool_manager import ToolManager
 from twinkle_agentic.verifier.result_check import CheckContext, checks_from_dicts, run_checks
@@ -67,13 +65,12 @@ def _dump_rollout_rows(episode_id: str, rows: list) -> None:
     segments for prefix-extension. Write-only and env-gated: a no-op (zero cost) when unset.
     """
     import os
-
-    root = os.environ.get("TWINKLE_ROLLOUT_TRAJ_DUMP")
+    root = os.environ.get('TWINKLE_ROLLOUT_TRAJ_DUMP')
     if not root:
         return
     os.makedirs(root, exist_ok=True)
-    rank = int(os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or 0)
-    path = os.path.join(root, f"rows.rank{rank}.jsonl")
+    rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+    path = os.path.join(root, f'rows.rank{rank}.jsonl')
 
     def _grid(value: Any) -> Any:
         # image_grid_thw / video_grid_thw arrive as a tensor (one row per media item);
@@ -81,45 +78,45 @@ def _dump_rollout_rows(episode_id: str, rows: list) -> None:
         # plain nested ints. Absent on text rows -- leave it None, not an empty grid.
         if value is None:
             return None
-        tolist = getattr(value, "tolist", None)
+        tolist = getattr(value, 'tolist', None)
         return tolist() if callable(tolist) else value
 
-    def _media_count(value: Any) -> int | None:
+    def _media_count(value: Any) -> Optional[int]:
         return len(value) if isinstance(value, (list, tuple)) else None
 
-    with open(path, "a", encoding="utf-8") as handle:
+    with open(path, 'a', encoding='utf-8') as handle:
         for seg, row in enumerate(rows):
-            messages = row.get("messages") or []
+            messages = row.get('messages') or []
             rec = {
-                "episode_id": episode_id,
-                "segment_index": row.get("segment_index", seg),
-                "rank": rank,
-                "input_ids": row.get("input_ids") or [],
-                "labels": row.get("labels") or [],
-                "completion_mask": row.get("completion_mask"),
-                "response_token_ids": row.get("response_token_ids") or [],
-                "response_positions": row.get("response_positions") or [],
-                "rollout_logps": row.get("rollout_logps"),
-                "messages": messages,
-                "stop_reason": row.get("stop_reason"),
+                'episode_id': episode_id,
+                'segment_index': row.get('segment_index', seg),
+                'rank': rank,
+                'input_ids': row.get('input_ids') or [],
+                'labels': row.get('labels') or [],
+                'completion_mask': row.get('completion_mask'),
+                'response_token_ids': row.get('response_token_ids') or [],
+                'response_positions': row.get('response_positions') or [],
+                'rollout_logps': row.get('rollout_logps'),
+                'messages': messages,
+                'stop_reason': row.get('stop_reason'),
                 # D6 media frame: raw media counts + the processor grid. The judge checks
                 # image-count consistency and the placeholder-token expansion against the grid.
-                "images_count": _media_count(row.get("images")),
-                "videos_count": _media_count(row.get("videos")),
-                "audios_count": _media_count(row.get("audios")),
-                "image_grid_thw": _grid(row.get("image_grid_thw")),
-                "video_grid_thw": _grid(row.get("video_grid_thw")),
+                'images_count': _media_count(row.get('images')),
+                'videos_count': _media_count(row.get('videos')),
+                'audios_count': _media_count(row.get('audios')),
+                'image_grid_thw': _grid(row.get('image_grid_thw')),
+                'video_grid_thw': _grid(row.get('video_grid_thw')),
             }
-            handle.write(json.dumps(rec, default=str) + "\n")
+            handle.write(json.dumps(rec, default=str) + '\n')
 
 
 # Termination reasons surfaced via ``trajectory['stop_reason']``. The sampler
 # path takes the first three from the sampler itself; the API path has to name
 # them, and one vocabulary for both is what lets a consumer read either.
-STOP_NO_TOOL = "stop"
-STOP_LENGTH = "length"
-STOP_MAX_TURNS = "max_turns"
-STOP_GENERATION_ERROR = "generation_error"
+STOP_NO_TOOL = 'stop'
+STOP_LENGTH = 'length'
+STOP_MAX_TURNS = 'max_turns'
+STOP_GENERATION_ERROR = 'generation_error'
 
 # Runaway guard: a ``followup_fn`` is expected to return None eventually. This
 # only bounds a callback that never does, so one bad hook cannot spin forever.
@@ -129,7 +126,6 @@ MAX_FOLLOWUPS = 20
 #: ceiling only: how many episodes are in flight is the driver's admission, not this.
 ROLLOUT_MAX_CONCURRENCY = 1024
 
-
 def _record_dispatch_probe(event: str, episode_id: str, **fields: Any) -> None:
     """Append one dispatch event per call when ``TWINKLE_DISPATCH_PROBE`` names a directory.
 
@@ -138,19 +134,17 @@ def _record_dispatch_probe(event: str, episode_id: str, **fields: Any) -> None:
     order that got it there, so this records each step entry, each session open, and each harness
     wait/item/serve per episode. Env-gated: unset, it does nothing.
     """
+    import json
     import os
 
-    import json
-
-    root = os.environ.get("TWINKLE_DISPATCH_PROBE")
+    root = os.environ.get('TWINKLE_DISPATCH_PROBE')
     if not root:
         return
     os.makedirs(root, exist_ok=True)
-    path = os.path.join(root, f"dispatch.{os.getpid()}.jsonl")
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps({"t": time.monotonic(), "event": event, "episode_id": episode_id, **fields}, default=str) + "\n"
-        )
+    path = os.path.join(root, f'dispatch.{os.getpid()}.jsonl')
+    with open(path, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps({'t': time.monotonic(), 'event': event, 'episode_id': episode_id,
+                                 **fields}, default=str) + '\n')
 
 
 #: Put on an episode's request queue when its agent program exits.
@@ -204,11 +198,11 @@ class RolloutStatus:
     """
 
     # Group identity and role, stamped by the driver.
-    prompt_id: str = ""
-    episode_id: str = ""
+    prompt_id: str = ''
+    episode_id: str = ''
     group_key: str | None = None
     #: '' for a policy sample, 'baseline' for a baseline episode a group asked for.
-    role: str = ""
+    role: str = ''
     # The policy version the episode was admitted under, and how far the policy moved by handover.
     policy_version: int = 0
     version_span: int = 0
@@ -236,16 +230,15 @@ class RolloutStatus:
 
 def _single_sequence(responses: Any) -> SampledSequence:
     if not isinstance(responses, list):
-        raise TypeError(f"expected List[SampleResponse] from sampler.sample, got {type(responses).__name__}")
+        raise TypeError(f'expected List[SampleResponse] from sampler.sample, got {type(responses).__name__}')
     if len(responses) != 1:
-        raise RuntimeError(f"sampler returned {len(responses)} responses for a single request; expected exactly one.")
+        raise RuntimeError(f'sampler returned {len(responses)} responses for a single request; expected exactly one.')
     response = responses[0]
     if not isinstance(response, (SampleResponse, SampleResponseModel)):
-        raise TypeError(
-            f"expected SampleResponse or SampleResponseModel from sampler.sample, got {type(response).__name__}"
-        )
+        raise TypeError(f'expected SampleResponse or SampleResponseModel from sampler.sample, '
+                        f'got {type(response).__name__}')
     if len(response.sequences) != 1:
-        raise RuntimeError(f"SampleResponse contains {len(response.sequences)} sequences; expected exactly one.")
+        raise RuntimeError(f'SampleResponse contains {len(response.sequences)} sequences; expected exactly one.')
     sequence = response.sequences[0]
     if isinstance(response, SampleResponseModel):
         return SampledSequence(**sequence.model_dump())
@@ -265,12 +258,12 @@ def is_error_observation(observation: str) -> bool:
     anywhere in the text also matches a *successful* read of a file that happens
     to contain them, and this decides whether an episode is cut short.
     """
-    text = (observation or "").strip()
+    text = (observation or '').strip()
     if not text:
         return False
-    if text.startswith("Error:"):
+    if text.startswith('Error:'):
         return True
-    if text.startswith(("Tool runtime unreachable:", "Tool runtime returned no result")):
+    if text.startswith(('Tool runtime unreachable:', 'Tool runtime returned no result')):
         return True
     return bool(re.search(r'"success"\s*:\s*false', text))
 
@@ -282,15 +275,15 @@ def _call_key(tool_call: dict[str, Any]) -> str:
     making progress; one that reissues the same call with the same arguments is
     not, whatever the tool answered.
     """
-    fn = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
-    name = fn.get("name") or tool_call.get("name") or tool_call.get("tool_name") or ""
-    args = fn.get("arguments", tool_call.get("arguments"))
+    fn = tool_call.get('function') if isinstance(tool_call.get('function'), dict) else {}
+    name = fn.get('name') or tool_call.get('name') or tool_call.get('tool_name') or ''
+    args = fn.get('arguments', tool_call.get('arguments'))
     if not isinstance(args, str):
         try:
             args = json.dumps(args, sort_keys=True, ensure_ascii=False)
         except (TypeError, ValueError):
             args = repr(args)
-    return f"{name}\x00{args}"
+    return f'{name}\x00{args}'
 
 
 def _tool_call_names(tool_calls: list[dict[str, Any]]) -> list[str]:
@@ -301,8 +294,8 @@ def _tool_call_names(tool_calls: list[dict[str, Any]]) -> list[str]:
     """
     names: list[str] = []
     for tool_call in tool_calls:
-        fn = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
-        name = fn.get("name") or tool_call.get("name") or tool_call.get("tool_name") or ""
+        fn = tool_call.get('function') if isinstance(tool_call.get('function'), dict) else {}
+        name = fn.get('name') or tool_call.get('name') or tool_call.get('tool_name') or ''
         if name:
             names.append(name)
     return names
@@ -314,16 +307,16 @@ def _default_tool_messages(
 ) -> list[dict[str, Any]]:
     msgs: list[dict[str, Any]] = []
     for i, obs in enumerate(observations):
-        msg: dict[str, Any] = {"role": "tool", "content": "" if obs is None else str(obs)}
+        msg: dict[str, Any] = {'role': 'tool', 'content': '' if obs is None else str(obs)}
         if i < len(tool_calls) and isinstance(tool_calls[i], dict):
             tc = tool_calls[i]
-            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-            tid = tc.get("id") or tc.get("tool_call_id")
-            name = fn.get("name") or tc.get("name") or tc.get("tool_name")
+            fn = tc.get('function') if isinstance(tc.get('function'), dict) else {}
+            tid = tc.get('id') or tc.get('tool_call_id')
+            name = fn.get('name') or tc.get('name') or tc.get('tool_name')
             if tid:
-                msg["tool_call_id"] = tid
+                msg['tool_call_id'] = tid
             if name:
-                msg["name"] = name
+                msg['name'] = name
         msgs.append(msg)
     return msgs
 
@@ -335,36 +328,34 @@ def _malformed_tool_message(errors: list[str]) -> dict[str, Any]:
     make. There is no ``tool_call_id`` to pair it with -- the call never became a
     call -- which ``_default_tool_messages`` above already treats as optional.
     """
-    reason = "; ".join(e for e in errors if e) or "the markup could not be parsed"
+    reason = '; '.join(e for e in errors if e) or 'the markup could not be parsed'
     return {
-        "role": "tool",
-        "content": (
-            "Your tool call was not run: " + reason + ". Send the call again. Inside "
-            "a JSON string a backslash has to be written as \\\\ and a line break as "
-            "\\n; a single quote needs no backslash at all."
-        ),
+        'role': 'tool',
+        'content': ('Your tool call was not run: ' + reason + '. Send the call again. Inside '
+                    'a JSON string a backslash has to be written as \\\\ and a line break as '
+                    '\\n; a single quote needs no backslash at all.'),
     }
 
 
-def _episode_id_of(trajectory: Any) -> str | None:
+def _episode_id_of(trajectory: Any) -> Optional[str]:
     if not isinstance(trajectory, dict):
         return None
-    episode_id = trajectory.get("episode_id")
+    episode_id = trajectory.get('episode_id')
     if episode_id is None:
-        episode_id = user_data_get(trajectory.get("user_data"), "episode_id")
+        episode_id = user_data_get(trajectory.get('user_data'), 'episode_id')
     return str(episode_id) if episode_id else None
 
 
-def _episode_key(args: tuple, kwargs: dict) -> str | None:
+def _episode_key(args: tuple, kwargs: dict) -> Optional[str]:
     """The routing key of ``step``/``stop``: the episode id, so every step of an episode meets its state.
 
     Read off ``episode_id`` when the caller passes it (the trajectory may be a reference the caller
     cannot open), else off the trajectory's ``user_data``.
     """
-    episode_id = kwargs.get("episode_id") or (args[1] if len(args) > 1 else None)
+    episode_id = kwargs.get('episode_id') or (args[1] if len(args) > 1 else None)
     if episode_id:
         return str(episode_id)
-    return _episode_id_of(kwargs.get("traj", args[0] if args else None))
+    return _episode_id_of(kwargs.get('traj', args[0] if args else None))
 
 
 def _canonical(message: dict[str, Any]) -> tuple:
@@ -374,20 +365,20 @@ def _canonical(message: dict[str, Any]) -> tuple:
     content ``None`` for ``''``, whitespace trimmed. Comparing these forms is what tells a
     conversation that grew from one that was rewritten.
     """
-    content = message.get("content")
+    content = message.get('content')
     if isinstance(content, list):
-        content = "".join(part.get("text") or "" for part in content if isinstance(part, dict))
+        content = ''.join(part.get('text') or '' for part in content if isinstance(part, dict))
     calls = []
-    for call in message.get("tool_calls") or []:
-        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
-        arguments = fn.get("arguments")
+    for call in message.get('tool_calls') or []:
+        fn = call.get('function') if isinstance(call.get('function'), dict) else {}
+        arguments = fn.get('arguments')
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
             except ValueError:
                 pass
-        calls.append((fn.get("name") or "", json.dumps(arguments, sort_keys=True, ensure_ascii=False)))
-    return (message.get("role"), str(content or "").strip(), tuple(calls), message.get("tool_call_id") or "")
+        calls.append((fn.get('name') or '', json.dumps(arguments, sort_keys=True, ensure_ascii=False)))
+    return (message.get('role'), str(content or '').strip(), tuple(calls), message.get('tool_call_id') or '')
 
 
 class _Episode:
@@ -398,7 +389,7 @@ class _Episode:
         self.trajectory = trajectory
         self.params = params
         self.ledger = None
-        self.tool_manager: ToolManager | None = None
+        self.tool_manager: Optional[ToolManager] = None
         self.env_open = False
         #: Set by ``_discard``. ``_open`` blocks in ``env.reset`` while every session slot is taken, and
         #: the episode can be discarded meanwhile, so the call that returns afterwards has to be able to
@@ -414,17 +405,17 @@ class _Episode:
         self.stuck = 0
         self.seen_calls: set = set()
         self.stuck_stop = False
-        self.tool_stop: str | None = None
+        self.tool_stop: Optional[str] = None
         self.truncated = False
-        self.stop_reason: str | None = None
-        self.error: str | None = None
+        self.stop_reason: Optional[str] = None
+        self.error: Optional[str] = None
         # The agent program: see ``MultiTurnRollout._harness_step``.
-        self.requests: queue.Queue | None = None
-        self.exit: tuple | None = None
+        self.requests: Optional[queue.Queue] = None
+        self.exit: Optional[tuple] = None
         self.deadline = 0.0
         self.segments = 0
         self.sent: list[tuple] = []
-        self.tools_key: str | None = None
+        self.tools_key: Optional[str] = None
         #: The last served reply, for resubmitted requests (an agent HTTP client that timed out
         #: and retried sends the same payload verbatim: it is answered verbatim, not re-served).
         self.last_reply: dict | None = None
@@ -438,10 +429,10 @@ class _Episode:
         #: froze, oldest first; the final segment's row joins them when the episode ends.
         self.closed_rows: list = []
         #: Stable identity supplied by the driver.  It is not a random session id.
-        self.state_key = str(trajectory.get("state_key") or "")
+        self.state_key = str(trajectory.get('state_key') or '')
         #: Behavior-policy binding for the whole episode. A resumed group keeps this adapter even
         #: after the sampler's mutable default has moved on to a newer policy.
-        self.adapter_path: str | None = trajectory.get("adapter_path")
+        self.adapter_path: Optional[str] = trajectory.get('adapter_path')
         #: Effects already represented by the latest durable episode checkpoint.
         self.completed_effects: set[str] = set()
 
@@ -524,45 +515,38 @@ class MultiTurnRollout:
         adapter_path: str | None = None,
         use_base_model: bool = False,
         concurrency: int | None = None,
-        segment_policy: str = "drop",
+        segment_policy: str = 'drop',
         seed: int | None = None,
         resume_store: ResumeStore | None = None,
     ):
         if sampler is None and response_callback is None:
-            raise ValueError("MultiTurnRollout requires a sampler or a response_callback.")
-        if (
-            sampler is not None
-            and template is not None
-            and getattr(getattr(type(sampler), "sample", None), "_enable_continous_work", None) is False
-        ):
+            raise ValueError('MultiTurnRollout requires a sampler or a response_callback.')
+        if sampler is not None and template is not None and getattr(
+                getattr(type(sampler), 'sample', None), '_enable_continous_work', None) is False:
             # A remote sampler whose sample is not continuous-work spreads each one-request
             # call over every worker and raises on the ranks that receive nothing.
-            raise ValueError(
-                f"{type(sampler).__name__}.sample must be declared with enable_continous_work=True: "
-                "this rollout samples one trajectory per call."
-            )
+            raise ValueError(f'{type(sampler).__name__}.sample must be declared with enable_continous_work=True: '
+                             'this rollout samples one trajectory per call.')
         if max_turns < 1:
-            raise ValueError(f"max_turns must be >= 1, got {max_turns}")
+            raise ValueError(f'max_turns must be >= 1, got {max_turns}')
         if max_trajectory_tokens is not None and max_trajectory_tokens < 1:
-            raise ValueError(f"max_trajectory_tokens must be >= 1 or None, got {max_trajectory_tokens}")
+            raise ValueError(f'max_trajectory_tokens must be >= 1 or None, got {max_trajectory_tokens}')
         if concurrency is not None and concurrency < 1:
-            raise ValueError(f"concurrency must be >= 1 or None, got {concurrency}")
+            raise ValueError(f'concurrency must be >= 1 or None, got {concurrency}')
         if adapter_path and use_base_model:
-            raise ValueError(
-                "adapter_path and use_base_model=True ask for opposite "
-                "weights; the sampler would drop the adapter silently."
-            )
+            raise ValueError('adapter_path and use_base_model=True ask for opposite '
+                             'weights; the sampler would drop the adapter silently.')
         if harness is not None:
             if env is None:
-                raise ValueError("a harness runs its program in an env session: pass env= (LocalEnv for this machine).")
+                raise ValueError('a harness runs its program in an env session: pass env= '
+                                 '(LocalEnv for this machine).')
             if template is None:
-                raise ValueError("a harness needs a template to account the requests it makes.")
+                raise ValueError('a harness needs a template to account the requests it makes.')
             if tool_manager is not None or followup_fn is not None:
-                raise ValueError(
-                    "a harness owns its tools and its loop; tool_manager= and followup_fn= apply to the tool loop only."
-                )
+                raise ValueError('a harness owns its tools and its loop; tool_manager= and followup_fn= '
+                                 'apply to the tool loop only.')
             if harness.protocol not in ENDPOINTS:
-                raise ValueError(f"harness protocol {harness.protocol!r} is not one of {sorted(ENDPOINTS)}")
+                raise ValueError(f'harness protocol {harness.protocol!r} is not one of {sorted(ENDPOINTS)}')
         # How many stuck turns in a row end the episode; 0 runs to ``max_turns``
         # regardless. A turn is stuck when it made no progress at all: every call in
         # it came back an error, or every call in it was byte-identical to one already
@@ -570,23 +554,22 @@ class MultiTurnRollout:
         # recorded episodes: errors alone stop 1 of 12 and save 9 of 239 calls; adding
         # the repeat rule stops 3 of 12 and saves 63 calls.
         if stop_after_stuck_turns < 0:
-            raise ValueError(f"stop_after_stuck_turns must be >= 0, got {stop_after_stuck_turns}")
+            raise ValueError(f'stop_after_stuck_turns must be >= 0, got {stop_after_stuck_turns}')
         # How a compaction boundary treats the segment it writes out: 'drop' (the default) keeps
         # only the final segment trainable -- the episode trains as one row; 'collect' freezes
         # each written-out segment into its own row, and the episode is delivered as several
         # independently-coded rows that share one identity and one outcome reward.
-        if segment_policy not in ("drop", "collect"):
+        if segment_policy not in ('drop', 'collect'):
             raise ValueError(f"segment_policy must be 'drop' or 'collect', got {segment_policy!r}.")
         # How many replies in a row may carry tool-call markup that does not parse
         # before the episode is given up. Such a reply asked for a tool and had the
         # markup rejected, so it gets the parser's reason back and another turn.
         if max_malformed_retries < 0:
-            raise ValueError(f"max_malformed_retries must be >= 0, got {max_malformed_retries}")
+            raise ValueError(f'max_malformed_retries must be >= 0, got {max_malformed_retries}')
         if template is not None:
-            assert template.truncation_strategy != "split", (
+            assert template.truncation_strategy != 'split', (
                 "MultiTurnRollout does not support truncation_strategy='split'; "
-                "use left/right/delete/raise on the template."
-            )
+                'use left/right/delete/raise on the template.')
         self.sampler = sampler
         self.template = template
         self.max_turns = max_turns
@@ -605,20 +588,20 @@ class MultiTurnRollout:
         self.stop_after_stuck_turns = stop_after_stuck_turns
         self.max_malformed_retries = max_malformed_retries
         # Left out entirely when unset, so a sampler without LoRA sees the call it always did.
-        self._adapter_kwargs: dict[str, Any] = {"adapter_path": adapter_path} if adapter_path else {}
+        self._adapter_kwargs: dict[str, Any] = {'adapter_path': adapter_path} if adapter_path else {}
         if use_base_model:
-            self._adapter_kwargs["use_base_model"] = True
+            self._adapter_kwargs['use_base_model'] = True
         self.adapter_path = adapter_path
         self.concurrency = concurrency
         self.segment_policy = segment_policy
         self._base_seed = seed
-        self._template_backend = getattr(type(sampler), "template_backend", "vllm") if sampler is not None else "vllm"
+        self._template_backend = getattr(type(sampler), 'template_backend', 'vllm') if sampler is not None else 'vllm'
         self.sampling_params = self._params(sampling_params or SamplingParams())
         self._episodes: dict[str, _Episode] = {}
         self._lock = threading.Lock()
         self._endpoint_lock = threading.Lock()
-        self._policy_endpoint: PolicyEndpoint | None = None
-        self._env_tool_infos: list | None = None
+        self._policy_endpoint: Optional[PolicyEndpoint] = None
+        self._env_tool_infos: Optional[list] = None
         self.resume_store = resume_store
 
     # ---------------------------------------------------------------- durable episode
@@ -627,61 +610,61 @@ class MultiTurnRollout:
         """Inject the run store before the first episode starts."""
         with self._lock:
             if self._episodes:
-                raise RuntimeError("bind_resume_store must run before any episode is opened")
+                raise RuntimeError('bind_resume_store must run before any episode is opened')
             self.resume_store = store
 
     def _capture_episode(self, ep: _Episode, *, allow_busy: bool = False) -> dict[str, Any]:
         if ep.busy and not allow_busy:
-            raise UnsafeResume(f"episode {ep.episode_id!r} is mid-step and cannot be checkpointed")
+            raise UnsafeResume(f'episode {ep.episode_id!r} is mid-step and cannot be checkpointed')
         if self.harness is not None:
-            raise UnsafeResume("agent-program episodes own live processes and cannot be checkpointed yet")
+            raise UnsafeResume('agent-program episodes own live processes and cannot be checkpointed yet')
         if not ep.state_key:
-            raise UnsafeResume(f"episode {ep.episode_id!r} has no stable state_key")
+            raise UnsafeResume(f'episode {ep.episode_id!r} has no stable state_key')
         if ep.ledger is None:
-            raise UnsafeResume(f"episode {ep.episode_id!r} has no token ledger yet")
+            raise UnsafeResume(f'episode {ep.episode_id!r} has no token ledger yet')
         if isinstance(ep.ledger, MessageLedger):
-            raise UnsafeResume("message-ledger episodes lose sampled token ids and cannot be resumed safely")
+            raise UnsafeResume('message-ledger episodes lose sampled token ids and cannot be resumed safely')
         env_state = None
         if ep.env_open:
             capability = env_resume_capability(self.env)
             if capability == EnvResumeCapability.NONE:
-                raise UnsafeResume(f"{type(self.env).__name__} declares no durable resume capability")
+                raise UnsafeResume(f'{type(self.env).__name__} declares no durable resume capability')
             env_state = self.env.checkpoint_episode(ep.episode_id, ep.state_key)
         return {
-            "format": "twinkle.multi-turn-episode.v1",
-            "state_key": ep.state_key,
-            "episode_id": ep.episode_id,
-            "trajectory": ep.trajectory,
-            "params": ep.params,
-            "ledger": ep.ledger.state_dict(),
-            "env_state": env_state,
-            "env_open": ep.env_open,
-            "budget": ep.budget,
-            "spent": ep.spent,
-            "followups": ep.followups,
-            "malformed": ep.malformed,
-            "stuck": ep.stuck,
-            "seen_calls": sorted(ep.seen_calls),
-            "stuck_stop": ep.stuck_stop,
-            "tool_stop": ep.tool_stop,
-            "truncated": ep.truncated,
-            "stop_reason": ep.stop_reason,
-            "error": ep.error,
-            "segments": ep.segments,
-            "sent": ep.sent,
-            "tools_key": ep.tools_key,
-            "last_reply": ep.last_reply,
-            "closed_rows": ep.closed_rows,
-            "completed_effects": sorted(ep.completed_effects),
+            'format': 'twinkle.multi-turn-episode.v1',
+            'state_key': ep.state_key,
+            'episode_id': ep.episode_id,
+            'trajectory': ep.trajectory,
+            'params': ep.params,
+            'ledger': ep.ledger.state_dict(),
+            'env_state': env_state,
+            'env_open': ep.env_open,
+            'budget': ep.budget,
+            'spent': ep.spent,
+            'followups': ep.followups,
+            'malformed': ep.malformed,
+            'stuck': ep.stuck,
+            'seen_calls': sorted(ep.seen_calls),
+            'stuck_stop': ep.stuck_stop,
+            'tool_stop': ep.tool_stop,
+            'truncated': ep.truncated,
+            'stop_reason': ep.stop_reason,
+            'error': ep.error,
+            'segments': ep.segments,
+            'sent': ep.sent,
+            'tools_key': ep.tools_key,
+            'last_reply': ep.last_reply,
+            'closed_rows': ep.closed_rows,
+            'completed_effects': sorted(ep.completed_effects),
         }
 
-    @remote_function(execute="first", collect="first", lazy_collect=False)
+    @remote_function(execute='first', collect='first', lazy_collect=False)
     def checkpoint_episode(self, episode_id: str) -> dict[str, Any]:
         """Persist one episode at an externally stable boundary."""
         with self._lock:
             ep = self._episodes.get(episode_id)
         if ep is None:
-            raise EpisodeError(f"episode {episode_id!r} is not held by this rollout")
+            raise EpisodeError(f'episode {episode_id!r} is not held by this rollout')
         return self._checkpoint_episode(ep)
 
     def _checkpoint_episode(self, ep: _Episode, *, allow_busy: bool = False) -> dict[str, Any]:
@@ -692,70 +675,70 @@ class MultiTurnRollout:
 
     def restore_episode(self, state: dict[str, Any]) -> str:
         """Rebuild an episode from a durable state before it is stepped again."""
-        if state.get("format") != "twinkle.multi-turn-episode.v1":
-            raise UnsafeResume("unsupported MultiTurnRollout episode format")
-        state_key = str(state.get("state_key") or "")
-        episode_id = str(state.get("episode_id") or "")
+        if state.get('format') != 'twinkle.multi-turn-episode.v1':
+            raise UnsafeResume('unsupported MultiTurnRollout episode format')
+        state_key = str(state.get('state_key') or '')
+        episode_id = str(state.get('episode_id') or '')
         if not state_key or not episode_id:
-            raise UnsafeResume("episode checkpoint has no state_key or episode_id")
+            raise UnsafeResume('episode checkpoint has no state_key or episode_id')
         if self.resume_store is not None:
-            checkpointed = set(state.get("completed_effects") or ())
+            checkpointed = set(state.get('completed_effects') or ())
             pending = set(self.resume_store.pending_effects(state_key))
             unsafe_pending = pending - checkpointed
             if unsafe_pending:
-                raise UnsafeResume(f"episode {state_key} has pending tool effects: {sorted(unsafe_pending)!r}")
+                raise UnsafeResume(f'episode {state_key} has pending tool effects: {sorted(unsafe_pending)!r}')
             # The checkpoint is written after the tool messages enter the ledger but before the
             # result journal record. If only that final record is missing, the checkpoint proves
             # the effect happened and already contains its observation; close the journal gap
             # instead of rejecting a state that cannot repeat the external call.
             for effect_key in pending & checkpointed:
-                self.resume_store.finish_effect(effect_key, {"recovered_from_checkpoint": True})
+                self.resume_store.finish_effect(effect_key, {'recovered_from_checkpoint': True})
             completed = set(self.resume_store.completed_effects(state_key))
             missing = completed - checkpointed
             if missing:
-                raise UnsafeResume(f"effect results exist without a matching episode checkpoint: {sorted(missing)!r}")
+                raise UnsafeResume(f'effect results exist without a matching episode checkpoint: {sorted(missing)!r}')
 
-        ep = _Episode(episode_id, dict(state["trajectory"]), state["params"])
+        ep = _Episode(episode_id, dict(state['trajectory']), state['params'])
         ep.state_key = state_key
         ep.ledger = self._new_ledger(episode_id)
         if isinstance(ep.ledger, MessageLedger):
-            raise UnsafeResume("message-ledger episodes lose sampled token ids and cannot be resumed safely")
-        ep.ledger.load_state_dict(state["ledger"])
-        ep.env_open = bool(state.get("env_open"))
+            raise UnsafeResume('message-ledger episodes lose sampled token ids and cannot be resumed safely')
+        ep.ledger.load_state_dict(state['ledger'])
+        ep.env_open = bool(state.get('env_open'))
         if ep.env_open:
             if self.env is None:
-                raise UnsafeResume("checkpoint has an environment state but this rollout has no env")
+                raise UnsafeResume('checkpoint has an environment state but this rollout has no env')
             capability = env_resume_capability(self.env)
             if capability == EnvResumeCapability.NONE:
-                raise UnsafeResume(f"{type(self.env).__name__} declares no durable resume capability")
-            self.env.restore_episode(episode_id, state_key, state["env_state"], ep.trajectory)
-        ep.budget = int(state["budget"])
-        ep.spent = int(state["spent"])
-        ep.followups = int(state["followups"])
-        ep.malformed = int(state["malformed"])
-        ep.stuck = int(state["stuck"])
-        ep.seen_calls = set(state.get("seen_calls") or ())
-        ep.stuck_stop = bool(state.get("stuck_stop"))
-        ep.tool_stop = state.get("tool_stop")
-        ep.truncated = bool(state.get("truncated"))
-        ep.stop_reason = state.get("stop_reason")
-        ep.error = state.get("error")
-        ep.segments = int(state.get("segments") or 0)
-        ep.sent = list(state.get("sent") or ())
-        ep.tools_key = state.get("tools_key")
-        ep.last_reply = state.get("last_reply")
-        ep.closed_rows = list(state.get("closed_rows") or ())
-        ep.completed_effects = set(state.get("completed_effects") or ())
+                raise UnsafeResume(f'{type(self.env).__name__} declares no durable resume capability')
+            self.env.restore_episode(episode_id, state_key, state['env_state'], ep.trajectory)
+        ep.budget = int(state['budget'])
+        ep.spent = int(state['spent'])
+        ep.followups = int(state['followups'])
+        ep.malformed = int(state['malformed'])
+        ep.stuck = int(state['stuck'])
+        ep.seen_calls = set(state.get('seen_calls') or ())
+        ep.stuck_stop = bool(state.get('stuck_stop'))
+        ep.tool_stop = state.get('tool_stop')
+        ep.truncated = bool(state.get('truncated'))
+        ep.stop_reason = state.get('stop_reason')
+        ep.error = state.get('error')
+        ep.segments = int(state.get('segments') or 0)
+        ep.sent = list(state.get('sent') or ())
+        ep.tools_key = state.get('tools_key')
+        ep.last_reply = state.get('last_reply')
+        ep.closed_rows = list(state.get('closed_rows') or ())
+        ep.completed_effects = set(state.get('completed_effects') or ())
         ep.tool_manager = self._episode_tools(episode_id)
         with self._lock:
             if episode_id in self._episodes:
-                raise UnsafeResume(f"episode {episode_id!r} is already held by this rollout")
+                raise UnsafeResume(f'episode {episode_id!r} is already held by this rollout')
             self._episodes[episode_id] = ep
         return episode_id
 
     def restore_episode_from_store(self, state_key: str) -> str:
         if self.resume_store is None:
-            raise UnsafeResume("no resume store is bound to this rollout")
+            raise UnsafeResume('no resume store is bound to this rollout')
         return self.restore_episode(self.resume_store.load_episode(state_key))
 
     @remote_function(dispatch="all", collect="none", lazy_collect=False)
@@ -767,9 +750,8 @@ class MultiTurnRollout:
     # ------------------------------------------------------------------ entries
 
     @remote_function(enable_continous_work=True, sticky_key=_episode_key, stash=(0,), lazy_collect=True)
-    def step(
-        self, traj: Trajectory, episode_id: str | None = None, session_wait: float | None = None
-    ) -> tuple[list, RolloutStatus]:
+    def step(self, traj: Trajectory, episode_id: str | None = None,
+             session_wait: Optional[float] = None) -> tuple[list, RolloutStatus]:
         """Advance the episode one generation; ``(rows, sample)`` with ``sample.done`` on the last.
 
         The first call of an episode opens it from ``traj``; later calls pass the first ``row``
@@ -791,7 +773,7 @@ class MultiTurnRollout:
         """Drop the episode: end its agent, close its env session, forget it."""
         self._discard(episode_id or _episode_id_of(traj))
 
-    @remote_function(dispatch="slice", collect="flatten")
+    @remote_function(dispatch='slice', collect='flatten')
     def __call__(self, trajectories: list[Trajectory]) -> list[Trajectory]:
         """Run every trajectory to its end; the results in the input order.
 
@@ -801,9 +783,8 @@ class MultiTurnRollout:
         collected segment, so the flattened output may hold more rows than inputs.
         """
         if isinstance(trajectories, dict):
-            raise TypeError(
-                f"{type(self).__name__}.__call__ expects a List[Trajectory]; wrap a single trajectory as [trajectory]."
-            )
+            raise TypeError(f'{type(self).__name__}.__call__ expects a List[Trajectory]; '
+                            'wrap a single trajectory as [trajectory].')
         trajectories = list(trajectories)
         if not trajectories:
             return []
@@ -819,8 +800,8 @@ class MultiTurnRollout:
                         return rows
             except EpisodeError as error:
                 out = dict(trajectory)
-                out["stop_reason"] = STOP_GENERATION_ERROR
-                out["error"] = str(error)
+                out['stop_reason'] = STOP_GENERATION_ERROR
+                out['error'] = str(error)
                 return [out]
 
         workers = min(len(trajectories), self.concurrency or len(trajectories))
@@ -829,7 +810,7 @@ class MultiTurnRollout:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             return [row for rows in pool.map(run, trajectories) for row in rows]
 
-    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def close(self) -> None:
         """Drop every episode and take the endpoint down; the sampler and env are not owned here."""
         with self._lock:
@@ -858,8 +839,8 @@ class MultiTurnRollout:
             :class:`StreamToolCall` after each turn that dispatched tools;
             :class:`StreamDone` once at the end, carrying the transcript trajectory.
         """
-        if self.harness is not None or self.sampler is None or not hasattr(self.sampler, "sample_stream"):
-            raise ValueError("MultiTurnRollout.stream requires a local sampler exposing sample_stream and no harness.")
+        if self.harness is not None or self.sampler is None or not hasattr(self.sampler, 'sample_stream'):
+            raise ValueError('MultiTurnRollout.stream requires a local sampler exposing sample_stream and no harness.')
         params = sampling_params if sampling_params is not None else self.sampling_params
         episode_id = uuid.uuid4().hex
         tool_manager = self.tool_manager
@@ -875,29 +856,26 @@ class MultiTurnRollout:
 
     # ------------------------------------------------------------------ episode
 
-    def _step(
-        self, traj: Trajectory, episode_id: str | None, session_wait: float | None = None
-    ) -> tuple[list, RolloutStatus]:
+    def _step(self, traj: Trajectory, episode_id: str | None,
+              session_wait: Optional[float] = None) -> tuple[list, RolloutStatus]:
         episode_id = episode_id or _episode_id_of(traj)
         if not episode_id:
-            raise ValueError("step needs an episode id: pass episode_id= or set user_data.episode_id.")
+            raise ValueError('step needs an episode id: pass episode_id= or set user_data.episode_id.')
         self._release_idle()
         with self._lock:
             ep = self._episodes.get(episode_id)
             opening = ep is None
             if opening:
-                if "turns" in traj:
+                if 'turns' in traj:
                     # A view an earlier step returned: the episode it names is gone.
-                    raise EpisodeError(
-                        f"episode {episode_id!r} is not held by this rollout (stopped, idle "
-                        "past episode_idle_timeout, or its replica restarted)."
-                    )
+                    raise EpisodeError(f'episode {episode_id!r} is not held by this rollout (stopped, idle '
+                                       'past episode_idle_timeout, or its replica restarted).')
                 ep = _Episode(episode_id, dict(traj), self._episode_params(traj))
                 self._episodes[episode_id] = ep
-            elif "turns" not in traj:
-                raise ValueError(f"episode {episode_id!r} is already running; every episode needs its own id.")
+            elif 'turns' not in traj:
+                raise ValueError(f'episode {episode_id!r} is already running; every episode needs its own id.')
             ep.busy = True
-        _record_dispatch_probe("step_entry", episode_id, opening=opening)
+        _record_dispatch_probe('step_entry', episode_id, opening=opening)
         try:
             if opening:
                 if self._open(ep, session_wait):
@@ -915,10 +893,10 @@ class MultiTurnRollout:
             ep.busy = False
             ep.touched = time.monotonic()
 
-    def _open(self, ep: _Episode, session_wait: float | None = None) -> bool:
+    def _open(self, ep: _Episode, session_wait: Optional[float] = None) -> bool:
         """Open the episode's env session and first turn. Returns True only on a no-slot sentinel."""
         if self.env is not None:
-            _record_dispatch_probe("reset_start", ep.episode_id)
+            _record_dispatch_probe('reset_start', ep.episode_id)
             try:
                 result = self.env.reset(ep.episode_id, ep.trajectory, wait=session_wait)
             except TimeoutError as exc:
@@ -927,8 +905,8 @@ class MultiTurnRollout:
                 # the whole batch instead of recording one generation_error row. Discard the registration
                 # (no session opened) and surface it as an episode failure, preserving the real cause.
                 self._discard(ep.episode_id)
-                raise EpisodeError(f"episode {ep.episode_id!r} could not open an env session: {exc}") from exc
-            _record_dispatch_probe("reset_returned", ep.episode_id, discarded=ep.discarded)
+                raise EpisodeError(f'episode {ep.episode_id!r} could not open an env session: {exc}') from exc
+            _record_dispatch_probe('reset_returned', ep.episode_id, discarded=ep.discarded)
             if isinstance(result, NoSlot):
                 # The pool is full and this call was asked not to wait. Drop the registration we just
                 # made (no session was opened, so there is nothing to close) and let _step report it.
@@ -945,24 +923,22 @@ class MultiTurnRollout:
                 try:
                     self.env.close(ep.episode_id)
                 except Exception:  # noqa
-                    logger.warning(
-                        f"closing the env session opened for discarded episode {ep.episode_id!r} failed.", exc_info=True
-                    )
-                raise EpisodeError(
-                    f"episode {ep.episode_id!r} was discarded while its env session was waiting to open."
-                )
+                    logger.warning(f'closing the env session opened for discarded episode '
+                                   f'{ep.episode_id!r} failed.', exc_info=True)
+                raise EpisodeError(f'episode {ep.episode_id!r} was discarded while its env session was '
+                                   'waiting to open.')
             ep.env_open = True
             ep.trajectory = self._with_observation(ep.trajectory, result)
         if self.harness is not None:
             self._start_agent(ep)
-            _record_dispatch_probe("agent_started", ep.episode_id)
+            _record_dispatch_probe('agent_started', ep.episode_id)
             return False
         ep.tool_manager = self._episode_tools(ep.episode_id)
         ep.ledger = self._new_ledger(ep.episode_id)
         # A trajectory that named no tools advertises the manager's, so the prompt
         # lists what can actually be dispatched.
         opening_tools = None
-        if "tools" not in ep.trajectory and ep.tool_manager is not None:
+        if 'tools' not in ep.trajectory and ep.tool_manager is not None:
             opening_tools = list(ep.tool_manager.tool_infos() or [])
         ep.ledger.open(ep.trajectory, tools=opening_tools)
         ep.budget = self.max_turns
@@ -976,15 +952,10 @@ class MultiTurnRollout:
         coded training rows sharing one identity and one outcome.
         """
         traj = ep.ledger.merge(
-            ep.trajectory,
-            turns=ep.ledger.turns,
-            stop_reason=ep.stop_reason,
-            truncated=ep.truncated,
-            segment_index=len(ep.closed_rows),
-            **fields,
-        )
+            ep.trajectory, turns=ep.ledger.turns, stop_reason=ep.stop_reason, truncated=ep.truncated,
+            segment_index=len(ep.closed_rows), **fields)
         if ep.error is not None:
-            traj["error"] = ep.error
+            traj['error'] = ep.error
         episode_end = None
         if self.on_episode_end is not None:
             episode_end = self.on_episode_end(traj, self.env, ep.episode_id)
@@ -1031,7 +1002,7 @@ class MultiTurnRollout:
             rewards["check"] = check_score
         traj["rewards"] = rewards
         if episode_end is not None:
-            traj["episode_end"] = episode_end
+            traj['episode_end'] = episode_end
         for row in ep.closed_rows:
             # The frozen rows carry the episode's env reward too: the reward keys belong to
             # the episode, and every row of it carries the same ones.
@@ -1045,19 +1016,18 @@ class MultiTurnRollout:
         _dump_rollout_rows(ep.episode_id, rows)
         extra = {
             key: traj[key]
-            for key in ("stuck_stop", "tool_stop", "followups", "segments", "agent_exit_code", "error")
-            if key in traj
+            for key in ('stuck_stop', 'tool_stop', 'followups', 'segments', 'agent_exit_code', 'error') if key in traj
         }
         if isinstance(episode_end, dict):
             extra.update(episode_end)
         elif episode_end is not None:
-            extra["episode_end"] = episode_end
+            extra['episode_end'] = episode_end
         prompt_tokens = response_tokens = 0
         coded = False
         row_lengths: list = []
         for row in rows:
-            input_ids = row.get("input_ids") or []
-            response = row.get("response_token_ids") or []
+            input_ids = row.get('input_ids') or []
+            response = row.get('response_token_ids') or []
             coded = coded or bool(input_ids)
             prompt_tokens += len(input_ids) - len(response)
             response_tokens += len(response)
@@ -1066,12 +1036,12 @@ class MultiTurnRollout:
             # The per-row lengths ride the status so the driver can hand each delivered row its
             # own facts: the episode totals would repeat on every row and weigh the batch's
             # metrics by its row count.
-            extra["row_token_lengths"] = row_lengths
+            extra['row_token_lengths'] = row_lengths
         sample = RolloutStatus(
             episode_id=ep.episode_id,
             # The episode's turns, not the last segment's: every row carries its own segment's
             # banked turns, and the episode is the unit that ran.
-            turns=sum(int(row.get("turns") or 0) for row in rows),
+            turns=sum(int(row.get('turns') or 0) for row in rows),
             done=True,
             stop_reason=ep.stop_reason,
             truncated=bool(ep.truncated),
@@ -1085,19 +1055,18 @@ class MultiTurnRollout:
     def _continue(self, ep: _Episode) -> tuple[list, RolloutStatus]:
         """The episode goes on: return its message view as the one row of an unfinished step."""
         return [self._view(ep)], RolloutStatus(
-            episode_id=ep.episode_id, turns=ep.ledger.turns, stop_reason=ep.stop_reason
-        )
+            episode_id=ep.episode_id, turns=ep.ledger.turns, stop_reason=ep.stop_reason)
 
     def _view(self, ep: _Episode) -> Trajectory:
         view = dict(ep.trajectory)
         if ep.ledger is not None:
-            view["messages"] = ep.ledger.messages
-            view["tools"] = ep.ledger.tools
-        view["turns"] = ep.ledger.turns if ep.ledger is not None else 0
-        view["followups"] = ep.followups
+            view['messages'] = ep.ledger.messages
+            view['tools'] = ep.ledger.tools
+        view['turns'] = ep.ledger.turns if ep.ledger is not None else 0
+        view['followups'] = ep.followups
         return view
 
-    def _discard(self, episode_id: str | None) -> None:
+    def _discard(self, episode_id: Optional[str]) -> None:
         """Forget the episode: fail its queued requests, end its agent and env session."""
         if not episode_id:
             return
@@ -1120,18 +1089,17 @@ class MultiTurnRollout:
                 # close costs nothing and covers the window the flag cannot.
                 self.env.close(episode_id)
             except Exception:  # noqa
-                logger.warning(f"closing the env session of episode {episode_id!r} failed.", exc_info=True)
+                logger.warning(f'closing the env session of episode {episode_id!r} failed.', exc_info=True)
 
     def _release_idle(self) -> None:
         now = time.monotonic()
         with self._lock:
             idle = [
-                episode_id
-                for episode_id, ep in self._episodes.items()
+                episode_id for episode_id, ep in self._episodes.items()
                 if not ep.busy and now - ep.touched > self.episode_idle_timeout
             ]
         for episode_id in idle:
-            logger.warning(f"releasing episode {episode_id!r}: no step for over {self.episode_idle_timeout:.0f}s.")
+            logger.warning(f'releasing episode {episode_id!r}: no step for over {self.episode_idle_timeout:.0f}s.')
             self._discard(episode_id)
 
     # ------------------------------------------------------------------ helpers
@@ -1141,20 +1109,21 @@ class MultiTurnRollout:
         if params.num_samples != 1:
             # n>1 would fork the conversation at turn 1, and a forked trajectory has no
             # defined continuation: run the trajectory several times instead.
-            raise ValueError(f"MultiTurnRollout supports num_samples=1 only, got {params.num_samples}")
+            raise ValueError(f'MultiTurnRollout supports num_samples=1 only, got {params.num_samples}')
         if self.template is not None and not params.logprobs:
             params = replace(params, logprobs=1)
         return params
 
     def _episode_params(self, traj: Trajectory) -> SamplingParams:
-        override = user_data_get(traj.get("user_data"), "sampling_params")
-        params = self.sampling_params if not override else self._params(replace(self.sampling_params, **dict(override)))
+        override = user_data_get(traj.get('user_data'), 'sampling_params')
+        params = (self.sampling_params if not override
+                  else self._params(replace(self.sampling_params, **dict(override))))
         # defect52b: --seed reaches the rollout half too. Derive a per-request seed from the episode's
         # stable (group_key, sample_index) identity so a group's num_generations samples differ -- a
         # constant seed would collapse them to one identical trajectory and zero the group's advantage.
         # An explicit user_data seed override wins; an episode without a stable identity (the display
         # stream, a bare __call__) stays unseeded.
-        if self._base_seed is not None and not (override and "seed" in dict(override)):
+        if self._base_seed is not None and not (override and 'seed' in dict(override)):
             derived = self._derive_seed(traj)
             if derived is not None:
                 params = replace(params, seed=derived)
@@ -1163,13 +1132,12 @@ class MultiTurnRollout:
     def _derive_seed(self, traj: Trajectory) -> int | None:
         """A per-(group, sample) seed: crc32 of the identity disperses without linear collisions."""
         import zlib
-
-        group_key = traj.get("group_key")
-        sample_index = traj.get("sample_index")
+        group_key = traj.get('group_key')
+        sample_index = traj.get('sample_index')
         if group_key is None or sample_index is None:
             return None
         try:
-            identity = f"{int(group_key)}:{int(sample_index)}".encode()
+            identity = f'{int(group_key)}:{int(sample_index)}'.encode()
         except (TypeError, ValueError):
             return None
         return (self._base_seed + zlib.crc32(identity)) & 0x7FFFFFFF
@@ -1179,20 +1147,19 @@ class MultiTurnRollout:
         if self.template is None:
             return MessageLedger(label=label, max_tokens=self.max_trajectory_tokens)
         return TurnLedger(
-            self.template, label=label, max_tokens=self.max_trajectory_tokens, backend=self._template_backend
-        )
+            self.template, label=label, max_tokens=self.max_trajectory_tokens, backend=self._template_backend)
 
     @staticmethod
     def _with_observation(trajectory: Trajectory, result: Any) -> Trajectory:
         """The opening, with the env's first observation appended as a user message."""
-        observation = getattr(result, "observation", None)
+        observation = getattr(result, 'observation', None)
         if not observation:
             return trajectory
         trajectory = dict(trajectory)
-        trajectory["messages"] = list(trajectory.get("messages") or []) + [{"role": "user", "content": observation}]
+        trajectory['messages'] = list(trajectory.get('messages') or []) + [{'role': 'user', 'content': observation}]
         return trajectory
 
-    def _episode_tools(self, episode_id: str) -> ToolManager | None:
+    def _episode_tools(self, episode_id: str) -> Optional[ToolManager]:
         """The shared tools plus, with an env, the env's tools bound to this episode's session."""
         manager = self.tool_manager.copy() if self.tool_manager is not None else None
         if self.env is None:
@@ -1214,19 +1181,17 @@ class MultiTurnRollout:
             state = ledger.state if ledger.state is not None else ledger.input_feature
             seq = self.response_callback(self._view(ep), state, params)
         else:
-            use_state = ledger.state is not None and getattr(type(self.sampler), "accepts_rollout_state", False)
+            use_state = ledger.state is not None and getattr(type(self.sampler), 'accepts_rollout_state', False)
             adapter_kwargs = dict(self._adapter_kwargs)
             if ep.adapter_path is not None:
-                adapter_kwargs["adapter_path"] = ep.adapter_path
-            responses = self.sampler.sample(
-                [ledger.state if use_state else ledger.input_feature],
-                sampling_params=params,
-                session_id=ep.episode_id,
-                **adapter_kwargs,
-            )
+                adapter_kwargs['adapter_path'] = ep.adapter_path
+            responses = self.sampler.sample([ledger.state if use_state else ledger.input_feature],
+                                            sampling_params=params,
+                                            session_id=ep.episode_id,
+                                            **adapter_kwargs)
             seq = _single_sequence(responses)
         if not isinstance(seq, SampledSequence):
-            raise TypeError(f"expected SampledSequence, got {type(seq).__name__}")
+            raise TypeError(f'expected SampledSequence, got {type(seq).__name__}')
         return seq
 
     @staticmethod
@@ -1236,34 +1201,35 @@ class MultiTurnRollout:
         A manager that answers with fewer results than calls leaves the rest
         empty rather than shifting them onto the wrong call.
         """
-        if hasattr(tool_manager, "call_many"):
+        if hasattr(tool_manager, 'call_many'):
             contents = tool_manager.call_many(tool_calls)
         else:
             contents = [tool_manager(tc) for tc in tool_calls]
-        obs = [""] * len(tool_calls)
-        for i, content in enumerate(contents[: len(tool_calls)]):
-            obs[i] = "" if content is None else str(content)
+        obs = [''] * len(tool_calls)
+        for i, content in enumerate(contents[:len(tool_calls)]):
+            obs[i] = '' if content is None else str(content)
         return obs
 
-    def _begin_tool_effect(self, ep: _Episode, tool_calls: list[dict[str, Any]]) -> tuple[str | None, list[str] | None]:
+    def _begin_tool_effect(self, ep: _Episode,
+                           tool_calls: list[dict[str, Any]]) -> tuple[Optional[str], Optional[list[str]]]:
         if self.resume_store is None or not ep.state_key:
             return None, None
-        calls = json.dumps(tool_calls, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(calls.encode("utf-8")).hexdigest()[:20]
-        effect_key = f"{ep.state_key}/effect/{ep.spent}/{digest}"
-        completed = self.resume_store.begin_effect(effect_key, {"calls": tool_calls})
+        calls = json.dumps(tool_calls, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        digest = hashlib.sha256(calls.encode('utf-8')).hexdigest()[:20]
+        effect_key = f'{ep.state_key}/effect/{ep.spent}/{digest}'
+        completed = self.resume_store.begin_effect(effect_key, {'calls': tool_calls})
         if completed is None:
             return effect_key, None
-        return effect_key, list(completed.get("observations") or ())
+        return effect_key, list(completed.get('observations') or ())
 
-    def _commit_tool_effect(self, ep: _Episode, effect_key: str | None, observations: list[str]) -> None:
+    def _commit_tool_effect(self, ep: _Episode, effect_key: Optional[str], observations: list[str]) -> None:
         if effect_key is None or self.resume_store is None:
             return
         ep.completed_effects.add(effect_key)
         # The checkpoint includes both the appended observation and the effect key.
         # Only after it is durable may the result record make crash recovery safe.
         self._checkpoint_episode(ep, allow_busy=True)
-        self.resume_store.finish_effect(effect_key, {"observations": observations})
+        self.resume_store.finish_effect(effect_key, {'observations': observations})
 
     # ---------------------------------------------------------------- tool loop
 
@@ -1286,13 +1252,13 @@ class MultiTurnRollout:
                 return self._finish_tool_episode(ep)
             params = ledger.capped_turn_params(params)
             if params is None:
-                raise EpisodeError(f"episode {ep.episode_id!r}: the prompt leaves no room for a generated token.")
+                raise EpisodeError(f'episode {ep.episode_id!r}: the prompt leaves no room for a generated token.')
 
         try:
             seq = self._generate(ep, ledger, params)
         except APIGenerationError as error:
             if not ledger.turns:
-                raise EpisodeError(f"episode {ep.episode_id!r}: the first generation failed: {error}") from error
+                raise EpisodeError(f'episode {ep.episode_id!r}: the first generation failed: {error}') from error
             ep.stop_reason = STOP_GENERATION_ERROR
             ep.error = str(error)
             ep.truncated = True
@@ -1303,22 +1269,22 @@ class MultiTurnRollout:
 
         msgs = ledger.messages
         last_msg = msgs[-1] if msgs else None
-        tool_calls = last_msg.get("tool_calls") if isinstance(last_msg, dict) else None
+        tool_calls = last_msg.get('tool_calls') if isinstance(last_msg, dict) else None
         if not tool_calls:
-            tool_calls = ledger.parse_tool_call(seq.decoded or "")
+            tool_calls = ledger.parse_tool_call(seq.decoded or '')
         if ep.followups:
             # Tools are withdrawn once a follow-up was appended: those stages write text
             # about the state as it is, and a code block in a reply parses as a call.
             tool_calls = None
             if isinstance(last_msg, dict):
                 message = dict(last_msg)
-                message["content"] = ledger.decode_tokens(seq)
-                message.pop("tool_calls", None)
+                message['content'] = ledger.decode_tokens(seq)
+                message.pop('tool_calls', None)
                 ledger.replace_last_message(message)
 
         # A reply cut off at max_tokens is truncated in exactly the sense the flag names;
         # tool calls it happens to contain are not dispatched.
-        if seq.stop_reason == "length" or ledger.full():
+        if seq.stop_reason == 'length' or ledger.full():
             ep.truncated = True
             return self._finish_tool_episode(ep)
 
@@ -1326,13 +1292,11 @@ class MultiTurnRollout:
             # Markup that did not parse is the model asking for a tool, not declining
             # one: hand back the parser's reason and let it write the call again. Not
             # after a follow-up, where a reply that looks like a call is text.
-            parse_errors = [] if ep.followups else ledger.tool_call_errors(seq.decoded or "")
+            parse_errors = [] if ep.followups else ledger.tool_call_errors(seq.decoded or '')
             if parse_errors:
                 if ep.malformed >= self.max_malformed_retries:
-                    raise EpisodeError(
-                        f"episode {ep.episode_id!r}: tool-call markup still malformed after "
-                        f"{ep.malformed} retries: {'; '.join(parse_errors)}"
-                    )
+                    raise EpisodeError(f'episode {ep.episode_id!r}: tool-call markup still malformed after '
+                                       f'{ep.malformed} retries: {"; ".join(parse_errors)}')
                 ep.malformed += 1
                 if not ledger.observe([_malformed_tool_message(parse_errors)]):
                     ep.truncated = True
@@ -1345,7 +1309,7 @@ class MultiTurnRollout:
         if ledger.turns >= self.max_turns:
             # Out of tool turns, not out of episode: the stages that read the end
             # state can still run on what was built.
-            ep.tool_stop = "max_turns"
+            ep.tool_stop = 'max_turns'
             if self._grant_followup(ep):
                 return self._next_turn(ep)
             ep.truncated = True
@@ -1353,11 +1317,10 @@ class MultiTurnRollout:
 
         ep.malformed = 0
         if ep.tool_manager is None:
-            raise ValueError("the model emitted tool_calls but this rollout has no tools (tool_manager= or env=).")
+            raise ValueError('the model emitted tool_calls but this rollout has no tools (tool_manager= or env=).')
         effect_key, cached_observations = self._begin_tool_effect(ep, tool_calls)
-        observations = (
-            cached_observations if cached_observations is not None else self._run_tools(ep.tool_manager, tool_calls)
-        )
+        observations = (cached_observations if cached_observations is not None else
+                        self._run_tools(ep.tool_manager, tool_calls))
         if self.stop_after_stuck_turns:
             keys = [_call_key(tc) for tc in tool_calls]
             all_repeats = bool(keys) and all(k in ep.seen_calls for k in keys)
@@ -1372,7 +1335,7 @@ class MultiTurnRollout:
         # are in the trajectory.
         if self.stop_after_stuck_turns and ep.stuck >= self.stop_after_stuck_turns:
             ep.stuck_stop = True
-            ep.tool_stop = "stuck"
+            ep.tool_stop = 'stuck'
             self._commit_tool_effect(ep, effect_key, observations)
             if not overflowed and self._grant_followup(ep):
                 return self._next_turn(ep, checkpoint=False)
@@ -1410,12 +1373,11 @@ class MultiTurnRollout:
         ledger = ep.ledger
         followup = self.followup_fn(
             ledger.merge(ep.trajectory, turns=ledger.turns, stop_reason=ep.stop_reason, truncated=ep.truncated),
-            ep.followups,
-        )
+            ep.followups)
         if followup is None:
             return False
         text, next_params = followup if isinstance(followup, tuple) else (followup, None)
-        if not ledger.observe([{"role": "user", "content": text}]):
+        if not ledger.observe([{'role': 'user', 'content': text}]):
             ep.truncated = True
             return False
         # Follow-up stages are answers, so a backend must not see tool schemas.
@@ -1446,7 +1408,7 @@ class MultiTurnRollout:
             task=self.harness.task(ep.trajectory),
             base_url=endpoint.base_url,
             api_key=ep.episode_id,
-            workspace=self.env.workspace(ep.episode_id) or "",
+            workspace=self.env.workspace(ep.episode_id) or '',
         )
         ep.deadline = time.monotonic() + self.harness.timeout + _AGENT_GRACE
         requests = ep.requests
@@ -1460,46 +1422,45 @@ class MultiTurnRollout:
                     ep.episode_id, command, interpreter="shell", timeout=self.harness.timeout, cap_memory=False
                 )
             except BaseException as error:  # noqa # reported by the step that reads the exit
-                ep.exit = (None, f"{type(error).__name__}: {error}")
+                ep.exit = (None, f'{type(error).__name__}: {error}')
             finally:
                 requests.put(_AGENT_EXITED)
 
-        threading.Thread(target=run, name=f"agent-{ep.episode_id[:8]}", daemon=True).start()
+        threading.Thread(target=run, name=f'agent-{ep.episode_id[:8]}', daemon=True).start()
 
     def _harness_step(self, ep: _Episode) -> tuple[list, RolloutStatus]:
         """Answer the agent's next request, or end the episode when the program exited."""
         wait = max(ep.deadline - time.monotonic(), 0.0)
-        _record_dispatch_probe("harness_wait", ep.episode_id, wait=wait)
+        _record_dispatch_probe('harness_wait', ep.episode_id, wait=wait)
         try:
             item = ep.requests.get(timeout=wait)
         except queue.Empty:
-            _record_dispatch_probe("harness_timeout", ep.episode_id)
-            raise EpisodeError(
-                f"episode {ep.episode_id!r}: the agent did not finish within {self.harness.timeout:.0f}s."
-            ) from None
-        _record_dispatch_probe("harness_item", ep.episode_id, exited=item is _AGENT_EXITED)
+            _record_dispatch_probe('harness_timeout', ep.episode_id)
+            raise EpisodeError(f'episode {ep.episode_id!r}: the agent did not finish within '
+                               f'{self.harness.timeout:.0f}s.') from None
+        _record_dispatch_probe('harness_item', ep.episode_id, exited=item is _AGENT_EXITED)
         if item is _AGENT_EXITED:
             return self._agent_exited(ep)
         try:
             result = self._serve(ep, item)
-            _record_dispatch_probe("harness_served", ep.episode_id)
+            _record_dispatch_probe('harness_served', ep.episode_id)
             return result
         except BaseException as error:
-            _record_dispatch_probe("harness_serve_error", ep.episode_id, error=f"{type(error).__name__}: {error}")
+            _record_dispatch_probe('harness_serve_error', ep.episode_id,
+                                   error=f'{type(error).__name__}: {error}')
             if not item.reply.done():
                 item.reply.set_exception(error)
             raise
 
     def _agent_exited(self, ep: _Episode) -> tuple[list, RolloutStatus]:
-        code, output = ep.exit or (None, "")
-        tail = (output or "")[-_OUTPUT_TAIL:]
+        code, output = ep.exit or (None, '')
+        tail = (output or '')[-_OUTPUT_TAIL:]
         if ep.ledger is None:
             # Wrong config, a crash before the first call, or a config that overrode the key.
-            raise EpisodeError(
-                f"episode {ep.episode_id!r}: the agent exited ({code}) without calling the endpoint:\n{tail}"
-            )
+            raise EpisodeError(f'episode {ep.episode_id!r}: the agent exited ({code}) without calling the '
+                               f'endpoint:\n{tail}')
         if code != 0:
-            raise EpisodeError(f"episode {ep.episode_id!r}: the agent exited with {code}:\n{tail}")
+            raise EpisodeError(f'episode {ep.episode_id!r}: the agent exited with {code}:\n{tail}')
         ep.stop_reason = STOP_NO_TOOL
         return self._finish(ep, segments=ep.segments, agent_exit_code=code)
 
@@ -1509,17 +1470,15 @@ class MultiTurnRollout:
         A history the agent rewrote (compacted, dropped a turn) or a tool change admits no
         append, so the recorded segment is over whatever the rewrite left it at.
         """
-        if self.segment_policy == "collect" and ep.ledger is not None:
+        if self.segment_policy == 'collect' and ep.ledger is not None:
             # The written-out segment freezes here: its account never changes again, so it
             # merges into its own row now (identity on it already, from admission); the
             # episode's other rows join it when the episode ends.
-            ep.closed_rows.append(
-                ep.ledger.merge(
-                    ep.trajectory, turns=ep.ledger.turns, truncated=False, segment_index=len(ep.closed_rows)
-                )
-            )
-        ledger = self._new_ledger(f"{ep.episode_id}#{ep.segments}")
-        ledger.open({"messages": list(request.messages)}, tools=list(request.tools))
+            ep.closed_rows.append(ep.ledger.merge(
+                ep.trajectory, turns=ep.ledger.turns, truncated=False,
+                segment_index=len(ep.closed_rows)))
+        ledger = self._new_ledger(f'{ep.episode_id}#{ep.segments}')
+        ledger.open({'messages': list(request.messages)}, tools=list(request.tools))
         return ledger
 
     def _serve(self, ep: _Episode, request: EndpointRequest) -> tuple[list, RolloutStatus]:
@@ -1527,7 +1486,8 @@ class MultiTurnRollout:
         canonical = [_canonical(message) for message in request.messages]
         tools_key = json.dumps(request.tools, sort_keys=True, ensure_ascii=False)
         ledger = ep.ledger
-        if ep.last_reply is not None and tools_key == ep.tools_key and canonical and canonical == ep.sent[:-1]:
+        if (ep.last_reply is not None and tools_key == ep.tools_key and canonical
+                and canonical == ep.sent[:-1]):
             # The same request a retry re-sends: answer with the reply it never saw, without
             # sampling, recording or starting a segment (the no-new-content history would
             # otherwise read as a rewrite and needlessly swap the ledger).
@@ -1582,9 +1542,9 @@ class MultiTurnRollout:
             # Housekeeping traffic the agent program does not expect a generation for: the
             # harness's reply answers it verbatim, costs no sampling, and rides the account
             # masked (the pair keeps the conversation prefix aligned, the reply is not trained).
-            message = noise.get("message") or {"role": "assistant", "content": ""}
+            message = noise.get('message') or {'role': 'assistant', 'content': ''}
             if extends:
-                if not ledger.observe(request.messages[len(ep.sent) :] + [message]):
+                if not ledger.observe(request.messages[len(ep.sent):] + [message]):
                     return self._end_agent_truncated(ep, request)
             else:
                 # A compaction or tool change the harness's own filter caught: swap the segment
@@ -1618,16 +1578,16 @@ class MultiTurnRollout:
             capped = None if ledger.turns else ledger.capped_turn_params(params)
             if capped is None:
                 if ep.ledger is None:
-                    raise EpisodeError(f"episode {ep.episode_id!r}: the prompt leaves no room for a generated token.")
+                    raise EpisodeError(f'episode {ep.episode_id!r}: the prompt leaves no room for a generated token.')
                 # Ends on the last recorded segment (a rewritten history with no room never became one).
                 return self._end_agent_truncated(ep, request)
             params = capped
 
-        prompt_tokens = len(ledger.input_feature.get("input_ids") or [])
+        prompt_tokens = len(ledger.input_feature.get('input_ids') or [])
         try:
             seq = self._generate(ep, ledger, params)
         except APIGenerationError as error:
-            raise EpisodeError(f"episode {ep.episode_id!r}: generation failed: {error}") from error
+            raise EpisodeError(f'episode {ep.episode_id!r}: generation failed: {error}') from error
         ledger.record(seq)
         if ledger is not ep.ledger:
             ep.ledger = ledger
@@ -1642,11 +1602,11 @@ class MultiTurnRollout:
         ep.sent = canonical + [_canonical(message)]
         ep.tools_key = tools_key
         ep.last_reply = {
-            "message": message,
-            "finish_reason": "tool_calls" if parsed else ("length" if seq.stop_reason == "length" else "stop"),
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": len(seq.tokens or []),
+            'message': message,
+            'finish_reason': 'tool_calls' if parsed else ('length' if seq.stop_reason == 'length' else 'stop'),
+            'usage': {
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': len(seq.tokens or []),
             },
         }
         request.reply.set_result(dict(ep.last_reply))
@@ -1715,7 +1675,7 @@ class MultiTurnRollout:
 
     def _end_agent_truncated(self, ep: _Episode, request: EndpointRequest) -> tuple[list, RolloutStatus]:
         """No room for the request: end on what is recorded (closing the session ends the agent)."""
-        request.reply.set_exception(RuntimeError(f"episode {ep.episode_id!r} reached its length limit"))
+        request.reply.set_exception(RuntimeError(f'episode {ep.episode_id!r} reached its length limit'))
         ep.truncated = True
         return self._finish(ep, segments=ep.segments)
 
@@ -1732,9 +1692,9 @@ class MultiTurnRollout:
         # Message-level accounting, but template-aware so a reply's tool-call markup still
         # parses. The feature stays a {'messages','tools'} dict with no input_ids, so
         # sample_stream re-encodes the whole trajectory each turn.
-        ledger = MessageLedger(label="stream", max_tokens=self.max_trajectory_tokens, template=self.template)
+        ledger = MessageLedger(label='stream', max_tokens=self.max_trajectory_tokens, template=self.template)
         opening_tools = None
-        if "tools" not in trajectory and tool_manager is not None:
+        if 'tools' not in trajectory and tool_manager is not None:
             opening_tools = list(tool_manager.tool_infos() or [])
         ledger.open(trajectory, tools=opening_tools)
 
@@ -1746,17 +1706,16 @@ class MultiTurnRollout:
             pieces: list[str] = []
             finish: str | None = None
             for delta, finish_reason in self.sampler.sample_stream(
-                ledger.input_feature, params, adapter_path=self.adapter_path
-            ):
+                    ledger.input_feature, params, adapter_path=self.adapter_path):
                 if delta:
                     pieces.append(delta)
                     yield StreamDelta(delta)
                 if finish_reason is not None:
                     finish = finish_reason
-            text = "".join(pieces)
+            text = ''.join(pieces)
             stop_reason = finish or STOP_NO_TOOL
             ledger.record(SampledSequence(stop_reason=stop_reason, tokens=[], decoded=text))
-            if finish == "length":
+            if finish == 'length':
                 # Cut off mid-reply: no tool call it was still emitting gets dispatched.
                 truncated = True
                 break
@@ -1768,7 +1727,7 @@ class MultiTurnRollout:
                 truncated = True
                 break
             if tool_manager is None:
-                raise ValueError("the model emitted tool_calls but stream() has no tools (tool_manager= or env=).")
+                raise ValueError('the model emitted tool_calls but stream() has no tools (tool_manager= or env=).')
             observations = self._run_tools(tool_manager, tool_calls)
             yield StreamToolCall(names=_tool_call_names(tool_calls), observations=observations)
             ledger.observe(_default_tool_messages(tool_calls, observations))
@@ -1777,16 +1736,6 @@ class MultiTurnRollout:
 
 
 __all__ = [
-    "EpisodeError",
-    "MAX_FOLLOWUPS",
-    "MultiTurnRollout",
-    "RolloutStatus",
-    "STOP_GENERATION_ERROR",
-    "STOP_LENGTH",
-    "STOP_MAX_TURNS",
-    "STOP_NO_TOOL",
-    "StreamDelta",
-    "StreamDone",
-    "StreamToolCall",
-    "is_error_observation",
+    'EpisodeError', 'MAX_FOLLOWUPS', 'MultiTurnRollout', 'RolloutStatus', 'STOP_GENERATION_ERROR', 'STOP_LENGTH',
+    'STOP_MAX_TURNS', 'STOP_NO_TOOL', 'StreamDelta', 'StreamDone', 'StreamToolCall', 'is_error_observation'
 ]

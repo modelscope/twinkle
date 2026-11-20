@@ -2,15 +2,15 @@
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from twinkle import remote_function
 from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
-from .resume import EnvResumeCapability, ResumableEnv, UnsafeCheckpoint, UnsupportedEnvResume, env_resume_capability
+from .resume import (EnvResumeCapability, ResumableEnv, UnsafeCheckpoint, UnsupportedEnvResume,
+                     env_resume_capability)
 from .snapshot import list_workspace
 
 logger = get_logger()
@@ -26,16 +26,14 @@ def _record_tool_exec(episode_id: str, n: int) -> None:
     tool_call, so it is deliberately not counted. Write-only and env-gated: a no-op when unset.
     """
     import os
-
-    root = os.environ.get("TWINKLE_ROLLOUT_TRAJ_DUMP")
+    root = os.environ.get('TWINKLE_ROLLOUT_TRAJ_DUMP')
     if not root:
         return
     import json
-
     os.makedirs(root, exist_ok=True)
-    rank = int(os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or 0)
-    with open(os.path.join(root, f"tool_counts.rank{rank}.jsonl"), "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"episode_id": episode_id, "executed": int(n)}) + "\n")
+    rank = int(os.environ.get('RANK') or os.environ.get('LOCAL_RANK') or 0)
+    with open(os.path.join(root, f'tool_counts.rank{rank}.jsonl'), 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps({'episode_id': episode_id, 'executed': int(n)}) + '\n')
 
 
 # What :meth:`Env.run_script` returns when it had to kill the script. 124 is
@@ -55,48 +53,63 @@ ENV_MAX_CONCURRENCY = 96
 # Shared rather than restated per implementation: a trajectory built against one
 # env has to replay on another, and it only does if the names and the argument
 # spellings are the same object.
-DEFAULT_TOOLS: list[ToolInfo] = [
+DEFAULT_TOOLS: List[ToolInfo] = [
     {
-        "type": "function",
-        "function": {
-            "name": "run_command",
-            "description": "Run a shell command inside the sandbox and return its output.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The shell command to execute."},
-                    "cwd": {"type": "string", "description": "Working directory (optional)."},
+        'type': 'function',
+        'function': {
+            'name': 'run_command',
+            'description': 'Run a shell command inside the sandbox and return its output.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'command': {
+                        'type': 'string',
+                        'description': 'The shell command to execute.'
+                    },
+                    'cwd': {
+                        'type': 'string',
+                        'description': 'Working directory (optional).'
+                    },
                 },
-                "required": ["command"],
+                'required': ['command'],
             },
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Write text content to a file inside the sandbox.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute file path in the sandbox."},
-                    "content": {"type": "string", "description": "Text content to write."},
+        'type': 'function',
+        'function': {
+            'name': 'write_file',
+            'description': 'Write text content to a file inside the sandbox.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'path': {
+                        'type': 'string',
+                        'description': 'Absolute file path in the sandbox.'
+                    },
+                    'content': {
+                        'type': 'string',
+                        'description': 'Text content to write.'
+                    },
                 },
-                "required": ["path", "content"],
+                'required': ['path', 'content'],
             },
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a text file from the sandbox.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute file path in the sandbox."},
+        'type': 'function',
+        'function': {
+            'name': 'read_file',
+            'description': 'Read a text file from the sandbox.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'path': {
+                        'type': 'string',
+                        'description': 'Absolute file path in the sandbox.'
+                    },
                 },
-                "required": ["path"],
+                'required': ['path'],
             },
         },
     },
@@ -106,7 +119,7 @@ DEFAULT_TOOLS: list[ToolInfo] = [
 def truncate_observation(text: str, limit: int = MAX_OBSERVATION_CHARS) -> str:
     if len(text) <= limit:
         return text
-    return text[:limit] + f"\n... [truncated, {len(text) - limit} chars omitted]"
+    return text[:limit] + f'\n... [truncated, {len(text) - limit} chars omitted]'
 
 
 def format_command_output(stdout: str, stderr: str, exit_code: int) -> str:
@@ -115,20 +128,19 @@ def format_command_output(stdout: str, stderr: str, exit_code: int) -> str:
     if stdout:
         parts.append(stdout)
     if stderr:
-        parts.append(f"[stderr]\n{stderr}")
+        parts.append(f'[stderr]\n{stderr}')
     if exit_code != 0:
-        parts.append(f"[exit code: {exit_code}]")
-    return truncate_observation("\n".join(parts)) if parts else "(no output)"
+        parts.append(f'[exit code: {exit_code}]')
+    return truncate_observation('\n'.join(parts)) if parts else '(no output)'
 
 
 @dataclass
 class StepResult:
     """Result returned by :meth:`Env.step`."""
-
-    observation: str = ""
+    observation: str = ''
     reward: float = 0.0
     done: bool = False
-    info: dict[str, Any] = field(default_factory=dict)
+    info: Dict[str, Any] = field(default_factory=dict)
 
 
 class SessionNotFound(KeyError):
@@ -198,7 +210,7 @@ class Env(ABC):
     snapshot_max_files = 40
     snapshot_per_file = 2000
     snapshot_budget = 20000
-    snapshot_skip = ("__pycache__", ".git", ".ipynb_checkpoints")
+    snapshot_skip = ('__pycache__', '.git', '.ipynb_checkpoints')
 
     #: Seconds a session may go untouched before the next ``reset`` closes it: a caller that died
     #: or never called ``close`` would otherwise hold a sandbox forever.
@@ -206,10 +218,10 @@ class Env(ABC):
     #: Seconds ``reset`` waits for a free session before it gives up with ``TimeoutError``.
     session_wait_timeout = 600.0
 
-    def __init__(self, max_sessions: int = 64, session_wait_timeout: float | None = 600.0):
+    def __init__(self, max_sessions: int = 64, session_wait_timeout: Optional[float] = 600.0):
         self._max_sessions = max(1, int(max_sessions))
         self._session_slots = threading.Semaphore(self._max_sessions)
-        self._sessions: dict[str, _Session] = {}
+        self._sessions: Dict[str, _Session] = {}
         self._sessions_lock = threading.Lock()
         #: Instance default for how long ``reset`` waits for a free permit; a per-call ``wait``
         #: override (see :meth:`reset`) takes precedence. Three states: positive = wait up to this
@@ -221,11 +233,11 @@ class Env(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def _open(self, trajectory: Trajectory | None) -> tuple[Any, StepResult]:
+    def _open(self, trajectory: Optional[Trajectory]) -> Tuple[Any, StepResult]:
         """Start one episode; returns its state and the initial observation."""
 
     @abstractmethod
-    def _step(self, state: Any, tool_name: str, arguments: dict[str, Any]) -> StepResult:
+    def _step(self, state: Any, tool_name: str, arguments: Dict[str, Any]) -> StepResult:
         """Run one tool call in the episode."""
 
     def _run_script(
@@ -234,9 +246,9 @@ class Env(ABC):
         raise NotImplementedError(f"{type(self).__name__} cannot run scripts; act through its tools instead.")
 
     def _close(self, state: Any) -> None:
-        return None
+        pass
 
-    def _workspace(self, state: Any) -> str | None:
+    def _workspace(self, state: Any) -> Optional[str]:
         return None
 
     # ------------------------------------------------------------------
@@ -247,26 +259,22 @@ class Env(ABC):
         with self._sessions_lock:
             session = self._sessions.get(episode_id)
         if session is None:
-            raise SessionNotFound(f"{type(self).__name__}: no open session for episode {episode_id!r}.")
+            raise SessionNotFound(f'{type(self).__name__}: no open session for episode {episode_id!r}.')
         session.touched = time.monotonic()
         return session
 
     def _close_idle_sessions(self) -> None:
         now = time.monotonic()
         with self._sessions_lock:
-            idle = [
-                eid
-                for eid, session in self._sessions.items()
-                if not session.script_inflight and now - session.touched > self.session_idle_timeout
-            ]
+            idle = [eid for eid, session in self._sessions.items()
+                    if not session.script_inflight and now - session.touched > self.session_idle_timeout]
         for eid in idle:
-            logger.warning(
-                f"{type(self).__name__}: closing session {eid!r}, idle for over {self.session_idle_timeout:.0f}s."
-            )
+            logger.warning(f'{type(self).__name__}: closing session {eid!r}, idle for over '
+                           f'{self.session_idle_timeout:.0f}s.')
             self.close(eid)
 
-    @remote_function(enable_continous_work=True, sticky_key="episode_id")
-    def reset(self, episode_id: str, traj: Trajectory | None = None, wait: float | None = None) -> Any:
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def reset(self, episode_id: str, traj: Optional[Trajectory] = None, wait: Optional[float] = None) -> Any:
         """Open the episode's session (closing an earlier one under the same id); returns the first observation.
 
         ``wait`` overrides the instance :attr:`session_wait_timeout` for this call only: a positive
@@ -289,14 +297,13 @@ class Env(ABC):
             with self._sessions_lock:
                 now = time.monotonic()
                 holders = sorted((eid, now - session.touched) for eid, session in self._sessions.items())
-            detail = ", ".join(f"{eid} idle {age:.0f}s" for eid, age in holders[:8])
+            detail = ', '.join(f'{eid} idle {age:.0f}s' for eid, age in holders[:8])
             raise TimeoutError(
-                f"{type(self).__name__}: no free session within {effective:.0f}s "
-                f"({self._max_sessions} permits, {len(holders)} sessions registered). "
-                f"Holders: {detail or 'none'}. "
-                "Fewer registered sessions than permits means the missing permits are held by resets "
-                "still inside _open, or were stranded by an earlier overwrite."
-            )
+                f'{type(self).__name__}: no free session within {effective:.0f}s '
+                f'({self._max_sessions} permits, {len(holders)} sessions registered). '
+                f'Holders: {detail or "none"}. '
+                'Fewer registered sessions than permits means the missing permits are held by resets '
+                'still inside _open, or were stranded by an earlier overwrite.')
         try:
             state, result = self._open(traj)
         except BaseException:
@@ -313,17 +320,14 @@ class Env(ABC):
             try:
                 self._close(displaced.state)
             except Exception:  # noqa
-                logger.warning(
-                    f"{type(self).__name__}: closing the session displaced by a concurrent "
-                    f"reset of episode {episode_id!r} failed.",
-                    exc_info=True,
-                )
+                logger.warning(f'{type(self).__name__}: closing the session displaced by a concurrent '
+                               f'reset of episode {episode_id!r} failed.', exc_info=True)
             finally:
                 self._session_slots.release()
         return result
 
-    @remote_function(enable_continous_work=True, sticky_key="episode_id")
-    def step(self, episode_id: str, tool_name: str, arguments: dict[str, Any] | None = None) -> StepResult:
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def step(self, episode_id: str, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> StepResult:
         session = self._session(episode_id)
         result = self._step(session.state, tool_name, arguments or {})
         if result.reward is not None:
@@ -332,8 +336,8 @@ class Env(ABC):
         _record_tool_exec(episode_id, 1)
         return result
 
-    @remote_function(enable_continous_work=True, sticky_key="episode_id")
-    def step_batch(self, episode_id: str, calls: Sequence[tuple[str, dict[str, Any]]]) -> list[StepResult]:
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def step_batch(self, episode_id: str, calls: Sequence[Tuple[str, Dict[str, Any]]]) -> List[StepResult]:
         """Execute already-parsed ``(tool_name, arguments)`` pairs in order, in one round trip."""
         session = self._session(episode_id)
         results = []
@@ -387,13 +391,13 @@ class Env(ABC):
         finally:
             session.script_inflight = False
 
-    @remote_function(enable_continous_work=True, sticky_key="episode_id")
-    def workspace(self, episode_id: str) -> str | None:
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def workspace(self, episode_id: str) -> Optional[str]:
         """The directory the episode works in, or None for an environment that keeps none."""
         return self._workspace(self._session(episode_id).state)
 
-    @remote_function(enable_continous_work=True, sticky_key="episode_id")
-    def snapshot(self, episode_id: str) -> tuple[str, str]:
+    @remote_function(enable_continous_work=True, sticky_key='episode_id')
+    def snapshot(self, episode_id: str) -> Tuple[str, str]:
         """The episode's end state as ``(listing, error)``; both empty when there is none.
 
         What an episode left behind, for a caller that has to describe it to a
@@ -405,12 +409,11 @@ class Env(ABC):
         state = self._session(episode_id).state
         return list_workspace(
             self._workspace(state),
-            lambda source: self._run_script(state, source, "python", None),
+            lambda source: self._run_script(state, source, 'python', None),
             max_files=self.snapshot_max_files,
             per_file=self.snapshot_per_file,
             budget=self.snapshot_budget,
-            skip=self.snapshot_skip,
-        )
+            skip=self.snapshot_skip)
 
     @remote_function(enable_continous_work=True, sticky_key="episode_id")
     def close(self, episode_id: str) -> float | None:
@@ -428,12 +431,12 @@ class Env(ABC):
         try:
             self._close(session.state)
         except Exception:  # noqa
-            logger.warning(f"{type(self).__name__}: closing session {episode_id!r} failed.", exc_info=True)
+            logger.warning(f'{type(self).__name__}: closing session {episode_id!r} failed.', exc_info=True)
         finally:
             self._session_slots.release()
         return session.reward if session.rewarded else None
 
-    @remote_function(dispatch="all", collect="first", lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def shutdown(self) -> None:
         """Close every open session."""
         with self._sessions_lock:
@@ -441,8 +444,8 @@ class Env(ABC):
         for episode_id in episode_ids:
             self.close(episode_id)
 
-    @remote_function(execute="first", collect="first", lazy_collect=False)
-    def tools(self) -> list[ToolInfo]:
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def tools(self) -> List[ToolInfo]:
         """What the model is told it can call in an episode."""
         return []
 
