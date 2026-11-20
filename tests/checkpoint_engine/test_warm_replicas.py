@@ -198,3 +198,16 @@ def test_warm_failure_closes_only_the_temporary_ipc_channel(monkeypatch):
     assert len(resets) == 2
     assert all(kwargs["channel"].startswith("main-warm-") and kwargs["backend"] == "ipc" for kwargs in resets)
     _assert_main_unchanged(manager, sampler, backend)
+
+
+@pytest.mark.parametrize("merge_and_sync", [False, True])
+def test_lending_prepares_only_merged_publication(monkeypatch, merge_and_sync):
+    manager, _, events = _manager(monkeypatch)
+    manager._merge_and_sync = merge_and_sync
+    manager.model.prepare_for_lending = lambda: events.append(("merge", {}))
+    manager.model.restore_after_lending = lambda: events.append(("restore", {}))
+
+    manager.prepare_for_lending()
+    manager.restore_after_lending()
+
+    assert [name for name, _ in events] == (["merge", "restore"] if merge_and_sync else ["restore"])

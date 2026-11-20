@@ -510,7 +510,9 @@ class ClusterAdapter:
 
     A new replica is passed to ``warmups[role]`` before it takes requests (the sampler's
     ``checkpoint_manager.warm`` loads the current weights into it). ``widths[role]`` is the device
-    count of one replica of that role (default 1).
+    count of one replica of that role (default 1). Paired ``before_lend`` / ``after_reclaim``
+    callbacks prepare weights before offloading and restore them after reloading the trainer,
+    including when growing or warming a replica fails.
 
     Known gap (TODO): ``adjust``'s move does not weigh its own cost, the way :meth:`lend` weighs
     a lend cycle against its measured seconds. Retiring the idlest role's replica aborts its
@@ -532,6 +534,8 @@ class ClusterAdapter:
                  lend_ranks: Optional[Sequence[int]] = None,
                  spare_ranks: Sequence[int] = (),
                  warmups: Optional[Mapping[str, Callable[[Any], None]]] = None,
+                 before_lend: Mapping[str, Callable[[], None]] | None = None,
+                 after_reclaim: Mapping[str, Callable[[], None]] | None = None,
                  widths: Optional[Mapping[str, int]] = None,
                  window: int = 3,
                  ratio_up: float = 1.5,
@@ -546,15 +550,19 @@ class ClusterAdapter:
             raise ValueError(f'need 1 <= ratio_down <= ratio_up, got {ratio_down} / {ratio_up}.')
         if lend_ranks and model is None:
             raise ValueError('lend_ranks are the trainer\'s devices: pass the trainer model to offload.')
-        unknown = sorted((set(warmups or {}) | set(widths or {})) - set(roles))
+        if set(before_lend or {}) != set(after_reclaim or {}):
+            raise ValueError('before_lend and after_reclaim must name the same roles.')
+        unknown = sorted((set(warmups or {}) | set(widths or {}) | set(before_lend or {})) - set(roles))
         if unknown:
-            raise ValueError(f'warmups / widths name unknown roles {unknown}; roles are {sorted(roles)}.')
+            raise ValueError(f'callbacks / widths name unknown roles {unknown}; roles are {sorted(roles)}.')
         if set(spare_ranks) & set(lend_ranks or ()):
             raise ValueError('spare_ranks and lend_ranks must not overlap.')
         self.roles = dict(roles)
         self.model = model
         self.lend_ranks = tuple(lend_ranks or ())
         self.warmups = dict(warmups or {})
+        self.before_lend = dict(before_lend or {})
+        self.after_reclaim = dict(after_reclaim or {})
         self.widths = {name: int((widths or {}).get(name, 1)) for name in self.roles}
         self.window = window
         self.ratio_up = ratio_up
@@ -567,6 +575,8 @@ class ClusterAdapter:
         self._cooldown = 0
         #: the role holding replicas on ``lend_ranks``, until ``reclaim``
         self._lent: Optional[str] = None
+        # Retain failed rollback state so reclaim cannot hand a merged model back to training.
+        self._pending_restore: str | None = None
         #: measured seconds of each lend->reclaim cycle (grow leg + retire/reload leg), most recent last
         self._switch_overheads: List[float] = []
         #: the grow leg's seconds of the cycle now running; ``reclaim`` folds it into the history
@@ -613,7 +623,8 @@ class ClusterAdapter:
         decision to ``train_idle_ratio`` alone).
         """
         with self._lock:
-            if not self.lend_ranks or self._lent is not None or train_idle_ratio <= self.lend_idle_ratio:
+            if (not self.lend_ranks or self._lent is not None or self._pending_restore is not None
+                    or train_idle_ratio <= self.lend_idle_ratio):
                 return
             if waited is not None and waited <= self._switch_cost():
                 return
@@ -624,13 +635,16 @@ class ClusterAdapter:
             if count == 0:
                 return
             started = time.monotonic()
-            self.model.offload_to_cpu()
+            self._pending_restore = name
             lend_targets = list(self.lend_ranks[:count * width])
             try:
+                if name in self.before_lend:
+                    self.before_lend[name]()
+                self.model.offload_to_cpu()
                 self.roles[name].add_workers(count, warmup=self.warmups.get(name), ranks=lend_targets)
             except BaseException as exc:
                 if not _is_cuda_oom(exc):
-                    self.model.reload_to_gpu()
+                    self._restore_trainer()
                     raise
                 # defect117: the trainer process's residual CUDA footprint (staging buffers, NCCL
                 # groups, context) stays on its ranks after offload_to_cpu, so a grown engine's
@@ -641,7 +655,7 @@ class ClusterAdapter:
                     self.roles[name].remove_workers(ranks=lend_targets)
                 except BaseException:
                     logger.warning(f'ClusterAdapter: lend cleanup remove_workers failed on {lend_targets}.')
-                self.model.reload_to_gpu()
+                self._restore_trainer()
                 logger.warning(
                     f'ClusterAdapter: lend skipped on ranks {lend_targets}: insufficient GPU headroom '
                     f'({exc}); lower --vllm_gpu_memory_utilization to enable lending.')
@@ -654,15 +668,23 @@ class ClusterAdapter:
         """Retire the replicas on ``lend_ranks`` and reload the trainer; a no-op when nothing is lent."""
         with self._lock:
             if self._lent is None:
+                if self._pending_restore is not None:
+                    self._restore_trainer()
                 return
             name, self._lent = self._lent, None
             started = time.monotonic()
             try:
                 self.roles[name].remove_workers(ranks=list(self.lend_ranks))
             finally:
-                self.model.reload_to_gpu()
+                self._restore_trainer()
             self._switch_overheads.append(self._lend_duration + (time.monotonic() - started))
             self._lend_duration = 0.0
+
+    def _restore_trainer(self) -> None:
+        self.model.reload_to_gpu()
+        if self._pending_restore in self.after_reclaim:
+            self.after_reclaim[self._pending_restore]()
+        self._pending_restore = None
 
     def _switch_cost(self) -> float:
         """The rolling-average seconds of one lend->reclaim cycle; a stand-in value until one is measured."""
