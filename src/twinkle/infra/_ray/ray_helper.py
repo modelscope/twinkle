@@ -636,7 +636,8 @@ class RayHelper:
             if device_type_upper != 'CPU':
                 gpu_ranks = placement['gpu_rank']
                 if device_type_upper == 'NPU':
-                    # Explicit placements for lent devices bypass ResourceManager's NPU sorting.
+                    # Ascend requires ascending visible IDs. Normalize each worker's assigned devices
+                    # here for both initial and dynamically added workers, preserving allocation metadata.
                     gpu_ranks = sorted(gpu_ranks, key=int)
                 env_vars[Platform.get_platform(device_type_upper).visible_device_env()] = ','.join(
                     str(r) for r in gpu_ranks)
