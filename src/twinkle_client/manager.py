@@ -1,22 +1,33 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 import atexit
 import os
 import threading
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from twinkle import get_logger
 from twinkle.protocol.types.server import CapacityInfoResponse, DeleteCheckpointResponse, GetServerCapabilitiesResponse
 from twinkle.protocol.types.session import CreateSessionRequest, CreateSessionResponse, SessionHeartbeatRequest
-from twinkle.protocol.types.training import (Checkpoint, Cursor, ParsedCheckpointTwinklePath, TrainingRun,
-                                             WeightsInfoResponse)
+from twinkle.protocol.types.training import (
+    Checkpoint,
+    Cursor,
+    ParsedCheckpointTwinklePath,
+    TrainingRun,
+    WeightsInfoResponse,
+)
 from twinkle_client.exceptions import TwinkleHTTPError
 from twinkle_client.http import ClientContext, ClientTransport
-from twinkle_client.http.context import (TWINKLE_SERVER_TOKEN, TWINKLE_SERVER_URL, clear_default_transport,
-                                         set_default_transport)
+from twinkle_client.http.context import (
+    TWINKLE_SERVER_TOKEN,
+    TWINKLE_SERVER_URL,
+    clear_default_transport,
+    set_default_transport,
+)
 from twinkle_client.operations import _guarded_operation
+
+if TYPE_CHECKING:
+    from twinkle_client.dataloader import DataLoader
 
 logger = get_logger()
 
@@ -213,11 +224,28 @@ class TwinkleClient:
         from twinkle_client.model import MultiLoraTransformersModel
         return MultiLoraTransformersModel(model_id, transport=self._transport, **kwargs)
 
+    # Sampler construction sends a create request. Training model construction is local.
     @_guarded_operation
     def sampler(self, model_id: str, **kwargs: Any):
         """Create a remote sampler bound explicitly to this client."""
         from twinkle_client.sampler import vLLMSampler
         return vLLMSampler(model_id, transport=self._transport, **kwargs)
+
+    def dataset(self, cls: str | type = 'Dataset', *args: Any, **kwargs: Any):
+        """Create a remote dataset bound explicitly to this client."""
+        if isinstance(cls, str):
+            from twinkle_client import dataset
+
+            if cls not in dataset.__all__:
+                raise ValueError(f'Unknown remote dataset class: {cls}')
+            cls = getattr(dataset, cls)
+        return cls(*args, transport=self._transport, **kwargs)
+
+    def dataloader(self, dataset, **kwargs: Any) -> DataLoader:
+        """Create a remote dataloader bound explicitly to this client."""
+        from twinkle_client.dataloader import DataLoader
+
+        return DataLoader(dataset, transport=self._transport, **kwargs)
 
     # ------------------------------------------------------------------
     # Health Check
