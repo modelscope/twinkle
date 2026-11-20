@@ -4,7 +4,7 @@
 # compatible client API (an alternative client protocol for the Twinkle server).
 # It covers: connecting to the server, preparing data manually with tokenizers,
 # running a training loop, saving checkpoints, and publishing to ModelScope.
-# The server must be running first (see server.py and server_config.yaml).
+# Start the server with `twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml`.
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv

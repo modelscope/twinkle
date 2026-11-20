@@ -16,7 +16,7 @@
 #      d. model.forward_backward(inputs, advantages, old_logps)
 #      e. Optimizer step
 #
-# The server must be running first (see server.py and server_config.yaml).
+# Start the server with `twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml`.
 # Requires both model and sampler services to be configured.
 
 import gc

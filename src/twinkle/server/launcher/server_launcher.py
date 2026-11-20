@@ -89,6 +89,8 @@ class ServerLauncher:
         return resolve_builder(import_path, self._get_builders())
 
     def _configure_environment(self) -> None:
+        if self.config.trust_remote_code is not None:
+            os.environ['TWINKLE_TRUST_REMOTE_CODE'] = '1' if self.config.trust_remote_code else '0'
         if any(app.import_path in ('model', 'sampler') for app in self.config.applications):
             os.environ['TWINKLE_STATE_RAY_NAMESPACE'] = self.ray_namespace
         os.environ.update(self.config.persistence.to_env_vars())

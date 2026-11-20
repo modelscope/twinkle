@@ -34,6 +34,8 @@ class ServerConfig(BaseModel):
 
     ray_namespace: str | None = None
     proxy_location: str | None = None
+    trust_remote_code: bool | None = Field(
+        default=None, description='Set TWINKLE_TRUST_REMOTE_CODE for the launcher and default Ray worker environment.')
     http_options: HttpOptions = Field(default_factory=HttpOptions)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)

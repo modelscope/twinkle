@@ -188,7 +188,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 将 SAVE_DIR export 给子进程（python server 通过环境变量读取）
+# 将 SAVE_DIR export 给子进程（Twinkle 服务通过环境变量读取）
 export TWINKLE_DEFAULT_SAVE_DIR="$SAVE_DIR"
 
 # 将分号分隔的字符串转为数组
@@ -383,8 +383,8 @@ require_command() {
 validate_runtime_dependencies() {
     require_command ps
     require_command tail
-    require_command python
     require_command ray
+    require_command twinkle-server
     require_command redis-server
     require_command redis-cli
     require_command pkill
@@ -693,7 +693,7 @@ start_twinkle_server() {
     echo ""
 
     touch "$LOG_FILE"
-    nohup python -m twinkle.server launch --config "$SERVER_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+    nohup twinkle-server launch -c "$SERVER_CONFIG_FILE" > "$LOG_FILE" 2>&1 &
     SERVER_PID=$!
     print_success "Twinkle Server 已启动 (PID: $SERVER_PID)"
 

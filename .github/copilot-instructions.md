@@ -37,7 +37,7 @@ These instructions help AI agents work productively in this repo. Focus on concr
   - Initialize infra: `twinkle.initialize(mode='local', seed=42)`
   - Inspect device placement: call `twinkle.infra.get_device_placement()`.
 - **Ray Serve demo (HTTP services):**
-  - Config and launcher: [cookbook/client/server/megatron/server.py](../cookbook/client/server/megatron/server.py), [cookbook/client/server/megatron/server_config.yaml](../cookbook/client/server/megatron/server_config.yaml)
+  - Config: [cookbook/client/server/megatron/server_config.yaml](../cookbook/client/server/megatron/server_config.yaml)
   - Start:
     - `cd cookbook/client/server/megatron`
     - `twinkle-server launch -c server_config.yaml`
