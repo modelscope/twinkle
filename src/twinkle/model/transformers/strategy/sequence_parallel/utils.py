@@ -379,10 +379,17 @@ class DistributedAttention(torch.nn.Module):
         else:
             query_layer, key_layer, value_layer = query, key, value
 
-        if (self.sequence_parallel.sp_world_size > 1 and torch.is_tensor(attention_mask) and attention_mask.dim() == 4):
+        if (self.sequence_parallel.sp_world_size > 1 and torch.is_tensor(attention_mask)
+                and attention_mask.dim() in (2, 4)):
+            # Attention masks arrive sharded along the sequence dim (like the pre-all-to-all q/k/v).
+            # Gather them to the global sequence length so they line up with the gathered q/k/v;
+            # a stale local-length mask (e.g. a 2D padding mask under sdpa/eager) makes downstream
+            # mask building index out of bounds on NPU (vector core exception 507035: bounds =
+            # local_seq_len, index = global position). The 4D path previously handled this; 2D
+            # padding masks (sdpa/eager) were missed.
             if attention_mask.shape[-1] != key_layer.shape[1]:
                 attention_mask = self.sequence_parallel.gather(attention_mask, dim=-1, position_ids=None)
-            if attention_mask.shape[-2] != query_layer.shape[1]:
+            if attention_mask.dim() == 4 and attention_mask.shape[-2] != query_layer.shape[1]:
                 attention_mask = self.sequence_parallel.gather(attention_mask, dim=-2, position_ids=None)
 
         if self.sequence_parallel.rp_world_size > 1:
