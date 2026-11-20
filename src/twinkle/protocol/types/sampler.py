@@ -58,6 +58,7 @@ class SampleResponseModel(ResponseModel):
     """Mirroring twinkle.data_format.SampleResponse."""
     sequences: list[SampledSequenceModel] = Field(..., description='List of sampled sequences')
     prompt_token_ids: list[int] | None = Field(None, description='Token IDs of the prompt the sequences continue')
+    prompt_token_ids_echoed: bool = Field(False, description='The backend returned request IDs before media expansion')
     prompt_logprobs: list[float | None] | None = None
     topk_prompt_logprobs: list[list[tuple[int, float]] | None] | None = None
 
