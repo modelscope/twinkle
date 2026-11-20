@@ -42,6 +42,21 @@ def test_localenv_workspace_round_trip_uses_a_new_session(tmp_path):
     restored.close("episode-1")
 
 
+def test_localenv_resume_preserves_scored_zero_reward(tmp_path):
+    source = LocalEnv(root=str(tmp_path))
+    source.reset("episode-1")
+    session = source._session("episode-1")
+    session.rewarded = True
+    session.reward = 0.0
+    state_key = "run-1/group-0/episode-1/attempt-0"
+    snapshot = source.checkpoint_episode("episode-1", state_key)
+    source.close("episode-1")
+
+    restored = LocalEnv(root=str(tmp_path))
+    restored.restore_episode("episode-1", state_key, snapshot)
+    assert restored.close("episode-1") == 0.0
+
+
 def test_localenv_checkpoint_refuses_a_running_process(tmp_path):
     env = LocalEnv(root=str(tmp_path))
     env.reset("episode-1")

@@ -625,12 +625,12 @@ class StreamingDriver:
         self._counters["dropped_stale"] += len(group.members)
         self._counters["dropped_group"] += 1
         if self.resume_store is not None:
+            self._persist_snapshot_locked()
             self.resume_store.journal.append(
                 JournalEvent.GROUP_DROPPED,
                 group.state_key,
                 {"reason": "stale", "binding": group.binding.to_dict(), "current_version": self._version},
             )
-            self._persist_snapshot_locked()
         for episode in group.members + group.baselines:
             if episode.lost:
                 continue
@@ -1536,6 +1536,7 @@ class StreamingDriver:
                     # waiting for its PRM scores, no step in flight; a stepping one is stopped when it returns
                     self.rollout.stop(episode.traj, episode_id=episode.episode_id)
         if self.resume_store is not None:
+            self._persist_snapshot_locked()
             self.resume_store.journal.append(
                 JournalEvent.GROUP_DROPPED,
                 group.state_key,
@@ -1545,7 +1546,6 @@ class StreamingDriver:
                     "current_version": self._version,
                 },
             )
-            self._persist_snapshot_locked()
             self._discard_group_state(group)
 
 

@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from twinkle_agentic.async_rl.rollout_resume import GroupPolicyBinding, ResumeStore, UnsafeResume
+from twinkle_agentic.async_rl.rollout_resume import GroupPolicyBinding, JournalEvent, ResumeStore, UnsafeResume
 from twinkle_agentic.async_rl.streaming_driver import _PENDING, StreamingDriver
 from twinkle_agentic.rollout.multi_turn import RolloutStatus
 
@@ -584,6 +584,34 @@ def test_resume_reissues_pending_prm_at_its_segment_and_keeps_the_held_barrier(t
     assert restored._groups["0"].members[0].prm_pending == 0
     assert len(rollout.calls) == 1
     restored.close()
+
+
+def test_group_drop_snapshot_precedes_journal_commit(tmp_path, monkeypatch):
+    store = ResumeStore(tmp_path, "run-drop-crash")
+    driver = StreamingDriver(
+        _prompts(1), _BlockingRollout(), batch_size=2, num_generations=2, max_steps=1, resume_store=store
+    )
+    driver._admit()
+    group = driver._groups["0"]
+
+    append = store.journal.append
+
+    def crash_on_drop_journal(event, state_key, payload=None):
+        if event == JournalEvent.GROUP_DROPPED:
+            raise RuntimeError("process exited before the drop journal commit")
+        return append(event, state_key, payload)
+
+    monkeypatch.setattr(store.journal, "append", crash_on_drop_journal)
+    with pytest.raises(RuntimeError, match="before the drop journal commit"):
+        driver._drop_group(group)
+
+    restored_rollout = _BlockingRollout()
+    restored = StreamingDriver(
+        _prompts(1), restored_rollout, batch_size=2, num_generations=2, max_steps=1, resume_store=store
+    )
+    restored.load_state_dict()
+    assert restored._groups == {}
+    assert restored_rollout.calls == []
 
 
 def test_terminal_group_snapshot_precedes_episode_state_cleanup(tmp_path):

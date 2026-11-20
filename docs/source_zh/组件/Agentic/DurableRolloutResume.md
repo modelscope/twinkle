@@ -32,6 +32,10 @@ binding = GroupPolicyBinding(
 - `policy_version` 是该组采样时的 policy 版本。
 - `adapter_path` 是该版本的 adapter 快照；`None` 表示使用基础模型。
 
+`adapter_path` 在一次 run 内必须指向不可变内容，不能原地覆盖或复用为另一个 policy；建议路径包含
+run、policy version 或 checkpoint generation。当前 binding 校验身份和路径一致性，不对远端 adapter
+内容额外计算哈希，因此 artifact 不可变性由 checkpoint 管理层保证。
+
 新 driver 快照同时写入结构化 `binding` 和旧版扁平字段。读取旧快照时会自动升级；
 binding 与扁平字段不一致时拒绝恢复。
 
@@ -90,7 +94,8 @@ driver.commit_batch(
 
 `commit_batch(checkpoint_ref, manifest)` 是 batch lease 与训练 checkpoint 的唯一关联点。
 未提交前崩溃，恢复上一模型 checkpoint 并重交付同一 lease；已提交后崩溃，恢复新
-checkpoint 且不再交付该 lease。
+checkpoint 且不再交付该 lease。调用方必须先确保模型和 optimizer checkpoint 已完整持久化，再调用
+`commit_batch()`；driver 不探测通用远端 checkpoint 的落盘状态，也不能修复一个提前提交的引用。
 
 ## ResumeStore 与 DurableJournal
 
@@ -140,11 +145,15 @@ closed。只恢复文本对话、但丢失 workspace 或工具状态的实现不
 3. checkpoint 持久化后写入 `TOOL_RESULT`。
 
 恢复时如果存在 intent 但没有 checkpoint 能证明结果，整组状态被拒绝，不会再次执行非
-幂等外部调用。已完成且被 episode checkpoint 覆盖的 effect 直接复用记录结果。
+幂等外部调用。已完成且被 episode checkpoint 覆盖的 effect 直接复用记录结果。这一策略是 fail
+closed，不等于为任意外部系统提供 exactly-once 执行；要继续该 uncertain effect，业务侧必须提供
+幂等键或结果查询/对账能力。
 
 ## 兼容性
 
 - `resume_store=None`：行为与原有 `StreamingDriver` 相同；
+- 一个 `run_id` 只对应一个活跃 driver 写者；journal 文件锁用于保护事件链，不允许多个 driver
+  共享同一 run 并分别覆盖 driver/lease 快照；
 - 旧 driver 快照：自动从 `version + adapter_path` 升级为 `GroupPolicyBinding`；
 - 未设置 checkpoint manager：仍可保存组和 lease，但不执行 policy 版本淘汰；
 - `ResumableEnv` 从 `twinkle_agentic.envs.resume` 或 `twinkle_agentic.envs` 导入；
@@ -238,7 +247,10 @@ durable 消除了恢复时的错误 policy 切换，但不宣称已经量化混�
 - vLLM-Ascend 0.23.0 在 CaMem sleep/wake 后激活多 policy LoRA 的稳定性；上述 4B 对照使用无 sleep
   colocate 路径；
 - 无法 checkpoint 的远端 agent harness；
-- 所有外部工具协议都具备幂等结果查询。
+- 所有外部工具协议都具备幂等结果查询；
+- 大规模长训练的持久化开销尚未形成独立基准。当前 journal 追加会重扫事件链，driver 在稳定边界
+  保存完整状态，LocalEnv 每轮复制并校验 workspace；后续可分别评估增量扫描、按 episode 分片和
+  增量 workspace 快照，不能用当前端到端墙钟结果替代这些专项评估。
 
 因此该机制的主要结论是进程重启时保持 GRPO 组语义、事务一致性、固定预算下的有效训练量，
 并减少重复工具副作用和重复采样，不宣称所有故障率下无条件提升模型质量或缩短墙钟时间。

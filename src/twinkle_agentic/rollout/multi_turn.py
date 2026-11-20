@@ -46,15 +46,15 @@ def _final_answer(traj: Trajectory) -> str:
     Multimodal content is a part list; the text parts concatenate in order.
     """
     content = None
-    for message in reversed(traj.get('messages') or []):
-        if message.get('role') == 'assistant':
-            content = message.get('content')
+    for message in reversed(traj.get("messages") or []):
+        if message.get("role") == "assistant":
+            content = message.get("content")
             break
     if content is None:
-        return ''
+        return ""
     if isinstance(content, list):
-        return ''.join(str(part.get('text') or '') for part in content if isinstance(part, dict))
-    return str(content or '')
+        return "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+    return str(content or "")
 
 
 def _dump_rollout_rows(episode_id: str, rows: list) -> None:
@@ -996,22 +996,23 @@ class MultiTurnRollout:
         # the same sandbox; ``env=None`` (a tools-only local episode) falls back to a LocalEnv
         # over the row's own ``workspace`` column.
         check_score: float | None = None
-        if traj.get('checks') is not None:
+        if traj.get("checks") is not None:
             if self.env is not None and not ep.env_open:
                 raise EpisodeError(
-                    f'episode {ep.episode_id!r}: its env session is already closed, so its terminal '
-                    'checks cannot see the state the agent left behind.')
+                    f"episode {ep.episode_id!r}: its env session is already closed, so its terminal "
+                    "checks cannot see the state the agent left behind."
+                )
             try:
-                checks = checks_from_dicts(traj.get('checks'))
+                checks = checks_from_dicts(traj.get("checks"))
             except Exception as exc:
-                raise EpisodeError(
-                    f'episode {ep.episode_id!r}: malformed checks column: {exc}') from exc
-            workspace = (self.env.workspace(ep.episode_id) if self.env is not None
-                         else str(traj.get('workspace') or ''))
+                raise EpisodeError(f"episode {ep.episode_id!r}: malformed checks column: {exc}") from exc
+            workspace = self.env.workspace(ep.episode_id) if self.env is not None else str(traj.get("workspace") or "")
             report = run_checks(
                 checks,
-                CheckContext(workspace=workspace, final_answer=_final_answer(traj),
-                             env=self.env, episode_id=ep.episode_id))
+                CheckContext(
+                    workspace=workspace, final_answer=_final_answer(traj), env=self.env, episode_id=ep.episode_id
+                ),
+            )
             check_score = float(report.score)
         env_reward: float | None = None
         if self.env is not None and ep.env_open:

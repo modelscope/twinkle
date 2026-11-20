@@ -219,6 +219,7 @@ class LocalEnv(Env):
             "files": len(tree["files"]),
             "bytes": tree["bytes"],
             "reward": session.reward,
+            "rewarded": session.rewarded,
         }
 
     def restore_episode(self, episode_id: str, state_key: str, state: dict[str, Any], trajectory=None) -> None:
@@ -240,7 +241,9 @@ class LocalEnv(Env):
 
         self.reset(episode_id, trajectory)
         try:
-            self._session(episode_id).reward = float(state.get("reward") or 0.0)
+            session = self._session(episode_id)
+            session.reward = float(state.get("reward") or 0.0)
+            session.rewarded = bool(state.get("rewarded", session.reward != 0.0))
             target = Path(self.workspace(episode_id))
             shutil.copytree(source, target, dirs_exist_ok=True)
         except BaseException:
