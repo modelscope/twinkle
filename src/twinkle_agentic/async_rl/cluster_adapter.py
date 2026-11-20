@@ -18,7 +18,6 @@ _ALLOWED_OVERRIDE_KEYS = frozenset({
     'trainer_model_parallel_width',
     'sampler_model_parallel_width',
     'sampler_replicas',
-    'shared_sampler',
     'flex_gpus',
     'max_num_seqs',
 })
@@ -26,6 +25,25 @@ _ALLOWED_OVERRIDE_KEYS = frozenset({
 _SWITCH_COST_WINDOW = 3
 #: Stand-in cycle cost (seconds) until a first lend->reclaim cycle has been measured.
 _SWITCH_COST_FALLBACK_S = 10.0
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """True if ``exc`` or its ray-wrapped cause chain is a CUDA out-of-memory error.
+
+    ray flattens the worker's ``torch.OutOfMemoryError`` into a ``RayTaskError`` whose message carries
+    the original text; detect by class name or message so this module need not import torch.
+    """
+    seen: set = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ == 'OutOfMemoryError':
+            return True
+        text = str(cur)
+        if 'CUDA out of memory' in text or 'OutOfMemoryError' in text:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 @dataclass(frozen=True)
@@ -37,7 +55,6 @@ class RolePlacement:
     replica_count: int
     ranks: Tuple[int, ...]
     gpus_per_worker: int
-    shared: bool = False
 
     def __post_init__(self) -> None:
         if self.model_parallel_width < 1 or self.replica_count < 1 or self.gpus_per_worker < 1:
@@ -59,28 +76,22 @@ class RLResourcePlan:
     trainer: RolePlacement
     sampler: RolePlacement
     auxiliaries: Tuple[RolePlacement, ...] = ()
-    shared_sampler: Optional[RolePlacement] = None
     flex_ranks: Tuple[int, ...] = ()
     max_num_seqs: Optional[int] = None
     explanation: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        non_shared = [self.trainer, self.sampler, *self.auxiliaries]
-        physical = [rank for role in non_shared for rank in role.ranks]
+        roles = [self.trainer, self.sampler, *self.auxiliaries]
+        physical = [rank for role in roles for rank in role.ranks]
         if len(physical) != len(set(physical)):
-            raise ValueError('non-shared role ranks must not overlap.')
+            raise ValueError('role ranks must not overlap.')
         if set(self.flex_ranks) & set(physical):
-            raise ValueError('flex ranks must be disjoint from initialized non-shared roles.')
+            raise ValueError('flex ranks must be disjoint from initialized roles.')
         if len(self.flex_ranks) != len(set(self.flex_ranks)):
             raise ValueError('flex ranks contain duplicates.')
         allocated = set(physical) | set(self.flex_ranks)
-        if self.shared_sampler is not None:
-            if not self.shared_sampler.shared:
-                raise ValueError('shared_sampler must have shared=True.')
-            if not set(self.shared_sampler.ranks).issubset(set(self.trainer.ranks)):
-                raise ValueError('shared sampler ranks must be a subset of the trainer world.')
         if allocated and allocated != set(range(max(allocated) + 1)):
-            raise ValueError('non-shared and flex physical ranks must form a contiguous range from zero.')
+            raise ValueError('role and flex physical ranks must form a contiguous range from zero.')
 
     @property
     def total_physical_gpus(self) -> int:
@@ -90,11 +101,10 @@ class RLResourcePlan:
         return len(ranks)
 
     def describe(self) -> str:
-        roles = (self.trainer, self.sampler, *self.auxiliaries,
-                 *((self.shared_sampler, ) if self.shared_sampler is not None else ()))
+        roles = (self.trainer, self.sampler, *self.auxiliaries)
         rows = [
             f'{role.role}: mp={role.model_parallel_width}, replicas={role.replica_count}, '
-            f'ranks={list(role.ranks)}, shared={role.shared}' for role in roles
+            f'ranks={list(role.ranks)}' for role in roles
         ]
         rows.append(f'flex_ranks={list(self.flex_ranks)}, physical_gpus={self.total_physical_gpus}')
         rows.extend(self.explanation)
@@ -236,7 +246,7 @@ class RLResourceEstimator:
     def estimate(self, *, hf_config: Any, trainer_gpus: int, auxiliary_widths: Mapping[str, int],
                  rollout_config: Any, prompt_lengths: Sequence[int], max_completion_length: int,
                  trainer_parallel_spec: Optional[str] = None) -> RLResourcePlan:
-        """One complete plan: trainer / sampler widths, replicas, auxiliaries, flex and shared pools.
+        """One complete plan: trainer / sampler widths, replicas, auxiliaries, and the flex pool.
 
         ``rollout_config`` is read for the backend's knobs (quantization, eager, max_model_len,
         resource_overrides, resource_mode, resource_flex_gpus, resource_total_gpus); the whole
@@ -362,19 +372,10 @@ class RLResourceEstimator:
                              f'width {sampler_width}. Increase the flex reservation or set it to zero.')
         if total_cap is not None and next_rank > total_cap:
             raise ValueError(f'resource plan needs {next_rank} GPUs but resource_total_gpus={total_cap}.')
-        enable_shared = bool(overrides.get('shared_sampler',
-                                           getattr(rollout_config, 'resource_mode', 'manual') == 'adaptive'))
-        shared = None
-        if enable_shared:
-            if trainer_gpus % sampler_width:
-                raise ValueError('shared sampler model_parallel_width must divide the complete trainer world.')
-            shared = RolePlacement('shared_sampler', sampler_width, trainer_gpus // sampler_width,
-                                   tuple(range(trainer_gpus)), sampler_width, shared=True)
         return RLResourcePlan(
             trainer=trainer,
             sampler=sampler,
             auxiliaries=tuple(auxiliaries),
-            shared_sampler=shared,
             flex_ranks=flex_ranks,
             max_num_seqs=max_seqs,
             explanation=(
@@ -624,12 +625,27 @@ class ClusterAdapter:
                 return
             started = time.monotonic()
             self.model.offload_to_cpu()
+            lend_targets = list(self.lend_ranks[:count * width])
             try:
-                self.roles[name].add_workers(
-                    count, warmup=self.warmups.get(name), ranks=list(self.lend_ranks[:count * width]))
-            except BaseException:
+                self.roles[name].add_workers(count, warmup=self.warmups.get(name), ranks=lend_targets)
+            except BaseException as exc:
+                if not _is_cuda_oom(exc):
+                    self.model.reload_to_gpu()
+                    raise
+                # defect117: the trainer process's residual CUDA footprint (staging buffers, NCCL
+                # groups, context) stays on its ranks after offload_to_cpu, so a grown engine's
+                # warm reserve (util x the whole card) can exceed the remaining free memory.
+                # Retire the half-built replica, reload the trainer, and skip the lend (training
+                # continues) instead of crashing; lowering util enables it.
+                try:
+                    self.roles[name].remove_workers(ranks=lend_targets)
+                except BaseException:
+                    logger.warning(f'ClusterAdapter: lend cleanup remove_workers failed on {lend_targets}.')
                 self.model.reload_to_gpu()
-                raise
+                logger.warning(
+                    f'ClusterAdapter: lend skipped on ranks {lend_targets}: insufficient GPU headroom '
+                    f'({exc}); lower --vllm_gpu_memory_utilization to enable lending.')
+                return
             self._lend_duration = time.monotonic() - started
             self._lent = name
             logger.info(f'ClusterAdapter: lent trainer ranks {list(self.lend_ranks[:count * width])} to {name}.')
