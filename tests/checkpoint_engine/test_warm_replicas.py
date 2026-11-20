@@ -56,19 +56,22 @@ def _manager(monkeypatch, *, shared=True, prefix="npu", fail=False):
         reset_checkpoint_engine=lambda channel, backend: record("reset_receiver", channel=channel, backend=backend),
     )
 
-    def transfer(session, receiver, count, merge_and_sync, base_sync_done):
+    def transfer(owner, receiver, count, merge_and_sync, base_sync_done):
+        assert owner is manager
         assert receiver is sub
+        activated = [kwargs for name, kwargs in events if name == "activate"]
+        assert len(activated) == 2
+        assert all(kwargs["backend"] == owner.backend for kwargs in activated)
         record(
             "transfer",
-            backend=session.backend,
-            channel=session.channel,
+            backend=owner.backend,
+            channel=activated[0]["channel"],
             count=count,
             base_sync_done=base_sync_done,
             merge_and_sync=merge_and_sync,
         )
 
     monkeypatch.setattr(CheckpointEngineManager, "_transfer", transfer)
-    monkeypatch.delenv("TWINKLE_DISABLE_DIRECT_VLLM_SYNC", raising=False)
     return manager, sub, events
 
 
@@ -84,38 +87,59 @@ def _assert_main_unchanged(manager, sampler, backend):
 
 
 @pytest.mark.parametrize("prefix", ["npu", "cuda"])
-def test_lent_replica_warm_uses_device_paired_direct_transfer(monkeypatch, prefix):
+@pytest.mark.parametrize("disable_direct_sync", ["0", "1"])
+def test_lent_replica_warm_uses_device_paired_direct_transfer(monkeypatch, prefix, disable_direct_sync):
     manager, sub, events = _manager(monkeypatch, prefix=prefix)
     sampler, backend = manager.sampler, manager.backend
+    monkeypatch.setenv("TWINKLE_DISABLE_DIRECT_VLLM_SYNC", disable_direct_sync)
 
     manager.warm(sub)
 
-    assert sorted(name for name, _ in events) == ["receive", "reset_model", "reset_receiver", "send"]
+    assert sorted(name for name, _ in events) == ["receive", "send"]
     send = next(kwargs for name, kwargs in events if name == "send")
     assert send["channel"].startswith("main-warm-")
     # True selects the exporter's merged LoRA path after training has begun.
     assert send["base_sync_done"] is True
     assert send["merge_and_sync"] is True
-    resets = [kwargs for name, kwargs in events if name.startswith("reset_")]
-    assert resets == [{"channel": send["channel"], "backend": "ipc"}] * 2
     _assert_main_unchanged(manager, sampler, backend)
 
 
-@pytest.mark.parametrize("shared", [False, True])
-def test_warm_checkpoint_transport_matches_physical_placement(monkeypatch, shared):
-    manager, sub, events = _manager(monkeypatch, shared=shared)
+@pytest.mark.parametrize("prefix", ["npu", "cuda"])
+def test_warm_flex_replica_uses_main_checkpoint_transport(monkeypatch, prefix):
+    manager, sub, events = _manager(monkeypatch, shared=False, prefix=prefix)
     sampler, backend = manager.sampler, manager.backend
-    monkeypatch.setenv("TWINKLE_DISABLE_DIRECT_VLLM_SYNC", "1")
 
     manager.warm(sub)
 
-    expected_backend = "ipc" if shared else "hccl"
     transfers = [kwargs for name, kwargs in events if name == "transfer"]
     assert len(transfers) == 1
-    assert transfers[0]["backend"] == expected_backend
+    assert transfers[0]["backend"] == backend
     assert transfers[0]["count"] == 1
     assert transfers[0]["base_sync_done"] is True
-    assert all(kwargs["backend"] == expected_backend for name, kwargs in events if name.startswith("reset_"))
+    resets = [kwargs for name, kwargs in events if name.startswith("reset_")]
+    assert resets == [{"channel": transfers[0]["channel"], "backend": backend}] * 2
+    _assert_main_unchanged(manager, sampler, backend)
+
+
+@pytest.mark.parametrize("prefix", ["npu", "cuda"])
+@pytest.mark.parametrize("operation", ["_activate_checkpoint_channel", "_transfer"])
+def test_warm_checkpoint_failure_cleans_only_the_temporary_transport(monkeypatch, prefix, operation):
+    manager, sub, events = _manager(monkeypatch, shared=False, prefix=prefix)
+    sampler, backend = manager.sampler, manager.backend
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("checkpoint failed")
+
+    monkeypatch.setattr(manager, operation, fail)
+
+    with pytest.raises(RuntimeError, match="checkpoint failed"):
+        manager.warm(sub)
+
+    resets = [kwargs for name, kwargs in events if name.startswith("reset_")]
+    assert len(resets) == 2
+    assert resets[0] == resets[1]
+    assert resets[0]["backend"] == backend
+    assert resets[0]["channel"].startswith("main-warm-")
     _assert_main_unchanged(manager, sampler, backend)
 
 
@@ -187,16 +211,14 @@ def test_warm_publishes_learned_lora_weights(monkeypatch):
     torch.testing.assert_close(model.base_model.model.linear.base_layer.weight, torch.zeros(2, 2))
 
 
-def test_warm_failure_closes_only_the_temporary_ipc_channel(monkeypatch):
+def test_warm_direct_failure_leaves_checkpoint_channel_untouched(monkeypatch):
     manager, sub, events = _manager(monkeypatch, fail=True)
     sampler, backend = manager.sampler, manager.backend
 
     with pytest.raises(RuntimeError, match="sender failed"):
         manager.warm(sub)
 
-    resets = [kwargs for name, kwargs in events if name.startswith("reset_")]
-    assert len(resets) == 2
-    assert all(kwargs["channel"].startswith("main-warm-") and kwargs["backend"] == "ipc" for kwargs in resets)
+    assert not any(name == "activate" or name.startswith("reset_") for name, _ in events)
     _assert_main_unchanged(manager, sampler, backend)
 
 

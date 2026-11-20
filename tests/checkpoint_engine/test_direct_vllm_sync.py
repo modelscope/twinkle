@@ -268,15 +268,20 @@ def test_is_colocated_routing(replicas, devices, expected):
 
 def test_warm_colocated_uses_ipc_and_skips_nccl():
     state, events, nccl = warm_state()
-    state.warm(state.sampler)
+    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is True
     names = [row[0] for row in events]
     assert sorted(names) == sorted(['send', 'receive', 'send_done', 'receive_done'])
-    assert nccl == ['close']  # Only the temporary IPC channel is closed; no NCCL transfer.
+    assert not nccl  # Direct warmup does not open a checkpoint-engine channel.
+    send = next(row for row in events if row[0] == 'send')
+    assert send[2]['channel'] == 'warm-chan'
+    assert state.base_sync_done is False
 
 
 def test_warm_flex_falls_through_to_nccl():
     state, events, nccl = warm_state(replicas=[[{'device_uuid': 'gpu2', 'endpoint': 'c'},
                                                 {'device_uuid': 'gpu3', 'endpoint': 'd'}]])
+    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is False
+    assert not events and not nccl
     state.warm(state.sampler)
     assert not events
     assert nccl == ['activate', 'transfer', 'close']
@@ -284,17 +289,18 @@ def test_warm_flex_falls_through_to_nccl():
 
 def test_warm_colocated_lora_syncs_base_then_adapter():
     state, events, nccl = warm_state(merge=False, base_done=True)
-    state.warm(state.sampler)
+    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is True
     sends = [row for row in events if row[0] == 'send']
     assert len(sends) == 2
     assert sends[0][2]['base_sync_done'] is False
     assert sends[1][2]['base_sync_done'] is True
-    assert nccl == ['close']
+    assert not nccl
+    assert state.base_sync_done is True
 
 
 def test_warm_colocated_merged_weights_single_transfer():
     state, events, nccl = warm_state(merge=True, base_done=True)
-    state.warm(state.sampler)
+    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is True
     sends = [row for row in events if row[0] == 'send']
     assert len(sends) == 1
     assert sends[0][2]['base_sync_done'] is True
@@ -305,6 +311,8 @@ def test_warm_colocated_merged_weights_single_transfer():
 def test_warm_non_vllm_sub_falls_through():
     state, events, nccl = warm_state()
     del state.sampler.direct_weight_sync_metadata
+    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is False
+    assert not events and not nccl
     state.warm(state.sampler)
     assert not events
     assert nccl == ['activate', 'transfer', 'close']
