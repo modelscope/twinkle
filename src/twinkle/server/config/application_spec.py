@@ -10,25 +10,13 @@ The schemas use ``extra='forbid'`` so unknown args (typos, copy-paste from
 other deployments) fail at load time instead of being silently dropped.
 """
 from __future__ import annotations
-
 import os
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .task_queue import TaskQueueConfig
 from .training import ModelArgs
-
-# Env var keys the launcher sets from the gateway ``server_config`` so that any
-# Ray worker (model / sampler / processor), not just the gateway, applies the
-# configured ServerState policy instead of ``get_server_state``'s hardcoded
-# defaults. Only the four *policy* fields are propagated; ``actor_name`` is a
-# per-process cache key, not a cross-worker policy, so it is excluded.
-SERVER_STATE_ENV_KEYS: tuple[str, ...] = (
-    'TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT',
-    'TWINKLE_SERVER_STATE_CLEANUP_INTERVAL',
-    'TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT',
-    'TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL',
-)
 
 # ---------- shared helpers ------------------------------------------------- #
 
@@ -57,7 +45,7 @@ class HttpOptions(BaseModel):
     ssl_certfile: str | None = None
 
     @model_validator(mode='after')
-    def _ssl_pair_set_together(self) -> 'HttpOptions':
+    def _ssl_pair_set_together(self) -> HttpOptions:
         if (self.ssl_keyfile is None) != (self.ssl_certfile is None):
             raise ValueError('ssl_keyfile and ssl_certfile must be set together to serve HTTPS')
         return self

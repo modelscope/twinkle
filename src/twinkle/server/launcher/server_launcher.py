@@ -1,8 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Initialize server configuration, deploy applications, and own their shutdown."""
 from __future__ import annotations
-
-import json
 import os
 import signal
 import threading
@@ -11,11 +9,13 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import json
+
 from twinkle import get_logger
 from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map, extract_model_alias
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.application_spec import ApplicationSpec
-from twinkle.server.config.resources import build_propagated_env_vars, build_worker_env_vars
+from twinkle.server.config.env_propagation import build_propagated_env_vars, build_worker_env_vars
 from twinkle.utils.loader import WORKER_SETUP_HOOK
 from .builder_registry import get_builders, resolve_builder
 
@@ -278,6 +278,7 @@ class ServerLauncher:
 
     def _shutdown(self, *, raise_errors: bool = True) -> None:
         from functools import partial
+
         from ray import serve
 
         from twinkle.server.telemetry import flush_telemetry_safely

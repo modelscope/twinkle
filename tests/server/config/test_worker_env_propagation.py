@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle.server.config.resources import (
+from twinkle.server.config.env_propagation import (
     SHARED_WORKER_ENV_KEYS,
     build_propagated_env_vars,
     build_shared_env_vars,

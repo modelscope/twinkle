@@ -1,19 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Shared instance startup, allocation, shutdown and monitoring budgets."""
+"""Environment variables propagated from the launcher to Ray workers."""
 
 import os
-
-from pydantic import BaseModel, ConfigDict, Field
-
-
-class ResourceOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    allocation_timeout_s: float = Field(default=3, gt=0, allow_inf_nan=False)
-    startup_timeout_s: float = Field(default=1800, gt=0, allow_inf_nan=False)
-    shutdown_timeout_s: float = Field(default=60, gt=0, allow_inf_nan=False)
-    sweep_interval_s: float = Field(default=5, gt=0, allow_inf_nan=False)
-
 
 SHARED_WORKER_ENV_KEYS: tuple[str, ...] = (
     "TWINKLE_STATE_RAY_NAMESPACE",
@@ -32,20 +20,32 @@ SHARED_WORKER_ENV_KEYS: tuple[str, ...] = (
     "TWINKLE_PERF",
 )
 
+PERSISTENCE_ENV_KEYS: tuple[str, ...] = (
+    "TWINKLE_PERSISTENCE_MODE",
+    "TWINKLE_PERSISTENCE_REDIS_URL",
+    "TWINKLE_PERSISTENCE_KEY_PREFIX",
+)
+
+# actor_name is a per-process cache key and is excluded from worker policy.
+SERVER_STATE_ENV_KEYS: tuple[str, ...] = (
+    "TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT",
+    "TWINKLE_SERVER_STATE_CLEANUP_INTERVAL",
+    "TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT",
+    "TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL",
+)
+
+EXPLICIT_PROCESS_ENV_KEYS = ("PYTHONPATH", "TWINKLE_DEFAULT_SAVE_DIR", "TMPDIR", "OMP_NUM_THREADS")
+
 
 def build_shared_env_vars() -> dict[str, str]:
     return {key: os.environ[key] for key in SHARED_WORKER_ENV_KEYS if key in os.environ}
 
 
 def build_persistence_env_vars() -> dict[str, str]:
-    from twinkle.server.config.persistence import PERSISTENCE_ENV_KEYS
-
     return {key: os.environ[key] for key in PERSISTENCE_ENV_KEYS if key in os.environ}
 
 
 def build_server_state_env_vars() -> dict[str, str]:
-    from twinkle.server.config.application_spec import SERVER_STATE_ENV_KEYS
-
     return {key: os.environ[key] for key in SERVER_STATE_ENV_KEYS if key in os.environ}
 
 
@@ -60,7 +60,7 @@ def build_propagated_env_vars() -> dict[str, str]:
 def build_worker_env_vars() -> dict[str, str]:
     """Policy plus the explicit process settings shared by launcher and resource owners."""
     env = build_propagated_env_vars()
-    for key in ("PYTHONPATH", "TWINKLE_DEFAULT_SAVE_DIR", "TMPDIR", "OMP_NUM_THREADS"):
+    for key in EXPLICIT_PROCESS_ENV_KEYS:
         if key in os.environ:
             env.setdefault(key, os.environ[key])
     return env

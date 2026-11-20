@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from twinkle.server.config.application_spec import SamplerArgs
-from twinkle.server.config.resources import ResourceOptions
+from twinkle.server.config.resource_options import ResourceOptions
 from twinkle.server.resources.runtime import RayRuntime
 from twinkle.server.state import get_server_state
 from twinkle.server.state.models import FutureFailureRecord, RuntimeContext

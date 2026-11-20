@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, ValidationInf
 
 from twinkle.hub.model_alias import extract_model_alias
 from twinkle.server.exceptions import RequestRejectedError
-from .resources import ResourceOptions
+from .resource_options import ResourceOptions
 from .task_queue import TaskQueueConfig
 
 if TYPE_CHECKING:

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from twinkle.server.lifecycle.proxy import ForwardedReply, ForwardedRequest
 
 from twinkle.server.config.application_spec import SamplerArgs
-from twinkle.server.config.resources import ResourceOptions
+from twinkle.server.config.resource_options import ResourceOptions
 from twinkle.server.exceptions import ResourceExhaustedError
 from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.sampler.concurrency import SamplerConcurrency
