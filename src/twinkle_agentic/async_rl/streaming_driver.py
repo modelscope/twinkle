@@ -29,7 +29,7 @@ import random
 import threading
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
@@ -594,12 +594,7 @@ class StreamingDriver:
             if drain.done():
                 drain.result()
             else:
-                waiting_on = self._close_waiting_on
-                if waiting_on == 'episode stops':
-                    episode_id = next(iter(self._closing_episodes.copy()), None)
-                    if episode_id is not None:
-                        waiting_on = f'stop for episode {episode_id}'
-                raise TimeoutError(f'StreamingDriver.close timed out waiting for {waiting_on}') from None
+                raise TimeoutError(f'StreamingDriver.close timed out waiting for {self._close_waiting_on}') from None
 
     def _drain_on_close(self, drain: Future) -> None:
         try:
@@ -615,36 +610,7 @@ class StreamingDriver:
         if self._thread is not None:
             self._thread.join()
 
-        episodes = self._closing_episodes
-        episodes.update((episode.episode_id, episode) for group in self._groups.values()
-                        for episode in group.members + group.baselines if not episode.done)
-        # A dropped group can still have a pending call that owns its session.
-        pending = deque(self._pending)
-        while pending:
-            future = pending.popleft()
-            kind, episode = self._pending[future]
-            episode_id = episode.episode_id
-            self._close_waiting_on = f'{kind} for episode {episode_id}'
-            if kind in ('step', 'stop'):
-                episodes[episode_id] = episode
-            try:
-                result = future.result()
-            except Exception:
-                # Failed session operations are followed by stop once the call settles.
-                pass
-            else:
-                if kind == 'stop':
-                    episode.done = True
-                elif kind == 'step':
-                    rows, sample = result
-                    episode.done = sample.done
-                    if rows:
-                        episode.traj = rows[0]
-                if episode.done:
-                    episodes.pop(episode_id, None)
-            del self._pending[future]
-
-        self._stop_remaining_episodes()
+        self._drain_episode_calls()
         with self._lock:
             self._groups.clear()
             self._ready.clear()
@@ -653,54 +619,95 @@ class StreamingDriver:
         while not self._events.empty():
             self._events.get_nowait()
 
-    def _stop_remaining_episodes(self) -> None:
+    def _drain_episode_calls(self) -> None:
         episodes = self._closing_episodes
-        if not episodes:
-            return
-        self._close_waiting_on = 'episode stops'
-        remaining = deque(episodes.values())
-        outcomes: queue.SimpleQueue[tuple[_Episode, BaseException | None]] = queue.SimpleQueue()
+        episodes.update((episode.episode_id, episode) for group in self._groups.values()
+                        for episode in group.members + group.baselines if not episode.done)
+        # A dropped group can still have a pending call that owns its session.
+        episodes.update((episode.episode_id, episode) for kind, episode in self._pending.values()
+                        if kind in ('step', 'stop'))
+        pending_by_episode = Counter(episode.episode_id for _, episode in self._pending.values())
+        requests: queue.SimpleQueue[_Episode | None] = queue.SimpleQueue()
+        completions: queue.SimpleQueue = queue.SimpleQueue()
 
         def stop_episodes() -> None:
-            while True:
-                try:
-                    episode = remaining.popleft()
-                except IndexError:
-                    return
+            for episode in iter(requests.get, None):
                 try:
                     future = self.rollout.stop(episode.traj or episode.submit_traj or {},
                                                episode_id=episode.episode_id)
                     if future is not None:
                         future.result()
                 except BaseException as error:
-                    outcomes.put((episode, error))
+                    completions.put(('stop', episode, error))
                 else:
-                    outcomes.put((episode, None))
+                    completions.put(('stop', episode, None))
 
-        count = len(episodes)
-        for index in range(min(count, self.CLOSE_STOP_WORKERS)):
+        workers = 0
+        for _ in range(min(len(episodes), self.CLOSE_STOP_WORKERS)):
             try:
                 threading.Thread(target=stop_episodes, name='twinkle-streaming-stop', daemon=True).start()
             except RuntimeError:
-                if index == 0:
+                if not workers:
                     raise
-                # Started workers still own the queue and can finish with fewer threads.
                 break
+            workers += 1
 
+        stopping = set()
         errors = []
-        failed = {}
-        for _ in range(count):
-            episode, error = outcomes.get()
-            episode_id = episode.episode_id
-            del episodes[episode_id]
-            if error is None:
-                episode.done = True
+
+        def enqueue_stop(episode_id: str) -> None:
+            episode = episodes.get(episode_id)
+            if episode is None or pending_by_episode[episode_id]:
+                return
+            if episode.done:
+                del episodes[episode_id]
             else:
-                error.add_note(f'Stopping rollout episode {episode_id}')
-                errors.append(error)
-                failed[episode_id] = episode
-        # Retry only stops whose completion could not be confirmed.
-        episodes.update(failed)
+                stopping.add(episode_id)
+                requests.put(episode)
+
+        try:
+            for future in self._pending:
+                future.add_done_callback(lambda finished: completions.put(('call', finished, None)))
+            for episode_id in tuple(episodes):
+                enqueue_stop(episode_id)
+            while self._pending or stopping:
+                if self._pending:
+                    kind, episode = next(iter(self._pending.values()))
+                    self._close_waiting_on = f'{kind} for episode {episode.episode_id}'
+                else:
+                    self._close_waiting_on = f'stop for episode {next(iter(stopping))}'
+                action, item, error = completions.get()
+                if action == 'stop':
+                    episode_id = item.episode_id
+                    stopping.remove(episode_id)
+                    if error is None:
+                        item.done = True
+                        del episodes[episode_id]
+                    else:
+                        error.add_note(f'Stopping rollout episode {episode_id}')
+                        errors.append(error)
+                    continue
+                kind, episode = self._pending.pop(item)
+                try:
+                    result = item.result()
+                except Exception:
+                    # Retry stop after a failed call has settled.
+                    pass
+                else:
+                    if kind == 'stop':
+                        episode.done = True
+                    elif kind == 'step':
+                        rows, sample = result
+                        episode.done = sample.done
+                        if rows:
+                            episode.traj = rows[0]
+                pending_by_episode[episode.episode_id] -= 1
+                enqueue_stop(episode.episode_id)
+        finally:
+            for _ in range(workers):
+                requests.put(None)
+
+        # Failed stops remain owned for the next close attempt.
         if errors:
             raise BaseExceptionGroup('could not close rollout episodes', errors)
 

@@ -84,6 +84,48 @@ async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(m
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('failed_stage', ['preparing', 'batch_committed'])
+async def test_upload_keeps_its_receipt_when_progress_cannot_be_written(monkeypatch, tmp_path, failed_stage):
+    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    checkpoint = create_checkpoint_manager('owner', client_type='twinkle').training_run_manager.get_base_dir() / 'saved'
+    checkpoint.mkdir(parents=True)
+    router = TrainingRouter.__new__(TrainingRouter)
+    router.state = ServerState(backend=FakeBackend())
+    router.store = router.state.create_training_store('upload-test')
+    router.replica_id = 'router'
+    await router.state.register_replica(router.replica_id, 0)
+    await router.state.touch_replica_last_seen(router.replica_id)
+    router._init_task_queue()
+    report_progress = router.state.report_future_progress
+    failures = []
+
+    async def record_progress(request_id, progress):
+        if progress['stage'] == failed_stage:
+            failures.append(failed_stage)
+            raise OSError('progress store temporarily unavailable')
+        await report_progress(request_id, progress)
+
+    def transfer(*, report, **_):
+        report(stage='batch_committed', uploaded_bytes=10, total_bytes=10, committed_bytes=10)
+        return 'commit-sha'
+
+    upload = Mock(side_effect=transfer)
+    monkeypatch.setattr(router.state, 'report_future_progress', record_progress)
+    monkeypatch.setattr(HubOperation, 'upload_checkpoint', upload)
+    body = {'checkpoint_dir': str(checkpoint), 'hub_model_id': 'owner/saved', 'client_upload_id': 'progress-fail'}
+    try:
+        response = await router.native_request(http_request(body), 'upload_to_hub')
+        record = await settle(router.state, response.request_id)
+        retry = await router.native_request(http_request(body), 'upload_to_hub')
+        assert failures == [failed_stage]
+        assert retry.request_id == response.request_id and retry.status == record['status'] == 'completed'
+        assert retry.result == record['result'] == {'repo_id': 'owner/saved', 'revision': 'commit-sha'}
+        upload.assert_called_once()
+    finally:
+        await router.shutdown_task_queue()
+
+
+@pytest.mark.asyncio
 async def test_keyed_upload_reconnects_to_original_task(monkeypatch, tmp_path):
     monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     checkpoint = create_checkpoint_manager('owner', client_type='twinkle').training_run_manager.get_base_dir() / 'saved'

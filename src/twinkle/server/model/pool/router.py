@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
 import uuid
 from types import SimpleNamespace
 
@@ -28,6 +29,8 @@ from twinkle.server.state.training_records import CreateTraining
 from twinkle.server.task_queue import TaskQueueMixin
 from twinkle.server.validation import assert_request_supported
 from .actor import controller_name
+
+logger = logging.getLogger(__name__)
 
 NATIVE_REQUESTS = {
     "forward": native.ForwardRequest,
@@ -192,15 +195,30 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
                 manager = create_checkpoint_manager(token, client_type="twinkle")
                 folder = manager.resolve_upload_dir(body.checkpoint_dir)
                 loop = asyncio.get_running_loop()
-                await self.state.report_future_progress(request_id, {"stage": "preparing"})
+
+                async def record_progress(progress):
+                    try:
+                        async with asyncio.timeout(5):
+                            await self.state.report_future_progress(request_id, progress)
+                    except Exception:
+                        # Progress is optional. Only the Hub result decides the upload outcome.
+                        logger.warning("Could not record progress for %s", request_id, exc_info=True)
+
+                await record_progress({"stage": "preparing"})
 
                 def report(**progress):
-                    write = asyncio.run_coroutine_threadsafe(self.state.report_future_progress(request_id, progress), loop)
+                    update = record_progress(progress)
+                    try:
+                        write = asyncio.run_coroutine_threadsafe(update, loop)
+                    except RuntimeError:
+                        update.close()
+                        logger.warning("Could not schedule progress for %s", request_id, exc_info=True)
+                        return
                     try:
                         write.result(timeout=5)
-                    except TimeoutError:
+                    except Exception:
                         write.cancel()
-                        raise
+                        logger.warning("Could not finish recording progress for %s", request_id, exc_info=True)
 
                 revision = await self.call_backend(
                     HubOperation.upload_checkpoint,

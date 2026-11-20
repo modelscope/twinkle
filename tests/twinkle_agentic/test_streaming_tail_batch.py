@@ -203,6 +203,48 @@ def test_close_timeout_keeps_the_pending_step_and_stop_owned():
     assert len(stopped) == 1 and driver.stats()['inflight'] == 0
 
 
+def test_close_stops_an_episode_as_soon_as_its_own_step_finishes():
+    steps = [Future(), Future()]
+    both_submitted, fast_stopped = Event(), Event()
+    stopped = []
+
+    class Rollout:
+        def step(self, traj, *, episode_id, session_wait):
+            index = traj['prompt']
+            if index == 1:
+                both_submitted.set()
+            return steps[index]
+
+        def stop(self, traj, *, episode_id):
+            index = traj['prompt']
+            assert steps[index].done()
+            stopped.append(index)
+            if index == 1:
+                fast_stopped.set()
+
+    driver = StreamingDriver([[{'prompt': 0}, {'prompt': 1}]], Rollout(), batch_size=2)
+    driver._start()
+    with ThreadPoolExecutor(1) as pool:
+        closing = None
+        try:
+            assert both_submitted.wait(5)
+            closing = pool.submit(driver.close, timeout=5)
+            with driver._lock:
+                assert driver._lock.wait_for(lambda: driver._closed, timeout=5)
+            steps[1].set_result(([{'prompt': 1}], RolloutStatus(episode_id='fast')))
+            assert fast_stopped.wait(2)
+            assert not steps[0].done() and not closing.done()
+            assert stopped == [1]
+        finally:
+            for index, step in enumerate(steps):
+                if not step.done():
+                    step.set_result(([{'prompt': index}], RolloutStatus(episode_id=str(index))))
+        if closing is not None:
+            closing.result(timeout=5)
+    driver.close()
+    assert stopped == [1, 0]
+
+
 @pytest.mark.parametrize('synchronous', [False, True])
 def test_slow_stop_does_not_block_other_episodes(synchronous, monkeypatch):
     all_submitted, slow_started, fast_stopped = Event(), Event(), Event()
