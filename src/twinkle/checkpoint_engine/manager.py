@@ -459,6 +459,22 @@ class CheckpointEngineManager:
 
     # ── New replicas ─────────────────────────────────────────────────────────
 
+    @remote_function(collect='first', lazy_collect=False)
+    def prepare_for_lending(self) -> None:
+        """Prepare merged publication while the trainer still owns its devices."""
+        with self._sync_lock:
+            prepare = getattr(self.model, 'prepare_for_lending', None)
+            if self._merge_and_sync and prepare is not None:
+                prepare()
+
+    @remote_function(collect='first', lazy_collect=False)
+    def restore_after_lending(self) -> None:
+        """Undo publication preparation after the trainer has reloaded its parameters."""
+        with self._sync_lock:
+            restore = getattr(self.model, 'restore_after_lending', None)
+            if restore is not None:
+                restore()
+
     def _replicas_share_trainer_devices(self, receiver) -> bool:
         """New vLLM workers on lent ranks use the colocated transport, even in a standalone run."""
         if (not hasattr(receiver, 'direct_weight_sync_metadata')
