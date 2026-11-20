@@ -179,3 +179,87 @@ def test_direct_authenticated_multi_bucket_transfer_and_reused_buffer(tmp_path, 
             if child.is_alive():
                 child.terminate()
                 child.join(timeout=10)
+
+
+def _drive_chunked_receive(monkeypatch, *, oom_assembly):
+    """Drive the real ``_receive_weights_from_ipc`` chunked path on one CUDA worker.
+
+    ``oom_assembly=True`` makes the full-tensor GPU assembly allocation raise OutOfMemoryError,
+    simulating a colocated low-headroom sync (defect117 e2e init-crash); the small IPC bucket
+    still maps fine, so only the assembly buffer is starved. Oracle = loaded bytes == source.
+    """
+    from twinkle.sampler.vllm_sampler import vllm_worker_extension as extension
+    dev = torch.device('cuda', 0)
+    src = torch.arange(256, dtype=torch.float32, device=dev)
+    total = src.numel() * src.element_size()
+    half = total // 2
+    bucket = src.view(torch.uint8).clone()
+    meta = iter(['bucket', {'bucket_meta': [
+        {'name': 'w', 'dtype': torch.float32, 'shape': (256,), 'offset': 0,
+         'nbytes': half, 'chunk_offset': 0, 'total_nbytes': total},
+        {'name': 'w', 'dtype': torch.float32, 'shape': (256,), 'offset': half,
+         'nbytes': total - half, 'chunk_offset': half, 'total_nbytes': total}], 'is_last': True}])
+    loaded, devices = {}, []
+
+    class Receiver(extension.TwinkleWorkerExtension):
+        def _load_weights(self, weights, **kwargs):
+            for name, t in weights:
+                devices.append(t.device.type)
+                loaded[name] = t.detach().to('cpu', copy=True)
+
+    class Socket:
+        def connect(self, e):
+            pass
+
+        def send(self, d):
+            pass
+
+        def close(self):
+            pass
+
+    worker = object.__new__(Receiver)
+    worker.device = dev
+    worker.rank = worker.local_rank = 0
+    worker.model_runner = NS(parallel_config=NS(tensor_parallel_size=1))
+    worker._zmq_ctx = NS(socket=lambda *a: Socket())
+    monkeypatch.setattr(extension, '_rebuild_ipc', lambda h, d: bucket)
+    monkeypatch.setattr(extension, '_ipc_handle_signature', lambda h: 'sig')
+    monkeypatch.setattr(extension, 'configure_zmq_socket', lambda *a, **k: None)
+    monkeypatch.setattr('twinkle.checkpoint_engine.zmq_auth.recv_auth_pyobj', lambda *a: next(meta))
+    monkeypatch.setattr(extension.Platform, 'get_platform', lambda: NS(ensure_ipc_reducer=lambda: None))
+    monkeypatch.setattr(extension.Torch, 'synchronize', lambda d: None)
+    monkeypatch.setattr(extension.Torch, 'ipc_collect', lambda: None)
+    monkeypatch.setattr('twinkle.patch.vllm_weight_loader.patch_lora_weight_loader', lambda: None)
+    if oom_assembly:
+        real_empty = torch.empty
+
+        def oom_empty(size, *a, **k):
+            dev_arg = k.get('device')
+            if dev_arg is not None and torch.device(dev_arg).type == 'cuda' and size == total:
+                raise torch.OutOfMemoryError(
+                    'CUDA out of memory. Tried to allocate %.2f GiB.' % (total / 2**30))
+            return real_empty(size, *a, **k)
+
+        monkeypatch.setattr(extension.torch, 'empty', oom_empty)
+    worker.update_weights_from_ipc(zmq_handle='ipc:///unused', independent=True)
+    return loaded, devices, src
+
+
+@pytest.mark.accel(1)
+def test_chunked_assembly_oom_falls_back_to_cpu(monkeypatch):
+    """Low-headroom chunked sync assembles on CPU instead of crashing the engine (defect117)."""
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA headroom gate')
+    loaded, devices, src = _drive_chunked_receive(monkeypatch, oom_assembly=True)
+    assert torch.equal(loaded['w'], src.cpu())
+    assert devices == ['cpu']
+
+
+@pytest.mark.accel(1)
+def test_chunked_assembly_stays_gpu_when_headroom_ok(monkeypatch):
+    """Normal-headroom chunked sync keeps the GPU assembly (no always-CPU perf regression)."""
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA headroom gate')
+    loaded, devices, src = _drive_chunked_receive(monkeypatch, oom_assembly=False)
+    assert torch.equal(loaded['w'], src.cpu())
+    assert devices == ['cuda']
