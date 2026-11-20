@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
+import copy
 import os
 import threading
 import uuid
@@ -454,52 +455,27 @@ class CheckpointEngineManager:
         receiver_devices = [t['device_uuid'] for t in targets]
         if len(set(receiver_devices)) != len(receiver_devices):
             return False
-        return all(devices.count(d) == 1 for d in receiver_devices)
-
-    def _warm_colocated_ipc(self, sub: Any, channel: str) -> bool:
-        """Warm colocated new replicas via direct IPC; return False to fall through to NCCL.
-
-        Lend grows sampler replicas onto the trainer's GPUs while the trainer is offloaded
-        (defect118). The NCCL checkpoint PG would assign trainer rank 0 and the new replica
-        rank 1 to the same CUDA device -> "Duplicate GPU detected" -> actor death. Direct IPC
-        pairs by device UUID and streams weights bucket-by-bucket, so it handles same-GPU and
-        an offloaded model (CPU -> GPU per bucket). Reclaim retires the lent replicas before
-        the next sync_weights, so the main NCCL channel never sees a colocated replica.
-        """
-        if not hasattr(sub, 'direct_weight_sync_metadata') or not hasattr(self.model, 'direct_weight_sync_device'):
-            return False
-        replicas = sub.direct_weight_sync_metadata()
-        devices = self.model.direct_weight_sync_device()
-        if not self._is_colocated(replicas, devices):
-            return False
-        targets = [t for r in replicas for t in (r if isinstance(r, list) else [r])]
-        self._ensure_model_keys()
-        steps = (False, True) if (not self._merge_and_sync and self.base_sync_done) else (False,)
-        for base_sync_done in steps:
-            peft_config = self._adapter_config(base_sync_done, self._merge_and_sync)
-            _together(
-                lambda b=base_sync_done, p=peft_config: self.model.send_weights_to_vllm(
-                    targets, channel=channel, auth_key=self._auth_key,
-                    base_sync_done=b, merge_and_sync=self._merge_and_sync,
-                    peft_config=p, model_keys=self._model_keys),
-                lambda b=base_sync_done, p=peft_config: sub.receive_weights_direct(
-                    targets, auth_key=self._auth_key, base_sync_done=b, peft_config=p))
-        logger.info('Warm via direct colocated IPC: %s new vLLM workers (defect118).', len(targets))
-        return True
+        return bool(receiver_devices) and all(devices.count(d) == 1 for d in receiver_devices)
 
     # ── New replicas ─────────────────────────────────────────────────────────
+
+    def _replicas_share_trainer_devices(self, receiver) -> bool:
+        """New vLLM workers on lent ranks use the colocated transport, even in a standalone run."""
+        if (not hasattr(receiver, 'direct_weight_sync_metadata')
+                or not hasattr(self.model, 'direct_weight_sync_device')):
+            return False
+        replicas = receiver.direct_weight_sync_metadata()
+        devices = self.model.direct_weight_sync_device()
+        return self._is_colocated(replicas, devices)
 
     @remote_function(collect='first', lazy_collect=False)
     def warm(self, sub) -> None:
         """Load the current weights into new sampler replicas before they take requests.
 
         ``sub`` is a handle holding only the new replicas (``add_workers`` passes it to its
-        ``warmup``). The transfer runs on a channel of its own, closed afterwards; the next
-        :meth:`sync_weights` rebuilds the main channel for the grown replica set.
-
-        Colocated new replicas (adaptive lend onto the trainer's GPUs) take the direct IPC
-        path: NCCL cannot place the trainer rank 0 and a new replica on the same CUDA device
-        ("Duplicate GPU detected", defect118). Flex growth on distinct GPUs keeps NCCL.
+        ``warmup``). The transfer runs on a channel of its own, closed afterwards. Workers on lent
+        trainer devices use the colocated transport; independent devices retain the standalone
+        transport. The next :meth:`sync_weights` rebuilds the main channel for the grown replica set.
         """
         if self.mode != 'standalone' or self.sync_backend != 'full':
             raise NotImplementedError(
@@ -507,17 +483,30 @@ class CheckpointEngineManager:
                 f'sync_backend={self.sync_backend!r}): colocated replicas share the trainer\'s devices '
                 'and the delta session has a fixed replica set.')
         with self._sync_lock:
-            channel = f'{self.channel}-warm-{uuid.uuid4().hex[:8]}'
-            if self._warm_colocated_ipc(sub, channel):
-                return
+            # Keep the main transport, replica membership and LoRA seed state intact while warming.
+            session = copy.copy(self)
+            session.sampler = sub
+            session.channel = f'{self.channel}-warm-{uuid.uuid4().hex[:8]}'
+            session._members = None
+            # A merged publication must include learned adapters, not just the initial base.
+            session.base_sync_done = self.base_sync_done and self._merge_and_sync
+            if self._replicas_share_trainer_devices(sub):
+                session.mode = 'colocate'
+                session.backend_cls = self.decide_backend_engine(mode='colocate')
+                session.backend = session.backend_cls.backend_name
             try:
-                count = len(self._activate_checkpoint_channel(sub, channel))
                 # LoRA-only syncs need the base first, then the current adapter on top of it.
-                self._transfer(sub, count, self._merge_and_sync, False)
-                if not self._merge_and_sync and self.base_sync_done:
-                    self._transfer(sub, count, self._merge_and_sync, True)
+                rounds = 2 if not self._merge_and_sync and self.base_sync_done else 1
+                count = None
+                for _ in range(rounds):
+                    if session.mode == 'colocate' and session._sync_weights_direct_vllm(self._merge_and_sync):
+                        continue
+                    if count is None:
+                        count = len(session._activate_checkpoint_channel())
+                    session._transfer(sub, count, self._merge_and_sync, session.base_sync_done)
+                    session.base_sync_done = True
             finally:
-                self._close_checkpoint_channel(sub, channel)
+                session._close_checkpoint_channel()
 
     # ── Delta ────────────────────────────────────────────────────────────────
 
