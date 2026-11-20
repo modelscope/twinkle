@@ -106,6 +106,13 @@ class FutureTransitions:
         return {**existing, 'status': 'running', 'queue_state': 'active', 'updated_at': now}
 
     @staticmethod
+    def fail_replica(existing: dict | None, *, replica_id: str, failure: dict, now: str) -> dict | None:
+        if (existing is None or existing.get('replica_id') != replica_id
+                or existing.get('status') in FutureTransitions.terminal):
+            return None
+        return {**existing, 'status': 'failed', 'result': None, 'failure': failure, 'updated_at': now}
+
+    @staticmethod
     def report_progress(existing: dict | None, *, progress: dict) -> dict | None:
         if existing is None or existing.get('status') != 'running':
             return None
@@ -207,6 +214,14 @@ class FutureManager(BaseManager[FutureRecord]):
             functools.partial(FutureTransitions.start, now=_now_iso()),
             return_changed=True,
         )
+
+    async def fail_replica(self, replica_id: str, failure: FutureFailureRecord) -> None:
+        """Settle work after its replica is confirmed stopped, without contacting it."""
+        transform = functools.partial(
+            FutureTransitions.fail_replica, replica_id=replica_id, failure=failure.model_dump(), now=_now_iso())
+        for request_id, record in (await self.get_all()).items():
+            if record.replica_id == replica_id and record.status not in TERMINAL_STATUSES:
+                await self._backend.update_atomic(self._make_key(request_id), transform)
 
     async def report_progress(self, request_id: str, progress: dict[str, Any]) -> None:
         await self._backend.update_atomic(
