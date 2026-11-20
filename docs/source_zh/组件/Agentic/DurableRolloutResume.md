@@ -240,12 +240,31 @@ naive 的 26 条混采 episode 最终被 staleness 规则淘汰，交付 optimiz
 durable 消除了恢复时的错误 policy 切换，但不宣称已经量化混采对模型质量的损害。训练曲线和逐次生成、
 工具、lease、journal 原始记录均已留存。
 
+### 8B、双卡与新版 CaMem 补充验证
+
+在另一台单节点双卡 Ascend 910（64GB/卡）上，使用 Qwen3-8B、CANN 9.1.0、torch_npu 2.10.0.post7、
+vLLM 0.33.0 和 vLLM-Ascend 0.32.0.dev0 补做验证：
+
+| 场景 | 结果 |
+|---|---|
+| 单卡无故障 | 完成 1 个 optimizer step 和 IPC 权重同步；训练与 vLLM 合计占用约 47.4GB |
+| 单卡安全边界退出 | 1 次重启后恢复 2 组、4 条成员，完成 `[1,2,3]`；跨重启重复工具调用为 0 |
+| 单卡不确定工具窗口 | pending intent 触发 fail closed，未重复执行非幂等工具；不将其算作训练恢复成功 |
+| 双卡无故障 | 双 rank 训练完成，2 个 vLLM worker 均完成 IPC 权重同步 |
+| 双卡安全边界退出 | 1 次重启后恢复 2 组、4 条成员，完成 `[1,2,3]`；重复工具及中途 policy 切换均为 0 |
+| 单卡 CaMem 两步 | 两轮 weights/KV sleep-wake 和第二轮 LoRA-only 同步完成，未出现旧版 `aclnnInplaceCopy` 错误 |
+
+该结果只覆盖上述版本组合和单节点双卡，不回溯证明 vLLM/vLLM-Ascend 0.23.0，也不代表 FSDP2
+或多节点已经验证。本地 overlay 的规模基准显示，journal 在 250、500、1000、2000 事件时的平均追加
+延迟约为 1.89、3.53、6.71、13.16ms，确认全量重扫是优先优化项；64MiB LocalEnv workspace 快照约
+85ms，在该本地盘上暂不是主要瓶颈。
+
 尚未覆盖：
 
 - 可写 NFS 或对象存储上的 lease、journal 和 adapter 故障矩阵；
-- 多卡 HCCL/FSDP2 与多节点验证；
+- 双卡 native_fsdp 以外的 FSDP2、多节点和更大规模验证；
 - vLLM-Ascend 0.23.0 在 CaMem sleep/wake 后激活多 policy LoRA 的稳定性；上述 4B 对照使用无 sleep
-  colocate 路径；
+  colocate 路径，新版结果不能替代旧版复测；
 - 无法 checkpoint 的远端 agent harness；
 - 所有外部工具协议都具备幂等结果查询；
 - 大规模长训练的持久化开销尚未形成独立基准。当前 journal 追加会重扫事件链，driver 在稳定边界
