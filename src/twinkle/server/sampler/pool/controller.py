@@ -16,6 +16,7 @@ import json
 if TYPE_CHECKING:
     from twinkle.server.lifecycle.proxy import ForwardedReply, ForwardedRequest
 
+from twinkle.protocol.headers import H_CLIENT_ID, H_REQUEST_ID, H_SESSION_ID
 from twinkle.server.config.application_spec import SamplerArgs
 from twinkle.server.config.resource_options import ResourceOptions
 from twinkle.server.exceptions import ResourceExhaustedError
@@ -160,8 +161,9 @@ class SamplerController:
             # Match the session scope used by resolve_twinkle_adapter_name.
             headers = {key.lower(): value for key, value in action["headers"]}
             owner = headers.get(b"twinkle-authorization") or headers.get(b"authorization")
-            session = headers.get(b"x-twinkle-session-id") or headers.get(b"x-request-id")
-            return endpoint, owner, session, json.loads(action["body"])["adapter_name"]
+            scope = (headers.get(H_SESSION_ID.lower().encode()) or headers.get(H_CLIENT_ID.lower().encode())
+                     or headers.get(H_REQUEST_ID.encode()))
+            return endpoint, owner, scope, json.loads(action["body"])["adapter_name"]
         return None
 
     def _remember(self, action):

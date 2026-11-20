@@ -10,9 +10,11 @@ from __future__ import annotations
 import logging
 import requests
 import time
+import uuid
 from collections.abc import Callable
 from typing import Any
 
+from twinkle.protocol.headers import H_REQUEST_ID
 from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope, UploadProgress
 from twinkle_client.exceptions import TaskCancelledError, TaskFailedError, TaskRecordLostError, TaskWaitTimeoutError
 from twinkle_client.http import ClientTransport
@@ -55,7 +57,9 @@ def _best_effort_cancel(request_id: str, transport: ClientTransport) -> None:
         logger.debug('[future] best-effort cancel of %s failed: %s', request_id, e)
 
 
-def _post_retrieve(request_id: str, transport: ClientTransport, *, after_progress: int | None = None) -> TaskEnvelope:
+def _post_retrieve(
+    request_id: str, transport: ClientTransport, *, http_request_id: str, after_progress: int | None = None
+) -> TaskEnvelope:
     """POST one retrieve and parse the reply into a TaskEnvelope.
 
     Raises ``requests.HTTPError`` (a :class:`TwinkleHTTPError` after the client
@@ -64,7 +68,7 @@ def _post_retrieve(request_id: str, transport: ClientTransport, *, after_progres
     body: dict[str, Any] = {'request_id': request_id}
     if after_progress is not None:
         body['after_progress'] = after_progress
-    response = transport.post(_retrieve_url(transport), json_data=body)
+    response = transport.post(_retrieve_url(transport), json_data=body, headers={H_REQUEST_ID: http_request_id})
     return TaskEnvelope.model_validate(response.json())
 
 
@@ -149,6 +153,7 @@ def resolve(
     resolved_transport = capture_transport(transport)
     deadline = time.monotonic() + total_timeout
     transport_failures = not_found_count = 0
+    poll_request_id = uuid.uuid4().hex
     try:
         report_progress(submit)
         while True:
@@ -156,7 +161,8 @@ def resolve(
                 raise TaskWaitTimeoutError(request_id=submit.request_id, waited=total_timeout)
             try:
                 cursor_args = {} if on_progress is None else {'after_progress': cursor}
-                reply = _post_retrieve(submit.request_id, resolved_transport, **cursor_args)
+                reply = _post_retrieve(
+                    submit.request_id, resolved_transport, http_request_id=poll_request_id, **cursor_args)
                 transport_failures = not_found_count = 0
             except (requests.ConnectionError, requests.Timeout):
                 transport_failures += 1
@@ -182,6 +188,7 @@ def resolve(
             if reply.status in TERMINAL_STATUSES:
                 return _unwrap(reply, model_cls)  # same call as the submit path
             _log_queue_state(reply)
+            poll_request_id = uuid.uuid4().hex
     except (KeyboardInterrupt, SystemExit):
         # Caller abandoned the wait: best-effort ask the server to drop the task if it
         # has not started, then re-raise so the interrupt is never swallowed.

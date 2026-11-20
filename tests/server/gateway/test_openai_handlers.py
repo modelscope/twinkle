@@ -159,15 +159,16 @@ class TestChatCompletions:
         assert resp.status_code == 404
         assert resp.json()['error']['type'] == 'model_not_found'
 
-    @pytest.mark.parametrize('request_id_header', [None, 'x-request-id', 'X-Ray-Serve-Request-Id'])
-    def test_sampler_request_id_and_auth(self, mock_gateway, request_id_header):
+    @pytest.mark.parametrize('has_request_id', [False, True])
+    def test_sampler_forwards_request_and_client_identity(self, mock_gateway, has_request_id):
         mock_self, app = mock_gateway
         mock_self.proxy.proxy_request.return_value = self._make_sample_response()
 
         client = TestClient(app)
-        headers = {'Authorization': 'Bearer my-key'}
-        if request_id_header:
-            headers[request_id_header] = 'client-id'
+        headers = {'Authorization': 'Bearer my-key', 'X-Twinkle-Client-Id': 'client-id',
+                   'X-Twinkle-Session-Id': 'session-id'}
+        if has_request_id:
+            headers['x-request-id'] = 'request-id'
         client.post(
             '/chat/completions',
             json={
@@ -182,8 +183,10 @@ class TestChatCompletions:
 
         forwarded = mock_self.proxy.proxy_request.call_args.kwargs['extra_headers']
         assert forwarded['x-request-id']
-        if request_id_header:
-            assert forwarded['x-request-id'] == 'client-id'
+        if has_request_id:
+            assert forwarded['x-request-id'] == 'request-id'
+        assert forwarded['X-Twinkle-Client-Id'] == 'client-id'
+        assert forwarded['X-Twinkle-Session-Id'] == 'session-id'
         assert forwarded['Twinkle-Authorization'] == 'Bearer my-key'
 
     def test_body_override_is_sample_request(self, mock_gateway):

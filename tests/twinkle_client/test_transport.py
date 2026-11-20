@@ -2,8 +2,15 @@
 from __future__ import annotations
 
 import logging
+import threading
+import uuid
+from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import pytest
 
+from twinkle.protocol.headers import H_CLIENT_ID, H_REQUEST_ID
+from twinkle.protocol.types.session import CreateSessionRequest
 from twinkle_client.http import ClientContext, ClientTransport
 from twinkle_client.http.context import capture_transport, clear_default_transport, set_default_transport
 from twinkle_client.manager import TwinkleClient
@@ -47,21 +54,76 @@ def _transport(name: str) -> ClientTransport:
             base_url=f'http://{name}',
             api_key=f'{name}-key',
             session_id=f'{name}-session',
-            routing_id=f'{name}-routing',
+            client_id=f'{name}-client',
         ),
         session=_Session(),
     )
 
 
-def test_context_normalizes_url_and_transport_builds_stable_headers():
+def test_transport_assigns_request_ids_and_preserves_client_identity():
     transport = _transport('alpha')
+    transport.get('/resource')
     transport.post('/resource')
-    _, url, kwargs = transport._session.calls[-1]
+    transport.post_model('/resource', CreateSessionRequest())
+    transport.delete('/resource')
+    request_ids = set()
+    for _, url, kwargs in transport._session.calls:
+        assert url == 'http://alpha/api/v1/resource'
+        headers = kwargs['headers']
+        assert headers['Authorization'] == 'Bearer alpha-key'
+        assert headers['X-Twinkle-Session-Id'] == 'alpha-session'
+        assert headers[H_CLIENT_ID] == 'alpha-client'
+        assert 'x-ray-serve-request-id' not in {name.lower() for name in headers}
+        request_ids.add(uuid.UUID(headers[H_REQUEST_ID]))
+    assert len(request_ids) == 4
 
-    assert url == 'http://alpha/api/v1/resource'
-    assert kwargs['headers']['Authorization'] == 'Bearer alpha-key'
-    assert kwargs['headers']['X-Twinkle-Session-Id'] == 'alpha-session'
-    assert kwargs['headers']['x-request-id'] == 'alpha-routing'
+
+def test_session_attachment_preserves_client_identity():
+    context = ClientContext('http://server', 'key')
+    assert uuid.UUID(context.client_id)
+    assert replace(context, session_id='session').client_id == context.client_id
+
+
+def test_transport_status_retry_reuses_request_id():
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+
+        def do_GET(self):
+            seen.append((self.headers[H_REQUEST_ID], self.headers[H_CLIENT_ID]))
+            self.send_response(503 if len(seen) == 1 else 200)
+            self.end_headers()
+
+    with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        transport = ClientTransport(ClientContext(f'http://127.0.0.1:{server.server_port}', 'key'), timeout=3)
+        try:
+            assert transport.get('/resource').status_code == 200
+            assert len(seen) == 2
+            assert seen[0] == seen[1]
+            assert uuid.UUID(seen[0][0])
+            assert seen[0][1] == transport.context.client_id
+        finally:
+            transport.close()
+            server.shutdown()
+            worker.join(timeout=3)
+
+
+def test_tinker_defaults_carry_the_client_identity(monkeypatch):
+    from twinkle_client.http import context
+    from twinkle_client.utils.patch_tinker import _make_patched_service_client_init
+
+    monkeypatch.setattr(context, '_default_transport', _transport('tinker'))
+    captured = {}
+
+    def original(_, **kwargs):
+        captured.update(kwargs['default_headers'])
+
+    _make_patched_service_client_init(original)(object(), api_key='explicit')
+    assert captured[H_CLIENT_ID] == captured[H_REQUEST_ID] == 'tinker-client'
+    assert captured['Twinkle-Authorization'] == 'Bearer explicit'
+    assert 'x-ray-serve-request-id' not in {name.lower() for name in captured}
 
 
 def test_wrapper_captures_default_once_and_factory_is_explicit():

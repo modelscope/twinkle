@@ -56,10 +56,12 @@ class ServiceProxy:
         scheme = "https" if self.http_options.get("ssl_certfile") else "http"
         return f"{scheme}://{host}:{port}{self.route_prefix.rstrip('/')}/{service_type}/{base_model}/{endpoint}"
 
-    def _prepare_headers(self, request_headers) -> dict[str, str]:
+    def _prepare_headers(self, request_headers, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
         headers = dict(request_headers)
         headers.pop("host", None)
         headers.pop("content-length", None)
+        if extra_headers:
+            headers.update((name.lower(), value) for name, value in extra_headers.items())
         return headers
 
     async def proxy_request(
@@ -74,9 +76,7 @@ class ServiceProxy:
     ) -> Response:
         body_bytes = body_override if body_override is not None else await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
-        headers = self._prepare_headers(request.headers)
-        if extra_headers:
-            headers.update(extra_headers)
+        headers = self._prepare_headers(request.headers, extra_headers)
         inject_context(headers)
         try:
             response = await self.client.request(
@@ -108,9 +108,7 @@ class ServiceProxy:
     ):
         body_bytes = body_override if body_override is not None else await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
-        headers = self._prepare_headers(request.headers)
-        if extra_headers:
-            headers.update(extra_headers)
+        headers = self._prepare_headers(request.headers, extra_headers)
         inject_context(headers)
         async with self.client.stream(method="POST", url=target_url, content=body_bytes, headers=headers) as response:
             if response.status_code >= 400:

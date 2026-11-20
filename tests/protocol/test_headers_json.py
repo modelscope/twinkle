@@ -6,23 +6,24 @@ from pydantic import BaseModel
 from twinkle.protocol.headers import (
     H_AUTH,
     H_AUTH_TWINKLE,
+    H_CLIENT_ID,
     H_REQUEST_ID,
-    H_REQUEST_ID_LEGACY,
-    build_routing_headers,
+    build_request_headers,
 )
 from twinkle.protocol.json_utils import json_safe
 
 
-class TestBuildRoutingHeaders:
+class TestBuildRequestHeaders:
 
-    def test_request_id_and_auth_keep_both_wire_names(self):
-        assert build_routing_headers('req-1', auth='secret') == {
+    def test_request_and_client_identity_with_both_auth_headers(self):
+        assert build_request_headers('req-1', auth='secret', client_id='client-1') == {
             H_REQUEST_ID: 'req-1',
-            H_REQUEST_ID_LEGACY: 'req-1',
+            H_CLIENT_ID: 'client-1',
             H_AUTH: 'secret',
             H_AUTH_TWINKLE: 'secret',
         }
-        assert build_routing_headers('req-1')[H_AUTH] == ''
+        assert build_request_headers('req-1')[H_AUTH] == ''
+        assert H_CLIENT_ID not in build_request_headers('req-1')
 
 
 class _Model(BaseModel):

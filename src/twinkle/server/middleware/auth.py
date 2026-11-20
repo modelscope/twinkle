@@ -1,9 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from fastapi import Request
-from fastapi.responses import JSONResponse
 from typing import Any
 
-from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, H_REQUEST_ID
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, H_CLIENT_ID, H_REQUEST_ID, H_SESSION_ID
 
 _OPENAI_COMPAT_SUFFIXES = ('/chat/completions', '/models')
 
@@ -17,7 +18,7 @@ async def verify_request_token(request: Request, call_next):
     2. Validates the token
     3. Extracts x-request-id (skipped for healthz
        and OpenAI-compat endpoints)
-    4. Stores token and request_id in request.state for later use
+    4. Stores token, session ID, client ID and request ID in request.state
 
     Args:
         request: The FastAPI Request object
@@ -34,15 +35,14 @@ async def verify_request_token(request: Request, call_next):
     path = request.url.path
     skip_request_id = '/healthz' in path or any(path.endswith(s) for s in _OPENAI_COMPAT_SUFFIXES)
 
-    if not skip_request_id:
-        request_id = request.headers.get(H_REQUEST_ID)
-        if not request_id:
-            return JSONResponse(status_code=400, content={'detail': f'Missing {H_REQUEST_ID} header'})
-        request.state.request_id = request_id
-    else:
-        request.state.request_id = request.headers.get(H_REQUEST_ID, '')
+    request_id = request.headers.get(H_REQUEST_ID, '')
+    if not skip_request_id and not request_id:
+        return JSONResponse(status_code=400, content={'detail': f'Missing {H_REQUEST_ID} header'})
+
+    request.state.request_id = request_id
+    request.state.client_id = request.headers.get(H_CLIENT_ID) or request_id
     request.state.token = token
-    request.state.session_id = request.headers.get('X-Twinkle-Session-Id') or ''
+    request.state.session_id = request.headers.get(H_SESSION_ID) or ''
     response = await call_next(request)
     return response
 

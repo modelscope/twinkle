@@ -12,7 +12,7 @@ from starlette.requests import Request
 from unittest.mock import AsyncMock
 
 from twinkle.server.lifecycle.proxy import ServiceProxy
-from twinkle.protocol.headers import H_REQUEST_ID, H_REQUEST_ID_LEGACY
+from twinkle.protocol.headers import H_CLIENT_ID, H_REQUEST_ID
 
 
 def _make_request(headers: list[tuple[bytes, bytes]] | None = None) -> Request:
@@ -43,10 +43,9 @@ def test_build_target_url(route_prefix, host, expected):
 @pytest.mark.asyncio
 async def test_forwarding_keeps_request_identity_auth_and_session():
     proxy = ServiceProxy()
-    legacy = H_REQUEST_ID_LEGACY.lower()
     request = _make_request([
         (H_REQUEST_ID.encode(), b'req-1'),
-        (legacy.encode(), b'compat-id'),
+        (H_CLIENT_ID.lower().encode(), b'client-1'),
         (b'authorization', b'Bearer owner'),
         (b'x-twinkle-session-id', b'session'),
         (b'host', b'original-host'),
@@ -59,10 +58,21 @@ async def test_forwarding_keeps_request_identity_auth_and_session():
 
     assert headers == {
         H_REQUEST_ID: 'req-1',
-        legacy: 'compat-id',
+        H_CLIENT_ID.lower(): 'client-1',
         'authorization': 'Bearer owner',
         'x-twinkle-session-id': 'session',
     }
+
+
+@pytest.mark.asyncio
+async def test_proxy_header_overrides_are_case_insensitive():
+    proxy = ServiceProxy()
+    request = _make_request([(b'twinkle-authorization', b'old'), (b'x-twinkle-client-id', b'client-1')])
+    try:
+        headers = proxy._prepare_headers(request.headers, {'Twinkle-Authorization': 'new', H_CLIENT_ID: 'client-1'})
+    finally:
+        await proxy.close()
+    assert headers == {'twinkle-authorization': 'new', 'x-twinkle-client-id': 'client-1'}
 
 
 @pytest.mark.asyncio

@@ -7,19 +7,26 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 /twinkle/sample (non-streaming) or /twinkle/sample_stream (streaming) routes.
 """
 from __future__ import annotations
-
 import asyncio
-import json
 import os
 import secrets
 import time
 import uuid
 from collections.abc import Callable
-from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
 from typing import TYPE_CHECKING, Any
 
-from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, H_REQUEST_ID, H_REQUEST_ID_LEGACY, build_routing_headers
+import json
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from twinkle.protocol.headers import (
+    H_AUTH,
+    H_AUTH_TWINKLE,
+    H_CLIENT_ID,
+    H_REQUEST_ID,
+    H_SESSION_ID,
+    build_request_headers,
+)
 from twinkle.server.lifecycle.envelope import envelope_from_record
 
 if TYPE_CHECKING:
@@ -28,14 +35,21 @@ if TYPE_CHECKING:
 import httpx
 
 import twinkle.protocol.types as types
-
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
-from .openai_bridge import (make_error, translate_chat_request, translate_completion_request,
-                            translate_completion_response, translate_completion_stream_chunk,
-                            translate_embedding_request, translate_embedding_response,
-                            translate_infer_request, translate_infer_response, translate_response,
-                            translate_stream_chunk)
+from .openai_bridge import (
+    make_error,
+    translate_chat_request,
+    translate_completion_request,
+    translate_completion_response,
+    translate_completion_stream_chunk,
+    translate_embedding_request,
+    translate_embedding_response,
+    translate_infer_request,
+    translate_infer_response,
+    translate_response,
+    translate_stream_chunk,
+)
 from .use_cases import poll_future
 
 logger = get_logger()
@@ -89,7 +103,7 @@ async def _resolve_sampler_envelope(gateway: GatewayServer, sampler_data: dict[s
         return await asyncio.wait_for(wait_for_terminal(envelope), timeout=timeout)
     except SamplerWaitTimeoutError:
         raise
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise SamplerWaitTimeoutError(
             f'Sampling task {envelope.request_id} did not finish within {timeout:g}s.') from None
 
@@ -299,10 +313,13 @@ async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
 
 
 def _sampler_headers(request: Request) -> dict[str, str]:
-    """Carry the caller's request ID or assign one for an OpenAI-compatible client."""
-    request_id = request.headers.get(H_REQUEST_ID) or request.headers.get(H_REQUEST_ID_LEGACY) or uuid.uuid4().hex
+    """Carry the caller's identity and assign a request ID when absent."""
+    request_id = request.headers.get(H_REQUEST_ID) or uuid.uuid4().hex
     auth = request.headers.get(H_AUTH_TWINKLE) or request.headers.get(H_AUTH) or ''
-    return build_routing_headers(request_id, auth)
+    headers = build_request_headers(request_id, auth, client_id=request.headers.get(H_CLIENT_ID, ''))
+    if session_id := request.headers.get(H_SESSION_ID):
+        headers[H_SESSION_ID] = session_id
+    return headers
 
 
 def _bad_request(exc: ValueError) -> JSONResponse:
