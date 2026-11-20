@@ -236,7 +236,8 @@ class TwinkleCompatModelBase:
         optimizer_config = self.optimizer_group.get(adapter_name)
         indices = loss_values.get('teacher_topk_indices')
         if indices is not None:
-            if self.device_mesh is not None and (self.device_mesh.tp_world_size > 1 or self.device_mesh.cp_world_size > 1):
+            if self.device_mesh is not None and (
+                    self.device_mesh.tp_world_size > 1 or self.device_mesh.cp_world_size > 1):
                 raise ValueError('Top-K GKD requires unsharded vocabulary and sequence logits (TP=CP=1).')
             if optimizer_config.processor.padding_side != 'right':
                 raise ValueError('Top-K GKD requires right padding.')
