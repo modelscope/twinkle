@@ -113,6 +113,50 @@ def test_lazy_wrapping_rebinds_each_tenants_optimizer_without_other_parameters(t
         torch.testing.assert_close(replacement['b'], torch.ones(2))
 
 
+@pytest.mark.parametrize('optimizer_cls', ['SGD', torch.optim.SGD])
+@pytest.mark.parametrize('momentum', [0.0, 0.9])
+def test_ep_sgd_updates_mixed_sharded_and_local_parameters(tmp_path, optimizer_cls, momentum):
+    import importlib
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+
+    dist.init_process_group('gloo', init_method=(tmp_path / 'rendezvous').as_uri(), rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh('cpu', (1,))
+        reference = [torch.nn.Parameter(torch.arange(start, start + 4, dtype=torch.float32).reshape(2, 2))
+                     for start in (0, 4)]
+        # EP-FSDP1 experts stay local, while the shared parameters are FSDP DTensors.
+        params = [torch.nn.Parameter(distribute_tensor(reference[0].detach().clone(), mesh, [Shard(0)])),
+                  torch.nn.Parameter(reference[1].detach().clone())]
+        kwargs = {'lr': 0.1, 'momentum': momentum, 'weight_decay': 0.2}
+        expected_optimizer = torch.optim.SGD(reference, foreach=False, **kwargs)
+        strategy = NativeFSDPStrategy(enable_ep=True)
+        optimizer = torch.optim.SGD(params, **strategy.adjust_optimizer_kwargs(optimizer_cls, kwargs))
+        sgd_module = importlib.import_module('torch.optim.sgd')
+        # Reproduce accelerator auto-selection on CPU without mocking DTensor operations.
+        with patch.object(sgd_module, '_default_to_fused_or_foreach', return_value=(False, True)):
+            for step in range(1, 4):
+                for index, (param, expected) in enumerate(zip(params, reference)):
+                    grad = torch.full_like(expected, (step + index) * 0.1)
+                    param.grad = (distribute_tensor(grad.clone(), mesh, [Shard(0)])
+                                  if isinstance(param, DTensor) else grad.clone())
+                    expected.grad = grad
+                optimizer.step()
+                expected_optimizer.step()
+                for param, expected in zip(params, reference):
+                    actual = param.to_local() if isinstance(param, DTensor) else param
+                    torch.testing.assert_close(actual, expected)
+                    if momentum:
+                        buffer = optimizer.state[param]['momentum_buffer']
+                        actual_buffer = buffer.to_local() if isinstance(buffer, DTensor) else buffer
+                        expected_buffer = expected_optimizer.state[expected]['momentum_buffer']
+                        torch.testing.assert_close(actual_buffer, expected_buffer)
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.fixture
 def head_sharding():
     strategy = NativeFSDPStrategy(device_mesh=MagicMock(), mixed_precision='bf16', enable_ep=False)
