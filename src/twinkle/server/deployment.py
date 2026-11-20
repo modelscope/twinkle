@@ -280,7 +280,6 @@ def bind_deployment(
         deploy_options: dict[str, Any],
         *,
         deployment_name: str,
-        request_router_config: Any | None = None,
         bind_args: tuple = (),
         bind_kwargs: dict[str, Any] | None = None,
 ) -> Any:
@@ -291,15 +290,11 @@ def bind_deployment(
         servable_cls: The deployment class.
         deploy_options: Ray Serve ``.options(...)`` kwargs.
         deployment_name: Name passed to ``serve.deployment(name=...)``.
-        request_router_config: Optional ``RequestRouterConfig`` (Model only).
         bind_args: Positional args forwarded to ``.bind(...)``.
         bind_kwargs: Keyword args forwarded to ``.bind(...)``.
     """
     ingress_cls = serve.ingress(app)(servable_cls)
-    deployment_kwargs: dict[str, Any] = {'name': deployment_name}
-    if request_router_config is not None:
-        deployment_kwargs['request_router_config'] = request_router_config
-    deployment_cls = serve.deployment(**deployment_kwargs)(ingress_cls)
+    deployment_cls = serve.deployment(name=deployment_name)(ingress_cls)
     return deployment_cls.options(**deploy_options).bind(*bind_args, **(bind_kwargs or {}))
 
 

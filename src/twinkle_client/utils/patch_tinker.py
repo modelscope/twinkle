@@ -1,22 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Patch tinker's internal_client_holder to bypass model_path prefix validation.
-
-This module patches the _create_sampling_session method to allow model_path
-without the 'tinker://' prefix requirement, and patches AsyncTinker.__init__
-to bypass the 'tml-' prefix validation for api_key.
-"""
+"""Adapt the pinned Tinker SDK to Twinkle authentication and training."""
 
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Union
+from typing import Any, Mapping
 
 from twinkle.protocol.headers import build_routing_headers
 from twinkle_client.http.context import get_api_key, get_request_id
 
 _patched = False
-_loss_fn_config_patched = False
 
 
 async def _create_sampling_session(self, model_path: str | None = None, base_model: str | None = None) -> str:
@@ -201,7 +194,7 @@ def patch_tinker():
     1. InternalClientHolder._create_sampling_session to bypass 'tinker://' prefix validation
     2. AsyncTinker.__init__ to bypass 'tml-' prefix validation for api_key
     3. ParsedCheckpointTinkerPath.from_tinker_path to support both 'tinker://' and 'twinkle://' prefixes
-    4. _get_default_headers to inject Twinkle-specific headers
+    4. ServiceClient.__init__ to inject Twinkle-specific headers
     5. ServiceClient.create_full_training_client to enable full-parameter (non-LoRA) training
 
     This patch is idempotent - calling it multiple times has no additional effect.

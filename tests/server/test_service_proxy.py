@@ -45,7 +45,8 @@ async def test_forwarding_keeps_request_identity_auth_and_session():
     proxy = ServiceProxy()
     legacy = H_REQUEST_ID_LEGACY.lower()
     request = _make_request([
-        (legacy.encode(), b'req-1'),
+        (H_REQUEST_ID.encode(), b'req-1'),
+        (legacy.encode(), b'compat-id'),
         (b'authorization', b'Bearer owner'),
         (b'x-twinkle-session-id', b'session'),
         (b'host', b'original-host'),
@@ -58,7 +59,7 @@ async def test_forwarding_keeps_request_identity_auth_and_session():
 
     assert headers == {
         H_REQUEST_ID: 'req-1',
-        legacy: 'req-1',
+        legacy: 'compat-id',
         'authorization': 'Bearer owner',
         'x-twinkle-session-id': 'session',
     }
@@ -96,12 +97,15 @@ async def test_proxy_waits_are_bounded_and_timeout_keeps_existing_wire():
 
 
 @pytest.mark.asyncio
-async def test_proxy_request_502_fallback_returns_error_payload():
+async def test_proxy_request_502_returns_forwarded_request_id():
     proxy = ServiceProxy(http_options={'host': 'localhost', 'port': 8000}, route_prefix='/api/v1')
     proxy.client.request = AsyncMock(side_effect=RuntimeError('upstream down'))
-    request = _make_request(headers=[(H_REQUEST_ID.encode(), b'req-9')])
-
-    response = await proxy.proxy_request(request, 'tinker/forward', 'Qwen', 'model', body_override=b'{}')
+    try:
+        response = await proxy.proxy_request(
+            _make_request(), 'twinkle/sample', 'Qwen', 'sampler',
+            body_override=b'{}', extra_headers={H_REQUEST_ID: 'req-9'})
+    finally:
+        await proxy.close()
 
     assert response.status_code == 502
     payload = json.loads(response.body)

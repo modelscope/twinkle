@@ -8,7 +8,7 @@ import httpx
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
-from twinkle.protocol.headers import H_REQUEST_ID, H_REQUEST_ID_LEGACY
+from twinkle.protocol.headers import H_REQUEST_ID
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.telemetry.tracing import inject_context
@@ -60,9 +60,6 @@ class ServiceProxy:
         headers = dict(request_headers)
         headers.pop("host", None)
         headers.pop("content-length", None)
-        request_id = request_headers.get(H_REQUEST_ID) or request_headers.get(H_REQUEST_ID_LEGACY)
-        if request_id is not None:
-            headers.setdefault(H_REQUEST_ID, request_id)
         return headers
 
     async def proxy_request(
@@ -93,7 +90,7 @@ class ServiceProxy:
             )
         except Exception as exc:
             logger.error("Proxy error: %s", str(exc), exc_info=True)
-            request_id = request.headers.get(H_REQUEST_ID) or request.headers.get(H_REQUEST_ID_LEGACY) or ""
+            request_id = headers.get(H_REQUEST_ID, "")
             payload = ErrorPayload(
                 error=f"Proxy Error: {exc}", category=ErrorCategory.Server, error_code=502, request_id=request_id
             )

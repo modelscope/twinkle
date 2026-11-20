@@ -4,7 +4,6 @@
 # Twinkle Megatron 服务启动脚本
 # ============================================
 # 功能：启动 Ray 集群（支持 GPU 节点）、LGTM 观测栈和 Twinkle 服务器。
-# 设置 TWINKLE_DASHSERVING_ADAPTER=1 时，同时启动 ASI Native HTTP Adapter。
 #
 # 用法：./run.sh [选项]
 #
@@ -20,7 +19,6 @@
 # 环境变量：
 #   MODELSCOPE_CACHE                         默认 /twinkle/runtime/.cache
 #   TWINKLE_WORK_DIR                         默认 /twinkle/runtime/work
-#   TWINKLE_DASHSERVING_ADAPTER              设为 1 时启动端口 9000 的 Adapter
 #   TWINKLE_RUN_EXISTING_ACTION              已有 run.sh 进程运行时的行为：exit 或 restart（默认 exit）
 #   TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待已有实例接收请求秒数（默认 120）
 #
@@ -83,10 +81,8 @@ TWINKLE_RUN_RESTART_REQUEST_FILE="${TWINKLE_RUN_RESTART_REQUEST_FILE:-/tmp/twink
 TWINKLE_RUN_EXISTING_ACTION="${TWINKLE_RUN_EXISTING_ACTION:-exit}"
 TWINKLE_RUN_RESTART_TIMEOUT_SECONDS="${TWINKLE_RUN_RESTART_TIMEOUT_SECONDS:-120}"
 SERVER_PID=""
-ADAPTER_PID=""
 TAIL_PID=""
 RESTART_REQUESTED_BY_SIGNAL=0
-TWINKLE_DASHSERVING_ADAPTER="${TWINKLE_DASHSERVING_ADAPTER:-0}"
 
 # ============================================
 # 参数解析（支持 --key=value 或 --key value 格式）
@@ -115,7 +111,6 @@ print_usage() {
 环境变量:
   MODELSCOPE_CACHE                         默认: /twinkle/runtime/.cache
   TWINKLE_WORK_DIR                         默认: /twinkle/runtime/work
-  TWINKLE_DASHSERVING_ADAPTER              设为 1 时启动端口 9000 的 Adapter
   TWINKLE_RUN_EXISTING_ACTION              已有 run.sh 进程运行时的行为：exit 或 restart (默认: exit)
   TWINKLE_RUN_RESTART_TIMEOUT_SECONDS      --restart 等待已有实例接收请求秒数 (默认: 120)
 
@@ -375,13 +370,6 @@ validate_runtime_config() {
     esac
 
     require_positive_int "TWINKLE_RUN_RESTART_TIMEOUT_SECONDS" "$TWINKLE_RUN_RESTART_TIMEOUT_SECONDS"
-    case "$TWINKLE_DASHSERVING_ADAPTER" in
-        0|1) ;;
-        *)
-            print_error "TWINKLE_DASHSERVING_ADAPTER 只能是 0 或 1，当前值: $TWINKLE_DASHSERVING_ADAPTER"
-            exit 1
-            ;;
-    esac
 }
 
 require_command() {
@@ -478,10 +466,8 @@ stop_pid() {
 
 cleanup_existing_runtime() {
     stop_pid "$TAIL_PID" "日志 tail"
-    stop_pid "$ADAPTER_PID" "DashServing Adapter"
     stop_pid "$SERVER_PID" "Twinkle Server"
     TAIL_PID=""
-    ADAPTER_PID=""
     SERVER_PID=""
 
     print_info "停止已有的 Twinkle Server..."
@@ -714,20 +700,6 @@ start_twinkle_server() {
     start_log_tail
 }
 
-start_dashserving_adapter() {
-    if [ "$TWINKLE_DASHSERVING_ADAPTER" != "1" ]; then
-        return
-    fi
-
-    print_header "启动 DashServing Adapter"
-    export PORT="${PORT:-9000}"
-    export TWINKLE_INTERNAL_URL="${TWINKLE_INTERNAL_URL:-http://127.0.0.1:8000}"
-    export TWINKLE_DS_TIMEOUT_SECONDS="${TWINKLE_DS_TIMEOUT_SECONDS:-600}"
-    nohup python -m twinkle.server.dashserving >> "$LOG_FILE" 2>&1 &
-    ADAPTER_PID=$!
-    print_success "DashServing Adapter 已启动 (PID: $ADAPTER_PID, port: $PORT)"
-}
-
 wait_runtime() {
     print_info "Twinkle runtime 已启动，等待 server 进程..."
     while true; do
@@ -737,12 +709,6 @@ wait_runtime() {
 
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             print_error "Twinkle Server 进程已退出 (PID: $SERVER_PID)"
-            return 1
-        fi
-
-        if [ "$TWINKLE_DASHSERVING_ADAPTER" = "1" ] \
-            && ! kill -0 "$ADAPTER_PID" 2>/dev/null; then
-            print_error "DashServing Adapter 进程已退出 (PID: $ADAPTER_PID)"
             return 1
         fi
 
@@ -764,7 +730,6 @@ run_service_once() {
     start_ray_cluster
     start_lgtm
     start_twinkle_server
-    start_dashserving_adapter
     wait_runtime
 }
 

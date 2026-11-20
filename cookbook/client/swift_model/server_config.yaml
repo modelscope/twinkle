@@ -33,8 +33,7 @@ telemetry:
   otlp_endpoint: http://localhost:4317
 
 persistence:
-  mode: file
-  file_path: /tmp/twinkle_state.json
+  mode: memory
 
 applications:
 
@@ -49,7 +48,7 @@ applications:
       supported_models:
         - google/gemma-4-12B-it
     deployments:
-      - name: TinkerCompatServer
+      - name: GatewayServer
         max_ongoing_requests: 50
         autoscaling_config:
           min_replicas: 1
@@ -121,4 +120,3 @@ applications:
           target_ongoing_requests: 128
         ray_actor_options:
           num_cpus: 0.1
-        
