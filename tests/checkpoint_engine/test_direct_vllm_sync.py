@@ -223,18 +223,22 @@ def test_colocate_releases_trainer_cache_before_waking_sampler(direct):
 #  non-list replicas  | replicas=None dev=[A,B]    | False | non-vLLM sampler
 #  LoRA warm two-step | colocated merge=False base_done=True | IPC base+adapter
 #    | LoRA adapter never synced to new replicas
-#  full warm one-step | colocated merge=True       | IPC base only
+#  merged warm one-step | colocated merge=True     | IPC merged weights
 #    | spurious adapter transfer on full-param
 #  non-vLLM sub       | sub lacks metadata attr    | False -> NCCL
 #    | regression on non-vLLM samplers
 
 
 def warm_state(devices=None, replicas=None, merge=True, base_done=False):
+    import threading
+
     devices = devices if devices is not None else ['gpu0', 'gpu1']
     replicas = replicas if replicas is not None else [[{'device_uuid': 'gpu0', 'endpoint': 'a'},
                                                        {'device_uuid': 'gpu1', 'endpoint': 'b'}]]
     state, events = manager(devices=devices, targets=replicas)
     state.mode = 'standalone'
+    state.backend = 'nccl'
+    state._sync_lock = threading.RLock()
     state.sync_backend = 'full'
     state._merge_and_sync = merge
     state.base_sync_done = base_done
@@ -253,6 +257,7 @@ def warm_state(devices=None, replicas=None, merge=True, base_done=False):
     ([[{'device_uuid': 'gpu0'}]], ['gpu0', 'gpu1'], True),
     ([[{'device_uuid': 'gpu0'}, {'device_uuid': 'gpu0'}]], ['gpu0', 'gpu1'], False),
     ([], ['gpu0', 'gpu1'], False),
+    ([[]], ['gpu0', 'gpu1'], False),
     ([None], ['gpu0', 'gpu1'], False),
     ([[{'device_uuid': 'gpu0'}]], [], False),
     (None, ['gpu0', 'gpu1'], False),
@@ -263,39 +268,43 @@ def test_is_colocated_routing(replicas, devices, expected):
 
 def test_warm_colocated_uses_ipc_and_skips_nccl():
     state, events, nccl = warm_state()
-    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is True
+    state.warm(state.sampler)
     names = [row[0] for row in events]
     assert sorted(names) == sorted(['send', 'receive', 'send_done', 'receive_done'])
-    assert not nccl  # NCCL activate/transfer/close never touched
+    assert nccl == ['close']  # Only the temporary IPC channel is closed; no NCCL transfer.
 
 
 def test_warm_flex_falls_through_to_nccl():
     state, events, nccl = warm_state(replicas=[[{'device_uuid': 'gpu2', 'endpoint': 'c'},
                                                 {'device_uuid': 'gpu3', 'endpoint': 'd'}]])
-    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is False
-    assert not events  # no IPC send/receive; warm() proceeds to the NCCL path
+    state.warm(state.sampler)
+    assert not events
+    assert nccl == ['activate', 'transfer', 'close']
 
 
 def test_warm_colocated_lora_syncs_base_then_adapter():
     state, events, nccl = warm_state(merge=False, base_done=True)
-    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is True
+    state.warm(state.sampler)
     sends = [row for row in events if row[0] == 'send']
     assert len(sends) == 2
     assert sends[0][2]['base_sync_done'] is False
     assert sends[1][2]['base_sync_done'] is True
-    assert not nccl
+    assert nccl == ['close']
 
 
-def test_warm_colocated_full_param_single_transfer():
+def test_warm_colocated_merged_weights_single_transfer():
     state, events, nccl = warm_state(merge=True, base_done=True)
-    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is True
+    state.warm(state.sampler)
     sends = [row for row in events if row[0] == 'send']
     assert len(sends) == 1
-    assert sends[0][2]['base_sync_done'] is False
+    assert sends[0][2]['base_sync_done'] is True
+    assert sends[0][2]['merge_and_sync'] is True
+    assert state.base_sync_done is True
 
 
 def test_warm_non_vllm_sub_falls_through():
     state, events, nccl = warm_state()
     del state.sampler.direct_weight_sync_metadata
-    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is False
+    state.warm(state.sampler)
     assert not events
+    assert nccl == ['activate', 'transfer', 'close']
