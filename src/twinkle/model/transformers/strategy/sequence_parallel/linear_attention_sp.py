@@ -6,11 +6,23 @@ from importlib import import_module
 from transformers.utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
 from typing import Any, Optional, Tuple
 
+
+def _fla_available_on_this_platform() -> bool:
+    """transformers' ``is_flash_linear_attention_available`` only whitelists cuda/xpu/mlu; on Ascend
+    (torch_npu) the package imports fine and its triton kernels run, so probe the package directly
+    and keep the transformers check only as a fast path where it already reports True."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec('fla') is not None
+    except Exception:
+        return False
+
+
 from twinkle.model.transformers.strategy.sequence_parallel.utils import (
     get_packed_cu_seqlens_from_sequence_parallel_context, head_to_seq_shard, seq_to_head_shard)
 from twinkle.patch import Patch
 
-if is_flash_linear_attention_available():
+if is_flash_linear_attention_available() or _fla_available_on_this_platform():
     from fla.modules.convolution import causal_conv1d as _FLA_CAUSAL_CONV1D_FN
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _FLA_CHUNK_GATED_DELTA_RULE
 else:
