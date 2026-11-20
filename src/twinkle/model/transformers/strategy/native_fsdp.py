@@ -370,14 +370,12 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         return ep_clip_kwargs
 
     def adjust_optimizer_kwargs(self, optimizer_cls, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Adjust optimizer kwargs for EP compatibility (e.g. disable foreach for Adam)."""
+        """Disable default foreach updates for mixed FSDP DTensors and local EP tensors."""
         if not self.enable_ep or 'foreach' in kwargs:
             return kwargs
-        from torch.optim import Adam, AdamW
-        is_adam_family = (
-            optimizer_cls in ('AdamW', 'Adam')
-            or (isinstance(optimizer_cls, type) and issubclass(optimizer_cls, (AdamW, Adam))))
-        if is_adam_family:
+        from torch.optim import SGD, Adam, AdamW
+        if (optimizer_cls in ('AdamW', 'Adam', 'SGD')
+                or (isinstance(optimizer_cls, type) and issubclass(optimizer_cls, (AdamW, Adam, SGD)))):
             kwargs['foreach'] = False
         return kwargs
 
