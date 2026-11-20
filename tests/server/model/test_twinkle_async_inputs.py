@@ -85,6 +85,9 @@ class _SchedulingManagement:
 
 @pytest.mark.asyncio
 async def test_forward_only_does_not_shard_output_field_names():
+    from twinkle.infra.dispatch import _dispatch_args
+    from twinkle.utils.device_mesh import DeviceMesh
+
     management = _SchedulingManagement()
     management.forward_only = management.forward_backward
     app = FastAPI()
@@ -96,10 +99,97 @@ async def test_forward_only_does_not_shard_output_field_names():
         training_id='training-a',
         adapter_name='adapter',
         inputs=[{'input_ids': [10]}, {'input_ids': [20]}],
-        loss_kwargs={'output_fields': ['logps']},
+        loss_kwargs={'output_fields': ['logps', 'entropies']},
     )
     await route.endpoint(request, body, management)
-    assert management.model_calls[-1][2]['output_fields'] == ('logps',)
+    inputs, _adapter_name, kwargs = management.model_calls[-1]
+    mesh = DeviceMesh.from_sizes(device_type='cpu', dp_size=2)
+    shards = _dispatch_args([0, 1], 'slice_dp', 'all', mesh, (), dict(kwargs, inputs=inputs))
+    assert [shard['inputs'] for _, _, shard in shards] == [[inputs[0]], [inputs[1]]]
+    assert [shard['output_fields'] for _, _, shard in shards] == [('logps', 'entropies')] * 2
+
+
+@pytest.mark.asyncio
+async def test_topk_teacher_scores_round_trip_and_follow_uneven_rows():
+    from types import SimpleNamespace
+
+    import torch
+
+    from twinkle.infra.collectors import tensor_dict
+    from twinkle.infra.dispatch import _dispatch_args
+    from twinkle.loss.gkd import GKDLoss
+    from twinkle.server.model.backends.transformers_model import _TransformersTinkerCompatMixin
+    from twinkle.utils.device_mesh import DeviceMesh
+    from twinkle_client._request_builder import build_request
+
+    class Teacher:
+        def forward_only(self, *, inputs, adapter_name, output_fields):
+            assert output_fields == ('logits',)
+            logits = torch.stack([dense[feature['input_ids'][0]] for feature in inputs])
+            # InputProcessor tensorizes each row in-place during the real forward.
+            for feature in inputs:
+                feature['input_ids'] = torch.tensor([feature['input_ids']])
+            return {'logits': logits}
+
+    class TeacherWorker(_TransformersTinkerCompatMixin, Teacher):
+        device_mesh = None
+        optimizer_group = {'training-a': SimpleNamespace(processor=SimpleNamespace(padding_side='right'))}
+
+    dense = torch.randn(4, 4, 5, generator=torch.Generator().manual_seed(7))
+    features = [{'input_ids': [i] * length, 'labels': [-100] + [i] * (length - 2) + [-100]}
+                for i, length in enumerate([3, 2, 4, 3])]
+    mesh = DeviceMesh.from_sizes(device_type='cpu', dp_size=2)
+    worker = TeacherWorker()
+
+    def score(**kwargs):
+        shards = _dispatch_args([0, 1], 'slice_dp', 'all', mesh, (), kwargs)
+        return tensor_dict([worker.forward_only(**shard) for _, _, shard in shards], mesh)
+
+    management = _SchedulingManagement()
+    management.backend = 'transformers'
+    management.forward_only = score
+    app = FastAPI()
+    _register_model_twinkle_routes(app, lambda: management)
+    routes = {getattr(route, 'path', None): route for route in app.routes}
+    request = Request({'type': 'http', 'headers': []})
+    request.state.session_id = 'session'
+    handle = {'training_id': 'training-a', 'adapter_name': 'adapter', 'inputs': features}
+    body = build_request(types.ForwardOnlyRequest, **handle, distillation_topk=3)
+    assert body.distillation_topk == 3 and not body.loss_kwargs
+    reply = await routes['/twinkle/forward_only'].endpoint(request, body, management)
+    result = reply.result['result']
+    assert set(result) == {'teacher_topk_indices', 'teacher_topk_logprobs'}
+    scores, indices = dense.topk(3, dim=-1)
+    logprobs = scores.log_softmax(dim=-1)
+    for i, feature in enumerate(features):
+        length = len(feature['input_ids'])
+        assert result['teacher_topk_indices'][i] == indices[i, :length].tolist()
+        torch.testing.assert_close(torch.tensor(result['teacher_topk_logprobs'][i]), logprobs[i, :length])
+
+    body = build_request(types.ForwardBackwardTaskRequest, **handle, **result)
+    await routes['/twinkle/forward_backward'].endpoint(request, body, management)
+    inputs, _, kwargs = management.model_calls[-1]
+    shards = _dispatch_args([0, 1], 'slice_dp', 'all', mesh, (), dict(kwargs, inputs=inputs))
+    student = torch.randn_like(dense, requires_grad=True)
+    loss = GKDLoss(temperature=0.7)
+    for rank, _, shard in shards:
+        for local_index, row in enumerate(shard['inputs']):
+            i = 2 * rank + local_index
+            length = len(row['input_ids'])
+            assert row['input_ids'][0].item() == i
+            micro_batch = loss.micro_batch_kwargs(shard, [local_index], batch_size=2)
+            assert micro_batch.pop('inputs') == [row]
+            loss_inputs = {'labels': row['labels'][None, :]}
+            outputs = {'logits': student[i:i + 1, :length]}
+            sparse = loss(loss_inputs, outputs, **micro_batch)['loss']
+            expected = loss(loss_inputs, outputs, teacher_logits=dense[i:i + 1, :length], topk=3)['loss']
+            torch.testing.assert_close(sparse, expected)
+            sparse.backward()
+    assert student.grad.isfinite().all() and student.grad.abs().sum() > 0
+
+    body.loss_kwargs['teacher_topk_indices'][0].pop()
+    with pytest.raises(ValueError, match='must match the encoded input length'):
+        await routes['/twinkle/forward_backward'].endpoint(request, body, management)
 
 
 @pytest.mark.asyncio

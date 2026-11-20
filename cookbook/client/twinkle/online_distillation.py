@@ -19,6 +19,7 @@ from twinkle.processor.trajectory import response_positions
 STUDENT_NAME = 'distill-student'
 TEACHER_NAME = 'distill-teacher'
 MAX_LENGTH = 256
+GKD_TOP_K = 32
 TEMPLATE_CLASS = 'swift.dev.template.Template'
 LORA = {'r': 8, 'lora_alpha': 16, 'lora_dropout': 0.0, 'target_modules': 'all-linear'}
 LOSS = {'gkd': 'GKDLoss', 'opd-rl': 'GRPOLoss', 'opsd': 'OPSDLoss'}
@@ -71,9 +72,12 @@ def response_scores(model, rows, token_rows, **kwargs):
     return scores
 
 
-def distillation_signal(method, model, teacher, pairs, sequences, features):
+def distillation_signal(method, model, teacher, pairs, sequences, features, *, gkd_top_k=GKD_TOP_K):
     if method == 'gkd':
-        # Full vocabulary scores make the HTTP payload grow with the batch size.
+        if gkd_top_k:
+            # Score the exact encoded rows used for training. The teacher returns only K candidates per position.
+            return teacher.forward_only(inputs=features, distillation_topk=gkd_top_k).result
+        # Explicit full-vocabulary comparison for short, small batches.
         result = teacher.forward_only(inputs=features, return_logits=True).result
         batch_size = len(features)
         length = max(len(feature['input_ids']) for feature in features)
@@ -119,7 +123,8 @@ def evaluate(sampler, tokenizer, pairs, policy, label, seed):
     }), flush=True)
 
 
-def train(method, steps, eval_size, seed, model_name, student_path=None, teacher_path=None, *, batch_size=None):
+def train(method, steps, eval_size, seed, model_name, student_path=None, teacher_path=None, *, batch_size=None,
+          gkd_top_k=GKD_TOP_K):
     # Use unordered operand pairs so '17 × 23' and '23 × 17' cannot leak across splits.
     pairs = list(combinations_with_replacement(range(11, 30), 2))
     random.Random(seed).shuffle(pairs)
@@ -169,7 +174,7 @@ def train(method, steps, eval_size, seed, model_name, student_path=None, teacher
             batch = list(islice(training, batch_size))
             sequences = sample(sampler, batch, policy, seed + step, logprobs=1 if method == 'opd-rl' else None)
             features = [training_feature(seq.new_input_feature, seq.tokens) for seq in sequences]
-            signal = distillation_signal(method, model, teacher, batch, sequences, features)
+            signal = distillation_signal(method, model, teacher, batch, sequences, features, gkd_top_k=gkd_top_k)
             model.forward_backward(inputs=features, **signal)
             model.clip_grad_and_step()
             metrics = model.calculate_metric(is_training=True).result
@@ -188,11 +193,15 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--model', default=STUDENT_NAME, help='Student model name published by the server')
     parser.add_argument('--batch-size', type=int, help='Training examples per step (default: 1 for GKD, 2 otherwise)')
+    parser.add_argument('--gkd-top-k', type=int, default=GKD_TOP_K,
+                        help='Teacher candidates per token position (default: %(default)s; 0 for full vocabulary)')
     args = parser.parse_args()
     if args.steps < 1 or not 1 <= args.eval_size <= 64:
         parser.error('steps must be positive and eval-size must be between 1 and 64')
     if args.batch_size is not None and args.batch_size < 1:
         parser.error('batch-size must be positive')
+    if args.gkd_top_k < 0 or args.gkd_top_k == 1:
+        parser.error('gkd-top-k must be 0 or at least 2')
     student_path = os.getenv('TWINKLE_DISTILL_STUDENT_PATH')
     teacher_path = os.getenv('TWINKLE_DISTILL_TEACHER_PATH')
     if args.method != 'opsd' and not student_path:
@@ -200,4 +209,4 @@ if __name__ == '__main__':
     if args.method != 'opsd' and not teacher_path:
         parser.error('Set TWINKLE_DISTILL_TEACHER_PATH to the local Qwen3.5-2B directory.')
     train(args.method, args.steps, args.eval_size, args.seed, args.model, student_path, teacher_path,
-          batch_size=args.batch_size)
+          batch_size=args.batch_size, gkd_top_k=args.gkd_top_k)

@@ -184,7 +184,7 @@ for epoch in range(3):
 
 Pass an `on_progress` callback to display transferred bytes, total bytes, committed bytes, and commit status. ModelScope reports updates as files finish transferring or batches are committed. Deduplication can make transferred bytes lower than committed bytes. Install the server with the `server` extra to include the upload dependency.
 
-To reconnect after a client disconnect, save a unique `client_upload_id` (for example, a UUID) before calling `model.upload_to_hub(..., client_upload_id=upload_id)`. Repeat the call with the same Twinkle credentials, ID, checkpoint, and destination. While the server retains the task, the SDK resumes waiting or returns the original revision if the upload already finished.
+To reconnect after a client disconnect, save a unique `client_upload_id` (for example, a UUID) before calling `model.upload_to_hub(..., client_upload_id=upload_id)`. Repeat the call with the same Twinkle credentials, ID, checkpoint, and destination. While the server retains the task, the SDK resumes waiting or returns the original outcome. If the task failed, use a new ID to start a new upload.
 
 For checkpoint resumption, the recommended client-side flow is:
 
@@ -217,9 +217,9 @@ To connect these exercises on your own task, use SFT to teach response format or
 (client-online-distillation)=
 ## Online Distillation
 
-One client script (`cookbook/client/twinkle/online_distillation.py`) teaches all three methods on short multiplication. For `17 × 23`, the student answers first. GKD asks an external teacher for every candidate token's score at each position. OPD-RL compares scores for the sampled tokens. OPSD gives the current student the worked solution and has it score its own original reply. Read `train()` for the shared loop and `distillation_signal()` for the three signals.
+One client script (`cookbook/client/twinkle/online_distillation.py`) teaches all three methods on short multiplication. For `17 × 23`, the student answers first. GKD compares distributions over the external teacher's top token candidates at each position. OPD-RL compares scores for the sampled tokens. OPSD gives the current student the worked solution and has it score its own original reply. Read `train()` for the shared loop and `distillation_signal()` for the three signals.
 
-Ask your service administrator for its URL, token, and model services. The example uses `distill-student` (Qwen3.5-0.8B). OPD-RL and GKD also use `distill-teacher` (frozen Qwen3.5-2B). GKD requires HTTP support for `teacher_logits`. The service administrator manages model weights, devices, and the training backend. `cookbook/client/server/transformer/distillation.yaml`
+Ask your service administrator for its URL, token, and model services. The example uses `distill-student` (Qwen3.5-0.8B). OPD-RL and GKD also use `distill-teacher` (frozen Qwen3.5-2B). The reference server configuration is `cookbook/client/server/transformer/distillation.yaml`.
 
 Install the client from the repository root for the same version as this guide. Use the URL, token, and model name provided by your administrator:
 
@@ -242,7 +242,7 @@ export TWINKLE_DISTILL_SERVER_STUDENT_PATH=/server/path/to/student-model
 python cookbook/client/twinkle/online_distillation.py --method opd-rl --model distill-student --steps 4
 ```
 
-Switch to `--method gkd` to run GKD. If the model service requires a larger training batch, set `--batch-size` to the supported size. GKD transfers full vocabulary scores, so a larger batch sends more data. Compare accuracy and output length on the same held-out questions in `eval=before` and `eval=after`. Four steps demonstrate the flow. Match the training example count and evaluation settings and use multiple seeds to compare learning.
+Switch to `--method gkd` to run GKD. By default, the teacher returns its 32 most likely tokens at each position, with probabilities normalized over those candidates. Set `--gkd-top-k 64` to compare more candidates. `--gkd-top-k 0` requests the full vocabulary for a small reference run and can produce large HTTP payloads. Compare accuracy and output length on the same held-out questions in `eval=before` and `eval=after`. Four steps demonstrate the flow. Match the training example count and evaluation settings and use multiple seeds to compare learning.
 
 (client-async-grpo)=
 ## Client-side Async GRPO

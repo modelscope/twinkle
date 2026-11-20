@@ -34,7 +34,7 @@ class TrainingRuntime:
     """Execute controller-owned training handles on one allocated backend."""
 
     training_context: TrainingRuntimeContext
-    _startup_template: dict | None = None
+    _startup_template: dict | None
 
     _training_states: dict[str, TrainingExecutionState]
 

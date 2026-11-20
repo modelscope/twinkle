@@ -50,6 +50,33 @@ def _data_plane_metrics(self, body):
     return {'input_tokens': input_tokens, 'batch_size': batch_size, 'data_world_size': self.data_world_size}
 
 
+def _restore_teacher_topk(kwargs, inputs):
+    indices = kwargs.get('teacher_topk_indices')
+    logprobs = kwargs.get('teacher_topk_logprobs')
+    if (not isinstance(indices, list) or not isinstance(logprobs, list)
+            or len(indices) != len(inputs) or len(logprobs) != len(inputs) or not inputs
+            or kwargs.get('teacher_logits') is not None):
+        raise ValueError('Supply both Top-K teacher fields with one row per input, or teacher_logits alone.')
+
+    token_rows, score_rows = [], []
+    k = None
+    for feature, token_row, score_row in zip(inputs, indices, logprobs, strict=True):
+        tokens = torch.as_tensor(token_row, device='cpu')
+        scores = torch.as_tensor(score_row, dtype=torch.float32, device='cpu')
+        input_ids = feature.get('input_ids')
+        if (getattr(input_ids, 'ndim', None) != 1 or tokens.ndim != 2 or tokens.shape != scores.shape
+                or tokens.shape[0] != len(input_ids) or tokens.shape[1] < 2
+                or (k is not None and tokens.shape[1] != k)):
+            raise ValueError('Top-K teacher rows must match the encoded input length and share K >= 2.')
+        if tokens.dtype != torch.int64 or tokens.min() < 0 or not scores.isfinite().all():
+            raise ValueError('Top-K teacher rows require nonnegative integer token IDs and finite logprobs.')
+        k = tokens.shape[1]
+        token_rows.append(tokens)
+        score_rows.append(scores)
+    return dict(teacher_topk_indices=torch.nn.utils.rnn.pad_sequence(token_rows, batch_first=True),
+                teacher_topk_logprobs=torch.nn.utils.rnn.pad_sequence(score_rows, batch_first=True))
+
+
 def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelManagement]) -> None:
     """Register all /twinkle/* routes on the given FastAPI app.
 
@@ -148,8 +175,11 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                     if isinstance(inputs[key], list) and isinstance(first_element(inputs[key]), (int, float)):
                         inputs[key] = torch.tensor(inputs[key])
             kwargs = backend_kwargs(body)
+            has_teacher_topk = 'teacher_topk_indices' in kwargs or 'teacher_topk_logprobs' in kwargs
             teacher_logits = kwargs.get('teacher_logits')
-            if isinstance(teacher_logits, list):
+            if has_teacher_topk:
+                kwargs.update(await asyncio.to_thread(_restore_teacher_topk, kwargs, all_inputs))
+            elif isinstance(teacher_logits, list):
                 # Restore the dense GKD tensor on CPU before splitting the batch across workers.
                 teacher_logits = await asyncio.to_thread(torch.as_tensor, teacher_logits, dtype=torch.float32,
                                                          device='cpu')
@@ -159,7 +189,8 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 kwargs['teacher_logits'] = teacher_logits
             resolved_adapter_name = self.resolve_model_adapter_name(adapter_name)
             preflight = getattr(self.model, 'preflight_loss_inputs', None)
-            if preflight is not None and any(key in kwargs for key in ('old_logps', 'ref_logps', 'advantages')):
+            if preflight is not None and (has_teacher_topk or any(
+                    key in kwargs for key in ('old_logps', 'ref_logps', 'advantages'))):
                 # Full, unsliced batch on every rank: a loss alignment error must
                 # fail all ranks before any of them enters its backward collective.
                 await self.call_backend(preflight, inputs=all_inputs, adapter_name=resolved_adapter_name, **kwargs)

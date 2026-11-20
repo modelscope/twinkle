@@ -148,6 +148,9 @@ class ForwardOnlyRequest(_InlineForwardBase):
     disable_lora: bool | None = backend_kwarg(default=None)
     continuation_token_ids: list[list[StrictInt]] | None = Field(
         default=None, description='One exact, already-generated reply per text trajectory to score')
+    distillation_topk: StrictInt | None = backend_only(
+        'transformers', default=None, ge=2,
+        description='Return only the top token IDs and their logprobs normalized over those candidates')
 
 
 class ForwardBackwardTaskRequest(_InlineForwardBase):

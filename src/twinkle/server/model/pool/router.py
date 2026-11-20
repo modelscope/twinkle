@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import uuid
 from types import SimpleNamespace
-from typing import Literal
 
 import json
 import ray
@@ -122,15 +121,6 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         if not session or await self.state.get_session_last_heartbeat(session) is None:
             raise ResourceNotFoundError("Unknown or expired session")
 
-    def _resolve_training_mode(
-        self, *, lora: bool, rank: int | None, rank_error: str
-    ) -> Literal["full", "lora"]:
-        mode = "lora" if lora else "full"
-        spec = self.config.get(self.model.name, mode)
-        if lora and (type(rank) is not int or not 0 < rank <= spec.config.max_r):
-            raise RequestRejectedError(rank_error)
-        return mode
-
     async def native_request(self, request, endpoint):
         schema = NATIVE_REQUESTS.get(endpoint)
         if schema is None:
@@ -153,14 +143,17 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
                 config = json.loads(body.config) if body.config is not None else None
             except (ValueError, TypeError) as exc:
                 raise RequestRejectedError("Expected a serialized LoRA config") from exc
-            rank = None
-            if isinstance(config, dict) and config.get("_TWINKLE_TYPE_") == "LoraConfig":
-                rank = config.get("r")
-            mode = self._resolve_training_mode(
-                lora=config is not None,
-                rank=rank,
-                rank_error="LoRA config/rank is not supported by this training specification",
-            )
+            mode = "full" if config is None else "lora"
+            spec = self.config.get(self.model.name, mode)
+            if config is not None:
+                rank = config.get("r") if isinstance(config, dict) else None
+                if (
+                    not isinstance(config, dict)
+                    or config.get("_TWINKLE_TYPE_") != "LoraConfig"
+                    or type(rank) is not int
+                    or not 0 < rank <= spec.config.max_r
+                ):
+                    raise RequestRejectedError("LoRA config/rank is not supported by this training specification")
             payload = body.model_dump(mode="json")
             if body.save_dir:
                 try:
@@ -215,11 +208,10 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         if endpoint == "create_model":
             if body.base_model != self.model.name:
                 raise RequestRejectedError("Model does not match the catalog endpoint")
-            mode = self._resolve_training_mode(
-                lora=body.lora_config is not None,
-                rank=body.lora_config.rank if body.lora_config is not None else None,
-                rank_error="LoRA rank exceeds the training specification",
-            )
+            mode = "lora" if body.lora_config is not None else "full"
+            spec = self.config.get(self.model.name, mode)
+            if body.lora_config is not None and not 0 < body.lora_config.rank <= spec.config.max_r:
+                raise RequestRejectedError("LoRA rank exceeds the training specification")
             await self._check_session(body.session_id)
             return await self.controller.create.remote(
                 CreateTraining(

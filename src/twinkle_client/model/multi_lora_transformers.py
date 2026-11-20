@@ -479,6 +479,7 @@ class MultiLoraTransformersModel:
             client_upload_id: Save a unique ID before submitting to reconnect
                 after a client disconnect. Repeat the same call with that ID
                 and the same checkpoint and destination while the task is retained.
+                If the retained task failed, use a new ID to start a new upload.
             on_progress: Receive the latest upload snapshots on the calling thread.
                 By default the SDK logs those snapshots.
 

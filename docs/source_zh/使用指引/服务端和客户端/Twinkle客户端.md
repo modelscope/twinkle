@@ -184,7 +184,7 @@ for epoch in range(3):
 
 可传入 `on_progress` 回调，在自己的界面显示已传字节、总量、已提交字节和提交状态。ModelScope 在文件传完或批次提交后更新进度。Hub 去重时，已传字节可能小于已提交字节。服务端通过 `server` 安装选项获取上传依赖。
 
-如果需要断线后继续查询，调用 `model.upload_to_hub(..., client_upload_id=upload_id)` 前先保存一个唯一标识，例如 UUID。重连时使用相同的 Twinkle 凭据、标识、检查点和目标仓库。服务端仍保留该任务时，SDK 会继续等待，任务已完成则返回原来的提交版本。
+如果需要断线后继续查询，调用 `model.upload_to_hub(..., client_upload_id=upload_id)` 前先保存一个唯一标识，例如 UUID。重连时使用相同的 Twinkle 凭据、标识、检查点和目标仓库。服务端仍保留该任务时，SDK 会继续等待或返回原有结果。如果任务已失败，使用新的标识发起上传。
 
 Twinkle Client 场景下，推荐的断点续训流程是：
 
@@ -217,9 +217,9 @@ Twinkle Client 场景下，推荐的断点续训流程是：
 (client-online-distillation)=
 ## 在线蒸馏入门
 
-`cookbook/client/twinkle/online_distillation.py` 用短乘法演示三种方法。以 `17 × 23` 为例，学生先生成自己的回答。GKD 让外部教师给每个位置的所有候选 token 打分，OPD-RL 只比较实际选中 token 的 logprob，OPSD 让当前学生读完参考解法，再给原回答打分。三个方法共用采样、更新、发布和评测。先读 `train()` 看这条主线，再读 `distillation_signal()` 看信号如何构造。
+`cookbook/client/twinkle/online_distillation.py` 用短乘法演示三种方法。以 `17 × 23` 为例，学生先生成自己的回答。GKD 在外部教师选出的候选 token 上比较两边的分布，OPD-RL 只比较实际选中 token 的 logprob，OPSD 让当前学生读完参考解法，再给原回答打分。三个方法共用采样、更新、发布和评测。先读 `train()` 看这条主线，再读 `distillation_signal()` 看信号如何构造。
 
-向服务管理员获取地址、令牌和兼容的模型服务。示例使用 `distill-student`（Qwen3.5-0.8B）。OPD-RL 和 GKD 另需 `distill-teacher`（冻结的 Qwen3.5-2B），其中 GKD 需要支持 `teacher_logits` 的 HTTP 接口。模型权重、设备和训练后端由服务管理员管理。`cookbook/client/server/transformer/distillation.yaml`
+向服务管理员获取地址、令牌和兼容的模型服务。示例使用 `distill-student`（Qwen3.5-0.8B）。OPD-RL 和 GKD 另需 `distill-teacher`（冻结的 Qwen3.5-2B）。服务端参考配置位于 `cookbook/client/server/transformer/distillation.yaml`。
 
 在与本指南同一版本的仓库根目录安装客户端，填入管理员提供的地址、令牌和模型名：
 
@@ -242,7 +242,7 @@ export TWINKLE_DISTILL_SERVER_STUDENT_PATH=/server/path/to/student-model
 python cookbook/client/twinkle/online_distillation.py --method opd-rl --model distill-student --steps 4
 ```
 
-将方法改为 `gkd` 可运行 GKD。如果模型服务要求更大的训练批次，用 `--batch-size` 指定服务支持的样本数。GKD 会传输完整词表的分数，批次越大，传输量越高。比较 `eval=before` 和 `eval=after` 的同一批题，检查答对数和输出长度。四步用于学会跑流程。比较收益时需要匹配训练样本数和评测设置，并用多个种子复跑。
+将方法改为 `gkd` 可运行 GKD。教师默认在每个位置选出最可能的 32 个 token，概率在这 32 个候选内归一化。用 `--gkd-top-k 64` 可以比较更多候选。`--gkd-top-k 0` 用于小规模的完整词表对照，请求体可能很大。比较 `eval=before` 和 `eval=after` 的同一批题，检查答对数和输出长度。四步用于学会跑流程。比较收益时需要匹配训练样本数和评测设置，并用多个种子复跑。
 
 (client-async-grpo)=
 ## 客户端异步 GRPO
