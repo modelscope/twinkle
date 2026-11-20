@@ -283,6 +283,7 @@ class Advantage:
     def __init__(self, *,
                  num_generations: int = 1,
                  reward_weights: Optional[Sequence[float]] = None,
+                 env_reward_weight: float = 1.0,
                  scale_rewards: Optional[str] = None,
                  beta: float = 0.0,
                  kl_in_reward: bool = False,
@@ -308,7 +309,9 @@ class Advantage:
                  segment_discount: float = 1.0) -> None:
         """GRPO-family knobs: ``num_generations`` / ``scale_rewards`` / ``beta`` / ``kl_in_reward``
         / ``kl_kind`` (the k3 per-row mean folds into the reward), ``reward_weights`` (the ORM
-        fold), ``use_prm`` + ``prm_orm_mix`` + ``prm_weights`` (PRM fusion), ``teacher_reweight``
+        fold), ``env_reward_weight`` (the env-family rewards the rollout recorded on the rows:
+        ``rewards.env`` plus terminal ``rewards.check``), ``use_prm`` + ``prm_orm_mix`` +
+        ``prm_weights`` (PRM fusion), ``teacher_reweight``
         + its ``rlsd_*`` / ``teacher_kl_coef`` knobs (per-token reweighting), ``sdar_loss_coef``
         (teacher-lane requirement for the loss), ``rollout_importance_sampling_mode`` /
         ``log_rollout_offpolicy_metrics`` (the pre-update policy lane and its diagnostics),
@@ -372,6 +375,12 @@ class Advantage:
                              'or pick the estimator that consumes them.')
         self.num_generations = num_generations
         self.reward_weights = reward_weights
+        # Negative would flip the env-family rewards' signal direction -- a config error, not a
+        # training choice. 0.0 stays legal (record the rewards in the metrics, keep them out of
+        # the training fold).
+        if env_reward_weight < 0:
+            raise ValueError(f'env_reward_weight must be non-negative, got {env_reward_weight}.')
+        self.env_reward_weight = float(env_reward_weight)
         self.scale_rewards = scale_rewards
         self.beta = beta
         self.kl_in_reward = kl_in_reward
@@ -507,15 +516,18 @@ class Advantage:
         # The nan rows then land per estimator: the grpo / rloo / passk lanes exclude them from the
         # group statistics and zero their advantage (see reduce_rewards / nanstd); the remaining
         # scalar estimators and gae fold them to 0, and gae refuses a batch with no valid score at
-        # all.
+        # all. The env-family columns (the rollout's own ``rewards.env`` / ``rewards.check``, read
+        # off the trajectories below) fold with the same nan contract.
         orm_rows = [self._orm_row(score) for score in scores]
+        env_keys, env_rows = self._env_family_rows(trajs)
+        reward_rows = [list(orm) + list(env) for orm, env in zip(orm_rows, env_rows)]
         matrix_rows = [[float('nan') if value is None or value != value else float(value) for value in row]
-                       or [float('nan')] for row in orm_rows]
+                       or [float('nan')] for row in reward_rows]
         widths = {len(row) for row in matrix_rows}
         if len(widths) != 1:
-            raise ValueError(f'the trajectories carry different ORM scorer counts {sorted(widths)}; every row '
-                             'of a batch is scored by the same scorer set (a missing score is None, not a '
-                             'shorter row).')
+            raise ValueError(f'the trajectories carry different reward column counts {sorted(widths)}; every '
+                             'row of a batch is scored by the same scorer set (a missing score is None, not '
+                             'a shorter row).')
         # An episode delivered as several rows (collected segments) counts ONCE in the group
         # statistics -- its reward entering the mean per row would weight compacted episodes by
         # their segment count -- and the per-episode advantage is broadcast back to every row.
@@ -556,10 +568,17 @@ class Advantage:
                 kl_values = [total / max(1, weights[episode]) for episode, total in enumerate(totals)]
             if baselines is not None:
                 baselines = [baselines[index] for index in folded]
+        # The env-family columns fold at env_reward_weight beside the ORM weights: with no env
+        # column the pass-through is byte-identical to the pre-env fold (None stays None).
+        fold_weights = self.reward_weights
+        if env_keys:
+            orm_width = len(orm_rows[0])
+            fold_weights = list(self.reward_weights or [1.0] * orm_width) + \
+                [self.env_reward_weight] * len(env_keys)
         advantages = compute_advantages(
             reward_matrix,
             self.num_generations,
-            reward_weights=self.reward_weights,
+            reward_weights=fold_weights,
             advantage_estimator=self,
             scale_rewards=self.scale_rewards or 'group',
             kl_in_reward=self.kl_in_reward,
@@ -617,7 +636,15 @@ class Advantage:
                                    'zero_advantage_rows': _zero_row_fraction(advantages)}
         # Rows that carried no signal, counted per lane so a silently broken scorer is visible:
         # zero advantage alone cannot distinguish "never scored" from "scored and average".
-        summary['unscored_orm_rows'] = sum(all(value != value for value in row) for row in matrix_rows)
+        # The env-family lanes report the same way: each source stays independently observable.
+        summary['unscored_orm_rows'] = sum(all(value is None or value != value for value in row)
+                                          for row in orm_rows)
+        for key_index, key in enumerate(env_keys):
+            values = [row[key_index] for row in env_rows]
+            valid = [float(value) for value in values if value is not None and value == value]
+            summary[f'mean_{key}_reward'] = sum(valid) / len(valid) if valid else 0.0
+            summary[f'unscored_{key}_rows'] = sum(1 for value in values
+                                                 if value is None or value != value)
         if baselines is not None:
             summary['unscored_baseline_rows'] = sum(value != value for value in baselines)
         if self.use_prm:
@@ -767,6 +794,28 @@ class Advantage:
         """The ORM scores of one score row, in the scorer order the driver stamped them."""
         rewards = score.get('rewards') or {}
         return list((rewards.get('orm') or {}).values())
+
+    def _env_family_rows(self, trajs: List[Trajectory]) -> Tuple[List[str], List[List[Optional[float]]]]:
+        """The env-sourced reward keys of the batch and their row values.
+
+        The rollout owns two reward keys that ride the trajectory itself (the driver's score
+        entry never carries them): ``rewards.env``, the episode's env session reward, and
+        ``rewards.check``, terminal checks run inside that session (a compile, a run, a file
+        assertion). A key present on any row of the batch becomes one column for every row --
+        a missing entry stays None, the same "a missing score is None, not a shorter row"
+        contract the ORM columns keep -- and folds at ``env_reward_weight`` (default 1.0: the
+        env-family rewards simply add to the ORM fold). Setting the weight while no row carries
+        either key is refused: nothing would ever read it.
+        """
+        keys = [key for key in ('env', 'check')
+                if any((traj.get('rewards') or {}).get(key) is not None for traj in trajs)]
+        if not keys and self.env_reward_weight not in (1.0, 0.0):
+            raise ValueError(
+                f'{type(self).__name__} reads env_reward_weight only when a trajectory carries '
+                "rewards.env (the episode's env session reward) or rewards.check (terminal checks); "
+                'no row of this batch does. Wire an env / checks column or drop the knob.')
+        rows = [[(traj.get('rewards') or {}).get(key) for key in keys] for traj in trajs]
+        return keys, rows
 
     def _process_row(self, traj: Trajectory, score: Dict[str, Any]) -> List[float]:
         """Broadcast one trajectory's PRM segment scores over the turns they closed.

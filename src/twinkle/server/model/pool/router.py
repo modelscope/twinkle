@@ -54,6 +54,7 @@ NATIVE_REQUESTS = {
     "load": native.LoadRequest,
     "resume_from_checkpoint": native.ResumeFromCheckpointRequest,
     "remove_adapter": native.AdapterRequest,
+    "stop_training": native.AdapterRequest,
     "add_adapter_to_model": native.AddAdapterRequest,
     "upload_to_hub": native.UploadToHubRequest,
     "create": native.CreateRequest,
@@ -192,6 +193,14 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
 
             ref = await self.schedule_background_task(upload, task_type=endpoint, token=token)
             return envelope_from_record(ref["request_id"], await self.state.get_future(ref["request_id"]))
+        if endpoint == "stop_training":
+            # Owner-side explicit stop by training id: the webui kills the local driver, so
+            # the driver's session dies with it and cannot release the training itself.
+            # The token that owns the run releases it WITHOUT a session -- the same
+            # authority level as the gateway's checkpoint deletion (delete-by-id with the
+            # owner token). A training whose session heartbeat already expired reports
+            # "unknown/expired handle" here, which is idempotent: the reaper released it.
+            return await self._release(body.training_id, token, None, "twinkle")
         session = get_session_id_from_request(request)
         await self._check_session(session)
         if endpoint == "remove_adapter":

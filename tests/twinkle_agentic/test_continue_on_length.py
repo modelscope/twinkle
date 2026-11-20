@@ -6,12 +6,16 @@ partial assistant message to its history and re-requesting: the endpoint must CO
 that open turn from the ledger's current state -- not open a segment, which re-encodes
 an assistant-ending prompt with ``add_generation_prompt=True`` and crashes (the template
 contract refuses it), or silently resets the turn/token account on the message face.
+The agent's merged view of the split replies follows its send-time strip recurrence
+(``echo_k = strip(echo_{k-1} + piece_k)``), NOT the raw concatenation -- boundary
+whitespace is gone, and a raw-concatenation view reads the second continuation as a
+rewrite (the attempt4 crash).
 
 Both ledger faces are driven through the real ``_serve``: message-level (template=None)
 and token-in (a char-level fake template enforcing the real encode contract). The fakes
 are confined to the engine's sampled reply and the tokenizer; detection, canonicalisation
 and the segment/turn bookkeeping are the product code under test. The full oracle matrix
-and its HEAD-worktree reverse-verification live in the regression campaign's
+and its two-layer HEAD-worktree reverse-verification live in the regression campaign's
 ``check2/tools/probe_defect110_continuation.py`` / ``probe_defect110_reverse.py``.
 """
 from __future__ import annotations
@@ -253,6 +257,32 @@ def test_m7_normal_two_turn():
     assert ep.ledger.messages == [U1, _a('ok'), U2, _a('ok2')]
 
 
+def test_m8_whitespace_boundary_repeated():
+    # The attempt4 crash shape: ms-agent strips stored content at send time, so the merged
+    # echo LOSES boundary whitespace ('answer = ' + '42 and ' echoes as 'answer =42 and').
+    # A raw-concatenation merged view reads the second continuation as a rewrite.
+    rollout, engine, _, _ = _make([('answer = ', 'length'), ('42 and ', 'length'), ('done.', 'stop')])
+    ep = _ep([U1])
+    _serve(rollout, ep, [U1])
+    r2 = _serve(rollout, ep, [U1, _a('answer =')])  # echo_1 = strip(partial)
+    assert r2['message']['content'] == '42 and ' and r2['finish_reason'] == 'length'
+    r3 = _serve(rollout, ep, [U1, _a('answer =42 and')])  # echo_2 = strip(echo_1 + piece_2)
+    assert r3['message']['content'] == 'done.' and r3['finish_reason'] == 'stop'
+    assert engine.calls == 3 and ep.segments == 1 and ep.ledger.turns == 1
+    assert ep.ledger.messages == [U1, _a('answer = 42 and done.')]  # ledger keeps the RAW stream
+
+
+def test_m9_whitespace_boundary_merged_suffix():
+    rollout, engine, _, _ = _make([('answer = ', 'length'), ('42.', 'stop'), ('ok', 'stop')])
+    ep = _ep([U1])
+    _serve(rollout, ep, [U1])
+    _serve(rollout, ep, [U1, _a('answer =')])
+    reply = _serve(rollout, ep, [U1, _a('answer =42.'), U2])  # merged echo + environment suffix
+    assert reply['message']['content'] == 'ok'
+    assert ep.segments == 1 and ep.ledger.turns == 2
+    assert ep.ledger.messages == [U1, _a('answer = 42.'), U2, _a('ok')]
+
+
 # ------------------------------------------------------------------ token face
 
 def test_t1_token_accounting():
@@ -345,5 +375,22 @@ def test_t6_normal_two_turn_token():
     _serve(rollout, ep, [U1, _a('ok'), U2])
     assert ep.ledger.turns == 2 and ep.segments == 1 and template.encode_calls == 1
     assert ep.ledger.messages == [U1, _a('ok'), U2, _a('ok2')]
+
+
+def test_t7_whitespace_boundary_token():
+    # Token face of the attempt4 crash: pre-follow-up the second continuation re-encodes
+    # an assistant-ending prompt and the template contract raises.
+    rollout, engine, template, tok = _make([('answer = ', 'length'), ('42 and ', 'length'), ('done.', 'stop')],
+                                           token_face=True)
+    ep = _ep([U1])
+    prompt_ids = tok.encode(tok.apply_chat_template([U1], add_generation_prompt=True))
+    _serve(rollout, ep, [U1])
+    _serve(rollout, ep, [U1, _a('answer =')])
+    reply = _serve(rollout, ep, [U1, _a('answer =42 and')])
+    assert reply['message']['content'] == 'done.'
+    pieces = tok.encode('answer = ') + tok.encode('42 and ') + tok.encode('done.')
+    assert ep.ledger.input_feature['input_ids'] == prompt_ids + pieces
+    assert ep.ledger.turns == 1 and ep.segments == 1 and template.encode_calls == 1
+    assert ep.ledger.messages == [U1, _a('answer = 42 and done.')]
 
 

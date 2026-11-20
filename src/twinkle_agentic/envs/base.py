@@ -148,11 +148,15 @@ class NoSlot:
 
 
 class _Session:
-    __slots__ = ("state", "reward", "touched", "script_inflight")
+    __slots__ = ("state", "reward", "rewarded", "touched", "script_inflight")
 
     def __init__(self, state: Any):
         self.state = state
         self.reward = 0.0
+        #: Whether any step ever carried a reward. A sandbox used only for its tools never
+        #: scores, and its constant 0.0 sum is "no reward", not a genuine zero -- ``close`` tells
+        #: the two apart so a caller does not fold an absent signal as a real score.
+        self.rewarded = False
         self.touched = time.monotonic()
         #: A whole script (agent program / verifier) is executing in this session right now. Such a
         #: session is alive even when it makes no env calls for a long time, so idle reaping must
@@ -322,7 +326,9 @@ class Env(ABC):
     def step(self, episode_id: str, tool_name: str, arguments: dict[str, Any] | None = None) -> StepResult:
         session = self._session(episode_id)
         result = self._step(session.state, tool_name, arguments or {})
-        session.reward += float(result.reward or 0.0)
+        if result.reward is not None:
+            session.rewarded = True
+            session.reward += float(result.reward)
         _record_tool_exec(episode_id, 1)
         return result
 
@@ -333,7 +339,9 @@ class Env(ABC):
         results = []
         for name, args in calls:
             result = self._step(session.state, name, args or {})
-            session.reward += float(result.reward or 0.0)
+            if result.reward is not None:
+                session.rewarded = True
+                session.reward += float(result.reward)
             results.append(result)
         _record_tool_exec(episode_id, len(results))
         return results
@@ -405,22 +413,25 @@ class Env(ABC):
         )
 
     @remote_function(enable_continous_work=True, sticky_key="episode_id")
-    def close(self, episode_id: str) -> float:
+    def close(self, episode_id: str) -> float | None:
         """End the episode's session and return its reward (the sum of its step rewards).
 
-        Closing an episode with no session returns 0.0.
+        ``None`` when the session never scored (no step ever carried a reward) or there was no
+        session at all: the caller keeps "no reward" apart from a genuine 0.0 score -- a sandbox
+        used only for its tools has no reward of its own, and folding its constant zero as one
+        would fabricate signal.
         """
         with self._sessions_lock:
             session = self._sessions.pop(episode_id, None)
         if session is None:
-            return 0.0
+            return None
         try:
             self._close(session.state)
         except Exception:  # noqa
             logger.warning(f"{type(self).__name__}: closing session {episode_id!r} failed.", exc_info=True)
         finally:
             self._session_slots.release()
-        return session.reward
+        return session.reward if session.rewarded else None
 
     @remote_function(dispatch="all", collect="first", lazy_collect=False)
     def shutdown(self) -> None:

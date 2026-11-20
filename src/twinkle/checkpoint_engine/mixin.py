@@ -355,22 +355,32 @@ class CheckpointEngineMixin:
         (not the full model).  Each received (name, tensor) is matched to the
         local state dict by name; a mismatch raises KeyError immediately.
 
-        The local state comes from ``_get_local_state_dict``, whose values are the
-        live parameters (``param.data``); ``param.data`` also tolerates plain
-        tensors, so hosts storing raw tensors keep working.
+        The local state comes from the live ``model.state_dict()`` (shared-storage views of the
+        actual parameters). A DTensor target is blended into its LIVE local shard: the received
+        bucket is a full tensor, wrapped Replicate on the target's mesh and redistributed to the
+        target's own placements so the slice geometry comes from the parameter itself. Blending
+        into ``_get_local_state_dict`` instead would mutate gathered throwaway copies
+        (``Torch.to_local_tensor`` calls ``full_tensor()``), leaving a sharded reference untouched.
         """
         engine = self._get_or_create_checkpoint_engine()
-        local_state = self._get_local_state_dict()
+        from torch.distributed.tensor import DTensor, Replicate
+        model = self.strategy.unwrap_model(self.model)
+        local_state = model.state_dict()
 
         async def _receive_and_ema():
             async for name, tensor in engine.receive_weights():
-                param = local_state[name]
-                # A received bucket rides the transport the pair negotiated --
-                # device-to-device on a shared NCCL channel, the ray object
-                # store (CPU tensors) across disjoint device groups. The EMA
-                # math runs on the parameter's device either way; ``.to`` is a
-                # no-op when the tensor already sits there.
-                param.data.mul_(alpha).add_(tensor.to(param.device), alpha=1.0 - alpha)
+                target = local_state[name]
+                # A received bucket rides the transport the pair negotiated -- device-to-device on a
+                # shared NCCL channel, the ray object store (CPU tensors) across disjoint device
+                # groups. Stage it onto the target's device before the EMA math.
+                if isinstance(target, DTensor):
+                    recv = tensor.to(target.to_local().device)
+                    recv_dt = DTensor.from_local(recv, target.device_mesh,
+                                                 [Replicate()] * len(target.placements), run_check=False)
+                    recv_local = recv_dt.redistribute(target.device_mesh, target.placements).to_local()
+                    target.to_local().mul_(alpha).add_(recv_local, alpha=1.0 - alpha)
+                else:
+                    target.mul_(alpha).add_(tensor.to(target.device), alpha=1.0 - alpha)
 
         result_container = {'error': None}
 

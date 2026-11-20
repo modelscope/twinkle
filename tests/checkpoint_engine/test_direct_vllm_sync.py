@@ -206,3 +206,96 @@ def test_colocate_releases_trainer_cache_before_waking_sampler(direct):
         'release_submitted', 'release_completed', ('weights',),
         'direct' if direct else 'fallback', *([] if direct else ['channel']),
         'offload', ('kv_cache',)]
+
+
+# ── defect118: warm() colocated replicas must use IPC, not NCCL ──────────────
+#
+# PLAN (case | input | expected | failure it kills):
+#  colocated TP2 lend | replicas=[[A,B]] dev=[A,B] | True; IPC, no NCCL
+#    | defect118 NCCL "Duplicate GPU detected" actor death
+#  flex TP2 growth    | replicas=[[C,D]] dev=[A,B] | False; NCCL fallback
+#    | regression: IPC for flex sends nothing (no matching trainer device)
+#  colocated TP1      | replicas=[[A]] dev=[A,B]   | True | TP1 lend missed
+#  duplicate recv uuid| replicas=[[A,A]] dev=[A,B] | False | invalid dup-GPU topology
+#  empty replicas     | replicas=[] dev=[A,B]      | False | nothing to warm
+#  None target        | replicas=[None] dev=[A,B]  | False | metadata not ready
+#  empty devices      | replicas=[[A]] dev=[]      | False | CPU model fallback
+#  non-list replicas  | replicas=None dev=[A,B]    | False | non-vLLM sampler
+#  LoRA warm two-step | colocated merge=False base_done=True | IPC base+adapter
+#    | LoRA adapter never synced to new replicas
+#  full warm one-step | colocated merge=True       | IPC base only
+#    | spurious adapter transfer on full-param
+#  non-vLLM sub       | sub lacks metadata attr    | False -> NCCL
+#    | regression on non-vLLM samplers
+
+
+def warm_state(devices=None, replicas=None, merge=True, base_done=False):
+    devices = devices if devices is not None else ['gpu0', 'gpu1']
+    replicas = replicas if replicas is not None else [[{'device_uuid': 'gpu0', 'endpoint': 'a'},
+                                                       {'device_uuid': 'gpu1', 'endpoint': 'b'}]]
+    state, events = manager(devices=devices, targets=replicas)
+    state.mode = 'standalone'
+    state.sync_backend = 'full'
+    state._merge_and_sync = merge
+    state.base_sync_done = base_done
+    state._peft_config = {'r': 16}
+    state._adapter_config = lambda b, m: state._peft_config
+    nccl = []
+    state._activate_checkpoint_channel = lambda *a, **k: nccl.append('activate') or []
+    state._transfer = lambda *a, **k: nccl.append('transfer')
+    state._close_checkpoint_channel = lambda *a, **k: nccl.append('close')
+    return state, events, nccl
+
+
+@pytest.mark.parametrize('replicas,devices,expected', [
+    ([[{'device_uuid': 'gpu0'}, {'device_uuid': 'gpu1'}]], ['gpu0', 'gpu1'], True),
+    ([[{'device_uuid': 'gpu2'}, {'device_uuid': 'gpu3'}]], ['gpu0', 'gpu1'], False),
+    ([[{'device_uuid': 'gpu0'}]], ['gpu0', 'gpu1'], True),
+    ([[{'device_uuid': 'gpu0'}, {'device_uuid': 'gpu0'}]], ['gpu0', 'gpu1'], False),
+    ([], ['gpu0', 'gpu1'], False),
+    ([None], ['gpu0', 'gpu1'], False),
+    ([[{'device_uuid': 'gpu0'}]], [], False),
+    (None, ['gpu0', 'gpu1'], False),
+])
+def test_is_colocated_routing(replicas, devices, expected):
+    assert CheckpointEngineManager._is_colocated(replicas, devices) is expected
+
+
+def test_warm_colocated_uses_ipc_and_skips_nccl():
+    state, events, nccl = warm_state()
+    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is True
+    names = [row[0] for row in events]
+    assert sorted(names) == sorted(['send', 'receive', 'send_done', 'receive_done'])
+    assert not nccl  # NCCL activate/transfer/close never touched
+
+
+def test_warm_flex_falls_through_to_nccl():
+    state, events, nccl = warm_state(replicas=[[{'device_uuid': 'gpu2', 'endpoint': 'c'},
+                                                {'device_uuid': 'gpu3', 'endpoint': 'd'}]])
+    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is False
+    assert not events  # no IPC send/receive; warm() proceeds to the NCCL path
+
+
+def test_warm_colocated_lora_syncs_base_then_adapter():
+    state, events, nccl = warm_state(merge=False, base_done=True)
+    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is True
+    sends = [row for row in events if row[0] == 'send']
+    assert len(sends) == 2
+    assert sends[0][2]['base_sync_done'] is False
+    assert sends[1][2]['base_sync_done'] is True
+    assert not nccl
+
+
+def test_warm_colocated_full_param_single_transfer():
+    state, events, nccl = warm_state(merge=True, base_done=True)
+    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is True
+    sends = [row for row in events if row[0] == 'send']
+    assert len(sends) == 1
+    assert sends[0][2]['base_sync_done'] is False
+
+
+def test_warm_non_vllm_sub_falls_through():
+    state, events, nccl = warm_state()
+    del state.sampler.direct_weight_sync_metadata
+    assert state._warm_colocated_ipc(state.sampler, 'warm-chan') is False
+    assert not events
