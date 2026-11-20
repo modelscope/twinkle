@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
-import json
+import builtins
 import threading
-from unittest.mock import Mock
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
+import json
 import pytest
 from starlette.requests import Request
 
@@ -12,11 +13,11 @@ from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import create, settle, setup
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager
-from twinkle.server.gateway.use_cases import poll_future
-from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
-from twinkle.server.state import ServerState
-from twinkle.server.model.pool.router import TrainingRouter
 from twinkle.server.config.training import TrainingConfig
+from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
+from twinkle.server.gateway.use_cases import poll_future
+from twinkle.server.model.pool.router import TrainingRouter
+from twinkle.server.state import ServerState
 
 
 def http_request(body, token='owner'):
@@ -203,14 +204,14 @@ async def test_keyed_upload_reconnects_to_original_task(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('rank', [8, 0, 33, True])
 async def test_native_lora_admission_does_not_import_peft(monkeypatch, rank):
-    import builtins
-    from unittest.mock import AsyncMock
-    from twinkle.server.exceptions import RequestRejectedError
     router = TrainingRouter.__new__(TrainingRouter)
     router.model = SimpleNamespace(name='small')
     router.state = ServerState(backend=FakeBackend())
     await router.state.create_session({'session_id': 'session'})
-    router.config = TrainingConfig(models=[{'name': 'small', 'model_id': 'weights', 'backend': 'transformers', 'device_type': 'cuda', 'mode': 'lora', 'config': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}])
+    router.config = TrainingConfig(models=[{
+        'name': 'small', 'model_id': 'weights', 'backend': 'transformers', 'device_type': 'cuda', 'mode': 'lora',
+        'config': {'num_devices': 1, 'device_mesh': {'dp_size': 1}},
+    }])
     async def create(payload):
         await router.state.store_future_status('created', 'pending', None)
         return {'request_id': 'created'}
@@ -232,6 +233,35 @@ async def test_native_lora_admission_does_not_import_peft(monkeypatch, rank):
         with pytest.raises(RequestRejectedError, match='rank'):
             await router.native_request(request, 'add_adapter_to_model')
         router.controller.create.remote.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('rank', [None, 1, 32, 0, 33])
+async def test_tinker_creation_preserves_mode_and_rank_boundary(rank):
+    router = TrainingRouter.__new__(TrainingRouter)
+    router.model = SimpleNamespace(name='small')
+    mode = 'full' if rank is None else 'lora'
+    router.config = TrainingConfig(models=[{
+        'name': 'small', 'model_id': 'weights', 'backend': 'transformers', 'device_type': 'cuda', 'mode': mode,
+        'config': {'num_devices': 1, 'device_mesh': {'dp_size': 1}},
+    }])
+    router.state = ServerState(backend=FakeBackend())
+    await router.state.create_session({'session_id': 'session'})
+    create_remote = AsyncMock(return_value={'request_id': 'created'})
+    router.controller = SimpleNamespace(create=SimpleNamespace(remote=create_remote))
+    request = http_request({
+        'base_model': 'small', 'session_id': 'session', 'model_seq_id': 0,
+        'lora_config': {'rank': rank} if rank is not None else None,
+    })
+
+    if rank in (0, 33):
+        with pytest.raises(RequestRejectedError, match='^LoRA rank exceeds the training specification$'):
+            await router.tinker_request(request, 'create_model')
+        create_remote.assert_not_awaited()
+    else:
+        assert await router.tinker_request(request, 'create_model') == {'request_id': 'created'}
+        create_remote.assert_awaited_once()
+        assert create_remote.call_args.args[0]['mode'] == mode
 
 
 @pytest.mark.asyncio
@@ -272,9 +302,10 @@ async def test_owner_can_retry_release_after_the_first_response_is_lost():
 
 def test_router_schemas_match_model_runtime_routes():
     from fastapi import FastAPI
+
+    from twinkle.server.model.pool.router import NATIVE_REQUESTS, TINKER_REQUESTS
     from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
     from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
-    from twinkle.server.model.pool.router import NATIVE_REQUESTS, TINKER_REQUESTS
 
     app = FastAPI()
     _register_model_tinker_routes(app, lambda: None)

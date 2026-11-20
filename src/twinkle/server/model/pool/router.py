@@ -3,11 +3,9 @@
 
 from __future__ import annotations
 import asyncio
-import hashlib
-import hmac
-import logging
 import uuid
 from types import SimpleNamespace
+from typing import Literal
 
 import json
 import ray
@@ -16,9 +14,8 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from tinker import types as tinker
 
-from twinkle.hub import HubOperation
 from twinkle.protocol.types import model as native
-from twinkle.server.checkpoint import _resolve_client_save_dir, create_checkpoint_manager, validate_user_path
+from twinkle.server.checkpoint import _resolve_client_save_dir, validate_user_path
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.exceptions import ProtocolMismatchError, RequestRejectedError, ResourceNotFoundError
 from twinkle.server.lifecycle.envelope import envelope_from_record
@@ -29,8 +26,7 @@ from twinkle.server.state.training_records import CreateTraining
 from twinkle.server.task_queue import TaskQueueMixin
 from twinkle.server.validation import assert_request_supported
 from .actor import controller_name
-
-logger = logging.getLogger(__name__)
+from .hub_upload import submit_upload
 
 NATIVE_REQUESTS = {
     "forward": native.ForwardRequest,
@@ -126,6 +122,15 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         if not session or await self.state.get_session_last_heartbeat(session) is None:
             raise ResourceNotFoundError("Unknown or expired session")
 
+    def _resolve_training_mode(
+        self, *, lora: bool, rank: int | None, rank_error: str
+    ) -> Literal["full", "lora"]:
+        mode = "lora" if lora else "full"
+        spec = self.config.get(self.model.name, mode)
+        if lora and (type(rank) is not int or not 0 < rank <= spec.config.max_r):
+            raise RequestRejectedError(rank_error)
+        return mode
+
     async def native_request(self, request, endpoint):
         schema = NATIVE_REQUESTS.get(endpoint)
         if schema is None:
@@ -148,17 +153,14 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
                 config = json.loads(body.config) if body.config is not None else None
             except (ValueError, TypeError) as exc:
                 raise RequestRejectedError("Expected a serialized LoRA config") from exc
-            mode = "full" if config is None else "lora"
-            spec = self.config.get(self.model.name, mode)
-            if config is not None:
-                rank = config.get("r") if isinstance(config, dict) else None
-                if (
-                    not isinstance(config, dict)
-                    or config.get("_TWINKLE_TYPE_") != "LoraConfig"
-                    or type(rank) is not int
-                    or not 0 < rank <= spec.config.max_r
-                ):
-                    raise RequestRejectedError("LoRA config/rank is not supported by this training specification")
+            rank = None
+            if isinstance(config, dict) and config.get("_TWINKLE_TYPE_") == "LoraConfig":
+                rank = config.get("r")
+            mode = self._resolve_training_mode(
+                lora=config is not None,
+                rank=rank,
+                rank_error="LoRA config/rank is not supported by this training specification",
+            )
             payload = body.model_dump(mode="json")
             if body.save_dir:
                 try:
@@ -181,66 +183,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             )
             return envelope_from_record(ref["request_id"], await self.state.get_future(ref["request_id"]))
         if endpoint == "upload_to_hub":
-            fingerprint = None
-            if body.client_upload_id is None:
-                request_id = f"req_{uuid.uuid4().hex}"
-            else:
-                # Scope the stable ID to the caller across sessions and replicas.
-                identity = hmac.digest(token.encode(), body.client_upload_id.encode(), "sha256")
-                request_id = f"req_upload_{identity.hex()}"
-                payload = json.dumps([body.checkpoint_dir, body.hub_model_id])
-                fingerprint = hashlib.sha256(payload.encode()).hexdigest()
-
-            async def upload():
-                manager = create_checkpoint_manager(token, client_type="twinkle")
-                folder = manager.resolve_upload_dir(body.checkpoint_dir)
-                loop = asyncio.get_running_loop()
-
-                async def record_progress(progress):
-                    try:
-                        async with asyncio.timeout(5):
-                            await self.state.report_future_progress(request_id, progress)
-                    except Exception:
-                        # Progress is optional. Only the Hub result decides the upload outcome.
-                        logger.warning("Could not record progress for %s", request_id, exc_info=True)
-
-                await record_progress({"stage": "preparing"})
-
-                def report(**progress):
-                    update = record_progress(progress)
-                    try:
-                        write = asyncio.run_coroutine_threadsafe(update, loop)
-                    except RuntimeError:
-                        update.close()
-                        logger.warning("Could not schedule progress for %s", request_id, exc_info=True)
-                        return
-                    try:
-                        write.result(timeout=5)
-                    except Exception:
-                        write.cancel()
-                        logger.warning("Could not finish recording progress for %s", request_id, exc_info=True)
-
-                revision = await self.call_backend(
-                    HubOperation.upload_checkpoint,
-                    repo_id=body.hub_model_id,
-                    folder_path=folder,
-                    token=body.hub_token or token,
-                    report=report,
-                )
-                return native.UploadToHubResponse(
-                    repo_id=HubOperation.remove_source_type(body.hub_model_id), revision=revision)
-
-            record = await self.state.get_future(request_id) if fingerprint is not None else None
-            if record is None:
-                await self.schedule_background_task(
-                    upload, task_type=endpoint, token=token, request_id=request_id, submission_fingerprint=fingerprint)
-                record = await self.state.get_future(request_id)
-            if fingerprint is not None and record is not None:
-                if record.get("owner_token") != token:
-                    raise ResourceNotFoundError("Unknown future")
-                if record.get("submission_fingerprint") != fingerprint:
-                    raise RequestRejectedError("client_upload_id is already bound to a different checkpoint or repository")
-            return envelope_from_record(request_id, record)
+            return await submit_upload(self, token, body)
         if endpoint == "stop_training":
             # Owner-side explicit stop by training id: the webui kills the local driver, so
             # the driver's session dies with it and cannot release the training itself.
@@ -272,10 +215,11 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         if endpoint == "create_model":
             if body.base_model != self.model.name:
                 raise RequestRejectedError("Model does not match the catalog endpoint")
-            mode = "lora" if body.lora_config is not None else "full"
-            spec = self.config.get(self.model.name, mode)
-            if body.lora_config is not None and not 0 < body.lora_config.rank <= spec.config.max_r:
-                raise RequestRejectedError("LoRA rank exceeds the training specification")
+            mode = self._resolve_training_mode(
+                lora=body.lora_config is not None,
+                rank=body.lora_config.rank if body.lora_config is not None else None,
+                rank_error="LoRA rank exceeds the training specification",
+            )
             await self._check_session(body.session_id)
             return await self.controller.create.remote(
                 CreateTraining(
