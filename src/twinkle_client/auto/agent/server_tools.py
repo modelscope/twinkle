@@ -55,10 +55,10 @@ class _ServerTools:
         def _start():
             sampler_list = samplers or []
 
-            # Step 1: Detect hardware & compute GPU partition
-            total_hw_gpus = self._detect_gpu_count()
+            # Step 1: Detect hardware & compute device partition
+            device_type, total_hw_gpus = self._detect_accelerator()
             if total_hw_gpus == 0:
-                return {'status': 'error', 'error': 'No GPUs detected. Cannot start training server.'}
+                return {'status': 'error', 'error': 'No GPUs or NPUs detected. Cannot start training server.'}
 
             alloc = self._compute_gpu_allocation(sampler_list, train_gpus, total_hw_gpus)
             if 'error' in alloc:
@@ -72,10 +72,11 @@ class _ServerTools:
                 port=port,
                 backend=backend,
                 samplers=sampler_list,
+                device_type=device_type,
             )
 
-            # Step 3: Start Ray cluster (multi-node GPU partitioning)
-            ray_err = self._start_ray_cluster(t_gpus, sampler_gpu_total)
+            # Step 3: Start Ray cluster (multi-node device partitioning)
+            ray_err = self._start_ray_cluster(t_gpus, sampler_gpu_total, device_type=device_type)
             if ray_err:
                 return {'status': 'error', 'error': ray_err}
 
@@ -102,9 +103,34 @@ class _ServerTools:
         return result
 
     @staticmethod
-    def _detect_gpu_count() -> int:
-        """Detect total hardware GPU count via nvidia-smi."""
+    def _detect_npu_count_from_smi() -> int:
+        """Detect total Ascend NPU device count via `npu-smi info -l`."""
+        import re
         import subprocess as _sp
+
+        try:
+            r = _sp.run(
+                ['npu-smi', 'info', '-l'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if r.returncode != 0:
+                return 0
+        except (FileNotFoundError, OSError):
+            return 0
+
+        chip_counts = [int(m) for m in re.findall(r'^\s*Chip Count\s*:\s*(\d+)\b', r.stdout, re.MULTILINE)]
+        if chip_counts:
+            return sum(chip_counts)
+        total_match = re.search(r'^\s*Total Count\s*:\s*(\d+)\b', r.stdout, re.MULTILINE)
+        return int(total_match.group(1)) if total_match else 0
+
+    @staticmethod
+    def _detect_accelerator() -> tuple[str, int]:
+        """Detect host accelerator type ('cuda' or 'npu') and device count."""
+        import subprocess as _sp
+
         try:
             r = _sp.run(
                 ['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
@@ -113,10 +139,41 @@ class _ServerTools:
                 timeout=10,
             )
             if r.returncode == 0:
-                return len([ln for ln in r.stdout.strip().split('\n') if ln.strip()])
+                count = len([ln for ln in r.stdout.strip().split('\n') if ln.strip()])
+                if count > 0:
+                    return 'cuda', count
         except (FileNotFoundError, OSError):
             pass
-        return 0
+
+        try:
+            import torch
+
+            if hasattr(torch, 'cuda') and torch.cuda.is_available():
+                count = int(torch.cuda.device_count())
+                if count > 0:
+                    return 'cuda', count
+            try:
+                import torch_npu  # noqa: F401
+            except (ImportError, OSError):
+                pass
+            npu = getattr(torch, 'npu', None)
+            if npu is not None and npu.is_available():
+                count = int(npu.device_count())
+                if count > 0:
+                    return 'npu', count
+        except (ImportError, AttributeError, RuntimeError):
+            pass
+
+        npu_count = _ServerTools._detect_npu_count_from_smi()
+        if npu_count > 0:
+            return 'npu', npu_count
+
+        return 'cuda', 0
+
+    @staticmethod
+    def _detect_gpu_count() -> int:
+        """Detect total hardware accelerator count (CUDA GPUs or Ascend NPUs)."""
+        return _ServerTools._detect_accelerator()[1]
 
     @staticmethod
     def _compute_gpu_allocation(
@@ -146,12 +203,12 @@ class _ServerTools:
         return {'train_gpus': t_gpus, 'sampler_gpus': sampler_gpu_total}
 
     @staticmethod
-    def _start_ray_cluster(train_gpus: int, sampler_gpus: int) -> str | None:
-        """Start Ray multi-node cluster with GPU partitioning.
+    def _start_ray_cluster(train_gpus: int, sampler_gpus: int, device_type: str = 'cuda') -> str | None:
+        """Start Ray multi-node cluster with accelerator partitioning.
 
-        Each role gets its own Ray node with dedicated CUDA_VISIBLE_DEVICES
-        so GPUs are indexed from 0 within each node. This prevents the
-        GPU ID mapping issues that occur with a single-node setup.
+        Each role gets its own Ray node with dedicated visible-device env vars
+        so devices are indexed from 0 within each node. This prevents the
+        device ID mapping issues that occur with a single-node setup.
 
         On a single machine, multiple raylets need separate --temp-dir to
         avoid being detected as "already running".
@@ -161,6 +218,8 @@ class _ServerTools:
         import subprocess as _sp
         import tempfile
         from pathlib import Path
+
+        dev_type = (device_type or 'cuda').lower()
 
         _sp.run(['ray', 'stop', '--force'], capture_output=True, timeout=15)
 
@@ -176,14 +235,20 @@ class _ServerTools:
             node_name: str = 'worker',
         ) -> str | None:
             env = os.environ.copy()
-            env['CUDA_VISIBLE_DEVICES'] = devices
             temp_dir = str(ray_base / node_name)
             cmd = ['ray', 'start', f'--temp-dir={temp_dir}']
             if head:
                 cmd += ['--head', '--port=6379', '--disable-usage-stats', '--include-dashboard=false']
             else:
                 cmd += ['--address=127.0.0.1:6379']
-            cmd.append(f'--num-gpus={num_gpus}')
+            if dev_type == 'npu':
+                env['ASCEND_RT_VISIBLE_DEVICES'] = devices
+                if num_gpus > 0:
+                    res_spec = json.dumps({'NPU': num_gpus})
+                    cmd.append(f'--resources={res_spec}')
+            else:
+                env['CUDA_VISIBLE_DEVICES'] = devices
+                cmd.append(f'--num-gpus={num_gpus}')
             r = _sp.run(cmd, capture_output=True, text=True, timeout=30, env=env)
             if r.returncode != 0 and 'already' not in r.stderr.lower():
                 return r.stderr.strip()
@@ -354,6 +419,7 @@ class _ServerTools:
         port: int = 8000,
         backend: str = 'transformers',
         samplers: list[dict] | None = None,
+        device_type: str = 'cuda',
     ) -> str:
         """Generate a server_config.yaml from template and return its path.
 
@@ -366,6 +432,9 @@ class _ServerTools:
         from pathlib import Path
 
         sampler_list = samplers or []
+        dev_type = (device_type or 'cuda').lower()
+        if dev_type not in ('cuda', 'npu', 'mps'):
+            raise ValueError(f'Unsupported device_type: {device_type!r}')
         if backend not in ('transformers', 'megatron'):
             raise ValueError(f'Unsupported training backend: {backend!r}')
         if backend == 'megatron' and train_gpus < 2:
@@ -438,10 +507,10 @@ class _ServerTools:
                     'device_group': {
                         'name': 'model',
                         'ranks': train_gpus,
-                        'device_type': 'cuda',
+                        'device_type': dev_type,
                     },
                     'device_mesh': {
-                        'device_type': 'cuda',
+                        'device_type': dev_type,
                         'dp_size': train_gpus,
                     },
                     'queue_config': {
@@ -516,7 +585,7 @@ class _ServerTools:
             # Build device_mesh: include tp_size when tp>1 so that
             # world_size = tp*dp and slice_dp dispatch computes correct
             # rank_stride for DP data sharding.
-            mesh_config: dict = {'device_type': 'cuda', 'dp_size': s_dp}
+            mesh_config: dict = {'device_type': dev_type, 'dp_size': s_dp}
             if s_tp > 1:
                 mesh_config['tp_size'] = s_tp
 
@@ -534,7 +603,7 @@ class _ServerTools:
                     'device_group': {
                         'name': s_name,
                         'ranks': s_total_gpus,
-                        'device_type': 'cuda',
+                        'device_type': dev_type,
                         'gpus_per_worker': s_tp,
                     },
                     'device_mesh': mesh_config,

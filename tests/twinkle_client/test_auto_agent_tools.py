@@ -127,3 +127,195 @@ def test_unsupported_training_backend_is_not_written(tmp_path, monkeypatch, back
     with pytest.raises(ValueError, match='Unsupported training backend'):
         ToolExecutor._generate_server_config('Qwen/student', train_gpus=1, backend=backend)
     assert not (tmp_path / '.cache' / 'twinkle' / 'server_config.yaml').exists()
+
+
+def test_detect_accelerator_cuda_via_nvidia_smi(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        subprocess,
+        'run',
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout='0\n1\n2\n3\n', stderr=''),
+    )
+    assert ToolExecutor._detect_accelerator() == ('cuda', 4)
+    assert ToolExecutor._detect_gpu_count() == 4
+
+
+def test_detect_accelerator_npu_via_torch(monkeypatch):
+    import subprocess
+    import torch
+    from types import SimpleNamespace
+
+    def _no_nvidia(cmd, *args, **kwargs):
+        raise FileNotFoundError(cmd[0])
+
+    monkeypatch.setattr(subprocess, 'run', _no_nvidia)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(
+        torch,
+        'npu',
+        SimpleNamespace(is_available=lambda: True, device_count=lambda: 8),
+        raising=False,
+    )
+    assert ToolExecutor._detect_accelerator() == ('npu', 8)
+    assert ToolExecutor._detect_gpu_count() == 8
+
+
+def test_detect_accelerator_npu_via_npu_smi_fallback(monkeypatch):
+    import subprocess
+    import torch
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(torch, 'npu', None, raising=False)
+
+    single_chip_out = (
+        '\tTotal Count                    : 8\n\n'
+        + '\n'.join(f'\tNPU ID                         : {i}\n\tChip Count                     : 1\n' for i in range(8))
+    )
+    dual_chip_out = (
+        '\tTotal Count                    : 4\n\n'
+        + '\n'.join(f'\tNPU ID                         : {i}\n\tChip Count                     : 2\n' for i in range(4))
+    )
+
+    for smi_stdout in (single_chip_out, dual_chip_out):
+        def _run(cmd, *args, _out=smi_stdout, **kwargs):
+            if cmd[0] == 'nvidia-smi':
+                raise FileNotFoundError('nvidia-smi')
+            if cmd[:3] == ['npu-smi', 'info', '-l']:
+                return SimpleNamespace(returncode=0, stdout=_out, stderr='')
+            raise AssertionError(f'Unexpected command: {cmd}')
+
+        monkeypatch.setattr(subprocess, 'run', _run)
+        assert ToolExecutor._detect_accelerator() == ('npu', 8)
+        assert ToolExecutor._detect_gpu_count() == 8
+
+    def _missing_all(cmd, *args, **kwargs):
+        raise FileNotFoundError(cmd[0])
+
+    monkeypatch.setattr(subprocess, 'run', _missing_all)
+    assert ToolExecutor._detect_accelerator() == ('cuda', 0)
+    assert ToolExecutor._detect_gpu_count() == 0
+
+
+@pytest.mark.parametrize('backend', ['transformers', 'megatron'])
+@pytest.mark.parametrize('samplers', [[], [{'model_id': 'Qwen/teacher', 'engine': 'vllm', 'tp': 2, 'dp': 2}]])
+def test_generated_server_config_supports_npu_device_type(tmp_path, monkeypatch, backend, samplers):
+    from pathlib import Path
+    from twinkle.server.config import ServerConfig
+
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    path = ToolExecutor._generate_server_config(
+        'Qwen/student',
+        train_gpus=2,
+        backend=backend,
+        samplers=samplers,
+        device_type='npu',
+    )
+    config = ServerConfig.from_yaml(path)
+    model_app = next(app for app in config.applications if app.import_path == 'model')
+    assert model_app.args.device_group['device_type'] == 'npu'
+    assert model_app.args.device_mesh['device_type'] == 'npu'
+    assert config.training_config.models[0].device_type == 'npu'
+    proc_app = next(app for app in config.applications if app.import_path == 'processor')
+    assert proc_app.args.device_group['device_type'] == 'CPU'
+    if samplers:
+        sampler_app = next(app for app in config.applications if app.import_path == 'sampler')
+        assert sampler_app.args.device_group['device_type'] == 'npu'
+        assert sampler_app.args.device_mesh['device_type'] == 'npu'
+
+
+def test_start_ray_cluster_npu_and_cuda_args(monkeypatch, tmp_path):
+    import subprocess
+    import tempfile
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(tmp_path))
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
+    monkeypatch.delenv('ASCEND_RT_VISIBLE_DEVICES', raising=False)
+
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append((list(cmd), kwargs.get('env')))
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr(subprocess, 'run', _fake_run)
+
+    assert ToolExecutor._start_ray_cluster(2, 2, device_type='npu') is None
+    npu_starts = [(cmd, env) for cmd, env in calls if cmd[:2] == ['ray', 'start']]
+    assert len(npu_starts) == 3
+
+    head_cmd, head_env = npu_starts[0]
+    assert '--head' in head_cmd
+    assert not any(arg.startswith('--num-gpus') for arg in head_cmd)
+    head_res = [arg.split('=', 1)[1] for arg in head_cmd if arg.startswith('--resources=')]
+    assert len(head_res) == 1 and json.loads(head_res[0]) == {'NPU': 2}
+    assert head_env is not None and head_env['ASCEND_RT_VISIBLE_DEVICES'] == '0,1'
+    assert 'CUDA_VISIBLE_DEVICES' not in head_env
+
+    worker_cmd, worker_env = npu_starts[1]
+    assert not any(arg.startswith('--num-gpus') for arg in worker_cmd)
+    worker_res = [arg.split('=', 1)[1] for arg in worker_cmd if arg.startswith('--resources=')]
+    assert len(worker_res) == 1 and json.loads(worker_res[0]) == {'NPU': 2}
+    assert worker_env is not None and worker_env['ASCEND_RT_VISIBLE_DEVICES'] == '2,3'
+
+    cpu_cmd, cpu_env = npu_starts[2]
+    assert not any(arg.startswith('--num-gpus') for arg in cpu_cmd)
+    assert not any(arg.startswith('--resources=') for arg in cpu_cmd)
+    assert cpu_env is not None and cpu_env['ASCEND_RT_VISIBLE_DEVICES'] == ''
+
+    calls.clear()
+    assert ToolExecutor._start_ray_cluster(2, 2, device_type='cuda') is None
+    cuda_starts = [(cmd, env) for cmd, env in calls if cmd[:2] == ['ray', 'start']]
+    assert len(cuda_starts) == 3
+    assert '--num-gpus=2' in cuda_starts[0][0]
+    assert cuda_starts[0][1] is not None and cuda_starts[0][1]['CUDA_VISIBLE_DEVICES'] == '0,1'
+    assert '--num-gpus=2' in cuda_starts[1][0]
+    assert cuda_starts[1][1] is not None and cuda_starts[1][1]['CUDA_VISIBLE_DEVICES'] == '2,3'
+    assert '--num-gpus=0' in cuda_starts[2][0]
+    assert cuda_starts[2][1] is not None and cuda_starts[2][1]['CUDA_VISIBLE_DEVICES'] == ''
+
+
+@pytest.mark.asyncio
+async def test_start_server_wires_detected_npu_end_to_end(monkeypatch):
+    executor = ToolExecutor(_Connection())
+    captured: dict[str, object] = {}
+
+    async def _not_running(url):
+        return False
+
+    def _fake_config(model_id, train_gpus, port=8000, backend='transformers', samplers=None, device_type='cuda'):
+        captured['config_device_type'] = device_type
+        captured['config_train_gpus'] = train_gpus
+        return '/tmp/fake_server_config.yaml'
+
+    def _fake_ray(train_gpus, sampler_gpus, device_type='cuda'):
+        captured['ray_device_type'] = device_type
+        captured['ray_train_gpus'] = train_gpus
+        return None
+
+    monkeypatch.setattr(executor, '_check_server_health', _not_running)
+    monkeypatch.setattr(ToolExecutor, '_detect_accelerator', staticmethod(lambda: ('npu', 4)))
+    monkeypatch.setattr(ToolExecutor, '_generate_server_config', staticmethod(_fake_config))
+    monkeypatch.setattr(ToolExecutor, '_start_ray_cluster', staticmethod(_fake_ray))
+    monkeypatch.setattr(
+        ToolExecutor,
+        '_launch_server_process',
+        staticmethod(lambda config_path: (object(), '/tmp/fake_server.log', None)),
+    )
+    monkeypatch.setattr(
+        ToolExecutor,
+        '_wait_server_ready',
+        staticmethod(lambda **kwargs: {'status': 'started', 'server_url': kwargs['server_url']}),
+    )
+
+    result = await executor._tool_start_server('Qwen/Qwen2.5-0.5B', train_gpus=2)
+    assert result['status'] == 'started'
+    assert captured == {
+        'config_device_type': 'npu',
+        'config_train_gpus': 2,
+        'ray_device_type': 'npu',
+        'ray_train_gpus': 2,
+    }
