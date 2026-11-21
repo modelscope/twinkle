@@ -634,8 +634,13 @@ class RayHelper:
                 _torch_setup.EXTRA_TORCH_KWARGS_ENV: _torch_setup.to_env_value(extra_torch_kwargs),
             })
             if device_type_upper != 'CPU':
+                gpu_ranks = placement['gpu_rank']
+                if device_type_upper == 'NPU':
+                    # Ascend requires ascending visible IDs. Normalize each worker's assigned devices
+                    # here for both initial and dynamically added workers, preserving allocation metadata.
+                    gpu_ranks = sorted(gpu_ranks, key=int)
                 env_vars[Platform.get_platform(device_type_upper).visible_device_env()] = ','.join(
-                    str(r) for r in placement['gpu_rank'])
+                    str(r) for r in gpu_ranks)
                 env_vars['MASTER_ADDR'] = ip
                 env_vars['MASTER_PORT'] = str(port)
                 # Prevent Ray from overriding CUDA_VISIBLE_DEVICES set in runtime_env
