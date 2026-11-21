@@ -48,8 +48,11 @@ class HTTPSampler:
 
     def _sample_one(self, item: Any, sampling_params: Any, adapter_uri: Optional[str]) -> SampleResponse:
         media = getattr(item, 'media', None)
+        wire_media = _wire_media(media) if media else {}
         if media:
-            entry = {'input_ids': list(item.engine_input_ids), **_wire_media(media)}
+            entry = {'input_ids': list(item.engine_input_ids), **wire_media}
+            if processor_kwargs := getattr(item, 'mm_processor_kwargs', None):
+                entry['mm_processor_kwargs'] = processor_kwargs
         else:
             entry = dict(getattr(item, 'feature', item))
         responses = self.sampler.sample(
@@ -57,14 +60,26 @@ class HTTPSampler:
         if len(responses) != 1:
             raise RuntimeError(f'the server returned {len(responses)} responses for one prompt.')
         response = responses[0]
+        if media:
+            echoed = getattr(response, 'prompt_token_ids_echoed', False)
+            expected = entry['input_ids'] if echoed else list(item.feature['input_ids'])
+            if response.prompt_token_ids != expected:
+                prefix = 'request' if echoed else 'expanded training prompt'
+                raise ValueError(f'Remote sampler prompt_token_ids do not match the {prefix}. '
+                                 'Check that the training and sampler media processors use the same settings.')
         sequences = []
         for seq in response.sequences:
             tokens = list(seq.tokens)
             if media:
                 completion = self.template.append_completion(item, tokens)
+                feature = dict(completion.state.feature)
+                for key, refs in wire_media.items():
+                    if _is_raw_media(feature.get(key)):
+                        feature[key] = refs
                 sequences.append(SampledSequence(
                     stop_reason=seq.stop_reason, tokens=tokens, logprobs=seq.logprobs,
-                    decoded=self.template.decode(tokens), new_input_feature=dict(completion.state.feature),
+                    decoded=self.template.decode(tokens),
+                    new_input_feature=feature,
                     new_state=completion.state))
             else:
                 sequences.append(SampledSequence(
@@ -109,6 +124,15 @@ def _wire_media(media: Any) -> Dict[str, List[str]]:
         if values:
             out[key] = [_media_ref(value) for value in values]
     return out
+
+
+def _is_raw_media(value: Any) -> bool:
+    entries = value if isinstance(value, (list, tuple)) else [value]
+    return bool(entries) and all(
+        isinstance(entry, (str, bytes, bytearray))
+        or (isinstance(entry, dict) and ('bytes' in entry or 'path' in entry))
+        or callable(getattr(entry, 'save', None))
+        for entry in entries)
 
 
 def _media_ref(value: Any) -> str:

@@ -121,7 +121,7 @@ def _build_rollout_rows_and_tags(
     return rows, tags
 
 
-def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
+def _to_sample_response_models(responses, *, prompt_token_ids_echoed: bool = False) -> list[types.SampleResponseModel]:
     """Convert internal sampler responses to the HTTP response schema."""
     sample_models = []
     for response in responses:
@@ -138,11 +138,8 @@ def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
         sample_models.append(
             types.SampleResponseModel(
                 sequences=sequences,
-                # The prompt's own ids, which is what makes a reply served over
-                # HTTP trainable: paired with a sequence's tokens they are the
-                # exact ids the model ran on, so a caller never has to re-encode
-                # the text and hope the tokenizer agrees with itself.
                 prompt_token_ids=(list(response.prompt_token_ids) if response.prompt_token_ids is not None else None),
+                prompt_token_ids_echoed=prompt_token_ids_echoed,
                 prompt_logprobs=response.prompt_logprobs,
                 topk_prompt_logprobs=response.topk_prompt_logprobs,
             ))
@@ -271,7 +268,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 )
 
             responses = await sample_with_weights(self, resolved_uri, generate)
-            return types.SampleResponseModelList(samples=_to_sample_response_models(responses)).model_dump()
+            samples = _to_sample_response_models(
+                responses, prompt_token_ids_echoed=getattr(self, 'sampler_type', None) in ('sglang', 'sglang_async'))
+            return types.SampleResponseModelList(samples=samples).model_dump()
 
         # Calculate metrics for queue scheduling. The body is wire-validated, so the
         # entries are models and ``input_ids`` is absent or a list of ints.
