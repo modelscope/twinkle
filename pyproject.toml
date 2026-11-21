@@ -28,6 +28,8 @@ twinkle-auto = "twinkle_client.auto:main"
 eval = ["evalscope>=1.11,<1.12"]
 megatron = ["megatron-core>=0.12.0", "transformer-engine[pytorch]", "mcore_bridge>=1.5.2"]
 data = ["py-data-juicer"]
+oss = ["ossfs>=1.9"]
+s3 = ["s3fs>=2024.10"]
 rl = [
   "vllm>=0.11",
   "ray[serve]>=2.55"

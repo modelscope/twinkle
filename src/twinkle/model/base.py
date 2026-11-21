@@ -26,14 +26,53 @@ if TYPE_CHECKING:
     from transformers import PreTrainedModel, PretrainedConfig
 
 
+from twinkle.utils.storage import LocalDiskStorage, Storage, WriteLease
+
+
 def copy_checkpoint_args(output_dir: str, checkpoint_dir: str) -> None:
-    """Copy the run-level CLI metadata into a completed checkpoint on the master rank."""
+    """Copy the run-level CLI metadata into a completed local checkpoint (master rank).
+
+    The local-only form the server-side model classes use: their checkpoints always live
+    on the server's local disk, so they never take a write lease (see
+    :func:`stage_checkpoint_args` for the lease-based form a training run's save uses).
+    """
     if not Platform.is_master():
         return
-    source = os.path.join(output_dir, 'args.json')
-    target = os.path.join(checkpoint_dir, 'args.json')
-    if os.path.isfile(source) and os.path.realpath(source) != os.path.realpath(target):
-        shutil.copy2(source, target)
+    LocalDiskStorage().copy_into_local(
+        os.path.join(output_dir, 'args.json'), os.path.join(checkpoint_dir, 'args.json'))
+
+
+def stage_checkpoint_args(output_dir: str, lease: WriteLease) -> None:
+    """Stage the run-level CLI metadata into the checkpoint's write lease on the master rank.
+
+    The lease carries the write: the real checkpoint dir for a local destination,
+    the staging copy a remote flush uploads together with the rest of the save.
+    """
+    if not Platform.is_master():
+        return
+    lease.storage.copy_into_local(os.path.join(output_dir, 'args.json'), os.path.join(lease.path, 'args.json'))
+
+
+#: A checkpoint is resumable when any of these lands (full save: trainer_state.json;
+#: weights-only: the HF-format config an adapter/full save always writes; megatron
+#: resume: the iteration tracker). Remote rotation counts only these and cleans
+#: the marker-less partials a crashed upload leaves behind.
+_ROTATION_MARKERS = (
+    'trainer_state.json',
+    'adapter_config.json',
+    'config.json',
+    'latest_checkpointed_iteration.txt',
+)
+
+
+def _rotation_order(name: str) -> float:
+    """Numeric fallback ordering for media whose directory listings carry no mtime.
+
+    Object stores have no directory objects: a prefix lists with mtime 0, so the
+    checkpoint name's step number orders retention there instead (``checkpoint-final``
+    highest, mirroring the local convention that the final save is the last one)."""
+    match = re.fullmatch(r'checkpoint-(\d+)', name)
+    return int(match.group(1)) if match else float('inf')
 
 
 def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_limit: Optional[int]) -> None:
@@ -42,18 +81,28 @@ def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_
         return
     if save_total_limit < 1:
         raise ValueError('save_total_limit must be >= 1.')
-    if not Platform.is_master() or not os.path.isdir(output_dir):
+    if not Platform.is_master():
         return
-    current = os.path.realpath(current_checkpoint_dir)
+    storage = Storage.from_url(output_dir)
+    if not storage.is_dir(output_dir):
+        return
     checkpoints = []
-    for entry in os.scandir(output_dir):
-        if not entry.is_dir(follow_symlinks=False) or re.fullmatch(r'checkpoint-(?:\d+|final)', entry.name) is None:
+    for entry in storage.iterdir(output_dir):
+        if not entry.is_dir or re.fullmatch(r'checkpoint-(?:\d+|final)', entry.name) is None:
             continue
-        path = os.path.realpath(entry.path)
-        checkpoints.append((path == current, entry.stat(follow_symlinks=False).st_mtime_ns, entry.name, path))
+        if storage.remote:
+            # Only a marker-complete directory counts remotely: a marker-less partial
+            # is a crashed upload, cleaned here instead of occupying a retention slot.
+            if not any(storage.exists(f'{entry.path}/{marker}') for marker in _ROTATION_MARKERS):
+                if not storage.same_dir(entry.path, current_checkpoint_dir):
+                    storage.delete_tree(entry.path)
+                continue
+        checkpoints.append(
+            (storage.same_dir(entry.path, current_checkpoint_dir),
+             entry.mtime_ns or _rotation_order(entry.name), entry.name, entry.path))
     checkpoints.sort()
     for _, _, _, checkpoint_path in checkpoints[:-save_total_limit]:
-        shutil.rmtree(checkpoint_path)
+        storage.delete_tree(checkpoint_path)
 
 
 # Trajectory fields ``TrainableModel._rollout_features`` lifts into loss kwargs on training calls.
@@ -208,6 +257,11 @@ class TrainableModel(ABC):
     _checkpoint_engine = None
     _async_write_executor: Optional[ThreadPoolExecutor] = None
     _async_write_future: Optional[Future] = None
+    #: write leases whose save returned but whose seal (rotation locally; barrier,
+    #: markers, cleanup, rotation remotely) still waits on every rank's write
+    #: landing -- run at the next join, which every participating rank enters;
+    #: None until an async save runs
+    _pending_write_leases: Optional[list] = None
 
     # -- async checkpoint persistence (staging/write separation) --------------------
     #
@@ -244,10 +298,28 @@ class TrainableModel(ABC):
         return self._async_write_executor
 
     def _join_async_save(self) -> None:
+        # The deferred seal of async saves: the barrier (and marker upload
+        # behind it) can only run here, on the main thread -- never in the tail.
+        leases, self._pending_write_leases = self._pending_write_leases, None
         future = self._async_write_future
         if future is not None:
             self._async_write_future = None
-            future.result()
+            try:
+                future.result()
+            except BaseException:
+                # A failed write must never be sealed: its markers would vouch for files
+                # that never landed. Drop the staged/partial copies, then re-raise.
+                for lease in leases or ():
+                    lease.abort()
+                raise
+        for lease in leases or ():
+            lease.seal()
+
+    def _defer_lease_seal(self, lease: WriteLease) -> None:
+        """Queue an async save's lease for the next join's seal."""
+        if self._pending_write_leases is None:
+            self._pending_write_leases = []
+        self._pending_write_leases.append(lease)
 
     def shutdown_async_saves(self) -> None:
         """Join any in-flight write and retire the writer thread (idempotent)."""

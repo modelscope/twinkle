@@ -27,7 +27,7 @@ class CheckpointWriterRankTest(unittest.TestCase):
                     wrapper._save_task_head_checkpoint = Mock()
                     wrapper.submit_async_write = Mock()
                     with patch(f'{module}.Platform.is_master', return_value=rank == 0), \
-                            patch(f'{module}.copy_checkpoint_args'), patch(f'{module}.rotate_checkpoints'):
+                            patch(f'{module}.stage_checkpoint_args'), patch(f'{module}.rotate_checkpoints'):
                         result = inspect.unwrap(TransformersModel.save)(
                             wrapper, name='checkpoint-final', output_dir='/unused',
                             save_optimizer=True, async_save=async_save)

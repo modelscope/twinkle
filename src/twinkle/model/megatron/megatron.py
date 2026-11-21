@@ -32,7 +32,8 @@ from twinkle.infra import remote_function
 from twinkle.utils import seed_from_env
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
-from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.base import (ModelLoaderProtocol, TrainableModel, rotate_checkpoints,
+                                 stage_checkpoint_args)
 from twinkle.model.micro_batch import (MicroBatchConfig, agree_micro_batch_count,
                                        plan_micro_batches_contiguous, sequence_length)
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
@@ -44,6 +45,7 @@ from twinkle.processor.tasks import get_task_spec
 from twinkle.template import Template
 from twinkle.template.utils import construct_template
 from twinkle.utils import construct_class, get_logger, pad_and_stack_tensors, selective_log_softmax
+from twinkle.utils.storage import Storage, is_remote_url, to_local
 from .moe.router_replay import RouterReplay
 from .mtp.mtp import MtpTrainingState
 from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
@@ -1692,6 +1694,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         if output_dir is None:
             output_dir = 'output'
         checkpoint_dir = os.path.join(output_dir, name)
+        # A local destination leases checkpoint_dir itself (the existing I/O runs in
+        # place); a remote one stages locally and flushes into the object store.
+        lease = Storage.from_url(checkpoint_dir).write_lease(
+            checkpoint_dir,
+            markers=('trainer_state.json', 'latest_checkpointed_iteration.txt') if save_optimizer else ())
+        lease.rotate = lambda: rotate_checkpoints(output_dir, lease.target, save_total_limit)
+        checkpoint_dir = lease.path
 
         is_lora = (optimizer_config.adapter_name != _default_adapter_name)
 
@@ -1736,26 +1745,34 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         # frozen trigger-time step, not the live cur_step which training advances before
                         # this deferred finalize runs (async staging race wrote a later iteration).
                         f.write(str(trainer_state['cur_step']))
-                    copy_checkpoint_args(output_dir, checkpoint_dir)
+                    stage_checkpoint_args(output_dir, lease)
+                # Every rank uploads its own staging here (pure file I/O, safe on this
+                # mcore thread); the barrier + marker upload wait for the join's seal.
+                lease.flush_files()
 
             async_request.finalize_fns.append(_finalize_async_checkpoint)
             self._mcore_async_calls_queue().schedule_async_request(async_request)
+            # The lease is sealed (barrier + markers + rotation) at the next wait_async_saves,
+            # AFTER the mcore queue joined -- the finalize above is what stages the markers.
+            self._defer_lease_seal(lease)
             # Join any earlier write that has since completed (mirrors v4's per-step finalize probe).
             self._maybe_finalize_mcore_async_saves()
-            return checkpoint_dir
+            return lease.target
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0 and save_optimizer:
             with open(state_path, 'w') as f:
                 json.dump(trainer_state, f, indent=2)
 
-        # Copy the run metadata and rotate only after every checkpoint component has completed. Rank 0
-        # removes old directories; the final barrier keeps workers from continuing while rotation is in flight.
-        copy_checkpoint_args(output_dir, checkpoint_dir)
-        rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
+        # Copy the run metadata and rotate only after every checkpoint component has completed:
+        # commit flushes this rank's files, and the seal inside it orders the barrier and
+        # the marker upload before the rotation. The final barrier keeps workers from
+        # continuing while rotation is in flight.
+        stage_checkpoint_args(output_dir, lease)
+        lease.commit()  # this rank's files, then barrier + markers + rotation (local: rotation only)
         if dist.is_initialized():
             dist.barrier()
 
-        return checkpoint_dir
+        return lease.target
 
     @remote_function(dispatch='all')
     @timed
@@ -1774,6 +1791,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         resume = kwargs.pop('load_optimizer', False)
         if output_dir is not None:
             checkpoint_dir = os.path.join(output_dir, name)
+        elif is_remote_url(name):
+            # An object-store checkpoint: materialize into the local cache before the
+            # local probes below would misread the URL as a missing path / hub id.
+            checkpoint_dir = to_local(name)
         elif os.path.exists(name):
             checkpoint_dir = name
         elif not resume:
@@ -1782,6 +1803,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             checkpoint_dir = HubOperation.download_model(name, token=token)
         else:
             checkpoint_dir = os.path.join('output', name)
+        checkpoint_dir = to_local(checkpoint_dir)
 
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 
@@ -1848,7 +1870,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 'component_states': {},
             }
 
-        trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
+        trainer_state_path = os.path.join(to_local(checkpoint_dir, require=('trainer_state.json',)),
+                                          'trainer_state.json')
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
         result = {
@@ -1954,8 +1977,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def wait_async_saves(self) -> None:
         """Join every in-flight save on both async channels (thread-pool tail + mcore queue)."""
-        super().wait_async_saves()
+        # The mcore queue joins FIRST: its finalize stages the remote lease's completion
+        # markers, which the base join's seal then uploads after every rank landed.
         self._maybe_finalize_mcore_async_saves(blocking=True)
+        super().wait_async_saves()
 
     def _save_mcore_optimizer(
         self,

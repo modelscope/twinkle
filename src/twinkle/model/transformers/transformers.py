@@ -35,7 +35,8 @@ from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, Sampl
 from twinkle.hub import HubOperation
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
-from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.base import (ModelLoaderProtocol, TrainableModel, rotate_checkpoints,
+                                 stage_checkpoint_args)
 from twinkle.model.state_dict_utils import normalize_adapter_keys
 from twinkle.model.micro_batch import (
     MicroBatchConfig,
@@ -60,6 +61,7 @@ from twinkle.utils import (construct_class, get_logger, prepare_replayed_selecti
                            replayed_selective_log_softmax, selective_log_softmax, torch_util)
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+from twinkle.utils.storage import Storage, is_remote_url, to_local, write_dir
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
@@ -2526,8 +2528,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         init_lora_weights = config.init_lora_weights
         config.init_lora_weights = True
         try:
-            os.makedirs(initial_dir, exist_ok=True)
-            model.save_pretrained(initial_dir)
+            with write_dir(initial_dir) as local:
+                model.save_pretrained(local)
         finally:
             config.init_lora_weights = init_lora_weights
         return True
@@ -2550,9 +2552,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # The conversion loads the initial snapshot through peft's inject_adapter, which freezes the
         # active adapter as a side effect; save + restore the requires_grad flags around it.
         requires_grad_state = {name: p.requires_grad for name, p in model.named_parameters()}
-        os.makedirs(os.path.dirname(converted_dir), exist_ok=True)
-        model.save_pretrained(
-            converted_dir, path_initial_model_for_weight_conversion=os.path.abspath(initial_model_dir))
+        with write_dir(converted_dir) as local:
+            model.save_pretrained(
+                local, path_initial_model_for_weight_conversion=os.path.abspath(to_local(initial_model_dir)))
         # peft replaces the adapter's config entry during conversion; restore the live one.
         model.peft_config[adapter_name] = saved_config
         for name, p in model.named_parameters():
@@ -2593,6 +2595,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return
         if kwargs.get('save_optimizer', False):
             self._validate_training_state_save(adapter_name)
+        # A local destination leases checkpoint_dir itself (the existing I/O runs in
+        # place); a remote one stages locally and flushes into the object store.
+        lease = Storage.from_url(checkpoint_dir).write_lease(
+            checkpoint_dir, markers=('trainer_state.json',) if kwargs.get('save_optimizer', False) else ())
+        lease.rotate = lambda: rotate_checkpoints(output_dir, lease.target, save_total_limit)
+        checkpoint_dir = lease.path
         if isinstance(self.strategy, NativeFSDPStrategy) and self.strategy.use_rank0_pretrained_broadcast():
             # Initial adapter snapshots precede the first forward. Materialize on every
             # rank before state-dict collectives: non-source ranks still hold meta tensors.
@@ -2651,19 +2659,23 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 _write_weights()
                 self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
                 self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
-                copy_checkpoint_args(output_dir, checkpoint_dir)
+                stage_checkpoint_args(output_dir, lease)
                 for write in deferred:
                     write()
-                rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
+                # Files only: the tail runs on the background writer and must not touch
+                # the training collectives, so the marker upload (and its barrier) waits
+                # for the join at the next wait_async_saves.
+                lease.flush_files()
 
             self.submit_async_write(_write_tail)
+            self._defer_lease_seal(lease)
         else:
             _write_weights()
             self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
             self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
-            copy_checkpoint_args(output_dir, checkpoint_dir)
-            rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
-        return checkpoint_dir
+            stage_checkpoint_args(output_dir, lease)
+            lease.commit()  # this rank's files, then barrier + markers + rotation (local: rotation only)
+        return lease.target
 
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
         """Return PEFT-normalized adapter state dict for saving."""
@@ -2794,14 +2806,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 
         if output_dir is None:
-            if os.path.exists(name):
+            if is_remote_url(name):
+                checkpoint_dir = to_local(name)
+            elif os.path.exists(name):
                 checkpoint_dir = name
             else:
                 # load from hub
                 token = kwargs.pop('token', None)
                 checkpoint_dir = HubOperation.download_model(name, token=token)
         else:
-            checkpoint_dir = os.path.join(output_dir, name)
+            checkpoint_dir = to_local(os.path.join(output_dir, name))
         model = self.strategy.unwrap_model(self.model)
         if isinstance(model, PeftModel):
             adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
@@ -2957,6 +2971,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 device_module.set_rng_state(device_rng_state)
 
     def _restore_training_state(self, checkpoint_dir, *, adapter_name=''):
+        checkpoint_dir = to_local(checkpoint_dir, require=('trainer_state.json',))
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)

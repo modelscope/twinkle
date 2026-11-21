@@ -16,10 +16,15 @@ _T = TypeVar('_T')
 
 def load_mm_file(path: Union[str, bytes, _T]) -> Union[BytesIO, _T]:
     from .safe_media import checked_media_path, safe_http_get
+    from .storage import is_remote_url, to_local
 
     res = path
     if isinstance(path, str):
         path = path.strip()
+        if is_remote_url(path):
+            # An object-store media file: materialize into the persistent cache, then
+            # read it like any local file below (checked_media_path stays in force).
+            path = to_local(path)
         if path.startswith('http'):
             retries = Retry(total=3, backoff_factor=1, allowed_methods=['GET'])
             with requests.Session() as session:
