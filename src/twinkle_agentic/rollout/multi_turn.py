@@ -7,6 +7,7 @@ episode opens it (its env session, its tools, its agent); the step that ends it 
 merged, trainable trajectory and releases everything. A caller that drives many episodes (the
 streaming driver) interleaves their steps; a caller that wants whole episodes uses ``__call__``.
 """
+import hashlib
 import json
 import queue
 import re
@@ -24,7 +25,9 @@ from twinkle.infra import remote_class, remote_function
 from twinkle.protocol.types.sampler import SampleResponseModel
 from twinkle.template.base import Template
 from twinkle.utils import get_logger
+from twinkle_agentic.async_rl.rollout_resume import ResumeStore, UnsafeResume
 from twinkle_agentic.envs.base import NoSlot
+from twinkle_agentic.envs.resume import EnvResumeCapability, env_resume_capability
 from twinkle_agentic.envs.env_tool import EnvTool
 from twinkle_agentic.protocol.api_sampler import APIGenerationError
 from twinkle_agentic.tools.tool_manager import ToolManager
@@ -41,15 +44,15 @@ def _final_answer(traj: Trajectory) -> str:
     Multimodal content is a part list; the text parts concatenate in order.
     """
     content = None
-    for message in reversed(traj.get('messages') or []):
-        if message.get('role') == 'assistant':
-            content = message.get('content')
+    for message in reversed(traj.get("messages") or []):
+        if message.get("role") == "assistant":
+            content = message.get("content")
             break
     if content is None:
-        return ''
+        return ""
     if isinstance(content, list):
-        return ''.join(str(part.get('text') or '') for part in content if isinstance(part, dict))
-    return str(content or '')
+        return "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+    return str(content or "")
 
 
 def _dump_rollout_rows(episode_id: str, rows: list) -> None:
@@ -415,7 +418,7 @@ class _Episode:
         self.tools_key: Optional[str] = None
         #: The last served reply, for resubmitted requests (an agent HTTP client that timed out
         #: and retried sends the same payload verbatim: it is answered verbatim, not re-served).
-        self.last_reply: Optional[dict] = None
+        self.last_reply: dict | None = None
         #: Continue-on-length (defect110): while an assistant turn is being continued, its reply
         #: reaches the agent as several wire messages the agent merges into ONE. ``merged_content``
         #: accumulates their content (None = no open split); ``split_start`` is where the split
@@ -425,6 +428,13 @@ class _Episode:
         #: Under segment_policy='collect': the rows of segments a compaction boundary already
         #: froze, oldest first; the final segment's row joins them when the episode ends.
         self.closed_rows: list = []
+        #: Stable identity supplied by the driver.  It is not a random session id.
+        self.state_key = str(trajectory.get('state_key') or '')
+        #: Behavior-policy binding for the whole episode. A resumed group keeps this adapter even
+        #: after the sampler's mutable default has moved on to a newer policy.
+        self.adapter_path: Optional[str] = trajectory.get('adapter_path')
+        #: Effects already represented by the latest durable episode checkpoint.
+        self.completed_effects: set[str] = set()
 
 
 @remote_class(max_concurrency=ROLLOUT_MAX_CONCURRENCY)
@@ -507,6 +517,7 @@ class MultiTurnRollout:
         concurrency: int | None = None,
         segment_policy: str = 'drop',
         seed: int | None = None,
+        resume_store: ResumeStore | None = None,
     ):
         if sampler is None and response_callback is None:
             raise ValueError('MultiTurnRollout requires a sampler or a response_callback.')
@@ -591,6 +602,150 @@ class MultiTurnRollout:
         self._endpoint_lock = threading.Lock()
         self._policy_endpoint: Optional[PolicyEndpoint] = None
         self._env_tool_infos: Optional[list] = None
+        self.resume_store = resume_store
+
+    # ---------------------------------------------------------------- durable episode
+
+    def bind_resume_store(self, store: ResumeStore) -> None:
+        """Inject the run store before the first episode starts."""
+        with self._lock:
+            if self._episodes:
+                raise RuntimeError('bind_resume_store must run before any episode is opened')
+            self.resume_store = store
+
+    def _capture_episode(self, ep: _Episode, *, allow_busy: bool = False) -> dict[str, Any]:
+        if ep.busy and not allow_busy:
+            raise UnsafeResume(f'episode {ep.episode_id!r} is mid-step and cannot be checkpointed')
+        if self.harness is not None:
+            raise UnsafeResume('agent-program episodes own live processes and cannot be checkpointed yet')
+        if not ep.state_key:
+            raise UnsafeResume(f'episode {ep.episode_id!r} has no stable state_key')
+        if ep.ledger is None:
+            raise UnsafeResume(f'episode {ep.episode_id!r} has no token ledger yet')
+        if isinstance(ep.ledger, MessageLedger):
+            raise UnsafeResume('message-ledger episodes lose sampled token ids and cannot be resumed safely')
+        env_state = None
+        if ep.env_open:
+            capability = env_resume_capability(self.env)
+            if capability == EnvResumeCapability.NONE:
+                raise UnsafeResume(f'{type(self.env).__name__} declares no durable resume capability')
+            env_state = self.env.checkpoint_episode(ep.episode_id, ep.state_key)
+        return {
+            'format': 'twinkle.multi-turn-episode.v1',
+            'state_key': ep.state_key,
+            'episode_id': ep.episode_id,
+            'trajectory': ep.trajectory,
+            'params': ep.params,
+            'ledger': ep.ledger.state_dict(),
+            'env_state': env_state,
+            'env_open': ep.env_open,
+            'budget': ep.budget,
+            'spent': ep.spent,
+            'followups': ep.followups,
+            'malformed': ep.malformed,
+            'stuck': ep.stuck,
+            'seen_calls': sorted(ep.seen_calls),
+            'stuck_stop': ep.stuck_stop,
+            'tool_stop': ep.tool_stop,
+            'truncated': ep.truncated,
+            'stop_reason': ep.stop_reason,
+            'error': ep.error,
+            'segments': ep.segments,
+            'sent': ep.sent,
+            'tools_key': ep.tools_key,
+            'last_reply': ep.last_reply,
+            'closed_rows': ep.closed_rows,
+            'completed_effects': sorted(ep.completed_effects),
+        }
+
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def checkpoint_episode(self, episode_id: str) -> dict[str, Any]:
+        """Persist one episode at an externally stable boundary."""
+        with self._lock:
+            ep = self._episodes.get(episode_id)
+        if ep is None:
+            raise EpisodeError(f'episode {episode_id!r} is not held by this rollout')
+        return self._checkpoint_episode(ep)
+
+    def _checkpoint_episode(self, ep: _Episode, *, allow_busy: bool = False) -> dict[str, Any]:
+        state = self._capture_episode(ep, allow_busy=allow_busy)
+        if self.resume_store is not None:
+            self.resume_store.checkpoint_episode(ep.state_key, state)
+        return state
+
+    def restore_episode(self, state: dict[str, Any]) -> str:
+        """Rebuild an episode from a durable state before it is stepped again."""
+        if state.get('format') != 'twinkle.multi-turn-episode.v1':
+            raise UnsafeResume('unsupported MultiTurnRollout episode format')
+        state_key = str(state.get('state_key') or '')
+        episode_id = str(state.get('episode_id') or '')
+        if not state_key or not episode_id:
+            raise UnsafeResume('episode checkpoint has no state_key or episode_id')
+        if self.resume_store is not None:
+            checkpointed = set(state.get('completed_effects') or ())
+            pending = set(self.resume_store.pending_effects(state_key))
+            unsafe_pending = pending - checkpointed
+            if unsafe_pending:
+                raise UnsafeResume(f'episode {state_key} has pending tool effects: {sorted(unsafe_pending)!r}')
+            # The checkpoint is written after the tool messages enter the ledger but before the
+            # result journal record. If only that final record is missing, the checkpoint proves
+            # the effect happened and already contains its observation; close the journal gap
+            # instead of rejecting a state that cannot repeat the external call.
+            for effect_key in pending & checkpointed:
+                self.resume_store.finish_effect(effect_key, {'recovered_from_checkpoint': True})
+            completed = set(self.resume_store.completed_effects(state_key))
+            missing = completed - checkpointed
+            if missing:
+                raise UnsafeResume(f'effect results exist without a matching episode checkpoint: {sorted(missing)!r}')
+
+        ep = _Episode(episode_id, dict(state['trajectory']), state['params'])
+        ep.state_key = state_key
+        ep.ledger = self._new_ledger(episode_id)
+        if isinstance(ep.ledger, MessageLedger):
+            raise UnsafeResume('message-ledger episodes lose sampled token ids and cannot be resumed safely')
+        ep.ledger.load_state_dict(state['ledger'])
+        ep.env_open = bool(state.get('env_open'))
+        if ep.env_open:
+            if self.env is None:
+                raise UnsafeResume('checkpoint has an environment state but this rollout has no env')
+            capability = env_resume_capability(self.env)
+            if capability == EnvResumeCapability.NONE:
+                raise UnsafeResume(f'{type(self.env).__name__} declares no durable resume capability')
+            self.env.restore_episode(episode_id, state_key, state['env_state'], ep.trajectory)
+        ep.budget = int(state['budget'])
+        ep.spent = int(state['spent'])
+        ep.followups = int(state['followups'])
+        ep.malformed = int(state['malformed'])
+        ep.stuck = int(state['stuck'])
+        ep.seen_calls = set(state.get('seen_calls') or ())
+        ep.stuck_stop = bool(state.get('stuck_stop'))
+        ep.tool_stop = state.get('tool_stop')
+        ep.truncated = bool(state.get('truncated'))
+        ep.stop_reason = state.get('stop_reason')
+        ep.error = state.get('error')
+        ep.segments = int(state.get('segments') or 0)
+        ep.sent = list(state.get('sent') or ())
+        ep.tools_key = state.get('tools_key')
+        ep.last_reply = state.get('last_reply')
+        ep.closed_rows = list(state.get('closed_rows') or ())
+        ep.completed_effects = set(state.get('completed_effects') or ())
+        ep.tool_manager = self._episode_tools(episode_id)
+        with self._lock:
+            if episode_id in self._episodes:
+                raise UnsafeResume(f'episode {episode_id!r} is already held by this rollout')
+            self._episodes[episode_id] = ep
+        return episode_id
+
+    def restore_episode_from_store(self, state_key: str) -> str:
+        if self.resume_store is None:
+            raise UnsafeResume('no resume store is bound to this rollout')
+        return self.restore_episode(self.resume_store.load_episode(state_key))
+
+    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    def discard_episode_state(self, state_key: str) -> None:
+        """Release environment snapshots after the driver has persisted the group's terminal state."""
+        if self.env is not None and env_resume_capability(self.env) != EnvResumeCapability.NONE:
+            self.env.discard_episode_state(state_key)
 
     # ------------------------------------------------------------------ entries
 
@@ -811,25 +966,26 @@ class MultiTurnRollout:
         # need to run something (shell / python) ride ``ctx.env``, so episodes run and score in
         # the same sandbox; ``env=None`` (a tools-only local episode) falls back to a LocalEnv
         # over the row's own ``workspace`` column.
-        check_score: Optional[float] = None
-        if traj.get('checks') is not None:
+        check_score: float | None = None
+        if traj.get("checks") is not None:
             if self.env is not None and not ep.env_open:
                 raise EpisodeError(
-                    f'episode {ep.episode_id!r}: its env session is already closed, so its terminal '
-                    'checks cannot see the state the agent left behind.')
+                    f"episode {ep.episode_id!r}: its env session is already closed, so its terminal "
+                    "checks cannot see the state the agent left behind."
+                )
             try:
-                checks = checks_from_dicts(traj.get('checks'))
+                checks = checks_from_dicts(traj.get("checks"))
             except Exception as exc:
-                raise EpisodeError(
-                    f'episode {ep.episode_id!r}: malformed checks column: {exc}') from exc
-            workspace = (self.env.workspace(ep.episode_id) if self.env is not None
-                         else str(traj.get('workspace') or ''))
+                raise EpisodeError(f"episode {ep.episode_id!r}: malformed checks column: {exc}") from exc
+            workspace = self.env.workspace(ep.episode_id) if self.env is not None else str(traj.get("workspace") or "")
             report = run_checks(
                 checks,
-                CheckContext(workspace=workspace, final_answer=_final_answer(traj),
-                             env=self.env, episode_id=ep.episode_id))
+                CheckContext(
+                    workspace=workspace, final_answer=_final_answer(traj), env=self.env, episode_id=ep.episode_id
+                ),
+            )
             check_score = float(report.score)
-        env_reward: Optional[float] = None
+        env_reward: float | None = None
         if self.env is not None and ep.env_open:
             env_reward = self.env.close(ep.episode_id)
             ep.env_open = False
@@ -839,23 +995,23 @@ class MultiTurnRollout:
         # ``rewards.env`` lands only when the env session actually scored (``close`` returns None
         # for a sandbox used only for its tools: its constant zero is "no reward", not a score),
         # so an absent env key never fabricates one.
-        rewards = dict(traj.get('rewards') or {})
+        rewards = dict(traj.get("rewards") or {})
         if env_reward is not None:
-            rewards['env'] = float(env_reward)
+            rewards["env"] = float(env_reward)
         if check_score is not None:
-            rewards['check'] = check_score
-        traj['rewards'] = rewards
+            rewards["check"] = check_score
+        traj["rewards"] = rewards
         if episode_end is not None:
             traj['episode_end'] = episode_end
         for row in ep.closed_rows:
             # The frozen rows carry the episode's env reward too: the reward keys belong to
             # the episode, and every row of it carries the same ones.
-            row_rewards = dict(row.get('rewards') or {})
+            row_rewards = dict(row.get("rewards") or {})
             if env_reward is not None:
-                row_rewards['env'] = float(env_reward)
+                row_rewards["env"] = float(env_reward)
             if check_score is not None:
-                row_rewards['check'] = check_score
-            row['rewards'] = row_rewards
+                row_rewards["check"] = check_score
+            row["rewards"] = row_rewards
         rows = list(ep.closed_rows) + [traj]
         _dump_rollout_rows(ep.episode_id, rows)
         extra = {
@@ -890,7 +1046,7 @@ class MultiTurnRollout:
             stop_reason=ep.stop_reason,
             truncated=bool(ep.truncated),
             token_lengths=(prompt_tokens, response_tokens) if coded else None,
-            routing_exported=traj.get('routed_experts') is not None,
+            routing_exported=traj.get("routed_experts") is not None,
             env_reward=float(env_reward) if env_reward is not None else 0.0,
             extra=extra,
         )
@@ -1026,10 +1182,13 @@ class MultiTurnRollout:
             seq = self.response_callback(self._view(ep), state, params)
         else:
             use_state = ledger.state is not None and getattr(type(self.sampler), 'accepts_rollout_state', False)
+            adapter_kwargs = dict(self._adapter_kwargs)
+            if ep.adapter_path is not None:
+                adapter_kwargs['adapter_path'] = ep.adapter_path
             responses = self.sampler.sample([ledger.state if use_state else ledger.input_feature],
                                             sampling_params=params,
                                             session_id=ep.episode_id,
-                                            **self._adapter_kwargs)
+                                            **adapter_kwargs)
             seq = _single_sequence(responses)
         if not isinstance(seq, SampledSequence):
             raise TypeError(f'expected SampledSequence, got {type(seq).__name__}')
@@ -1051,10 +1210,33 @@ class MultiTurnRollout:
             obs[i] = '' if content is None else str(content)
         return obs
 
+    def _begin_tool_effect(self, ep: _Episode,
+                           tool_calls: list[dict[str, Any]]) -> tuple[Optional[str], Optional[list[str]]]:
+        if self.resume_store is None or not ep.state_key:
+            return None, None
+        calls = json.dumps(tool_calls, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        digest = hashlib.sha256(calls.encode('utf-8')).hexdigest()[:20]
+        effect_key = f'{ep.state_key}/effect/{ep.spent}/{digest}'
+        completed = self.resume_store.begin_effect(effect_key, {'calls': tool_calls})
+        if completed is None:
+            return effect_key, None
+        return effect_key, list(completed.get('observations') or ())
+
+    def _commit_tool_effect(self, ep: _Episode, effect_key: Optional[str], observations: list[str]) -> None:
+        if effect_key is None or self.resume_store is None:
+            return
+        ep.completed_effects.add(effect_key)
+        # The checkpoint includes both the appended observation and the effect key.
+        # Only after it is durable may the result record make crash recovery safe.
+        self._checkpoint_episode(ep, allow_busy=True)
+        self.resume_store.finish_effect(effect_key, {'observations': observations})
+
     # ---------------------------------------------------------------- tool loop
 
     def _tool_step(self, ep: _Episode) -> tuple[list, RolloutStatus]:
         """One generation and, when it called tools, their round."""
+        if self.resume_store is not None:
+            self._checkpoint_episode(ep, allow_busy=True)
         ledger = ep.ledger
         ep.spent += 1
 
@@ -1136,7 +1318,9 @@ class MultiTurnRollout:
         ep.malformed = 0
         if ep.tool_manager is None:
             raise ValueError('the model emitted tool_calls but this rollout has no tools (tool_manager= or env=).')
-        observations = self._run_tools(ep.tool_manager, tool_calls)
+        effect_key, cached_observations = self._begin_tool_effect(ep, tool_calls)
+        observations = (cached_observations if cached_observations is not None else
+                        self._run_tools(ep.tool_manager, tool_calls))
         if self.stop_after_stuck_turns:
             keys = [_call_key(tc) for tc in tool_calls]
             all_repeats = bool(keys) and all(k in ep.seen_calls for k in keys)
@@ -1152,18 +1336,25 @@ class MultiTurnRollout:
         if self.stop_after_stuck_turns and ep.stuck >= self.stop_after_stuck_turns:
             ep.stuck_stop = True
             ep.tool_stop = 'stuck'
+            self._commit_tool_effect(ep, effect_key, observations)
             if not overflowed and self._grant_followup(ep):
-                return self._next_turn(ep)
+                return self._next_turn(ep, checkpoint=False)
             ep.truncated = True
             return self._finish_tool_episode(ep)
         if overflowed:
+            self._commit_tool_effect(ep, effect_key, observations)
             return self._finish_tool_episode(ep)
-        return self._next_turn(ep)
+        self._commit_tool_effect(ep, effect_key, observations)
+        return self._next_turn(ep, checkpoint=False)
 
-    def _next_turn(self, ep: _Episode) -> tuple[list, RolloutStatus]:
+    def _next_turn(self, ep: _Episode, *, checkpoint: bool = True) -> tuple[list, RolloutStatus]:
         """Another generation is due -- unless the budget is spent, which ends the episode here."""
         if ep.spent >= ep.budget:
             return self._finish_tool_episode(ep)
+        if checkpoint and self.resume_store is not None:
+            # The start-of-step checkpoint predates the generation just recorded. Save the completed
+            # turn too, so a driver snapshot with pending PRM work resumes from the same boundary.
+            self._checkpoint_episode(ep, allow_busy=True)
         return self._continue(ep)
 
     def _finish_tool_episode(self, ep: _Episode) -> tuple[list, RolloutStatus]:
@@ -1227,8 +1418,9 @@ class MultiTurnRollout:
                 # The agent program is a full third-party runtime, not a model-written tool
                 # script: the tool-script address-space cap would strangle it before its first
                 # request (defect108). Its containment is the harness timeout passed here.
-                ep.exit = self.env.run_script(ep.episode_id, command, interpreter='shell',
-                                              timeout=self.harness.timeout, cap_memory=False)
+                ep.exit = self.env.run_script(
+                    ep.episode_id, command, interpreter="shell", timeout=self.harness.timeout, cap_memory=False
+                )
             except BaseException as error:  # noqa # reported by the step that reads the exit
                 ep.exit = (None, f'{type(error).__name__}: {error}')
             finally:
@@ -1301,9 +1493,14 @@ class MultiTurnRollout:
             # otherwise read as a rewrite and needlessly swap the ledger).
             request.reply.set_result(dict(ep.last_reply))
             return self._continue(ep)
-        if (ledger is not None and ep.last_reply is not None
-                and ep.last_reply.get('finish_reason') == 'length'
-                and tools_key == ep.tools_key and canonical and canonical == ep.sent):
+        if (
+            ledger is not None
+            and ep.last_reply is not None
+            and ep.last_reply.get("finish_reason") == "length"
+            and tools_key == ep.tools_key
+            and canonical
+            and canonical == ep.sent
+        ):
             # Continue-on-length (chat protocol): the agent echoed the conversation ending with
             # our truncated reply and asks for more of THAT turn. Detection is against the WIRE
             # view (ep.sent), not ledger.messages: the ledger banks the decoded text with the
@@ -1316,17 +1513,19 @@ class MultiTurnRollout:
         if ep.merged_content is not None and ledger is not None and tools_key == ep.tools_key and canonical:
             # A continued turn reaches the agent as several wire messages it merges into ONE
             # assistant message; reconstruct that merged view to recognise what comes back.
-            merged_view = ep.sent[:ep.split_start] + [
-                ('assistant', ep.merged_content.strip(), ep.sent[-1][2], '')]
-            if (ep.last_reply is not None and ep.last_reply.get('finish_reason') == 'length'
-                    and canonical == merged_view):
+            merged_view = ep.sent[: ep.split_start] + [("assistant", ep.merged_content.strip(), ep.sent[-1][2], "")]
+            if (
+                ep.last_reply is not None
+                and ep.last_reply.get("finish_reason") == "length"
+                and canonical == merged_view
+            ):
                 # Still truncated after the merge: continue the same turn again.
                 return self._continue_generation(ep, request, canonical, tools_key)
-            if len(canonical) > len(merged_view) and canonical[:len(merged_view)] == merged_view:
+            if len(canonical) > len(merged_view) and canonical[: len(merged_view)] == merged_view:
                 # The merged turn plus what the environment added (tool results, a new
                 # question): an append onto the SAME ledger, so the banked assistant turn
                 # keeps its sampled tokens instead of being dropped with a fresh segment.
-                if not ledger.observe(request.messages[len(merged_view):]):
+                if not ledger.observe(request.messages[len(merged_view) :]):
                     return self._end_agent_truncated(ep, request)
                 ep.merged_content = None
                 merged_extends = True
@@ -1334,8 +1533,11 @@ class MultiTurnRollout:
         if self.harness is not None and not merged_extends:
             noise = self.harness.noise_reply(request.messages, request.tools, request.params)
         extends = merged_extends or (
-            ledger is not None and tools_key == ep.tools_key and len(canonical) > len(ep.sent)
-            and canonical[:len(ep.sent)] == ep.sent)
+            ledger is not None
+            and tools_key == ep.tools_key
+            and len(canonical) > len(ep.sent)
+            and canonical[: len(ep.sent)] == ep.sent
+        )
         if noise is not None:
             # Housekeeping traffic the agent program does not expect a generation for: the
             # harness's reply answers it verbatim, costs no sampling, and rides the account
@@ -1362,7 +1564,7 @@ class MultiTurnRollout:
             # Token-in: what the agent added since our last reply (tool results, its own
             # notes) is the environment's, appended masked. A merged continuation already
             # observed its suffix above.
-            if not merged_extends and not ledger.observe(request.messages[len(ep.sent):]):
+            if not merged_extends and not ledger.observe(request.messages[len(ep.sent) :]):
                 return self._end_agent_truncated(ep, request)
         else:
             # The first request, or a history the agent rewrote (compacted, dropped a
@@ -1413,8 +1615,9 @@ class MultiTurnRollout:
             return self._finish(ep, segments=ep.segments)
         return self._continue(ep)
 
-    def _continue_generation(self, ep: _Episode, request: EndpointRequest, canonical: list,
-                             tools_key: str) -> tuple[list, RolloutStatus]:
+    def _continue_generation(
+        self, ep: _Episode, request: EndpointRequest, canonical: list, tools_key: str
+    ) -> tuple[list, RolloutStatus]:
         """Extend the open assistant turn: the agent asked for more of a length-truncated reply.
 
         The ledger already holds the conversation including the truncated reply, so the sampler
@@ -1430,15 +1633,15 @@ class MultiTurnRollout:
         if ledger.unfit(params):
             # The turn is already banked: no room ends the episode truncated, as in _serve.
             return self._end_agent_truncated(ep, request)
-        prompt_tokens = len(ledger.input_feature.get('input_ids') or [])
-        prev_wire = ep.last_reply['message']
+        prompt_tokens = len(ledger.input_feature.get("input_ids") or [])
+        prev_wire = ep.last_reply["message"]
         # Parse on the ledger's RAW contiguous text: the model generated it as one token
         # stream, and a call completing across the boundary must read as it was sampled.
-        prev_raw = ledger.messages[-1].get('content') or ''
+        prev_raw = ledger.messages[-1].get("content") or ""
         try:
             seq = self._generate(ep, ledger, params)
         except APIGenerationError as error:
-            raise EpisodeError(f'episode {ep.episode_id!r}: generation failed: {error}') from error
+            raise EpisodeError(f"episode {ep.episode_id!r}: generation failed: {error}") from error
         ledger.record_continuation(seq)
         ep.stop_reason = seq.stop_reason
         text = ledger.decode_tokens(seq)
@@ -1446,22 +1649,22 @@ class MultiTurnRollout:
         message = assistant_message(text, parsed, self.template.clean_tool_call(text) if parsed else text)
         if ep.merged_content is None:
             ep.split_start = len(ep.sent) - 1
-            ep.merged_content = (prev_wire.get('content') or '').strip()
+            ep.merged_content = (prev_wire.get("content") or "").strip()
         # The agent's merged view is NOT the raw concatenation: ms-agent strips each stored
         # message at send time (its _format_input_message mutates content.strip()), so the
         # boundary whitespace of earlier pieces is gone before the next piece appends.
         # Track its exact recurrence echo_k = strip(echo_{k-1} + piece_k), or the second
         # continuation's merged echo reads as a rewrite and re-encodes assistant-ending
         # (the attempt4 crash, defect110 follow-up).
-        ep.merged_content = (ep.merged_content + (message.get('content') or '')).strip()
+        ep.merged_content = (ep.merged_content + (message.get("content") or "")).strip()
         ep.sent = canonical + [_canonical(message)]
         ep.tools_key = tools_key
         ep.last_reply = {
-            'message': message,
-            'finish_reason': 'tool_calls' if parsed else ('length' if seq.stop_reason == 'length' else 'stop'),
-            'usage': {
-                'prompt_tokens': prompt_tokens,
-                'completion_tokens': len(seq.tokens or []),
+            "message": message,
+            "finish_reason": "tool_calls" if parsed else ("length" if seq.stop_reason == "length" else "stop"),
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": len(seq.tokens or []),
             },
         }
         request.reply.set_result(dict(ep.last_reply))

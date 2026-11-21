@@ -89,16 +89,25 @@ class ClientCheckpointManager:
         self.sampler = sampler
         self.name_prefix = name_prefix
         self._version = 0
+        self._paths: Dict[int, str] = {}
         self._lock = threading.Lock()
 
     def sync_weights(self) -> None:
         with self._lock:
             saved = self.model.save(f'{self.name_prefix}-{self._version}', save_optimizer=False)
-            self.sampler.adapter_path = saved.twinkle_path
+            path = saved.twinkle_path
+            self._paths[self._version] = path
+            self.sampler.adapter_path = path
             self._version += 1
 
     def version(self) -> int:
         return self._version
+
+    def adapter_path(self, version: int) -> Optional[str]:
+        """Resolve the driver-visible policy version to its immutable adapter."""
+        with self._lock:
+            # version() counts completed syncs, so the adapter saved by sync N is policy N + 1.
+            return self._paths.get(int(version) - 1) if version >= 1 else None
 
 
 def _wire_media(media: Any) -> Dict[str, List[str]]:

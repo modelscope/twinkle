@@ -21,6 +21,8 @@ in :class:`~twinkle_agentic.envs.agentenv.AgentEnv` or another sandbox.
 Every episode gets its own directory under ``root`` as the working directory of all its calls;
 closing the episode removes it, and kills whatever it still had running.
 """
+import hashlib
+import json
 import os
 import resource
 import shlex
@@ -30,6 +32,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle import remote_class, remote_function
@@ -37,6 +42,7 @@ from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
 from .base import (DEFAULT_TOOLS, ENV_MAX_CONCURRENCY, TIMEOUT_EXIT_CODE, Env, StepResult, format_command_output,
                    truncate_observation)
+from .resume import EnvResumeCapability, UnsafeCheckpoint
 
 logger = get_logger()
 
@@ -65,6 +71,8 @@ class _LocalSession:
 class LocalEnv(Env):
     """Run scripts and tool calls on this machine. See the module docstring."""
 
+    resume_capability = EnvResumeCapability.DURABLE_CHECKPOINT
+
     def __init__(self,
                  root: Optional[str] = None,
                  max_sessions: int = 64,
@@ -91,6 +99,7 @@ class LocalEnv(Env):
         self._command_timeout = command_timeout
         self._memory_limit_gb = memory_limit_gb
         self._envs = dict(envs or {})
+        self._resume_root = Path(self._root) / '.twinkle-resume'
 
     # ------------------------------------------------------------------
     # Session hooks
@@ -111,8 +120,136 @@ class LocalEnv(Env):
     def _workspace(self, state: _LocalSession) -> str:
         return state.workspace
 
-    def _run_script(self, state: _LocalSession, source: str, interpreter: str = 'python',
-                    timeout: Optional[float] = None, cap_memory: bool = True) -> Tuple[int, str]:
+    # ------------------------------------------------------------------
+    # Durable session state
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _state_dir_name(state_key: str) -> str:
+        # Keep the durable path short enough for Windows' classic MAX_PATH.
+        return hashlib.sha256(state_key.encode('utf-8')).hexdigest()[:24]
+
+    @staticmethod
+    def _tree_digest(root: Path) -> Dict[str, Any]:
+        digest = hashlib.sha256()
+        files = []
+        total = 0
+        for path in sorted(root.rglob('*')):
+            if path.is_symlink():
+                raise UnsafeCheckpoint(f'workspace snapshot refuses symbolic link {path}')
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            data = path.read_bytes()
+            file_digest = hashlib.sha256(data).hexdigest()
+            digest.update(relative.encode('utf-8'))
+            digest.update(b'\0')
+            digest.update(file_digest.encode('ascii'))
+            files.append({'path': relative, 'size': len(data), 'sha256': file_digest})
+            total += len(data)
+        return {'digest': digest.hexdigest(), 'files': files, 'bytes': total}
+
+    def checkpoint_episode(self, episode_id: str, state_key: str) -> Dict[str, Any]:
+        """Copy one quiescent workspace behind a new atomic generation pointer."""
+        session = self._session(episode_id)
+        state = session.state
+        if session.script_inflight:
+            raise UnsafeCheckpoint(f'episode {episode_id!r} has a script in flight')
+        with state.lock:
+            if state.closed:
+                raise UnsafeCheckpoint(f'episode {episode_id!r} is already closed')
+            if state.procs:
+                raise UnsafeCheckpoint(f'episode {episode_id!r} has a running process')
+
+        generation = f'{time.time_ns():x}-{uuid.uuid4().hex[:8]}'
+        key_root = self._resume_root / self._state_dir_name(state_key)
+        generation_root = key_root / generation
+        workspace_copy = generation_root / 'workspace'
+        generation_root.mkdir(parents=True, exist_ok=False)
+        try:
+            shutil.copytree(state.workspace, workspace_copy)
+            tree = self._tree_digest(workspace_copy)
+            manifest = {
+                'format': 'twinkle.localenv.v1',
+                'state_key': state_key,
+                'generation': generation,
+                'workspace': tree,
+            }
+            manifest_bytes = json.dumps(manifest, ensure_ascii=False, sort_keys=True,
+                                        separators=(',', ':')).encode('utf-8')
+            manifest_path = generation_root / 'manifest.json'
+            manifest_path.write_bytes(manifest_bytes)
+            with open(manifest_path, 'r+b') as stream:
+                os.fsync(stream.fileno())
+            head = {
+                'generation': generation,
+                'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+            }
+            head_bytes = json.dumps(head, sort_keys=True).encode('utf-8')
+            pending = key_root / f'.head.{generation}.tmp'
+            key_root.mkdir(parents=True, exist_ok=True)
+            with open(pending, 'wb') as stream:
+                stream.write(head_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(pending, key_root / 'head.json')
+        except BaseException:
+            shutil.rmtree(generation_root, ignore_errors=True)
+            raise
+        for old in key_root.iterdir():
+            if old.is_dir() and old.name != generation:
+                shutil.rmtree(old, ignore_errors=True)
+        return {
+            "format": "twinkle.localenv.v1",
+            "state_key": state_key,
+            "generation": generation,
+            "manifest_sha256": head["manifest_sha256"],
+            "files": len(tree["files"]),
+            "bytes": tree["bytes"],
+            "reward": session.reward,
+            "rewarded": session.rewarded,
+        }
+
+    def restore_episode(self, episode_id: str, state_key: str, state: dict[str, Any], trajectory=None) -> None:
+        """Allocate a fresh session and rehydrate the snapshot named by ``state``."""
+        if state.get('format') != 'twinkle.localenv.v1' or state.get('state_key') != state_key:
+            raise UnsafeCheckpoint('LocalEnv restore metadata does not match the episode state key')
+        generation = str(state.get('generation') or '')
+        if not generation:
+            raise UnsafeCheckpoint('LocalEnv restore metadata has no generation')
+        generation_root = self._resume_root / self._state_dir_name(state_key) / generation
+        manifest_path = generation_root / 'manifest.json'
+        manifest_bytes = manifest_path.read_bytes()
+        if hashlib.sha256(manifest_bytes).hexdigest() != state.get('manifest_sha256'):
+            raise UnsafeCheckpoint('LocalEnv snapshot manifest checksum mismatch')
+        manifest = json.loads(manifest_bytes)
+        source = generation_root / 'workspace'
+        if self._tree_digest(source)['digest'] != manifest['workspace']['digest']:
+            raise UnsafeCheckpoint('LocalEnv snapshot workspace checksum mismatch')
+
+        self.reset(episode_id, trajectory)
+        try:
+            session = self._session(episode_id)
+            session.reward = float(state.get("reward") or 0.0)
+            session.rewarded = bool(state.get("rewarded", session.reward != 0.0))
+            target = Path(self.workspace(episode_id))
+            shutil.copytree(source, target, dirs_exist_ok=True)
+        except BaseException:
+            self.close(episode_id)
+            raise
+
+    @remote_function(dispatch="all", collect="none", lazy_collect=False)
+    def discard_episode_state(self, state_key: str) -> None:
+        shutil.rmtree(self._resume_root / self._state_dir_name(state_key), ignore_errors=True)
+
+    def _run_script(
+        self,
+        state: _LocalSession,
+        source: str,
+        interpreter: str = "python",
+        timeout: float | None = None,
+        cap_memory: bool = True,
+    ) -> tuple[int, str]:
         timeout = self._command_timeout if timeout is None else timeout
         # The script file is never written into the workspace. A workspace gets read back -- by a
         # snapshot, or by a check that lists the directory -- and a stray _script.py in there reads
@@ -132,7 +269,7 @@ class LocalEnv(Env):
                 # which is already in the right environment.
                 argv = ['/bin/bash', '-c', source]
             else:
-                return 1, f'unsupported interpreter {interpreter!r}; use python or shell'
+                return 1, f"unsupported interpreter {interpreter!r}; use python or shell"
             return self._spawn(state, argv, timeout, cap_memory)
         finally:
             shutil.rmtree(holder, ignore_errors=True)
@@ -208,8 +345,7 @@ class LocalEnv(Env):
             raise ValueError(f'path {path!r} escapes the workspace')
         return target
 
-    def _spawn(self, state: _LocalSession, argv: List[str], timeout: float,
-               cap_memory: bool = True) -> Tuple[int, str]:
+    def _spawn(self, state: _LocalSession, argv: list[str], timeout: float, cap_memory: bool = True) -> tuple[int, str]:
         env = dict(os.environ, **_SCRIPT_ENVS, **self._envs)
         # Inherited from the trainer, and a check that imports torch would
         # otherwise take a share of a GPU that is mid-generation.

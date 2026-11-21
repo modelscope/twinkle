@@ -9,6 +9,8 @@ from twinkle import remote_function
 from twinkle.data_format import Trajectory
 from twinkle.data_format.message import Tool as ToolInfo
 from twinkle.utils import get_logger
+from .resume import (EnvResumeCapability, ResumableEnv, UnsafeCheckpoint, UnsupportedEnvResume,
+                     env_resume_capability)
 from .snapshot import list_workspace
 
 logger = get_logger()
@@ -158,7 +160,7 @@ class NoSlot:
 
 
 class _Session:
-    __slots__ = ('state', 'reward', 'rewarded', 'touched', 'script_inflight')
+    __slots__ = ("state", "reward", "rewarded", "touched", "script_inflight")
 
     def __init__(self, state: Any):
         self.state = state
@@ -238,9 +240,10 @@ class Env(ABC):
     def _step(self, state: Any, tool_name: str, arguments: Dict[str, Any]) -> StepResult:
         """Run one tool call in the episode."""
 
-    def _run_script(self, state: Any, source: str, interpreter: str, timeout: Optional[float],
-                    cap_memory: bool = True) -> Tuple[int, str]:
-        raise NotImplementedError(f'{type(self).__name__} cannot run scripts; act through its tools instead.')
+    def _run_script(
+        self, state: Any, source: str, interpreter: str, timeout: float | None, cap_memory: bool = True
+    ) -> tuple[int, str]:
+        raise NotImplementedError(f"{type(self).__name__} cannot run scripts; act through its tools instead.")
 
     def _close(self, state: Any) -> None:
         pass
@@ -347,13 +350,15 @@ class Env(ABC):
         _record_tool_exec(episode_id, len(results))
         return results
 
-    @remote_function(enable_continous_work=True, sticky_key='episode_id')
-    def run_script(self,
-                   episode_id: str,
-                   source: str,
-                   interpreter: str = 'python',
-                   timeout: Optional[float] = None,
-                   cap_memory: bool = True) -> Tuple[int, str]:
+    @remote_function(enable_continous_work=True, sticky_key="episode_id")
+    def run_script(
+        self,
+        episode_id: str,
+        source: str,
+        interpreter: str = "python",
+        timeout: float | None = None,
+        cap_memory: bool = True,
+    ) -> tuple[int, str]:
         """Run a whole script in the episode's session; returns ``(exit_code, output)``.
 
         The execution path a *verifier* (or an agent program) takes, as opposed to :meth:`step`,
@@ -410,8 +415,8 @@ class Env(ABC):
             budget=self.snapshot_budget,
             skip=self.snapshot_skip)
 
-    @remote_function(enable_continous_work=True, sticky_key='episode_id')
-    def close(self, episode_id: str) -> Optional[float]:
+    @remote_function(enable_continous_work=True, sticky_key="episode_id")
+    def close(self, episode_id: str) -> float | None:
         """End the episode's session and return its reward (the sum of its step rewards).
 
         ``None`` when the session never scored (no step ever carried a reward) or there was no
