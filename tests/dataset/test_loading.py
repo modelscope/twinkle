@@ -21,6 +21,20 @@ TEST_DATA_DIR = Path(__file__).parent / 'test_data'
 class TestLocalDatasetLoading:
     """Test local dataset loading (normal mode)"""
 
+    def test_remote_code_switch_applies_to_initial_and_added_datasets(self, monkeypatch):
+        calls = []
+
+        def load(meta, **kwargs):
+            calls.append((meta.dataset_id, kwargs['trust_remote_code']))
+            return {}
+
+        monkeypatch.setenv('TWINKLE_TRUST_REMOTE_CODE', '0')
+        monkeypatch.setattr(Dataset, '_load_dataset', staticmethod(load))
+        dataset = Dataset(DatasetMeta(dataset_id='initial'), trust_remote_code=True)
+        dataset.add_dataset(DatasetMeta(dataset_id='added'), trust_remote_code=True)
+
+        assert calls == [('initial', False), ('added', False)]
+
     def test_load_local_csv(self):
         """Test loading local CSV file"""
         csv_path = str(TEST_DATA_DIR / 'test.csv')

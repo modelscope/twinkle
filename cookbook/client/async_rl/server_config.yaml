@@ -42,21 +42,6 @@ applications:
         ray_actor_options:
           num_cpus: 0.1
 
-  # TransferQueue-backed DataRef service.
-  - name: data-plane
-    route_prefix: /api/v1/data-plane
-    import_path: data_plane
-    args:
-      config:
-        backend:
-          SimpleStorage:
-            num_data_storage_units: 2
-    deployments:
-      - name: DataPlaneManagement
-        num_replicas: 1
-        ray_actor_options:
-          num_cpus: 1
-
   # One GPU hosts the training base model and multiple LoRA adapters.
   - name: models-Qwen3.5-4B
     route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
@@ -70,7 +55,6 @@ applications:
         adapter_timeout: 30
       max_loras: 8
       max_length: 10240
-      data_plane_url: http://127.0.0.1:8000/api/v1/data-plane
       nproc_per_node: 1
       device_group:
         name: model
@@ -100,9 +84,8 @@ applications:
     import_path: sampler
     args:
       model_id: ${oc.env:TWINKLE_LOCAL_MODEL_PATH}
-      data_plane_url: http://127.0.0.1:8000/api/v1/data-plane
       nproc_per_node: 1
-      sampler_type: vllm_async
+      sampler_type: vllm
       engine_args:
         max_model_len: 4096
         gpu_memory_utilization: 0.5

@@ -1,11 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Internal HTTP adapter used by Model and Sampler component deployments."""
 from __future__ import annotations
-
-import httpx
+import uuid
 from typing import Any
 
-from twinkle.protocol.headers import build_routing_headers
+import httpx
+
+from twinkle.protocol.headers import build_request_headers
 from twinkle.protocol.types.component import DataRef
 
 
@@ -33,7 +34,7 @@ class DataPlaneProxy:
                 'ref': ref.model_dump(),
                 'fields': fields
             },
-            headers=build_routing_headers(f'data-ref-{ref.ref_id}'),
+            headers=build_request_headers(uuid.uuid4().hex),
         )
         response.raise_for_status()
         return response.json()['rows']
@@ -54,7 +55,7 @@ class DataPlaneProxy:
                 'kind': kind,
                 'tags': tags
             },
-            headers=build_routing_headers(f'data-put-{kind}'),
+            headers=build_request_headers(uuid.uuid4().hex),
         )
         response.raise_for_status()
         return DataRef(**response.json())
@@ -75,7 +76,7 @@ class DataPlaneProxy:
                 'rows': rows,
                 'tags': tags,
             },
-            headers=build_routing_headers(f'data-append-{ref.ref_id}'),
+            headers=build_request_headers(uuid.uuid4().hex),
         )
         response.raise_for_status()
         return DataRef(**response.json())

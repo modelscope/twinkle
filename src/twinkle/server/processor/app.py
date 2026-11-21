@@ -9,16 +9,17 @@ Follows the same structural pattern as model/app.py:
 - ProcessorManagement is a top-level class inheriting ProcessorManagerMixin
 - Routes are registered in build_processor_app() via _register_processor_routes()
 - serve.ingress(app)(ProcessorManagement) applied before deployment
-- Sticky session routing via @serve.multiplexed keyed on session ID
+- One Serve replica owns the processor registry
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from fastapi import FastAPI
-from ray import serve
 from typing import Any
 
 from twinkle import DeviceGroup, get_logger
+from twinkle.server.config.application_spec import validate_processor_replicas
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.runtime import init_twinkle_runtime
 from twinkle.server.session_resource import ProcessorManagerMixin
@@ -38,7 +39,6 @@ class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
     - Processors are registered with a session ID on creation.
     - A background task expires processors whose session has timed out.
     - Per-user processor limit is enforced at registration.
-    - Sticky session routing ensures session requests hit the same replica.
     """
 
     def __init__(self,
@@ -66,30 +66,26 @@ class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
             processor_timeout=float(_cfg.get('processor_timeout', 1800.0)),
             per_token_processor_limit=int(_cfg.get('per_token_processor_limit', _env_limit)),
         )
-        # Note: countdown task is started lazily in _ensure_sticky()
 
-    @serve.multiplexed(max_num_models_per_replica=100)
-    async def _sticky_entry(self, sticky_key: str):
-        return sticky_key
-
-    async def _ensure_sticky(self):
-        sticky_key = serve.get_multiplexed_model_id()
-        await self._sticky_entry(sticky_key)
-        # Lazy-start countdown task on first request (requires running event loop)
+    async def _ensure_resource_cleanup_started(self) -> None:
+        # Start on the first request, when the replica has a running event loop.
         self._ensure_countdown_started()
         await self._ensure_state_cleanup_started()
 
     async def _on_processor_expired(self, processor_id: str) -> None:
-        """Remove the local processor and release its shared quota lease."""
+        """Close the processor's workers and release its shared quota lease."""
         info = self.get_resource_info(processor_id)
+        close = getattr(self.resource_dict.get(processor_id), 'close', None)
+        if callable(close):
+            await asyncio.to_thread(close)
         self.resource_dict.pop(processor_id, None)
-        self.unregister_resource(processor_id)
         if info is not None:
             await self.state.release_processor_quota(
                 info['token'],
                 processor_id,
                 lease_seconds=self._processor_quota_lease_seconds,
             )
+        self.unregister_resource(processor_id)
 
 
 def build_processor_app(ncpu_proc_per_node: int,
@@ -121,6 +117,10 @@ def build_processor_app(ncpu_proc_per_node: int,
     Returns:
         Ray Serve deployment bound with configuration.
     """
+
+    validate_processor_replicas(deploy_options)
+    if deploy_options.get('autoscaling_config') is None:
+        deploy_options = {**deploy_options, 'num_replicas': 1}
 
     # Build the FastAPI app + middleware stack + routes via the shared scaffold,
     # then bind the Ray Serve deployment. No per-builder copy of the lifespan /

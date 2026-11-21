@@ -58,6 +58,7 @@ def envelope_from_record(
     common = dict(
         queue_state=record.get('queue_state'),
         queue_state_reason=record.get('queue_state_reason'),
+        progress=record.get('progress'),
     )
     if status in ('failed', 'cancelled'):
         return TaskEnvelope(

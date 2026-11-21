@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Shared Blackjack task contract and the OpenSpiel command run in a sandbox."""
 import argparse
-from pathlib import Path
-
 import json
+from pathlib import Path
 
 
 class BlackjackTask:
@@ -26,24 +25,38 @@ class BlackjackTask:
         }]
 
 
-def play(seed, actions):
-    from open_spiel.python.rl_environment import ChanceEventSampler, Environment
+    @staticmethod
+    def episode_outcome(trajectory, _env, _episode_id):
+        # Tool observations contain the game's terminal flag even for a draw (reward 0).
+        return {'game_finished': any(
+            message['role'] == 'tool' and message['content'].endswith('Game over: True.')
+            for message in trajectory['messages'])}
 
-    game = Environment('blackjack', chance_event_sampler=ChanceEventSampler(seed))
-    state = game.reset()
-    for action in actions:
-        if state.last():
-            raise ValueError('game is already over')
-        state = game.step([{'hit': 0, 'stand': 1}[action]])
-    cards = state.observations['info_state'][0]
+
+def cards_observation(cards, done):
     if len(cards) != 189:
         raise RuntimeError('unexpected OpenSpiel Blackjack observation')
     ranks = ('A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K')
     player = [ranks[i % 13] for i in range(52) if cards[85 + i]]
     dealer = [ranks[i % 13] for i in range(52) if cards[137 + i]]
+    return f'Your cards: {player}. Dealer visible cards: {dealer}. Game over: {done}.'
+
+
+def play(seed, actions):
+    from open_spiel.python.rl_environment import ChanceEventSampler, Environment
+
+    game = Environment('blackjack', chance_event_sampler=ChanceEventSampler(seed))
+    state = game.reset()
+    reward = 0.0
+    for action in actions:
+        if state.last():
+            reward = 0.0  # Further actions leave the game unchanged and earn nothing.
+            break
+        state = game.step([{'hit': 0, 'stand': 1}[action]])
+        reward = float(state.rewards[0]) if state.rewards else 0.0
     return {
-        'observation': f'Your cards: {player}. Dealer visible cards: {dealer}. Game over: {state.last()}.',
-        'reward': float(state.rewards[0]) if state.rewards else 0.0,
+        'observation': cards_observation(state.observations['info_state'][0], state.last()),
+        'reward': reward,
         'done': state.last(),
     }
 

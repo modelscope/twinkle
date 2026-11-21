@@ -13,9 +13,8 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from tinker import types as tinker
 
-from twinkle.hub import HubOperation
 from twinkle.protocol.types import model as native
-from twinkle.server.checkpoint import _resolve_client_save_dir, create_checkpoint_manager, validate_user_path
+from twinkle.server.checkpoint import _resolve_client_save_dir, validate_user_path
 from twinkle.server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
 from twinkle.server.exceptions import ProtocolMismatchError, RequestRejectedError, ResourceNotFoundError
 from twinkle.server.lifecycle.envelope import envelope_from_record
@@ -26,6 +25,7 @@ from twinkle.server.state.training_records import CreateTraining
 from twinkle.server.task_queue import TaskQueueMixin
 from twinkle.server.validation import assert_request_supported
 from .actor import controller_name
+from .hub_upload import submit_upload
 
 NATIVE_REQUESTS = {
     "forward": native.ForwardRequest,
@@ -176,23 +176,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             )
             return envelope_from_record(ref["request_id"], await self.state.get_future(ref["request_id"]))
         if endpoint == "upload_to_hub":
-
-            async def upload():
-                checkpoint = body.checkpoint_dir
-                if checkpoint.startswith("twinkle://"):
-                    checkpoint = create_checkpoint_manager(token, client_type="twinkle").resolve_checkpoint_dir(
-                        checkpoint
-                    )
-                await self.call_backend(
-                    HubOperation.push_to_hub,
-                    repo_id=body.hub_model_id,
-                    folder_path=checkpoint,
-                    token=body.hub_token or token,
-                    private=True,
-                )
-
-            ref = await self.schedule_background_task(upload, task_type=endpoint, token=token)
-            return envelope_from_record(ref["request_id"], await self.state.get_future(ref["request_id"]))
+            return await submit_upload(self, token, body)
         if endpoint == "stop_training":
             # Owner-side explicit stop by training id: the webui kills the local driver, so
             # the driver's session dies with it and cannot release the training itself.
@@ -248,7 +232,9 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         return await self.proxy.proxy_request(request, f"tinker/{endpoint}", route["instance_id"], "training-runtime")
 
     async def _release(self, training_id, token, session, client_type):
-        await self.controller.route.remote(training_id, token, session)
+        route = await self.controller.route.remote(training_id, token, session, for_release=True)
+        if route["base_model"] != self.model.name:
+            raise ResourceNotFoundError("Training handle belongs to another model endpoint")
 
         async def release():
             await self.controller.release.remote(training_id, token, session)

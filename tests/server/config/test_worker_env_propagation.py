@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle.server.config.resources import (
+from twinkle.server.config.env_propagation import (
     SHARED_WORKER_ENV_KEYS,
     build_propagated_env_vars,
     build_shared_env_vars,
@@ -48,3 +48,34 @@ def test_ray_runtime_env_seeds_workers_with_perf(monkeypatch):
     monkeypatch.setenv('TWINKLE_PERF', '1')
     runtime_env = build_ray_runtime_env()
     assert runtime_env.get('env_vars', {}).get('TWINKLE_PERF') == '1'
+
+
+@pytest.mark.parametrize(('yaml_value', 'inherited', 'expected'), [
+    ('true', '0', '1'),
+    ('false', '1', '0'),
+    (None, '0', '0'),
+    (None, None, None),
+])
+def test_launch_config_sets_driver_and_worker_trust_remote_code(monkeypatch, tmp_path, yaml_value, inherited, expected):
+    import os
+
+    from twinkle.server.config import ServerConfig
+    from twinkle.server.launcher.server_launcher import ServerLauncher, build_ray_runtime_env
+
+    key = 'TWINKLE_TRUST_REMOTE_CODE'
+    monkeypatch.setenv(key, inherited or '')
+    if inherited is None:
+        monkeypatch.delenv(key)
+    for name in ('TWINKLE_PERSISTENCE_MODE', 'TWINKLE_TELEMETRY_ENABLED', 'TWINKLE_MODEL_ID_ALIASES'):
+        monkeypatch.setenv(name, '')
+    path = tmp_path / 'server.yaml'
+    path.write_text(f'trust_remote_code: {yaml_value}\n' if yaml_value else '{}\n')
+    launcher = ServerLauncher(ServerConfig.from_yaml(path))
+    launcher._configure_environment()
+    assert os.environ.get(key) == expected
+    assert build_ray_runtime_env().get('env_vars', {}).get(key) == expected
+    assert launcher._deployment_options({})['ray_actor_options']['runtime_env']['env_vars'].get(key) == expected
+
+    override = {'ray_actor_options': {'runtime_env': {'env_vars': {key: 'deployment-override'}}}}
+    assert launcher._deployment_options(override)['ray_actor_options']['runtime_env']['env_vars'][key] == (
+        'deployment-override')

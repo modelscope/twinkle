@@ -271,6 +271,26 @@ def test_data_plane_application_uses_its_own_strict_args_schema() -> None:
         })
 
 
+@pytest.mark.parametrize('options', [
+    {'num_replicas': 1},
+    {'autoscaling_config': {'min_replicas': 1, 'max_replicas': 1}},
+])
+def test_processor_accepts_single_replica(options) -> None:
+    ApplicationSpec.model_validate({'name': 'processor', 'import_path': 'processor', 'deployments': [options]})
+
+
+@pytest.mark.parametrize('options', [
+    {'num_replicas': 2},
+    {'num_replicas': 'auto'},
+    {'autoscaling_config': {'min_replicas': 0, 'max_replicas': 1}},
+    {'autoscaling_config': {'min_replicas': 1, 'max_replicas': 2}},
+    {'autoscaling_config': {'min_replicas': 1, 'max_replicas': 1, 'initial_replicas': 0}},
+])
+def test_processor_rejects_config_that_allows_other_replica_counts(options) -> None:
+    with pytest.raises(ValidationError, match='Processor .*replica'):
+        ApplicationSpec.model_validate({'name': 'processor', 'import_path': 'processor', 'deployments': [options]})
+
+
 def test_processor_queue_config_is_rejected() -> None:
     # A processor deployment has no task queue; queue_config was silently ignored
     # before and now fails validation (F013 / P009) naming the offending field.

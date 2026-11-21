@@ -20,8 +20,8 @@ class TestTranslateChatRequest:
                 'content': 'Hello'
             }],
         }
-        req, sticky = translate_chat_request(body)
-        assert sticky == 'lora-abc'
+        req, model = translate_chat_request(body)
+        assert model == 'lora-abc'
         assert req['adapter_name'] == 'lora-abc'
         assert req['inputs'] == {'messages': [{'role': 'user', 'content': 'Hello'}]}
         assert req['sampling_params'] is None

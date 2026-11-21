@@ -35,7 +35,8 @@ from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, Sampl
 from twinkle.hub import HubOperation
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
-from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.base import (ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints,
+                                write_task_head_checkpoint)
 from twinkle.model.state_dict_utils import normalize_adapter_keys
 from twinkle.model.micro_batch import (
     MicroBatchConfig,
@@ -2598,6 +2599,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # rank before state-dict collectives: non-source ranks still hold meta tensors.
             self._lazy_wrap_model()
         model = self.strategy.unwrap_model(self.model)
+        is_peft = isinstance(model, PeftModel)
+        if is_peft and max_shard_size != '5GB':
+            raise NotImplementedError(
+                'max_shard_size is not supported for PEFT adapter checkpoints; remove the option or save a '
+                'full-model checkpoint.')
         save_kwargs = {
             'safe_serialization': safe_serialization,
             'max_shard_size': max_shard_size,
@@ -2607,6 +2613,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             processed_state_dict = self.strategy.get_full_state_dict(self.model)
         else:
             processed_state_dict = self._get_adapter_state_dict_for_save(adapter_name)
+
+        # Capture the head while all ranks participate and the tenant still owns its slot.
+        head_state = self._task_head_state(adapter_name)
+        is_master = Platform.is_master()
+        tokenizer = self._checkpoint_processor(adapter_name) if is_master else None
+        peft_config = model.peft_config[adapter_name] if is_master and is_peft else None
 
         # The optimizer/scheduler/scaler/rng state goes through the strategy's save protocol (deepspeed's
         # engine.save_checkpoint / FSDP2's get_optimizer_state_dict perform collectives), so it stays on
@@ -2621,48 +2633,35 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 defer_trainer_state=async_save,
             )
 
-        def _write_weights() -> None:
-            """Pure file I/O over the staged CPU payloads; no collectives, no device tensors."""
-            if isinstance(model, PeftModel):
-                if max_shard_size != '5GB':
-                    raise NotImplementedError(
-                        'max_shard_size is not supported for PEFT adapter checkpoints; remove the option or save a '
-                        'full-model checkpoint.')
-                if Platform.is_master():
-                    model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
-                    contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
-                    if safe_serialization:
-                        save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
-                    else:
-                        torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
-            elif Platform.is_master():
+        deferred = list(self._deferred_trainer_state_writes)
+
+        def _write_checkpoint() -> None:
+            if peft_config is not None:
+                peft_config.save_pretrained(checkpoint_dir)
+                contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
+                if safe_serialization:
+                    save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+                else:
+                    torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
+            else:
                 # Transformers' is_main_process only guards metadata/cleanup, not weight
                 # shard writes. Gather state on every rank above, but write it only once.
                 model.save_pretrained(
                     checkpoint_dir, state_dict=processed_state_dict, is_main_process=True,
                     **save_kwargs)
-
-        if async_save:
-            # trainer_state.json doubles as the completion marker a resume reads; the deferred writes run
-            # last so a crash mid-write leaves a directory the resume path cannot mistake for complete.
-            deferred = list(self._deferred_trainer_state_writes)
-
-            def _write_tail() -> None:
-                _write_weights()
-                self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
-                self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
-                copy_checkpoint_args(output_dir, checkpoint_dir)
-                for write in deferred:
-                    write()
-                rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
-
-            self.submit_async_write(_write_tail)
-        else:
-            _write_weights()
-            self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
-            self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
+            tokenizer.save_pretrained(checkpoint_dir)
+            write_task_head_checkpoint(checkpoint_dir, head_state)
             copy_checkpoint_args(output_dir, checkpoint_dir)
+            # Publish the async completion marker after the checkpoint files are written.
+            for write in deferred:
+                write()
             rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
+
+        if is_master:
+            if async_save:
+                self.submit_async_write(_write_checkpoint)
+            else:
+                _write_checkpoint()
         return checkpoint_dir
 
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
@@ -2768,15 +2767,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 os.path.join(output_dir, 'scaler.pt'),
             )
 
+    def _checkpoint_processor(self, adapter_name):
+        template = self.optimizer_group[adapter_name].template
+        return self._default_tokenizer if template is None else template.processor
+
     def _save_tokenizer(self, output_dir, **kwargs):
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
-        optimizer_config = self.optimizer_group[adapter_name]
-        template_ins = optimizer_config.template
         if Platform.is_master():
-            if template_ins is not None:
-                template_ins.processor.save_pretrained(output_dir)
-            else:
-                self._default_tokenizer.save_pretrained(output_dir)
+            self._checkpoint_processor(kwargs.get('adapter_name', _default_adapter_name)).save_pretrained(output_dir)
 
     @remote_function()
     @timed

@@ -11,7 +11,7 @@
 #      until the upload reaches a terminal state, raising on failure.
 #
 # Prerequisites:
-#   - Server must be running (see server.py / server_config.yaml)
+#   - Start the server with `twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml`
 #   - A ModelScope API token with write access to the target repository
 
 import dotenv

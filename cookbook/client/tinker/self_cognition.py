@@ -5,7 +5,7 @@
 #      a custom identity (name, author).
 #   2. eval():  Load a trained checkpoint and sample from it to verify
 #      that the model has learned the custom identity.
-# The server must be running first (see server.py and server_config.yaml).
+# Start the server with `twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml`.
 import os
 import numpy as np
 from tqdm import tqdm

@@ -12,6 +12,8 @@ Twinkle's DPO extension also uses `importance_sampling`, with `ref_logps` on **e
 
 ## Initialization
 
+From the repository root, run `python -m pip install -e '.[client]'` to install the Tinker SDK version pinned by Twinkle.
+
 ```python
 # Initialize Tinker client before importing ServiceClient
 from twinkle import init_tinker_client
@@ -35,8 +37,8 @@ for item in service_client.get_server_capabilities().supported_models:
 
 When calling `init_tinker_client`, the following operations are automatically executed:
 
-1. **Patch Tinker SDK**: Bypass Tinker's `tinker://` prefix validation, allowing it to connect to standard HTTP addresses
-2. **Set Request Headers**: Inject necessary authentication headers such as `X-Ray-Serve-Request-Id` and `Authorization`
+1. Adapt Tinker to accept Twinkle API tokens and `twinkle://` checkpoint paths.
+2. Add the authentication and request headers that Twinkle Server expects.
 
 After initialization, import `from tinker import ServiceClient` to connect to Twinkle Server. Training code can reuse the supported endpoints subject to the loss compatibility limits above.
 

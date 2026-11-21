@@ -36,6 +36,15 @@ def copy_checkpoint_args(output_dir: str, checkpoint_dir: str) -> None:
         shutil.copy2(source, target)
 
 
+def write_task_head_checkpoint(checkpoint_dir: str, state: Dict[str, Any]) -> None:
+    """Write an already collected task head using slot-independent checkpoint keys."""
+    if not state:
+        return
+    from safetensors.torch import save_file
+    save_file({key: value.contiguous() for key, value in state.items()},
+              os.path.join(checkpoint_dir, 'task_head.safetensors'))
+
+
 def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_limit: Optional[int]) -> None:
     """Retain the newest completed checkpoint directories, always protecting the current save."""
     if save_total_limit is None:
@@ -463,16 +472,10 @@ class TrainableModel(ABC):
             torch_util.copy_tensor_(tensors[key[len('task_head.'):]], value)
 
     def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
-        """Write the adapter's attached head to its own task_head.safetensors.
-
-        Keyed 'task_head.<name>' -- slot-independent, so a re-added adapter may land
-        on a different slot and still restore. Runs on the master rank only; the head
-        file is tiny, so it writes synchronously alongside the (async) weights."""
+        """Gather the attached head on participating ranks and write it on the master."""
         state = self._task_head_state(adapter_name)
         if state and self._task_head_is_master():
-            from safetensors.torch import save_file
-            save_file({key: value.contiguous() for key, value in state.items()},
-                      os.path.join(checkpoint_dir, 'task_head.safetensors'))
+            write_task_head_checkpoint(checkpoint_dir, state)
 
     def _load_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
         """Restore the attached head from task_head.safetensors; head-less legacy

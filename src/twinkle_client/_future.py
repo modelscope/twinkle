@@ -10,9 +10,12 @@ from __future__ import annotations
 import logging
 import requests
 import time
-from typing import Any, Optional
+import uuid
+from collections.abc import Callable
+from typing import Any
 
-from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope
+from twinkle.protocol.headers import H_REQUEST_ID
+from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope, UploadProgress
 from twinkle_client.exceptions import TaskCancelledError, TaskFailedError, TaskRecordLostError, TaskWaitTimeoutError
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
@@ -54,13 +57,18 @@ def _best_effort_cancel(request_id: str, transport: ClientTransport) -> None:
         logger.debug('[future] best-effort cancel of %s failed: %s', request_id, e)
 
 
-def _post_retrieve(request_id: str, transport: ClientTransport) -> TaskEnvelope:
+def _post_retrieve(
+    request_id: str, transport: ClientTransport, *, http_request_id: str, after_progress: int | None = None
+) -> TaskEnvelope:
     """POST one retrieve and parse the reply into a TaskEnvelope.
 
     Raises ``requests.HTTPError`` (a :class:`TwinkleHTTPError` after the client
     error-parsing change lands) on a non-2xx response.
     """
-    response = transport.post(_retrieve_url(transport), json_data={'request_id': request_id})
+    body: dict[str, Any] = {'request_id': request_id}
+    if after_progress is not None:
+        body['after_progress'] = after_progress
+    response = transport.post(_retrieve_url(transport), json_data=body, headers={H_REQUEST_ID: http_request_id})
     return TaskEnvelope.model_validate(response.json())
 
 
@@ -117,6 +125,7 @@ def resolve(
     model_cls,
     total_timeout: float = _DEFAULT_TOTAL_TIMEOUT,
     transport: ClientTransport | None = None,
+    on_progress: Callable[[UploadProgress], None] | None = None,
 ) -> Any:
     """Block until ``submit``'s task reaches a terminal state, then return its result.
 
@@ -128,18 +137,32 @@ def resolve(
     The main loop never sleeps: waiting is delegated to Retrieve_Endpoint's
     long-poll. Only transport retries back off.
     """
+    cursor = 0
+
+    def report_progress(envelope: TaskEnvelope) -> None:
+        nonlocal cursor
+        progress = envelope.progress
+        if on_progress is not None and progress is not None and progress.sequence > cursor:
+            cursor = progress.sequence
+            on_progress(progress)
+
     if submit.status in TERMINAL_STATUSES:
+        report_progress(submit)
         return _unwrap(submit, model_cls)  # same call as the retrieve path
 
     resolved_transport = capture_transport(transport)
     deadline = time.monotonic() + total_timeout
     transport_failures = not_found_count = 0
+    poll_request_id = uuid.uuid4().hex
     try:
+        report_progress(submit)
         while True:
             if time.monotonic() >= deadline:
                 raise TaskWaitTimeoutError(request_id=submit.request_id, waited=total_timeout)
             try:
-                reply = _post_retrieve(submit.request_id, resolved_transport)
+                cursor_args = {} if on_progress is None else {'after_progress': cursor}
+                reply = _post_retrieve(
+                    submit.request_id, resolved_transport, http_request_id=poll_request_id, **cursor_args)
                 transport_failures = not_found_count = 0
             except (requests.ConnectionError, requests.Timeout):
                 transport_failures += 1
@@ -161,9 +184,11 @@ def resolve(
                     raise
                 time.sleep(min(2**transport_failures, 30))
                 continue
+            report_progress(reply)
             if reply.status in TERMINAL_STATUSES:
                 return _unwrap(reply, model_cls)  # same call as the submit path
             _log_queue_state(reply)
+            poll_request_id = uuid.uuid4().hex
     except (KeyboardInterrupt, SystemExit):
         # Caller abandoned the wait: best-effort ask the server to drop the task if it
         # has not started, then re-raise so the interrupt is never swallowed.
@@ -171,10 +196,16 @@ def resolve(
         raise
 
 
-def resolve_response(response, model_cls, *, transport: ClientTransport | None = None) -> Any:
+def resolve_response(
+    response, model_cls, *, transport: ClientTransport | None = None,
+    on_progress: Callable[[UploadProgress], None] | None = None,
+) -> Any:
     """Resolve a Submit_Endpoint response using the submitter's transport."""
+    payload = response.json()
     return resolve(
-        TaskEnvelope.model_validate(response.json()),
+        TaskEnvelope.model_validate(payload),
         model_cls=model_cls,
         transport=transport,
+        # Older servers reject unknown retrieve fields and omit progress in submit replies.
+        on_progress=on_progress if 'progress' in payload else None,
     )
