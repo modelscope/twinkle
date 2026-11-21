@@ -110,7 +110,10 @@ class HubOperation:
 
     @classmethod
     def upload_checkpoint(cls, repo_id: str, folder_path: str, token: str, report: Callable[..., None]) -> str:
-        """Upload a private checkpoint and return the provider's commit ID."""
+        """Upload a private checkpoint and return the provider's commit ID.
+
+        Hugging Face does not expose per-byte progress through this path.
+        """
         if cls.source_type(repo_id) == 'hf':
             return cls.push_to_hub(repo_id, folder_path, token=token, private=True).oid
         return MSHub.upload_checkpoint(cls.remove_source_type(repo_id), folder_path, token, report)
@@ -237,6 +240,7 @@ class MSHub(HubOperation):
 
     @staticmethod
     def upload_checkpoint(repo_id: str, folder_path: str, token: str, report: Callable[..., None]) -> str:
+        requires('modelscope-hub')
         from modelscope_hub import HubApi
         from modelscope_hub.errors import AlreadyExistsError
 

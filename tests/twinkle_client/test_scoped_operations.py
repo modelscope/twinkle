@@ -168,6 +168,72 @@ def test_scope_releases_other_handles_and_retains_failed_release_until_retry(los
     assert not model._training_ids and session.closed
 
 
+class ExpiredSession(Session):
+    def post(self, url, **kwargs):
+        if url.rsplit('/', 1)[-1] == 'remove_adapter':
+            self.calls.append('remove_adapter')
+            return Response({
+                'error': 'Training handle expired',
+                'category': 'user',
+                'error_code': 404,
+                'request_id': 'release-expired',
+            }, 404)
+        return super().post(url, **kwargs)
+
+
+def test_expired_training_handle_does_not_prevent_close():
+    session = ExpiredSession()
+    with RolloutResources(lambda: client_for(session)) as resources:
+        model = resources.client.model('model')
+        model.add_adapter_to_model('slot')
+
+    assert session.closed
+    assert not model._training_ids
+    assert not resources._operation_scope._training_releases
+    assert session.calls.count('remove_adapter') == 1
+    resources.close()
+
+
+def test_explicit_expired_release_forgets_scope_before_raising():
+    session = ExpiredSession()
+    with RolloutResources(lambda: client_for(session)) as resources:
+        model = resources.client.model('model')
+        model.add_adapter_to_model('slot')
+        with pytest.raises(TwinkleHTTPError) as caught:
+            model.remove_adapter()
+
+    assert caught.value.status_code == 404
+    assert session.closed
+    assert not model._training_ids
+    assert not resources._operation_scope._training_releases
+    assert session.calls.count('remove_adapter') == 1
+
+
+def test_route_not_found_does_not_settle_training_release():
+    class RouteMissingSession(Session):
+        missing = True
+
+        def post(self, url, **kwargs):
+            if url.rsplit('/', 1)[-1] == 'remove_adapter' and self.missing:
+                self.calls.append('remove_adapter')
+                return Response({'detail': 'Not Found'}, 404)
+            return super().post(url, **kwargs)
+
+    session = RouteMissingSession()
+    resources = RolloutResources(lambda: client_for(session))
+    with pytest.raises(BaseExceptionGroup, match='resource cleanup'):
+        with resources:
+            model = resources.client.model('model')
+            model.add_adapter_to_model('slot')
+
+    assert not session.closed
+    assert model._training_ids == {'slot': 'training-1'}
+    assert resources._operation_scope._training_releases
+    session.missing = False
+    resources.close()
+    assert session.closed and not model._training_ids
+
+
 def test_sampling_remains_concurrent_while_a_guarded_training_call_is_blocked():
     session = Session()
     session.sample_barrier = threading.Barrier(2)

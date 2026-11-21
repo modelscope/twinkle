@@ -575,7 +575,12 @@ class StreamingDriver:
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
     def close(self, timeout: float = 30.0) -> None:
-        """Wait up to timeout seconds for cleanup; retry close to confirm settlement."""
+        """Wait up to timeout seconds for cleanup; retry close to confirm settlement.
+
+        Raises:
+            TimeoutError: Cleanup did not settle before the deadline.
+            BaseExceptionGroup: One or more rollout episodes failed to close.
+        """
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError('close timeout must be finite and positive')
         deadline = time.monotonic() + timeout

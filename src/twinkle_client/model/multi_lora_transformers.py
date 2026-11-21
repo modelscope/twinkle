@@ -213,7 +213,8 @@ class MultiLoraTransformersModel:
                 self.adapter_name = adapter_name
             scope = self._transport._operation_scope
             if scope is not None:
-                scope.own_training(result.training_id, lambda: self._release_adapter(adapter_name, result.training_id))
+                scope.own_training(
+                    result.training_id, lambda: self._release_adapter(adapter_name, result.training_id, missing_ok=True))
             return result.training_id
         finally:
             with self._training_lock:
@@ -225,20 +226,22 @@ class MultiLoraTransformersModel:
         name = adapter_name or self.adapter_name
         with self._training_lock:
             training_id = self._training_ids.get(name)
-        try:
-            self._release_adapter(name, training_id)
-        except TwinkleHTTPError as exc:
-            if exc.status_code == 404:
-                self._forget_training(name, training_id)
-            # A missing handle is unusable, but does not certify device release.
-            raise
+        self._release_adapter(name, training_id)
 
-    def _release_adapter(self, name, training_id):
-        self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
+    def _release_adapter(self, name, training_id, missing_ok=False):
+        missing_error = None
+        try:
+            self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
+        except TwinkleHTTPError as exc:
+            if exc.status_code != 404 or exc.error_code != 404:
+                raise
+            missing_error = exc
         self._forget_training(name, training_id)
         scope = self._transport._operation_scope
         if scope is not None:
             scope.forget_training(training_id)
+        if missing_error is not None and not missing_ok:
+            raise missing_error
 
     def _forget_training(self, name: str, training_id: str) -> None:
         """A late response must never erase a newer same-name binding."""
