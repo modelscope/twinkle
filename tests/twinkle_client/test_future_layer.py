@@ -6,6 +6,9 @@
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+from uuid import uuid4
+
 import pytest
 import requests
 
@@ -13,6 +16,7 @@ from twinkle_client import _future
 from twinkle_client.exceptions import TaskFailedError, TaskRecordLostError, TaskWaitTimeoutError
 from twinkle.protocol.types.errors import ErrorPayload
 from twinkle.protocol.types.lifecycle import TaskEnvelope
+from twinkle.protocol.types.model import SaveRequest
 
 
 class _Model:
@@ -37,6 +41,36 @@ def _failed(**kw):
 
 def _running():
     return TaskEnvelope(request_id='r', status='running', queue_state='active')
+
+
+@pytest.mark.parametrize('state', ['failed', 'bad-result', 'wait-timeout', 'submit-timeout'])
+def test_tracked_task_reports_only_unresolved_remote_work(state, monkeypatch):
+    unknown = []
+    body = SaveRequest(training_id='run', adapter_name='', client_save_id=uuid4())
+    request_id = body.tracked_request_id()
+    assert SaveRequest.model_validate_json(body.model_dump_json()).tracked_request_id() == request_id
+    assert body.model_copy(update={'training_id': 'other'}).tracked_request_id() != request_id
+
+    def post(*args):
+        if state == 'submit-timeout':
+            raise requests.ReadTimeout()
+        envelope = {'failed': _failed(), 'bad-result': _completed(None), 'wait-timeout': _running()}[state]
+        return SimpleNamespace(json=envelope.model_dump)
+
+    def invalid(value):
+        raise ValueError('invalid result')
+
+    def timeout(*args, **kwargs):
+        raise TaskWaitTimeoutError(request_id='r', waited=1)
+
+    if state == 'wait-timeout':
+        monkeypatch.setattr(_future, 'resolve', timeout)
+    expected = {'failed': TaskFailedError, 'bad-result': ValueError,
+                'wait-timeout': TaskWaitTimeoutError, 'submit-timeout': requests.ReadTimeout}[state]
+    with pytest.raises(expected):
+        _future.submit_tracked_task(SimpleNamespace(post_model=post), 'url', body,
+                                    SimpleNamespace(model_validate=invalid), unknown.append, request_id=request_id)
+    assert unknown == {'failed': [], 'bad-result': [], 'wait-timeout': ['r'], 'submit-timeout': [request_id]}[state]
 
 
 def test_terminal_submit_issues_no_retrieve(monkeypatch):

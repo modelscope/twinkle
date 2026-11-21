@@ -178,3 +178,32 @@ def resolve_response(response, model_cls, *, transport: ClientTransport | None =
         model_cls=model_cls,
         transport=transport,
     )
+
+
+def submit_tracked_task(transport, url, body, model_cls, on_outcome_unknown, *, request_id=None):
+    """Notify the caller only when a submitted task may still be running."""
+    try:
+        response = transport.post_model(url, body)
+    except (requests.ConnectTimeout, requests.exceptions.InvalidHeader, requests.exceptions.InvalidURL,
+            requests.exceptions.InvalidSchema, requests.exceptions.MissingSchema):
+        raise
+    except requests.HTTPError as exc:
+        status = _status_of(exc)
+        if status is None or status in (408, 499) or status >= 500:
+            on_outcome_unknown(request_id)
+        raise
+    except (requests.RequestException, KeyboardInterrupt, SystemExit):
+        on_outcome_unknown(request_id)
+        raise
+
+    try:
+        submit = TaskEnvelope.model_validate(response.json())
+        request_id = submit.request_id
+        result = resolve(submit, model_cls=None, transport=transport)
+    except (TaskFailedError, TaskCancelledError):
+        raise
+    except BaseException:
+        on_outcome_unknown(request_id)
+        raise
+    # Response-model validation is local. The remote operation has ended.
+    return model_cls.model_validate(result) if model_cls is not None else result
