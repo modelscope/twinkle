@@ -406,6 +406,7 @@ foundation for building customizable, enterprise-grade training services.
 | Component Type | Component Link                                                                                           | Component Function                                                                      | Author              |
 | -------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ------------------- |
 | Patch          | [qwen3_moe_transformers4_patch](https://www.modelscope.cn/models/twinkle-kit/qwen3_moe_transformers4_patch) | Fixes Qwen3 MoE model hang issue during FSDP2 training, effective for transformers==4.x | ModelScope Official |
+| Decision | [Typed decision training](cookbook/transformers/decision/README.md) | Candidate scoring, soft-label losses, LoRA head persistence and question accuracy | Community |
 
 ## Contributions
 
