@@ -30,10 +30,16 @@ def _preload_pip_cudnn():
     main = os.path.join(libdir, 'libcudnn.so.9')
     if not os.path.exists(main):
         return
-    ctypes.CDLL(main, mode=ctypes.RTLD_GLOBAL)
-    for name in sorted(os.listdir(libdir)):
-        if name.startswith('libcudnn_') and name.endswith('.so.9'):
-            ctypes.CDLL(os.path.join(libdir, name), mode=ctypes.RTLD_GLOBAL)
+    try:
+        ctypes.CDLL(main, mode=ctypes.RTLD_GLOBAL)
+        for name in sorted(os.listdir(libdir)):
+            if name.startswith('libcudnn_') and name.endswith('.so.9'):
+                ctypes.CDLL(os.path.join(libdir, name), mode=ctypes.RTLD_GLOBAL)
+    except OSError as e:
+        # Preloading is an optimization, not a contract: an unresolvable wheel must not
+        # break collection for the whole suite. Fall back to the default resolution order.
+        import warnings
+        warnings.warn(f'pip cuDNN preload skipped ({e}); default symbol resolution applies.', stacklevel=2)
 
 
 _preload_pip_cudnn()

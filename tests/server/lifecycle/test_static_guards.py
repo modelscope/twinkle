@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Static / structural guards for the lifecycle refactor.
 
+- the deleted symbols occur zero times under ``src/twinkle/**``.
 - ``TaskEnvelope`` has exactly one construction site.
 - The client-side invariant: the client HTTP timeout is <= 120 and strictly
   greater than the server Long_Poll_Window.
@@ -10,11 +11,32 @@ nothing checks decays into a false claim -- as happened with "a consistency test
 the two sets are equal", which was written in a docstring while no such test existed.
 """
 from __future__ import annotations
-
 from pathlib import Path
+
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SRC = _REPO_ROOT / 'src' / 'twinkle'
+
+# Symbols the refactor removed. A wildcard search (not a per-file list) must find
+# each of them zero times across the whole server tree.
+_FORBIDDEN_SYMBOLS = (
+    'schedule_task_and_wait',
+    'run_task',
+    'persist_status',
+    '_complete_result',
+    '_complete_error',
+)
+
+
+@pytest.mark.parametrize('symbol', _FORBIDDEN_SYMBOLS)
+def test_deleted_symbol_has_zero_occurrences(symbol):
+    hits = []
+    for path in _SRC.rglob('*.py'):
+        text = path.read_text(encoding='utf-8')
+        if symbol in text:
+            hits.append(str(path.relative_to(_REPO_ROOT)))
+    assert hits == [], f'{symbol!r} still occurs in: {hits}'
 
 
 def test_client_http_timeout_bounds():
