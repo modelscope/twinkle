@@ -119,7 +119,19 @@ def _capture_builder(monkeypatch, build_callable, *args, **kwargs) -> _CaptureRe
 
 
 def test_gateway_builder_characterization(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from twinkle.server import deployment as app_scaffold
     from twinkle.server.gateway import app as gateway_mod
+
+    # The gateway's require_api_key middleware resolves the live servable on every request
+    # (serve.get_replica_context); outside a Serve replica stand in a keyless gateway so the
+    # probe reaches verify_token instead of dying on the replica-context lookup.
+    monkeypatch.setattr(
+        app_scaffold.serve, 'get_replica_context',
+        lambda: SimpleNamespace(
+            servable_object=SimpleNamespace(api_key=None, route_prefix=''),
+            replica_id=SimpleNamespace(unique_id='replica-test')))
 
     res = _capture_builder(
         monkeypatch,
@@ -129,7 +141,7 @@ def test_gateway_builder_characterization(monkeypatch) -> None:
     assert res.deployment_name == 'GatewayServer'
     assert _route_set(res.app) == _baseline_route_set('gateway')
     _assert_auth_middleware_effect(res.app)
-    _assert_middleware_lifo_order(res.app, expect_cleanup=True)
+    _assert_middleware_lifo_order(res.app, expect_cleanup=True, expect_api_key=True)
 
 
 def test_model_builder_characterization(monkeypatch) -> None:
@@ -275,15 +287,23 @@ def _registered_http_middleware_names(app: FastAPI) -> list[str]:
     return names
 
 
-def _assert_middleware_lifo_order(app: FastAPI, *, expect_cleanup: bool, expect_replica_id: bool = False) -> None:
+def _assert_middleware_lifo_order(app: FastAPI,
+                                  *,
+                                  expect_cleanup: bool,
+                                  expect_replica_id: bool = False,
+                                  expect_api_key: bool = False) -> None:
     """Assert the scaffold middleware stack preserves the intended LIFO order.
 
     ``user_middleware`` is ordered OUTERMOST → INNERMOST (Starlette prepends
     each new entry). Model and Sampler add ``inject_replica_id`` after the
-    scaffold stack, making it the outermost middleware when enabled.
+    scaffold stack, making it the outermost middleware when enabled; the
+    gateway adds ``require_api_key`` last, wrapping the whole scaffold stack
+    so a key-rejected request short-circuits before any handler runs.
     """
     names = _registered_http_middleware_names(app)
     expected = []
+    if expect_api_key:
+        expected.append('require_api_key')
     if expect_replica_id:
         expected.append('inject_replica_id')
     expected.extend(['metrics_middleware', 'tracing_middleware', 'verify_token'])

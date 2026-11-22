@@ -157,14 +157,38 @@ def test_the_endpoint_is_per_physical_gpu():
         pytest.skip('needs two GPUs to show the endpoints differ')
     from twinkle.checkpoint_engine import IPCCheckpointEngine
 
+    engine = IPCCheckpointEngine()
     torch.cuda.set_device(0)
-    first = IPCCheckpointEngine.endpoint()
+    first = engine.endpoint()
     torch.cuda.set_device(1)
-    second = IPCCheckpointEngine.endpoint()
+    second = engine.endpoint()
     torch.cuda.set_device(0)
 
     assert first != second
     assert first.startswith('ipc://')
+
+
+def test_the_endpoint_is_per_channel_on_the_same_gpu():
+    """Two colocate managers over one GPU pair must not share (and unlink) each other's socket.
+
+    PLAN: same device, channels 'sampler' vs 'model_to_model' -> distinct socket paths; a channel
+    with filesystem-hostile characters is sanitized, not injected into the path. Kills the
+    pre-channel layout where the second bind unlinked the first manager's socket.
+    """
+    from twinkle.checkpoint_engine import IPCCheckpointEngine
+
+    torch.cuda.set_device(0)
+    a = IPCCheckpointEngine(channel='sampler').endpoint()
+    b = IPCCheckpointEngine(channel='model_to_model').endpoint()
+    hostile = IPCCheckpointEngine(channel='../../etc x').endpoint()
+    assert a != b
+    assert a.startswith('ipc://') and b.startswith('ipc://')
+    # Sanitization keeps the channel a single path component (dots are legal filename chars;
+    # separators and spaces are what would escape the socket directory or break the path).
+    # The endpoint is a full socket path (/tmp/...), so the component check applies to its basename.
+    hostile_name = hostile[len('ipc://'):].rsplit('/', 1)[-1]
+    assert '/' not in hostile_name and ' ' not in hostile_name
+    assert hostile.rsplit('/', 1)[0] == a.rsplit('/', 1)[0], 'sanitized channel escaped the socket directory'
 
 
 def test_mismatched_world_sizes_are_refused():

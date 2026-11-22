@@ -20,7 +20,6 @@ Note: nproc_per_node=1 is intentional — the test internally spawns 4 worker pr
 mp.spawn (1 for the single-GPU baseline and 4 for the EP+FSDP run).
 """
 
-import numpy as np
 import os
 import pytest
 import socket
@@ -34,8 +33,7 @@ from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import NativeFSDPStrategy
 from twinkle.utils import DeviceMesh
 
-pytestmark = pytest.mark.skip(
-    reason='Heavy multi-GPU MoE test (needs 4 GPUs + Qwen3.5-4B); not viable on dual-V100 CI, run manually.')
+pytestmark = [pytest.mark.slow, pytest.mark.accel(4)]
 
 ABS_TOL = 5e-3
 LOSS_TOL = 1e-4
@@ -240,16 +238,10 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         torch.manual_seed(1234)
         torch.cuda.manual_seed_all(1234)
 
-        # New design: main mesh does NOT include 'ep' dimension
-        # Main mesh: fsdp=4 (all 4 GPUs for FSDP)
-        # ep_size=2 is stored as attribute, used to build separate ep_fsdp_device_mesh
+        # Current design: the twinkle DeviceMesh carries ep_size/ep_fsdp_size as attributes; the
+        # strategy builds the separate ('ep', 'ep_fsdp') torch mesh from them.
         ep_size = 2
-        device_mesh = DeviceMesh(
-            device_type='cuda',
-            mesh=np.arange(world_size).reshape(world_size),  # 1D mesh: [0, 1, 2, 3]
-            mesh_dim_names=('fsdp', ),
-            ep_size=ep_size,  # ep_size as attribute, not mesh dimension
-        )
+        device_mesh = DeviceMesh.from_sizes(world_size=world_size, fsdp_size=world_size, ep_size=ep_size)
 
         model = _load_model(model_id, local_only, device, num_layers=1)
         model.train()
@@ -261,12 +253,21 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         labels = input_ids.clone()
         labels[:, 0] = -100
 
-        # Build explicit ep_fsdp_device_mesh
-        ep_fsdp_mesh = device_mesh.build_ep_fsdp_device_mesh(ep_size=ep_size)
+        # The strategy owns the ('ep', 'ep_fsdp') torch mesh (built from the twinkle mesh's
+        # ep_size/ep_fsdp_size); the old manual build_ep_fsdp_device_mesh call is gone.
+        fsdp = NativeFSDPStrategy(
+            device_mesh=device_mesh,
+            mixed_precision='no',
+            fsdp_config={},
+            enable_ep=True,
+            ep_size=ep_size,
+        )
+        ep_fsdp_mesh = fsdp.ep_fsdp_device_mesh
 
-        # Apply EP with ep_fsdp_device_mesh
+        # Mirror TransformersModel._lazy_wrap_model: EP is applied to the unwrapped model BEFORE
+        # FSDP2 wrapping (wrap_model's _ensure_moe_patched_if_needed guard enforces this order).
         apply_expert_parallel(
-            getattr(model, 'model', model),
+            model,
             device_mesh,
             config={
                 'enabled': True,
@@ -277,13 +278,6 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         )
 
         # FSDP2 wrap
-        fsdp = NativeFSDPStrategy(
-            device_mesh=device_mesh,
-            mixed_precision='no',
-            fsdp_config={},
-            enable_ep=True,
-            ep_fsdp_device_mesh=ep_fsdp_mesh,
-        )
         model, _ = fsdp.wrap_model(model, optimizer=None)
 
         outputs = model(input_ids=input_ids, position_ids=position_ids, labels=labels, use_cache=False)

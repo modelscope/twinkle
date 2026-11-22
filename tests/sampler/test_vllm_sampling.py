@@ -11,7 +11,7 @@ import torch
 from safetensors.torch import save_file
 
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
-from twinkle.exceptions import FullWeightLoadError
+from twinkle.utils.exceptions import FullWeightLoadError
 from twinkle.sampler.vllm_sampler.vllm_sampler import vLLMSampler
 
 

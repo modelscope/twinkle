@@ -36,7 +36,7 @@ class _Sleeper:
 @pytest.fixture(scope='module', autouse=True)
 def _ray_and_ray_mode():
     """Bring up Ray and put infra into 'ray' mode for the driver-side path."""
-    ray.init(ignore_reinit_error=True, num_cpus=2, logging_level='ERROR')
+    ray.init(address='local', ignore_reinit_error=True, num_cpus=2, logging_level='ERROR')
     prev_mode = infra._mode
     infra._mode = 'ray'
     try:

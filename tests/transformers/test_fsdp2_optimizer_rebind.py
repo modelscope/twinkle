@@ -313,8 +313,18 @@ class _Accelerator:
         plugin = None if fsdp_version is None else SimpleNamespace(fsdp_version=fsdp_version)
         self.state = SimpleNamespace(fsdp_plugin=plugin)
 
+    @property
+    def is_fsdp2(self):
+        # wrap_model reads this to route model-only FSDP2 calls; mirror the real attribute.
+        plugin = self.state.fsdp_plugin
+        return plugin is not None and getattr(plugin, 'fsdp_version', 1) == 2
+
     def prepare(self, *args):
         return self._prepared
+
+    def _prepare_fsdp2(self, *args):
+        # Model-only preparation returns a list, same container contract as prepare.
+        return list(args)
 
 
 def _wrap(prepared, fsdp_version=None):

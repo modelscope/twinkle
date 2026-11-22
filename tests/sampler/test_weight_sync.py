@@ -42,8 +42,7 @@ MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen2.5-3B-Instruct')
 
 logger = logging.getLogger(__name__)
 
-pytestmark = pytest.mark.skip(
-    reason='Heavy weight-sync test (vLLM + NCCL multi-process, 2-4 GPUs); not viable on dual-V100 CI, run manually.')
+pytestmark = [pytest.mark.slow, pytest.mark.accel(2)]
 
 
 def log(msg):
@@ -204,10 +203,14 @@ def test_standalone_weight_sync(model_gpus: int = 1, sampler_gpus: int = 1):
     # test lora-only sync
 
     sync_start = time.time()
-    # base
-    manager.sync_weights()
-    # lora
-    manager.sync_weights('default')
+    # Current contract: an enable_lora receiver takes merge_and_sync=False -- the first call syncs
+    # the base (renamed to vLLM's .base_layer params), later calls sync only the LoRA delta of the
+    # auto-detected default adapter. (The old positional adapter-name argument is gone; passing
+    # 'default' positionally landed in merge_and_sync and sent canonical names the LoRA-wrapped
+    # receiver does not expose.)
+    manager.sync_weights(merge_and_sync=False)
+    # lora-only incremental
+    manager.sync_weights(merge_and_sync=False)
     sampler.reset_prefix_cache()
     sync_time = time.time() - sync_start
     log(f'  Weight sync completed in {sync_time:.2f}s')

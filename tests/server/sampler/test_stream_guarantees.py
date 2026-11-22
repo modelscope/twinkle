@@ -49,6 +49,7 @@ async def test_sampler_request_refreshes_replica_liveness():
 async def test_stream_without_actor_returns_structured_error():
     service = SimpleNamespace(
         sampler=SimpleNamespace(_actors=[]),
+        deploy_adapters={},
         _on_request_start=AsyncMock(return_value='token'),
     )
     app = FastAPI()

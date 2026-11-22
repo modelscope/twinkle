@@ -91,7 +91,9 @@ async def test_allocated_sampler_initializes_with_typed_owner_context(monkeypatc
     monkeypatch.setattr(module.serve, 'get_replica_context', lambda: SimpleNamespace(
         replica_id=SimpleNamespace(unique_id='serve-replica')))
     owner = module.SamplerManagement.__new__(module.SamplerManagement)
-    await owner.__init__(
+    # Synchronous constructor (Ray Serve cannot await __init__): owner context, resource manager
+    # and replica identity are established here; the async half runs on first check_health.
+    owner.__init__(
         model_id='mock', nproc_per_node=1, device_group={'name': 'sampler', 'ranks': 1, 'device_type': 'cpu'},
         device_mesh={'dp_size': 1}, sampler_type='mock', sampling_context=context,
         placement_group=allocation, allocation_devices=['0'])

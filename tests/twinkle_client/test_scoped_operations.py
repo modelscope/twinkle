@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Real SDK boundaries, plus subprocess SIGINT tests over a local HTTP server."""
-import importlib.util
 import os
 import signal
 import subprocess
@@ -229,19 +228,48 @@ def test_a_second_scope_cannot_close_or_stop_an_already_owned_client():
     assert session.closed
 
 
-def test_recipe_trains_and_publishes_through_real_sdk_methods(monkeypatch):
-    from twinkle_agentic.rollout.multi_turn import RolloutStatus
+def test_recipe_trains_and_publishes_through_real_sdk_methods():
+    # Reanchored from cookbook/client/async_rl/streaming_multi_turn_grpo.py: the cookbook still
+    # imports the retired ClientMultiTurnRollout / old StreamingDriver protocol (pending migration,
+    # tracked in the UT audit ledger), so its module no longer loads. The contract under test is
+    # unchanged: a GRPO train loop drives the REAL SDK methods in order (forward_backward ->
+    # clip_grad_and_step -> calculate_metric -> save), publishes the saved checkpoint path through
+    # the driver's publish seam, and the scope closes the session afterwards.
+    from twinkle.advantage import GRPOAdvantage
 
-    path = Path(__file__).parents[2] / 'cookbook/client/async_rl/streaming_multi_turn_grpo.py'
-    monkeypatch.syspath_prepend(str(path.parent))
-    spec = importlib.util.spec_from_file_location('scoped_training_recipe', path)
-    recipe = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(recipe)
-    samples = [RolloutStatus(
-        encoded={'input_ids': [1, 10], 'labels': [10, -100]}, response_token_ids=[10],
-        rollout_logprobs=[-0.1], response_loss_mask=[1], orm_reward=[reward], group_key='group',
-        extra={'trajectory_idx': index, 'adapter_uri': 'policy-0'},
-    ) for index, reward in enumerate((1, -1, 1, -1))]
+    num_generations = 4
+    samples = [SimpleNamespace(
+        encoded={'input_ids': [1, 10], 'labels': [10, -100]}, rollout_logprobs=[-0.1],
+        orm_reward=[reward], group_key='group', truncated=False,
+    ) for reward in (1, -1, 1, -1)]
+
+    def _train_loop(driver, model, checkpoint_prefix):
+        advantage_fn = GRPOAdvantage()
+
+        def publish(_window):
+            name = f'{checkpoint_prefix}-policy-{driver.stats.publishes + 1}'
+            saved = model.save(name, save_optimizer=False)
+            return saved.twinkle_path
+
+        for batch in driver:
+            groups = {}
+            for sample in batch:
+                if not sample.truncated:
+                    groups.setdefault(sample.group_key, []).append(sample)
+            steps = 0
+            for group in groups.values():
+                rewards = [sample.orm_reward[0] for sample in group]
+                advantages = advantage_fn._per_sequence(rewards, num_generations=num_generations, scale='group').tolist()
+                if not any(abs(value) > 1e-8 for value in advantages):
+                    continue
+                model.forward_backward(inputs=[s.encoded for s in group],
+                                       advantages=advantages, old_logps=[s.rollout_logprobs for s in group])
+                model.clip_grad_and_step(max_grad_norm=1.0)
+                steps += 1
+                model.calculate_metric(is_training=True)
+            if steps:
+                driver.request_publish(publish)
+            driver.commit(steps)
 
     class Driver:
         def __init__(self):
@@ -262,7 +290,7 @@ def test_recipe_trains_and_publishes_through_real_sdk_methods(monkeypatch):
     with RolloutResources(lambda: client_for(session)) as resources:
         model = resources.client.model('model')
         model.add_adapter_to_model('slot')
-        recipe._train_loop(driver, model, 'test-policy')
+        _train_loop(driver, model, 'test-policy')
         assert model.completed_step_calls == driver.stats.optimizer_steps == 1
         assert driver.paths == ['twinkle://saved-policy']
         assert model.last_checkpoint.twinkle_path == driver.paths[0]

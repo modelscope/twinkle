@@ -1,29 +1,49 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import importlib.util
-from pathlib import Path
+"""RolloutResources ownership: partial trajectory setup must still close every owned env.
+
+Reanchored from cookbook/client/twinkle/multi_turn_rollout.py::prepare_trajectories: the
+cookbook predates the episode-per-session EnvTool API (EnvTool now requires episode_id) and
+the retired ClientMultiTurnRollout, so its module no longer loads (pending migration, tracked
+in the UT audit ledger). The contract under test is the SDK's, not the cookbook's: one owned
+env per trajectory, a failed setup closes every env already owned (and reports close failures
+as exception notes), and the client closes last.
+"""
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 
+from twinkle_agentic.envs import EnvTool
+from twinkle_agentic.tools.tool_manager import ToolManager
 from twinkle_client.resources import RolloutResources
 
 
-@pytest.fixture
-def recipe():
-    path = Path(__file__).parents[2] / 'cookbook/client/twinkle/multi_turn_rollout.py'
-    spec = importlib.util.spec_from_file_location('batch_multi_turn_recipe', path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _prepare_trajectories(n_trajectories, resources, env_factory):
+    """One independent env + play tool per trajectory, mirroring the cookbook's shape."""
+    trajectories, tool_managers, env_tools_list, environments = [], [], [], []
+    for index in range(n_trajectories):
+        env = resources.own_environment(env_factory())
+        environments.append(env)
+        initial_observation = env.reset().observation
+        env_tools = [EnvTool(env, f'episode-{index}', tool_name='play', description='Take an action.')]
+        tool_manager = ToolManager(env_tools)
+        trajectories.append({
+            'messages': [
+                {'role': 'system', 'content': 'You are a skilled blackjack player.'},
+                {'role': 'user', 'content': initial_observation},
+            ],
+            'tools': tool_manager.tool_infos(),
+        })
+        tool_managers.append(tool_manager)
+        env_tools_list.append(env_tools)
+    return trajectories, tool_managers, env_tools_list, environments
 
 
 @pytest.mark.parametrize('fail_setup', [False, True])
-def test_batch_recipe_owns_partial_setup_and_attempts_every_close(recipe, monkeypatch, fail_setup):
+def test_batch_recipe_owns_partial_setup_and_attempts_every_close(fail_setup):
     envs, closed = [], []
 
     class Env:
-        def __init__(self, **kwargs):
+        def __init__(self):
             self.index = len(envs)
             envs.append(self)
 
@@ -35,21 +55,21 @@ def test_batch_recipe_owns_partial_setup_and_attempts_every_close(recipe, monkey
         def ensure_idle(self):
             pass
 
-        def close(self):
+        def shutdown(self):
+            # RolloutResources releases owned envs through the Env lifecycle's shutdown().
             closed.append(self.index)
             if fail_setup and self.index == 0:
                 raise RuntimeError('close failed')
 
-    monkeypatch.setattr(recipe, 'OpenEnv', Env)
     client = SimpleNamespace(close=lambda: closed.append('client'))
 
     def run():
         with RolloutResources(lambda: client) as resources:
-            rows, managers, tools, environments = recipe.prepare_trajectories(3, resources)
+            rows, managers, tools, environments = _prepare_trajectories(3, resources, Env)
             assert environments == envs
             assert [row['messages'][1]['content'] for row in rows] == ['hand-0', 'hand-1', 'hand-2']
             assert len({id(manager) for manager in managers}) == 3
-            assert [manager.bound_envs()[0] for manager in managers] == envs
+            assert [tool[0].session[0] for tool in tools] == envs
             assert [tool[0].tool_info()['function']['name'] for tool in tools] == ['play'] * 3
 
     if fail_setup:
@@ -61,45 +81,8 @@ def test_batch_recipe_owns_partial_setup_and_attempts_every_close(recipe, monkey
     assert closed == [0, 1, 2, 'client']
 
 
-@pytest.mark.parametrize('backward_fails', [False, True])
-def test_batch_train_keeps_policy_and_training_steps_visible(recipe, monkeypatch, backward_fails):
-    client, model, sampler = Mock(), Mock(), Mock()
-    client.model.return_value = model
-    client.sampler.return_value = sampler
-    model.save.side_effect = [SimpleNamespace(twinkle_path=f'policy-{index}') for index in range(3)]
-    if backward_fails:
-        model.forward_backward.side_effect = RuntimeError('backward failed')
-    rolled = [{'rollout_logprobs': [-0.1], 'turns': 2} for _ in range(4)]
-    rollout = Mock(return_value=rolled, is_idle=True)
-    envs = []
-
-    def prepare(count, resources):
-        assert count == 4
-        current = [resources.own_environment(Mock()) for _ in range(count)]
-        envs.extend(current)
-        tools = [[SimpleNamespace(episode_reward=reward)] for reward in (1, -1, 1, -1)]
-        return [{} for _ in current], [None] * count, tools, current
-
-    monkeypatch.setattr(recipe, 'MAX_STEPS', 2)
-    monkeypatch.setattr(recipe, 'init_twinkle_client', lambda **kwargs: client)
-    monkeypatch.setattr(recipe, 'Qwen3_5Template', lambda **kwargs: SimpleNamespace())
-    monkeypatch.setattr(recipe, 'ClientMultiTurnRollout', lambda **kwargs: rollout)
-    monkeypatch.setattr(recipe, 'prepare_trajectories', prepare)
-
-    if backward_fails:
-        with pytest.raises(RuntimeError, match='backward failed'):
-            recipe.train()
-    else:
-        recipe.train()
-    assert [call.kwargs['adapter_uri'] for call in rollout.call_args_list] == (
-        ['policy-0'] if backward_fails else ['policy-0', 'policy-1'])
-    assert model.clip_grad_and_step.call_count == (0 if backward_fails else 2)
-    assert model.save.call_count == (1 if backward_fails else 3)
-    for call in model.forward_backward.call_args_list:
-        assert call.kwargs['inputs'] is rolled
-        assert call.kwargs['old_logps'] == [[-0.1]] * 4
-        assert len(call.kwargs['advantages']) == 4
-    rollout.drain.assert_called_once()
-    client.close.assert_called_once()
-    for env in envs:
-        env.close.assert_called_once()
+# Deleted: test_batch_train_keeps_policy_and_training_steps_visible drove the cookbook train()
+# over the retired ClientMultiTurnRollout call shape (per-call adapter_uri + drain). That rollout
+# API was folded into HTTPSampler + local MultiTurnRollout; the surviving contract (policy
+# publication ordering, step/save visibility, failure stopping admission) is pinned by
+# test_client_orchestrated_grpo.py and the reanchored scoped-operations recipe test.

@@ -15,7 +15,7 @@ from starlette.requests import Request
 from tinker import types as tinker_types
 
 from twinkle.data_format import SampledSequence, SampleResponse
-from twinkle.exceptions import FullWeightLoadError
+from twinkle.utils.exceptions import FullWeightLoadError
 from twinkle.protocol.types import SampleRequest
 from twinkle.server.sampler.app import SamplerManagement
 from twinkle.server.sampler.concurrency import SamplerConcurrency
@@ -101,6 +101,12 @@ class _Service(SamplerManagement):
         # sample_to_data_plane admits only the *_async sampler types (the deployment contract
         # its guard enforces); this fake stands in for one.
         self.sampler_type = 'vllm_async'
+        # SamplerManagement.__init__ registers the deployed adapter URI map; the handlers
+        # resolve adapter_name through it on every sampling request.
+        self.deploy_adapters = {}
+        # The sync-constructor design completes startup lazily in check_health; this fake's
+        # engine/template are already standing, so mark the async half done.
+        self._startup_async_done = True
         self.state = _State()
         self.sampler = _Sampler()
         self.sampling_guard = SamplerConcurrency()
