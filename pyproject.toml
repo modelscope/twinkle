@@ -72,6 +72,7 @@ test = [
   "pytest-asyncio",
   "pytest-xdist",
   "rouge",
+  "ruff==0.13.0",
   "grimp>=3.0"
 ]
 docs = [
