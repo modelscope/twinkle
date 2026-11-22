@@ -536,6 +536,13 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
     ) -> types.TaskEnvelope:
         raise RequestRejectedError('Training lifecycle operations must use the catalog endpoint')
 
+    @app.post('/twinkle/stop_training', response_model=types.TaskEnvelope)
+    async def stop_training(
+        request: Request, body: types.AdapterRequest, self: ModelManagement = Depends(self_fn)) -> types.TaskEnvelope:
+        # Owner-side stop lives on the pool router (wildcard /twinkle/{endpoint} -> native_request);
+        # the model app rejects lifecycle operations like its create/add_adapter siblings.
+        raise RequestRejectedError('Training lifecycle operations must use the catalog endpoint')
+
     # ------------------------------------------------------------------ #
     # Hub upload (pure I/O -> background task; state-tracked via Retrieve_Endpoint)
     # ------------------------------------------------------------------ #

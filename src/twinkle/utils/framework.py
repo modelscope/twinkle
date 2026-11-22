@@ -119,8 +119,11 @@ class Torch(Framework):
             device_module.empty_cache()
 
     @staticmethod
-    @lru_cache
     def get_current_device() -> 'Union[int, str, "torch.device"]':
+        # NOT cached: the current device is mutable process state (torch.cuda.set_device).
+        # An lru_cache here froze the first device forever, so e.g. the IPC endpoint derived
+        # the same GPU UUID for every device in the process and non-colocated ranks collided
+        # on one socket. current_device() is a cheap C call; only the platform probe below is cached.
         device_module = Torch._device_module()
         if device_module is None:
             return 'cpu'
