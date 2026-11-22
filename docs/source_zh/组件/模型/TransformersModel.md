@@ -29,7 +29,7 @@ class TransformersModel:
 - mixed_precision: 混合精度信息，默认`bf16`，如果有30系以上显卡建议维持不变
 - strategy: 如何封装模型使用多卡训练，默认使用`accelerate`框架。
 - ddp_config: strategy为`accelerate`时的DDP配置，参见：[DDPKwargs](https://github.com/huggingface/accelerate/blob/main/src/accelerate/utils/dataclasses.py#L155)
-- fsdp_config: strategy为`accelerate`时的FSDP配置，参见：[FSDPConfig](https://github.com/huggingface/accelerate/blob/main/src/accelerate/utils/dataclasses.py#L1566)。strategy为`native_fsdp`时额外支持`mixed_precision`子配置（独立精度配置，字段对应FSDP2的[MixedPrecisionPolicy](https://docs.pytorch.org/docs/stable/distributed.fsdp.html#torch.distributed.fsdp.MixedPrecisionPolicy)）：
+- fsdp_config: strategy为`accelerate`时的FSDP配置，参见：[FSDPConfig](https://github.com/huggingface/accelerate/blob/main/src/accelerate/utils/dataclasses.py#L1566)。strategy为`native_fsdp`时额外支持`mixed_precision`子配置（独立精度配置，字段对应FSDP2的[MixedPrecisionPolicy](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html#torch.distributed.fsdp.MixedPrecisionPolicy)）：
   - `param_dtype`: 计算精度。前向/反向前，FSDP将all-gather出的完整参数cast到该精度参与计算；
   - `reduce_dtype`: 梯度归约精度。跨卡reduce-scatter累加在该精度下进行，设为`fp32`可降低多卡累加误差，代价是归约通信量翻倍（即"BF16计算、FP32归约"）；
   - `output_dtype`: 每个FSDP包装单元forward输出cast到的精度。

@@ -214,8 +214,8 @@ model.set_lr_scheduler('default', lr_decay_steps=1000, max_lr=1e-4)
 | 场景 | 示例 |
 |---|---|
 | 单轮数学问答（GSM8K） | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
-| 工具多轮 Blackjack（StreamingDriver，显式同步训练循环） | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
-| E2B sandbox 中的 Blackjack（复用相同训练循环） | [e2b_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/e2b_multi_turn_grpo.py) |
+| 工具多轮 Blackjack（StreamingDriver，显式同步训练循环） | `streaming_multi_turn_grpo.py` |
+| E2B sandbox 中的 Blackjack（复用相同训练循环） | `e2b_multi_turn_grpo.py` |
 
 ### 1. 启动服务端
 

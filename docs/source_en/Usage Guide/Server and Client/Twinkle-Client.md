@@ -215,8 +215,8 @@ The client can train while sampling continues. After [installing Twinkle](../Ins
 | Task | Example |
 |---|---|
 | Single-turn math questions (GSM8K) | [client_orchestrated_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/client_orchestrated_grpo.py) |
-| Blackjack with tools (StreamingDriver, explicit synchronous training loop) | [streaming_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/streaming_multi_turn_grpo.py) |
-| Blackjack in E2B sandboxes (same training loop) | [e2b_multi_turn_grpo.py](https://github.com/modelscope/twinkle/blob/main/cookbook/client/async_rl/e2b_multi_turn_grpo.py) |
+| Blackjack with tools (StreamingDriver, explicit synchronous training loop) | `streaming_multi_turn_grpo.py` |
+| Blackjack in E2B sandboxes (same training loop) | `e2b_multi_turn_grpo.py` |
 
 ### 1. Start the Server
 
