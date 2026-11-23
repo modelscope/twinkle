@@ -6,13 +6,9 @@ structured containers (:class:`TaskMetrics` / ``_RequestMetrics``) and ``get_tas
 Keeping the metric types and the registry in one file (with the HTTP middleware factory in
 ``http_middleware.py``) avoids a ``metrics <-> adapters`` import cycle.
 
-Per-deployment adapters are cached on the *registry instance*
-(``_task_metrics`` / ``_request_metrics``), not at module level. That is load-bearing: the
-adapters hold bound instrument objects, and ``reset()`` swaps the singleton precisely in
-order to rebind them to a real MeterProvider (``worker_init.ensure_telemetry_initialized``
-does ``init_telemetry()`` -> ``reset()``). A module-level cache survived that swap, so
-anything that called ``get_task_metrics`` before ``init_telemetry`` cached NoOp instruments
-for the life of the process.
+The OpenTelemetry proxy meter binds early instruments when the worker installs
+its MeterProvider. Keep one registry per process so its gauge callbacks and
+the resource publisher share the same cache.
 """
 
 from __future__ import annotations
@@ -24,7 +20,9 @@ from typing import Any
 from twinkle.server.exceptions import ResourceReleaseError
 from .provider import get_meter
 
-METERED_TASK_TYPES = frozenset({'forward', 'forward_only', 'forward_backward', 'step', 'optim_step', 'sample'})
+METERED_TASK_TYPES = frozenset({
+    'forward', 'forward_only', 'forward_backward', 'step', 'clip_grad_and_step', 'optim_step', 'sample',
+})
 
 try:
     from opentelemetry.metrics import Observation
@@ -35,7 +33,7 @@ _RESOURCE_GAUGES: tuple[tuple[str, str, str], ...] = (
     ('active_sessions', 'twinkle.sessions.active', 'Number of active client sessions'),
     ('active_models', 'twinkle.models.active', 'Number of registered models'),
     ('active_sampling_sessions', 'twinkle.sampling_sessions.active', 'Number of active sampling sessions'),
-    ('active_futures', 'twinkle.futures.active', 'Number of pending futures/tasks'),
+    ('active_futures', 'twinkle.futures.active', 'Number of retained task results, including pending futures'),
 )
 
 # ---------------------------------------------------------------------------

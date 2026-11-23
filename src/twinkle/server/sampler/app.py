@@ -262,6 +262,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
 
     async def _on_request_start(self, request: Request) -> str:
         request.state.model_id = self.model_id
+        request.state.base_model = self.model_id
         await self.state.touch_replica_last_seen(self.replica_id)
         await self._ensure_state_cleanup_started()
         return get_token_from_request(request)

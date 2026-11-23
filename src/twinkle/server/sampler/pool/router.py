@@ -14,6 +14,7 @@ from twinkle.server.lifecycle.proxy import ForwardedRequest
 from twinkle.server.middleware.auth import get_token_from_request
 from twinkle.server.sampler.weights import is_full_checkpoint
 from twinkle.server.state import get_server_state
+from twinkle.server.telemetry.tracing import inject_context, record_http_status, traced_operation
 from .controller import sampler_controller_name
 
 
@@ -31,6 +32,7 @@ class SamplerRouter:
 
     async def forward(self, request, endpoint):
         request.state.model_id = self.model_id
+        request.state.base_model = self.model_id
         body = await request.body()
         payload: ForwardedRequest = {
             "endpoint": endpoint,
@@ -66,7 +68,15 @@ class SamplerRouter:
 
             queue = Queue(maxsize=128)
         try:
-            reply = await self.controller.request.remote(payload, queue, full_path)
+            with traced_operation('sampler.forward', attrs={'twinkle.transport': 'ray'}) as span:
+                carrier = {}
+                inject_context(carrier)
+                trace_headers = {key.encode(): value.encode() for key, value in carrier.items()}
+                payload["headers"] = [
+                    (key, value) for key, value in payload["headers"] if key.lower() not in trace_headers
+                ] + list(trace_headers.items())
+                reply = await self.controller.request.remote(payload, queue, full_path)
+                record_http_status(span, reply["status"], client=True)
         except BaseException:
             if queue is not None:
                 queue.shutdown(force=True)

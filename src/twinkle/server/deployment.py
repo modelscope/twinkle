@@ -237,7 +237,7 @@ def build_deployment_app(
             return await call_next(request)
         except Exception as exc:
             tb = traceback.format_exc()
-            logger.error(tb)
+            logger.error("Unhandled HTTP error (%s)", type(exc).__name__)
             # Unify the last-resort 500 with the rest of the wire: an
             # ``ErrorPayload`` body (Server category keeps the traceback) instead
             # of the legacy ``{'detail': <traceback>}`` shape.
@@ -323,6 +323,6 @@ class LazyCleanupMixin:
             # Idempotent via the ResourceCleanupCoordinator's own start guard.
             await self.state.start_cleanup_task()
         except Exception as e:
-            logger.warning(f'Failed to start ServerState cleanup task: {e}')
+            logger.warning('Failed to start ServerState cleanup task (%s)', type(e).__name__)
         else:
             self._state_cleanup_started = True

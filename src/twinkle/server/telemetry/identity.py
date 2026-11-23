@@ -18,7 +18,7 @@ def user_id_key() -> str | None:
 
 def user_fingerprint(token: str | None, client_id: str | None = None) -> str | None:
     key = user_id_key()
-    if key and (token or client_id):
-        value = f'token:{token}' if token else f'client:{client_id}'
+    if key:
+        value = f'token:{token}' if token else f'client:{client_id}' if client_id else 'anonymous'
         return fingerprint(value, key)
     return None

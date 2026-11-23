@@ -41,10 +41,11 @@ async def verify_request_token(request: Request, call_next):
         return JSONResponse(status_code=400, content={'detail': f'Missing {H_REQUEST_ID} header'})
 
     request.state.request_id = request_id
-    request.state.client_id = request.headers.get(H_CLIENT_ID) or request_id
+    client_id = request.headers.get(H_CLIENT_ID)
+    request.state.client_id = client_id or request_id
     request.state.token = token
     request.state.session_id = request.headers.get(H_SESSION_ID) or ''
-    request.state.user_id = user_fingerprint(token, request.state.client_id)
+    request.state.user_id = user_fingerprint(token, client_id)
     binding = current_user_id.set(request.state.user_id)
     try:
         return await call_next(request)

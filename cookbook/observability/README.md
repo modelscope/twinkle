@@ -54,7 +54,7 @@ Check out the target branch or tag before building a release image.
 The provisioned **Twinkle / Twinkle Server Overview** dashboard shows:
 
 - HTTP request rate and P95 latency per deployment (Gateway / Model / Sampler / Processor)
-- Active resources (sessions, models, sampling sessions, futures) — reported by
+- Active resources and retained futures — reported by
   the cleanup-leader worker only, so the gauges read absolute values rather
   than the count multiplied by the worker fleet size
 - Task queue depth, execution P95, wait-time P95

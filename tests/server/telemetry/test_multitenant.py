@@ -82,9 +82,18 @@ async def test_usage_is_recorded_once_at_admission(monkeypatch, in_memory_span_e
     @app.post('/train')
     async def train(request: Request):
         request.state.model_id = 'training-1'
+        request.state.base_model = 'base-model'
         return await submit_training_task(
             queue, compute, training_id='training-1', stream='native', seq_id=1, peek=True,
             token=get_token_from_request(request), input_tokens=3, task_type='forward_backward')
+
+    @app.post('/clip/{training_id}')
+    async def clip_grad_and_step(request: Request, training_id: str):
+        request.state.model_id = training_id
+        request.state.base_model = 'base-model'
+        return await submit_training_task(
+            queue, compute, training_id=training_id, stream='native', seq_id=2 if training_id == 'training-1' else 1,
+            peek=True, token=get_token_from_request(request), task_type='clip_grad_and_step')
 
     @app.post('/sample')
     async def sample(request: Request):
@@ -117,13 +126,19 @@ async def test_usage_is_recorded_once_at_admission(monkeypatch, in_memory_span_e
     logger.addHandler(caplog.handler)
     try:
         token = 'synthetic-header-credential'
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://local',
-                                     headers={'Authorization': f'Bearer {token}', 'x-request-id': 'client-call'}) as client:
-            for route in ('train', 'train', 'sample', 'sample', 'save', 'heartbeat', 'poll', 'rejected', 'register'):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url='http://local',
+            headers={'Authorization': f'Bearer {token}', 'x-request-id': 'client-call'},
+        ) as client:
+            routes = (
+                'train', 'train', 'clip/training-1', 'clip/training-1', 'clip/training-2',
+                'sample', 'sample', 'save', 'heartbeat', 'poll', 'rejected', 'register',
+            )
+            for route in routes:
                 response = await client.post('/' + route)
                 assert response.status_code == (429 if route == 'rejected' else 200)
-            response = await client.post('/twinkle/call', json={
-                'processor_id': 'pid:processor-1', 'function': 'process', 'call_kwargs': {}})
+            response = await client.post(
+                '/twinkle/call', json={'processor_id': 'pid:processor-1', 'function': 'process', 'call_kwargs': {}})
             assert response.json() == {'result': 'processed'}
 
         instruments = {
@@ -133,10 +148,10 @@ async def test_usage_is_recorded_once_at_admission(monkeypatch, in_memory_span_e
         }
         requests = instruments['twinkle.usage.requests.total']
         assert {point.attributes['task_type']: point.value for point in requests} == {
-            'forward_backward': 1, 'sample': 1}
+            'forward_backward': 1, 'clip_grad_and_step': 2, 'sample': 1}
         assert sum(point.value for point in instruments['twinkle.usage.input_tokens.total']) == 8
         assert sum(point.value for point in instruments['twinkle.usage.run_seconds.total']) > 0
-        assert {point.attributes['model_id'] for point in requests} == {'training-1', 'base-model'}
+        assert {point.attributes['model_id'] for point in requests} == {'base-model'}
         user_id = user_fingerprint(token)
         assert {point.attributes['user_id'] for point in requests} == {user_id}
         http = [point.attributes for point in instruments['twinkle.http.requests.total']]
@@ -145,8 +160,11 @@ async def test_usage_is_recorded_once_at_admission(monkeypatch, in_memory_span_e
 
         spans = in_memory_span_exporter.get_finished_spans()
         executions = [span for span in spans if span.name == 'task_queue.execute']
-        assert len(executions) == 3
-        parent_trace = {span.context.trace_id for span in spans if span.name in ('POST /train', 'POST /sample', 'POST /save')}
+        assert len(executions) == 5
+        assert {s.attributes['twinkle.model_id'] for s in executions
+                if s.attributes['twinkle.task_type'] == 'clip_grad_and_step'} == {'training-1', 'training-2'}
+        submission_spans = {'POST /train', 'POST /clip/{training_id}', 'POST /sample', 'POST /save'}
+        parent_trace = {span.context.trace_id for span in spans if span.name in submission_spans}
         for span in executions:
             assert span.context.trace_id in parent_trace
             assert span.attributes['twinkle.user_id'] == user_id
@@ -181,6 +199,8 @@ async def test_training_logs_link_each_outcome_to_its_training(caplog, in_memory
     store_future_status = queue.state.store_future_status
 
     async def check_queue_log_before_status_write(request_id, status, *args, **kwargs):
+        if request_id == 'req-4' and status == 'completed':
+            raise RuntimeError('private result write failure')
         if status == 'queued':
             assert any(getattr(log, 'twinkle_request_id', None) == request_id and log.twinkle_task_outcome == 'queued'
                        for log in caplog.records)
@@ -204,14 +224,15 @@ async def test_training_logs_link_each_outcome_to_its_training(caplog, in_memory
     caplog.set_level(logging.INFO)
     logger.addHandler(caplog.handler)
     try:
-        cases = ((complete, 'completed'), (fail, 'failed'), (timeout, 'timeout'), (refuse, 'refused'))
+        cases = ((complete, 'completed'), (fail, 'failed'), (timeout, 'timeout'), (refuse, 'refused'),
+                 (complete, 'failed'))
         for number, (operation, expected) in enumerate(cases):
             model_id = f'training-{number}'
             fingerprint = f'fingerprint-{number}'
             request_id = f'req-{number}'
             binding = current_user_id.set(fingerprint)
             try:
-                await queue.submit_and_peek(operation, model_id=model_id, token=TOKEN,
+                result = await queue.submit_and_peek(operation, model_id=model_id, token=TOKEN,
                                             task_type='forward_backward', request_id=request_id)
             finally:
                 current_user_id.reset(binding)
@@ -224,6 +245,12 @@ async def test_training_logs_link_each_outcome_to_its_training(caplog, in_memory
             span, = [span for span in in_memory_span_exporter.get_finished_spans()
                      if span.attributes.get('twinkle.request_id') == request_id]
             assert records[-1].twinkle_trace_id == f'{span.context.trace_id:032x}'
+            assert span.status.status_code.name == ('UNSET' if expected == 'completed' else 'ERROR')
+            assert span.attributes['twinkle.task_outcome'] == ('failed' if expected == 'refused' else expected)
+            if number == 4:
+                assert result.status == 'failed'
+                assert 'private result write failure' not in repr(dict(span.attributes))
+                assert 'private result write failure' not in caplog.text
             assert TOKEN not in repr([record.__dict__ for record in records])
     finally:
         logger.removeHandler(caplog.handler)
@@ -244,4 +271,127 @@ def test_same_card_index_on_two_nodes_has_distinct_observations(monkeypatch):
         assert gpu.attributes == {'node': node, 'gpu_index': 0, 'gpu_uuid': 'GPU-test'}
         if resource_metrics._PSUTIL_AVAILABLE:
             cpu, = collector._cpu_utilization_callback(None)
-            assert cpu.attributes == {'node': node, 'pid': os.getpid()}
+            assert cpu.attributes == {'node': node}
+            rss, = collector._process_memory_callback(None)
+            assert rss.attributes == {'node': node, 'pid': os.getpid()}
+        competitor = resource_metrics.ResourceMetricsCollector()
+        assert list(competitor._gpu_memory_callback(None)) == []
+        collector.close()
+        assert list(competitor._gpu_memory_callback(None)) == [gpu]
+        competitor.close()
+
+
+@pytest.mark.asyncio
+async def test_http_failure_status_and_anonymous_attribution(monkeypatch, in_memory_span_exporter):
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    from twinkle.protocol.headers import H_CLIENT_ID
+    from twinkle.server import deployment
+
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[reader])
+    monkeypatch.setattr(metrics, 'get_meter', meter_provider.get_meter)
+    monkeypatch.setattr(metrics.MetricsRegistry, '_instance', None)
+    monkeypatch.setenv(USER_ID_KEY_ENV, 'test-identity-secret')
+    in_memory_span_exporter.clear()
+
+    async def verify(request, call_next):
+        if request.url.path == '/middleware-error':
+            raise RuntimeError('private auth error')
+        return await verify_request_token(request, call_next)
+
+    monkeypatch.setattr(deployment, 'verify_request_token', verify)
+
+    def register(app, _):
+        @app.get('/v1/models', status_code=429)
+        async def handler(request: Request):
+            return {'fingerprint': request.state.user_id}
+
+    app = deployment.build_deployment_app('Audit', register)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url='http://test',
+        ) as client:
+            identities = (({}, user_fingerprint(None)), ({H_CLIENT_ID: 'sdk'}, user_fingerprint(None, 'sdk')))
+            for headers, expected in identities:
+                for request_id in ('id-one', 'id-two'):
+                    response = await client.get('/v1/models', headers={**headers, 'x-request-id': request_id})
+                    assert response.status_code == 429
+                    assert response.json()['fingerprint'] == expected
+            assert (await client.get('/middleware-error')).status_code == 500
+
+        points = [p for r in reader.get_metrics_data().resource_metrics for scope in r.scope_metrics
+                  for m in scope.metrics if m.name == 'twinkle.http.requests.total' for p in m.data.data_points]
+        assert sum(p.value for p in points if p.attributes['status'] == '500') == 1
+        spans = in_memory_span_exporter.get_finished_spans()
+        assert [s.status.status_code.name for s in spans if s.name == 'GET /v1/models'] == ['UNSET'] * 4
+        error, = [s for s in spans if s.attributes.get('http.response.status_code') == 500]
+        assert error.status.status_code.name == 'ERROR'
+        event, = error.events
+        assert dict(event.attributes) == {'exception.type': 'RuntimeError'}
+    finally:
+        meter_provider.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proxy_client_span_connects_two_server_spans(in_memory_span_exporter):
+    from twinkle.server.lifecycle.proxy import ServiceProxy
+
+    in_memory_span_exporter.clear()
+    upstream = FastAPI()
+    upstream.middleware('http')(create_tracing_middleware('Model'))
+
+    @upstream.post('/api/v1/model/base-model/twinkle/step', status_code=429)
+    async def step():
+        return {}
+
+    proxy = ServiceProxy()
+    await proxy.client.aclose()
+    proxy.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=upstream))
+    gateway = FastAPI()
+    gateway.middleware('http')(create_tracing_middleware('Gateway'))
+
+    @gateway.post('/train')
+    async def train(request: Request):
+        return await proxy.proxy_request(request, 'twinkle/step', 'base-model', 'model')
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway), base_url='http://test') as client:
+            assert (await client.post('/train')).status_code == 429
+    finally:
+        await proxy.close()
+
+    target, outbound, entry = in_memory_span_exporter.get_finished_spans()
+    assert target.parent.span_id == outbound.context.span_id
+    assert outbound.parent.span_id == entry.context.span_id
+    assert len({s.context.trace_id for s in (target, outbound, entry)}) == 1
+    assert outbound.kind.name == 'CLIENT' and outbound.status.status_code.name == 'ERROR'
+    assert entry.status.status_code.name == target.status.status_code.name == 'UNSET'
+
+
+@pytest.mark.asyncio
+async def test_sampler_router_propagates_new_trace_context(in_memory_span_exporter):
+    from starlette.requests import Request as ASGIRequest
+
+    from twinkle.server.sampler.pool.router import SamplerRouter
+    from twinkle.server.telemetry.tracing import traced_operation
+
+    in_memory_span_exporter.clear()
+    forwarded = AsyncMock(return_value={'status': 200, 'body': b'{}', 'headers': []})
+    router = SamplerRouter.__new__(SamplerRouter)
+    router.model_id = 'base-model'
+    router.controller = SimpleNamespace(request=SimpleNamespace(remote=forwarded))
+    request = ASGIRequest(
+        {'type': 'http', 'method': 'POST', 'headers': [], 'query_string': b''},
+        receive=AsyncMock(return_value={'type': 'http.request', 'body': b'{}'}),
+    )
+    with traced_operation('router.http'):
+        assert (await router.forward(request, 'twinkle/sample')).status_code == 200
+    hop, entry = in_memory_span_exporter.get_finished_spans()
+    assert hop.parent.span_id == entry.context.span_id
+    payload = forwarded.await_args.args[0]
+    headers = dict(payload['headers'])
+    assert headers[b'traceparent'].decode().split('-')[1:3] == [
+        f'{entry.context.trace_id:032x}', f'{hop.context.span_id:016x}',
+    ]

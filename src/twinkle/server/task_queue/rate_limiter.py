@@ -133,7 +133,7 @@ class RateLimiter:
                 logger.debug('[RateLimiter] Cleanup task cancelled')
                 break
             except Exception as e:
-                logger.warning(f'[RateLimiter] Error in cleanup task: {e}')
+                logger.warning('[RateLimiter] Error in cleanup task (%s)', type(e).__name__)
                 continue
 
     def start_cleanup_task(self) -> None:

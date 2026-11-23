@@ -75,6 +75,6 @@ class ResourceCountPublisher:
                 for name, mgr in self._managers:
                     registry.set_resource_count(name, await mgr.count())
             except Exception as e:
-                logger.debug(f'[ResourceCountPublisher] Error publishing metrics: {e}')
+                logger.debug('[ResourceCountPublisher] Error publishing metrics (%s)', type(e).__name__)
             if self._admin_index is not None:
                 await self._admin_index.publish()

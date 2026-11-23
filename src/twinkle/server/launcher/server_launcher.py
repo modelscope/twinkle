@@ -113,12 +113,15 @@ class ServerLauncher:
         from twinkle.server.telemetry.identity import USER_ID_KEY_ENV, user_id_key
         if USER_ID_KEY_ENV in os.environ and user_id_key() is None:
             raise ValueError(f'{USER_ID_KEY_ENV} must be nonempty and distinct from TWINKLE_TOKEN_SALT')
+        if USER_ID_KEY_ENV not in os.environ:
+            logger.warning('Tenant usage and snapshots require %s', USER_ID_KEY_ENV)
         init_telemetry(telemetry)
         os.environ.update({
             'TWINKLE_TELEMETRY_DEBUG': str(int(telemetry.debug)),
             'TWINKLE_TELEMETRY_SERVICE': telemetry.service_name,
             'TWINKLE_TELEMETRY_ENDPOINT': telemetry.otlp_endpoint,
             'TWINKLE_TELEMETRY_INTERVAL': str(telemetry.export_interval_ms),
+            'TWINKLE_TELEMETRY_RESOURCE_ATTRIBUTES': json.dumps(telemetry.resource_attributes),
         })
 
     def _init_ray(self) -> None:

@@ -39,7 +39,7 @@
       },
       {
         "name": "model_id",
-        "label": "Model / training ID",
+        "label": "Base model",
         "type": "query",
         "datasource": {"type":"prometheus","uid":"twinkle-mimir"},
         "definition": "label_values({__name__=~\"twinkle_http_requests_total|twinkle_usage_requests_total\"}, model_id)",
@@ -48,6 +48,14 @@
         "includeAll": true,
         "allValue": ".*",
         "current": {"text":"All","value":"$__all"}
+      },
+      {
+        "name": "training_id",
+        "label": "Training ID",
+        "type": "textbox",
+        "description": "Leave blank for all tasks, or enter a training ID or prefix to filter logs and traces.",
+        "query": "",
+        "current": {"text":"","value":""}
       },
       {
         "name": "node",
@@ -77,7 +85,7 @@
       "id": 18,
       "type": "table",
       "title": "Current trainings",
-      "description": "Live training state. Select a base model or training ID to inspect that training. If the snapshot has an update time and the table has no data, no current trainings match the fingerprint.",
+      "description": "Live training state. Click a base model or training ID to filter task logs and traces by that training. If the snapshot has an update time and the table has no data, no current trainings match the fingerprint.",
       "datasource": {
         "type": "redis-datasource",
         "uid": "twinkle-redis"
@@ -148,7 +156,7 @@
                   {
                     "title": "Open training activity",
                     "targetBlank": true,
-                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-model_id=${__data.fields[\"Training ID\"]}&${user_id:queryparam}"
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"Training ID\"]}&${user_id:queryparam}"
                   }
                 ]
               }
@@ -217,7 +225,7 @@
                   {
                     "title": "Open training activity",
                     "targetBlank": true,
-                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-model_id=${__data.fields[\"Training ID\"]}&${user_id:queryparam}"
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"Training ID\"]}&${user_id:queryparam}"
                   }
                 ]
               }
@@ -473,7 +481,7 @@
             {
               "title": "Open matching task logs",
               "targetBlank": true,
-              "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?viewPanel=21&from=${__from}&to=${__to}&${user_id:queryparam}&${model_id:queryparam}&${node:queryparam}&var-task_outcome=failed%7Ctimeout%7Crefused"
+              "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?viewPanel=21&from=${__from}&to=${__to}&${user_id:queryparam}&${model_id:queryparam}&${training_id:queryparam}&${node:queryparam}&var-task_outcome=failed%7Ctimeout%7Crefused"
             }
           ]
         },
@@ -487,7 +495,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(count_over_time({service_name=~\".+\"} | twinkle_model_id=~\"${model_id:regex}\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome =~ \"failed|timeout|refused\" [$__range])) or (sum(count_over_time({service_name=~\".+\"} | twinkle_model_id=~\"${model_id:regex}\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome != \"\" [$__range])) * 0)",
+          "expr": "sum(count_over_time({service_name=~\".+\"} | twinkle_model_id=~\"(${training_id:regex}).*\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome =~ \"failed|timeout|refused\" [$__range])) or (sum(count_over_time({service_name=~\".+\"} | twinkle_model_id=~\"(${training_id:regex}).*\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome != \"\" [$__range])) * 0)",
           "queryType": "instant"
         }
       ]
@@ -536,7 +544,7 @@
                   {
                     "title": "Open training activity",
                     "targetBlank": true,
-                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-model_id=${__data.fields[\"training_id\"]}&${user_id:queryparam}"
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"training_id\"]}&${user_id:queryparam}"
                   }
                 ]
               }
@@ -558,7 +566,7 @@
                   {
                     "title": "Open training activity",
                     "targetBlank": true,
-                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-model_id=${__data.fields[\"training_id\"]}&${user_id:queryparam}"
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"training_id\"]}&${user_id:queryparam}"
                   }
                 ]
               }
@@ -657,7 +665,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(30, topk by (training_id) (1, max_over_time({service_name=~\".+\"} |= \"[TaskQueue]\" | regexp `model_id=(?P<legacy_training>training_[0-9a-f]+)(, user_id=(?P<legacy_owner>[0-9a-f]{64}))?` | label_format training_id=`{{ .twinkle_model_id | default .legacy_training }}`, owner=`{{ .twinkle_user_id | default .legacy_owner }}` | training_id=~\"training_.+\" | owner=~\"(${user_id:raw}).*\" | label_format training_ref=`{{ .training_id | trimPrefix \"training_\" | trunc 12 }}`, last_task=`{{ __timestamp__ | unixEpochMillis }}` | unwrap last_task | __error__=\"\" [$__range]) by (training_id, training_ref, twinkle_base_model, owner)))",
+          "expr": "topk(30, topk by (training_id) (1, max_over_time({service_name=~\".+\"} |= \"[TaskQueue]\" | regexp `model_id=(?P<legacy_training>training_[0-9a-f]+)(, user_id=(?P<legacy_owner>[0-9a-f]{64}))?` | label_format training_id=`{{ .twinkle_model_id | default .legacy_training }}`, owner=`{{ .twinkle_user_id | default .legacy_owner }}` | training_id=~\"training_.+\" | training_id=~\"(${training_id:regex}).*\" | owner=~\"(${user_id:raw}).*\" | label_format training_ref=`{{ .training_id | trimPrefix \"training_\" | trunc 12 }}`, last_task=`{{ __timestamp__ | unixEpochMillis }}` | unwrap last_task | __error__=\"\" [$__range]) by (training_id, training_ref, twinkle_base_model, owner)))",
           "queryType": "instant"
         }
       ]
@@ -777,7 +785,7 @@
                   {
                     "title": "Open matching task logs",
                     "targetBlank": true,
-                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?viewPanel=21&from=${__from}&to=${__to}&${user_id:queryparam}&${model_id:queryparam}&${node:queryparam}&var-task_outcome=${__value.raw}"
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?viewPanel=21&from=${__from}&to=${__to}&${user_id:queryparam}&${model_id:queryparam}&${training_id:queryparam}&${node:queryparam}&var-task_outcome=${__value.raw}"
                   }
                 ]
               }
@@ -796,7 +804,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (twinkle_task_outcome) (count_over_time({service_name=~\".+\"} | twinkle_model_id=~\"${model_id:regex}\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome != \"\" [$__range]))",
+          "expr": "sum by (twinkle_task_outcome) (count_over_time({service_name=~\".+\"} | twinkle_model_id=~\"(${training_id:regex}).*\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome != \"\" [$__range]))",
           "queryType": "instant",
           "legendFormat": "{{twinkle_task_outcome}}"
         }
@@ -842,7 +850,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{service_name=~\".+\"} | twinkle_model_id=~\"${model_id:regex}\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome =~ \"${task_outcome:raw}\"",
+          "expr": "{service_name=~\".+\"} | twinkle_model_id=~\"(${training_id:regex}).*\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome =~ \"${task_outcome:raw}\"",
           "queryType": "range",
           "maxLines": 200
         }
@@ -852,11 +860,11 @@
       "id": 16,
       "type": "table",
       "title": "Runtime task traces",
-      "description": "Filter by Token fingerprint or model / training ID. Open a Trace ID to see the request path. On task_queue.execute, use Logs for this span to see the task's Runtime logs.",
+      "description": "Filter by Token fingerprint or training ID. Open a Trace ID to see the request path. On task_queue.execute, use Logs for this span to see the task's Runtime logs.",
       "datasource": {"type":"tempo","uid":"twinkle-tempo"},
       "gridPos": {"x":0,"y":40,"w":24,"h":9},
       "fieldConfig": {"defaults":{},"overrides":[]},
-      "targets": [{"refId":"A","queryType":"traceql","query":"{ name = \"task_queue.execute\" && span.twinkle.user_id =~ \"^(${user_id:raw}).*$\" && span.twinkle.model_id =~ \"${model_id:regex}\" }","limit":25}]
+      "targets": [{"refId":"A","queryType":"traceql","query":"{ name = \"task_queue.execute\" && span.twinkle.user_id =~ \"^(${user_id:raw}).*$\" && span.twinkle.model_id =~ \"^(${training_id:regex}).*$\" }","limit":25}]
     },
     {
       "id": 1,
@@ -981,6 +989,22 @@
       "fieldConfig": {"defaults":{"unit":"bytes"},"overrides":[]},
       "options": {},
       "targets": [{"refId":"A","expr":"max by (node, gpu_index, gpu_uuid) (twinkle_gpu_memory_usage_bytes{node=~\"${node:regex}\"})","legendFormat":"{{node}} GPU {{gpu_index}} {{gpu_uuid}}"}]
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "Last Runtime metric received",
+      "description": "Age of the most recent exporter heartbeat at the selected time. A missing heartbeat can indicate a stopped Runtime or an unreachable telemetry backend.",
+      "gridPos": {"x": 0, "y": 107, "w": 12, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "fieldConfig": {"defaults": {
+        "unit": "s",
+        "mappings": [{"type": "value", "options": {"-1": {"text": "No recent metrics", "color": "orange"}}}]
+      }, "overrides": []},
+      "targets": [{"refId": "A", "instant": true, "range": false,
+        "expr": "(time() - max by (node) (timestamp(twinkle_telemetry_heartbeat{node=~\"${node:regex}\"}))) or on() vector(-1)",
+        "legendFormat": "{{node}}"
+      }]
     },
     {
       "id": 17,

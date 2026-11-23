@@ -35,12 +35,14 @@ class _BlockingQueue:
 async def test_sampler_request_refreshes_replica_liveness():
     service = SamplerManagement.__new__(SamplerManagement)
     service.replica_id = 'sampler-replica'
+    service.model_id = 'sampling-model'
     service.state = SimpleNamespace(touch_replica_last_seen=AsyncMock())
     service._ensure_state_cleanup_started = AsyncMock()
     request = SimpleNamespace(
         headers={'Authorization': 'Bearer token'}, state=SimpleNamespace(token='token'))
 
     assert await service._on_request_start(request) == 'token'
+    assert request.state.base_model == 'sampling-model'
     service.state.touch_replica_last_seen.assert_awaited_once_with('sampler-replica')
 
 

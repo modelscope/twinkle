@@ -326,7 +326,7 @@ class SessionResourceMixin(ABC):
                                 info['expiring'] = False
 
             except Exception as e:
-                logger.warning(f'[{self._resource_type}Manager] Error in countdown loop: {e}')
+                logger.warning('[%sManager] Error in countdown loop (%s)', self._resource_type, type(e).__name__)
                 continue
 
         logger.debug(f'[{self._resource_type}Manager] Countdown task stopped')

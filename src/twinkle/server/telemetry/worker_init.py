@@ -6,8 +6,9 @@ to re-initialize telemetry in each worker process using environment variables
 set by the launcher.
 """
 from __future__ import annotations
-
 import os
+
+import json
 
 from twinkle.utils import get_logger
 
@@ -26,20 +27,13 @@ def ensure_telemetry_initialized() -> None:
     if _worker_initialized:
         return
 
-    _worker_initialized = True
-
-    telemetry_enabled = os.environ.get('TWINKLE_TELEMETRY_ENABLED') == '1'
-
-    if not telemetry_enabled:
-        # Even with telemetry disabled, register the resource collector so
-        # graceful-degradation behavior matches the enabled path.
-        _start_resource_collector()
+    if os.environ.get('TWINKLE_TELEMETRY_ENABLED') != '1':
         return
 
     try:
         from twinkle.server.config.telemetry import TelemetryConfig
-        from twinkle.server.telemetry.metrics import MetricsRegistry
         from twinkle.server.telemetry.provider import init_telemetry
+        from twinkle.server.telemetry.resource_metrics import get_collector
 
         config = TelemetryConfig(
             enabled=True,
@@ -47,30 +41,13 @@ def ensure_telemetry_initialized() -> None:
             service_name=os.environ.get('TWINKLE_TELEMETRY_SERVICE', 'twinkle-server'),
             otlp_endpoint=os.environ.get('TWINKLE_TELEMETRY_ENDPOINT', 'http://localhost:4317'),
             export_interval_ms=int(os.environ.get('TWINKLE_TELEMETRY_INTERVAL', '30000')),
+            resource_attributes=json.loads(os.environ.get('TWINKLE_TELEMETRY_RESOURCE_ATTRIBUTES', '{}')),
         )
-        init_telemetry(config)
-        # Reset MetricsRegistry singleton so it picks up the real MeterProvider
-        MetricsRegistry.reset()
-        logger.info(f'Worker telemetry initialized (service={config.service_name}, debug={config.debug})')
-    except Exception as e:
-        logger.warning(f'Failed to initialize worker telemetry: {e}')
-
-    _start_resource_collector()
-
-
-def _start_resource_collector() -> None:
-    """Start the resource (CPU / Memory / GPU) metrics collector.
-
-    Safe to call even when telemetry init was skipped or failed — the
-    collector picks up the NoOp meter and silently records no observations
-    the collector picks up the NoOp meter and silently records nothing.
-    """
-    try:
-        from twinkle.server.telemetry import resource_metrics
-
-        resource_metrics.get_collector().maybe_start()
-    except Exception as e:
-        logger.debug(f'Resource metrics collector start failed: {e}')
+        if init_telemetry(config):
+            get_collector().maybe_start()
+            _worker_initialized = True
+    except Exception as exc:
+        logger.warning('Failed to initialize worker telemetry (%s)', type(exc).__name__)
 
 
 def flush_telemetry_safely() -> None:
@@ -85,5 +62,8 @@ def flush_telemetry_safely() -> None:
     try:
         from twinkle.server.telemetry.provider import shutdown_telemetry
         shutdown_telemetry()
+        if _worker_initialized:
+            from twinkle.server.telemetry.resource_metrics import get_collector
+            get_collector().close()
     except Exception as e:  # pragma: no cover - defensive
-        logger.warning(f'Telemetry shutdown failed: {e}')
+        logger.warning('Telemetry shutdown failed (%s)', type(e).__name__)

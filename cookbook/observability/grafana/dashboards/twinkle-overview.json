@@ -78,7 +78,7 @@
         "y": 8
       },
       "id": 3,
-      "title": "Active resources",
+      "title": "Resources and retained results",
       "type": "timeseries",
       "targets": [
         {
@@ -98,7 +98,7 @@
         },
         {
           "expr": "sum(twinkle_futures_active)",
-          "legendFormat": "futures",
+          "legendFormat": "retained results",
           "refId": "D"
         }
       ]

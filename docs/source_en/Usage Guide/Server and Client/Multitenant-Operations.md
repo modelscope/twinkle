@@ -48,8 +48,7 @@ three refresh intervals, rounded up to seconds. An empty snapshot reports
 ## Investigate usage and latency
 
 - **Current trainings** shows the live state, base model, and user fingerprint.
-  Click a base model or training ID to select that training in the usage, latency,
-  task logs, and traces. **Training snapshot updated** shows the live snapshot's
+  Click a base model or training ID in the table to filter task logs and traces by that training. **Training snapshot updated** shows the live snapshot's
   update time or `Unavailable` if it expired. When an update time is present,
   `No trainings` means there are no current trainings and `No data` means
   the fingerprint filter matched no rows. Find finished trainings
@@ -63,11 +62,12 @@ three refresh intervals, rounded up to seconds. An empty snapshot reports
   use **Logs for this span** on the matching task trace.
 - **User fingerprint prefix** accepts the 12-character prefix shown in charts
   or the complete `twinkle.user_id` from a trace. Leave it blank to see all
-  users. The filter applies to usage, traces, and Redis
-  details. Training metrics use the training handle as
-  `model_id`. Sampling metrics use the deployed model identifier.
+  users. The filter applies to usage, traces, and Redis details. **Base model**
+  filters usage and latency metrics. **Training ID** filters task logs and traces.
+  Requests without a token use a stable client ID when available and share an
+  anonymous fingerprint otherwise.
 - Count one request per successful admission for `forward`, `forward_only`,
-  `forward_backward`, `step` / `optim_step`, and ordinary `sample` / `asample`.
+  `forward_backward`, `step`, `clip_grad_and_step`, `optim_step`, and ordinary `sample` / `asample`.
   Input token counts use the submission size already available at admission.
   Unencoded inputs without token IDs contribute zero to that counter.
   Run seconds sum task execution time across replicas. The range totals subtract
@@ -78,12 +78,13 @@ three refresh intervals, rounded up to seconds. An empty snapshot reports
   rates across replicas and models, applies a per-fingerprint override when
   present, and highlights relative usage. Existing per-replica rate limits
   continue to govern admission.
-- Use **Runtime task traces** to find traces for the selected model or training.
+- Use **Runtime task traces** to find traces for the selected training.
   In **Explore → Tempo**, search by trace ID or use the TraceQL editor with
   `{ span.twinkle.request_id = "req_..." }`. For a reused SDK HTTP request ID,
   search `span.twinkle.http_request_id` and narrow by time and operation.
   Open `task_queue.execute` to see the user's `twinkle.user_id`, queue wait
-  (`twinkle.wait_seconds`), and execution time (`twinkle.execution_seconds`).
+  (`twinkle.wait_seconds`), execution time (`twinkle.execution_seconds`), and final task outcome.
+  Telemetry records the error type when an operation fails.
   HTTP latency measures the Runtime response, including a separate result
   poll when the operation is asynchronous.
 - On `task_queue.execute`, use **Logs for this span** to find Runtime logs
@@ -102,8 +103,13 @@ three refresh intervals, rounded up to seconds. An empty snapshot reports
   GPU charts show physical cards by node and UUID. In the execution span, open
   **Links** and choose **Node GPU utilization** or **Node CPU utilization** for
   the node and time around that span. New traces also show `twinkle.node` as a
-  resource attribute. Establish exclusive
-  model-to-device ownership before attributing device usage to a model.
+  resource attribute. Workers on a node share a node-local temporary directory
+  to elect a CPU and GPU metrics publisher. Process RSS stays per worker.
+  Establish exclusive model-to-device ownership before attributing device usage
+  to a model.
+- **Last Runtime metric received** shows the age of the latest heartbeat per reporting
+  node. If it goes missing, check Runtime and Collector connectivity. The heartbeat
+  covers the metrics pipeline. Check Loki and Tempo independently when testing ingestion.
 
 ## Release checks
 

@@ -8,13 +8,17 @@ dependencies** — when either is missing, the corresponding gauges report no
 data and the collector does not raise.
 
 The collector is started by :func:`worker_init.ensure_telemetry_initialized`
-in each Ray Serve worker process so per-replica resource usage shows up in
-Mimir / Grafana.
+in each worker. One process per node and telemetry destination reports node
+metrics, while each worker reports its own RSS.
 """
 from __future__ import annotations
-
+import fcntl
 import os
+import tempfile
 from collections.abc import Iterator
+from functools import cached_property
+from hashlib import sha256
+from pathlib import Path
 from typing import Any
 
 from .correlation import telemetry_node
@@ -55,7 +59,15 @@ class ResourceMetricsCollector:
     def __init__(self) -> None:
         self._started = False
         self._node = telemetry_node()
-        self._process_attrs = {'node': self._node, 'pid': os.getpid()}
+        self._node_attrs = {'node': self._node}
+        self._process_attrs = {**self._node_attrs, 'pid': os.getpid()}
+        scope = (
+            self._node,
+            os.environ.get('TWINKLE_TELEMETRY_SERVICE', 'twinkle-server'),
+            os.environ.get('TWINKLE_TELEMETRY_ENDPOINT', 'http://localhost:4317'),
+        )
+        self._lock_scope = sha256(repr(scope).encode()).hexdigest()[:16]
+        self._node_leases = {}
         # Track which gauges were registered so callers (and tests) can
         # introspect what's exported in this process.
         self.registered_gauges: list[str] = []
@@ -113,26 +125,43 @@ class ResourceMetricsCollector:
             except Exception:
                 pass
 
+    def _owns_node_metrics(self, group: str) -> bool:
+        lease = self._node_leases.get(group)
+        try:
+            if lease is None:
+                path = Path(tempfile.gettempdir()) / f'twinkle-{os.getuid()}-{self._lock_scope}-{group}.lock'
+                lease = path.open('a')
+                self._node_leases[group] = lease
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
+    def close(self) -> None:
+        for lease in self._node_leases.values():
+            lease.close()
+        self._node_leases.clear()
+
     # ----- callbacks ----------------------------------------------------- #
 
     def _cpu_utilization_callback(self, _options: Any) -> Iterator[Any]:
         from opentelemetry.metrics import Observation  # type: ignore
 
-        if not _PSUTIL_AVAILABLE:
+        if not _PSUTIL_AVAILABLE or not self._owns_node_metrics('system'):
             return iter(())
         try:
             value = float(psutil.cpu_percent(interval=None)) / 100.0
-            return iter([Observation(value, self._process_attrs)])
+            return iter([Observation(value, self._node_attrs)])
         except Exception:
             return iter(())
 
     def _memory_usage_callback(self, _options: Any) -> Iterator[Any]:
         from opentelemetry.metrics import Observation  # type: ignore
 
-        if not _PSUTIL_AVAILABLE:
+        if not _PSUTIL_AVAILABLE or not self._owns_node_metrics('system'):
             return iter(())
         try:
-            return iter([Observation(int(psutil.virtual_memory().used), self._process_attrs)])
+            return iter([Observation(int(psutil.virtual_memory().used), self._node_attrs)])
         except Exception:
             return iter(())
 
@@ -147,37 +176,42 @@ class ResourceMetricsCollector:
         except Exception:
             return iter(())
 
-    def _gpu_attrs(self, index: int, handle: Any) -> dict[str, str | int]:
-        uuid = pynvml.nvmlDeviceGetUUID(handle)
-        return {'node': self._node, 'gpu_index': index, 'gpu_uuid': uuid.decode() if isinstance(uuid, bytes) else uuid}
+    @cached_property
+    def _devices(self) -> list[tuple[Any, dict[str, str | int]]]:
+        devices = []
+        for index in range(_nvml_handle_count()):
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+                uuid = pynvml.nvmlDeviceGetUUID(handle)
+                attrs = {
+                    **self._node_attrs,
+                    'gpu_index': index,
+                    'gpu_uuid': uuid.decode() if isinstance(uuid, bytes) else uuid,
+                }
+                devices.append((handle, attrs))
+            except Exception:
+                continue
+        return devices
 
     def _gpu_utilization_callback(self, _options: Any) -> Iterator[Any]:
-        from opentelemetry.metrics import Observation  # type: ignore
+        from opentelemetry.metrics import Observation
 
-        count = _nvml_handle_count()
-        out: list[Any] = []
-        for i in range(count):
-            try:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                out.append(Observation(float(util.gpu) / 100.0, self._gpu_attrs(i, handle)))
-            except Exception:
-                continue
-        return iter(out)
+        if self._owns_node_metrics('gpu'):
+            for handle, attrs in self._devices:
+                try:
+                    yield Observation(float(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu) / 100.0, attrs)
+                except Exception:
+                    continue
 
     def _gpu_memory_callback(self, _options: Any) -> Iterator[Any]:
-        from opentelemetry.metrics import Observation  # type: ignore
+        from opentelemetry.metrics import Observation
 
-        count = _nvml_handle_count()
-        out: list[Any] = []
-        for i in range(count):
-            try:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                out.append(Observation(int(mem.used), self._gpu_attrs(i, handle)))
-            except Exception:
-                continue
-        return iter(out)
+        if self._owns_node_metrics('gpu'):
+            for handle, attrs in self._devices:
+                try:
+                    yield Observation(int(pynvml.nvmlDeviceGetMemoryInfo(handle).used), attrs)
+                except Exception:
+                    continue
 
 
 _GLOBAL_COLLECTOR: ResourceMetricsCollector | None = None
@@ -193,4 +227,6 @@ def get_collector() -> ResourceMetricsCollector:
 def reset_collector_for_tests() -> None:
     """Clear the module-global collector. Test-only helper."""
     global _GLOBAL_COLLECTOR
+    if _GLOBAL_COLLECTOR is not None:
+        _GLOBAL_COLLECTOR.close()
     _GLOBAL_COLLECTOR = None

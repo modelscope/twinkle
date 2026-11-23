@@ -10,11 +10,11 @@ Properties covered:
 - Correlation prefix invariant
 """
 from __future__ import annotations
+from unittest import mock
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from unittest import mock
 
 from twinkle.server.telemetry import correlation
 from twinkle.server.telemetry.correlation import CORRELATION_KEYS, PREFIX, set_correlation_attrs
@@ -136,7 +136,10 @@ def test_exception_recorded_and_reraised(in_memory_span_exporter) -> None:
     assert spans, 'span was not exported'
     span = spans[-1]
     assert span.status.status_code.name == 'ERROR'
-    assert [event.name for event in span.events] == ['exception']
+    event, = span.events
+    assert event.name == 'exception'
+    assert dict(event.attributes) == {'exception.type': 'ValueError'}
+    assert not span.status.description
 
 
 # ---------- ResourceMetricsCollector wiring ------------------------------ #
@@ -179,81 +182,98 @@ def test_resource_metrics_collector_idempotent() -> None:
     assert collector.registered_gauges == pre
 
 
-def test_worker_init_starts_collector() -> None:
-    """``ensure_telemetry_initialized`` calls the resource collector even when
-    telemetry is disabled — the collector silently records to a NoOp meter
-    in that case."""
-    from twinkle.server.telemetry import resource_metrics, worker_init
+def test_worker_init_registers_resources_only_with_telemetry(monkeypatch) -> None:
+    from twinkle.server.telemetry import provider, resource_metrics, worker_init
 
-    # Force the worker_init guard to re-run and clear the global collector
-    # so we observe a fresh ``maybe_start`` call.
-    worker_init._worker_initialized = False
-    resource_metrics.reset_collector_for_tests()
-
-    sentinel = mock.MagicMock()
-    sentinel.maybe_start = mock.MagicMock()
-
-    with mock.patch.object(resource_metrics, 'get_collector', return_value=sentinel) as get_spy:
+    monkeypatch.setattr(worker_init, '_worker_initialized', False)
+    monkeypatch.delenv('TWINKLE_TELEMETRY_ENABLED', raising=False)
+    with (mock.patch.object(resource_metrics, 'get_collector') as get_collector,
+          mock.patch.object(provider, 'init_telemetry', side_effect=(False, True)) as init):
         worker_init.ensure_telemetry_initialized()
+        get_collector.assert_not_called()
 
-    assert get_spy.call_count >= 1
-    assert sentinel.maybe_start.call_count == 1
+        monkeypatch.setenv('TWINKLE_TELEMETRY_ENABLED', '1')
+        monkeypatch.setenv('TWINKLE_TELEMETRY_RESOURCE_ATTRIBUTES', '{"deployment.environment.name":"test"}')
+        worker_init.ensure_telemetry_initialized()
+        get_collector.assert_not_called()
+        worker_init.ensure_telemetry_initialized()
+        worker_init.ensure_telemetry_initialized()
+        get_collector.return_value.maybe_start.assert_called_once()
+        assert init.call_args.args[0].resource_attributes == {'deployment.environment.name': 'test'}
 
 
-def test_init_telemetry_attaches_handler_to_twinkle_logger() -> None:
-    """``init_telemetry`` must attach the OTLP ``LoggingHandler`` to BOTH
-    the root logger AND the ``twinkle`` logger.
-
-    The ``twinkle.utils.logger`` module configures the ``twinkle`` namespace
-    with ``propagate=False`` and its own StreamHandler — so an OTLP handler
-    bound only to root would never see any ``twinkle.*`` log records, and
-    the entire server's logs would be invisible in Loki / OTLP backends.
-    """
+def test_pipeline_exports_once_and_keeps_early_gauge_callbacks(monkeypatch) -> None:
     import logging
-    from opentelemetry import _logs as _otel_logs
+
     from opentelemetry import metrics, trace
-    from opentelemetry.sdk._logs import LoggingHandler
+    from opentelemetry._logs import _internal as logs
+    from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
     from opentelemetry.util._once import Once
 
     from twinkle.server.config.telemetry import TelemetryConfig
     from twinkle.server.telemetry import provider
+    from twinkle.server.telemetry.metrics import MetricsRegistry
 
-    # Reset all OTel global guards so init_telemetry runs cleanly.
-    trace._TRACER_PROVIDER_SET_ONCE = Once()
-    trace._TRACER_PROVIDER = None
-    metrics._METER_PROVIDER_SET_ONCE = Once()
-    metrics._METER_PROVIDER = None
-    if hasattr(_otel_logs, '_LOGGER_PROVIDER_SET_ONCE'):
-        _otel_logs._LOGGER_PROVIDER_SET_ONCE = Once()
-        _otel_logs._LOGGER_PROVIDER = None
-    provider._initialized = False
+    for module, name in ((trace, 'TRACER'), (metrics._internal, 'METER'), (logs, 'LOGGER')):
+        monkeypatch.setattr(module, f'_{name}_PROVIDER_SET_ONCE', Once())
+        monkeypatch.setattr(module, f'_{name}_PROVIDER', None)
+    monkeypatch.setattr(metrics._internal, '_PROXY_METER_PROVIDER', metrics._internal._ProxyMeterProvider())
+    monkeypatch.setattr(MetricsRegistry, '_instance', None)
+    early = MetricsRegistry.get()
 
-    # Clear stale handlers that might be attached from prior tests.
-    for name in ('', 'twinkle'):
-        for h in list(logging.getLogger(name).handlers):
-            if isinstance(h, LoggingHandler):
-                logging.getLogger(name).removeHandler(h)
+    sink = InMemoryLogRecordExporter()
+    reader = InMemoryMetricReader()
+    monkeypatch.setattr(provider, 'OTLPLogExporter', lambda **_: sink)
+    monkeypatch.setattr(provider, 'PeriodicExportingMetricReader', lambda *_, **__: reader)
 
+    config = TelemetryConfig(enabled=True, service_name='audit', export_interval_ms=100)
     try:
-        provider.init_telemetry(
-            TelemetryConfig(
-                enabled=True,
-                debug=True,  # debug=True → console exporter, no real OTLP needed
-                service_name='twinkle-server-test',
-            ))
-        root_handlers = [h for h in logging.getLogger().handlers if isinstance(h, LoggingHandler)]
-        twinkle_handlers = [h for h in logging.getLogger('twinkle').handlers if isinstance(h, LoggingHandler)]
-        assert len(root_handlers) == 1, root_handlers
-        assert len(twinkle_handlers) == 1, twinkle_handlers
-        assert root_handlers[0] is twinkle_handlers[0], ('root and twinkle should share the same handler instance')
-        # The OTLP handler carries the transport-stack feedback-loop filter.
-        assert any(isinstance(flt, provider._OTLPTransportFilter) for flt in root_handlers[0].filters), \
-            'OTLP transport filter not attached to the handler'
+        assert provider.init_telemetry(config)
+        assert provider.init_telemetry(config)
+        assert MetricsRegistry.get() is early
+        early.set_resource_count('active_sessions', 7)
+        early.request_metrics('Audit').request_duration_seconds.observe(0.08)
+        data = {m.name: m.data.data_points for r in reader.get_metrics_data().resource_metrics
+                for scope in r.scope_metrics for m in scope.metrics}
+        assert [p.value for p in data['twinkle.sessions.active']] == [7]
+        assert [p.value for p in data['twinkle.telemetry.heartbeat']] == [1]
+        bounds = data['twinkle.http.request.duration_seconds'][0].explicit_bounds
+        assert 0.05 in bounds and 0.1 in bounds
+
+        root = logging.getLogger('audit')
+        with traced_operation('log.audit') as span:
+            context = span.get_span_context()
+            root.warning('stdlib audit')
+            logging.getLogger('twinkle').warning('twinkle audit')
+            logging.getLogger('opentelemetry.audit').warning('transport audit')
+            try:
+                raise ValueError('private error text')
+            except ValueError:
+                root.exception('private error text')
+        provider._logger_provider.force_flush()
+        records = [entry.log_record for entry in sink.get_finished_logs()]
+        for body in ('stdlib audit', 'twinkle audit'):
+            record, = [r for r in records if r.body == body]
+            assert record.trace_id == context.trace_id
+            assert record.span_id == context.span_id
+        assert not any(r.body == 'transport audit' for r in records)
+        failure, = [r for r in records if r.attributes.get('error_type') == 'ValueError']
+        assert failure.body == 'Operation failed'
+        assert 'private error text' not in repr(dict(failure.attributes))
+        handler = provider._logging_handler
     finally:
         provider.shutdown_telemetry()
-        # shutdown should detach from both
-        assert all(not isinstance(h, LoggingHandler) for name in ('', 'twinkle')
-                   for h in logging.getLogger(name).handlers)
+    assert all(handler not in logging.getLogger(name).handlers for name in ('', 'twinkle'))
+
+
+def test_telemetry_export_interval_must_be_positive() -> None:
+    from pydantic import ValidationError
+
+    from twinkle.server.config.telemetry import TelemetryConfig
+
+    with pytest.raises(ValidationError, match='export_interval_ms'):
+        TelemetryConfig(export_interval_ms=0)
 
 
 # ---------- inbound HTTP trace-context continuity ------------------ #

@@ -179,7 +179,7 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
                 hub_api.login()
                 username = ModelScopeConfig.get_user_info()[0]
             except Exception as e:
-                logger.error(f'Failed to get username from ModelScope: {e}')
+                logger.error('Failed to get username from ModelScope (%s)', type(e).__name__)
                 raise HTTPException(
                     status_code=401,
                     detail='Failed to get username from ModelScope. Please ensure your token is valid.')

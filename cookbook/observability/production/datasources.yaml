@@ -41,8 +41,8 @@ datasources:
         spanStartTimeShift: '-2m'
         spanEndTimeShift: '2m'
         tags:
-          - key: service.instance.id
-            value: instance
+          - key: twinkle.node
+            value: node
         queries:
           - name: Node CPU utilization
             query: 'max by (node) (twinkle_system_cpu_utilization{$${__tags}})'

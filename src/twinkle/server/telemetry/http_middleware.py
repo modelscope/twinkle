@@ -8,7 +8,7 @@ and the queue code no longer imports a module called ``middleware`` just to reac
 ``get_task_metrics``.
 """
 from __future__ import annotations
-
+import asyncio
 import time
 from collections.abc import Callable
 from typing import Any
@@ -38,20 +38,26 @@ def create_metrics_middleware(deployment: str) -> Callable:
 
     async def metrics_middleware(request: Any, call_next: Callable) -> Any:
         start = time.monotonic()
-        response = await call_next(request)
-        elapsed = time.monotonic() - start
-        status = str(response.status_code)
-        # The HTTP verb is the ``method`` label (standard RED semantics); the route template would
-        # merge GET/POST and make the label useless for read/write split.
-        route_name = request.path_params.get('endpoint') or getattr(request.scope.get('route'), 'name', None)
-        operation = route_name if route_name in _OPERATIONS else 'request'
-        tags = {'deployment': deployment, 'method': request.method, 'operation': operation}
-        for key in ('user_id', 'model_id'):
-            if value := getattr(request.state, key, None):
-                tags[key] = value
-        m = MetricsRegistry.get().request_metrics(deployment)
-        m.requests_total.inc(tags={**tags, 'status': status})
-        m.request_duration_seconds.observe(elapsed, tags=tags)
-        return response
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        except asyncio.CancelledError:
+            status = None
+            raise
+        finally:
+            if status is not None:
+                elapsed = time.monotonic() - start
+                route_name = request.path_params.get('endpoint') or getattr(request.scope.get('route'), 'name', None)
+                operation = route_name if route_name in _OPERATIONS else 'request'
+                tags = {'deployment': deployment, 'method': request.method, 'operation': operation}
+                if user_id := getattr(request.state, 'user_id', None):
+                    tags['user_id'] = user_id
+                if base_model := getattr(request.state, 'base_model', None):
+                    tags['model_id'] = base_model
+                m = MetricsRegistry.get().request_metrics(deployment)
+                m.requests_total.inc(tags={**tags, 'status': str(status)})
+                m.request_duration_seconds.observe(elapsed, tags=tags)
 
     return metrics_middleware

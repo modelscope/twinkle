@@ -11,14 +11,13 @@ exposes:
 """
 
 from __future__ import annotations
-
 import logging
 import uuid
+from copy import copy
 from typing import Any
 
 from twinkle.server.config.telemetry import TelemetryConfig
 from twinkle.utils import get_logger
-
 from .correlation import telemetry_node
 
 logger = get_logger()
@@ -49,10 +48,12 @@ class _OTLPTransportFilter(logging.Filter):
 try:
     from opentelemetry import metrics, trace
     from opentelemetry._logs import set_logger_provider
+    from opentelemetry.metrics import Observation
     from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, ConsoleLogExporter
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, PeriodicExportingMetricReader
+    from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
@@ -73,13 +74,30 @@ try:
 except Exception:  # pragma: no cover - defensive fallback
     _OTLP_AVAILABLE = False
 
-# Logging instrumentor is also optional.
-try:
-    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+if _OTEL_AVAILABLE:
+    class _TelemetryLoggingHandler(LoggingHandler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if exc_type := record.exc_info and record.exc_info[0]:
+                # Preserve local traceback formatting. Export only structured exception types.
+                record = copy(record)
+                record.msg = 'Operation failed'
+                record.args = ()
+                record.error_type = exc_type.__name__
+                record.exc_info = None
+                record.exc_text = None
+            super().emit(record)
 
-    _LOGGING_INSTRUMENTOR_AVAILABLE = True
-except Exception:  # pragma: no cover - defensive fallback
-    _LOGGING_INSTRUMENTOR_AVAILABLE = False
+
+# All buckets and observations use seconds.
+_LATENCY_BUCKETS = {
+    'twinkle.http.request.duration_seconds': (
+        .001, .005, .01, .025, .05, .1, .25, .5, 1, 2, 5, 10, 30, 60, 120),
+    'twinkle.task.wait_seconds': (
+        .001, .005, .01, .025, .05, .1, .25, .5, 1, 2, 5, 10, 30, 60, 120, 300),
+    'twinkle.task.execution_seconds': (
+        .005, .01, .025, .05, .1, .25, .5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800),
+}
+
 
 # ---------------------------------------------------------------------------
 # Module-level state for shutdown.
@@ -114,27 +132,26 @@ class _LoggingWriter:
         pass
 
 
-def init_telemetry(config: TelemetryConfig) -> None:
+def init_telemetry(config: TelemetryConfig) -> bool:
     """Initialize the three OTEL pillars (traces, metrics, logs).
 
-    No-op when ``config.enabled`` is False or the OTEL SDK is missing.
+    Return whether the process has a telemetry pipeline.
     """
     global _tracer_provider, _meter_provider, _logger_provider
     global _logging_handler, _initialized
 
     if not config.enabled:
-        return
+        return False
 
     if not _OTEL_AVAILABLE:
         logger.warning(
             'OpenTelemetry SDK not available, skipping telemetry init: %s',
             _OTEL_IMPORT_ERROR,
         )
-        return
+        return False
 
     if _initialized:
-        logger.debug('Telemetry already initialized; skipping re-init.')
-        return
+        return True
 
     # ---- Resource -------------------------------------------------------
     resource_attrs: dict[str, str] = {'service.name': config.service_name}
@@ -161,8 +178,6 @@ def init_telemetry(config: TelemetryConfig) -> None:
 
     tracer_provider = TracerProvider(resource=resource)
     tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
-    trace.set_tracer_provider(tracer_provider)
-    _tracer_provider = tracer_provider
 
     # ---- Metrics --------------------------------------------------------
     if use_console:
@@ -177,9 +192,14 @@ def init_telemetry(config: TelemetryConfig) -> None:
     meter_provider = MeterProvider(
         resource=resource,
         metric_readers=[metric_reader],
+        views=[View(instrument_name=name, aggregation=ExplicitBucketHistogramAggregation(bounds))
+               for name, bounds in _LATENCY_BUCKETS.items()],
     )
-    metrics.set_meter_provider(meter_provider)
-    _meter_provider = meter_provider
+    meter_provider.get_meter('twinkle-server').create_observable_gauge(
+        'twinkle.telemetry.heartbeat',
+        callbacks=[lambda _: [Observation(1, {'node': resource_attrs['twinkle.node']})]],
+        description='Runtime metrics exporter heartbeat',
+    )
 
     # ---- Logs -----------------------------------------------------------
     if use_console:
@@ -189,17 +209,14 @@ def init_telemetry(config: TelemetryConfig) -> None:
 
     logger_provider = LoggerProvider(resource=resource)
     logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
+    trace.set_tracer_provider(tracer_provider)
+    metrics.set_meter_provider(meter_provider)
     set_logger_provider(logger_provider)
+    _tracer_provider = tracer_provider
+    _meter_provider = meter_provider
     _logger_provider = logger_provider
 
-    # Bridge Python logging -> OTEL logs.
-    if _LOGGING_INSTRUMENTOR_AVAILABLE:
-        try:
-            LoggingInstrumentor().instrument(set_logging_format=True)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning('LoggingInstrumentor failed to instrument: %s', exc)
-
-    handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
+    handler = _TelemetryLoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
     # Drop OTLP transport-stack records BEFORE they reach the OTLP exporter, so
     # an exporter error logged under ``opentelemetry.*`` / ``grpc`` / ``urllib3``
     # is not re-handled and re-exported into a feedback loop. Attach the filter
@@ -211,7 +228,9 @@ def init_telemetry(config: TelemetryConfig) -> None:
     # under ``twinkle.*`` (which is the entire server codebase) never bubble
     # up to root and would be invisible to an OTLP handler bound there only.
     logging.getLogger().addHandler(handler)
-    logging.getLogger('twinkle').addHandler(handler)
+    twinkle_logger = logging.getLogger('twinkle')
+    if not twinkle_logger.propagate:
+        twinkle_logger.addHandler(handler)
     _logging_handler = handler
 
     _initialized = True
@@ -221,6 +240,7 @@ def init_telemetry(config: TelemetryConfig) -> None:
         config.debug,
         config.otlp_endpoint,
     )
+    return True
 
 
 def shutdown_telemetry() -> None:

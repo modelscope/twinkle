@@ -89,7 +89,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         self.controller = ray.get_actor(controller_name(namespace), namespace=namespace)
         self.proxy = ServiceProxy(http_options)
         self.replica_id = "training-router_" + uuid.uuid4().hex
-        self._init_task_queue(None, deployment_name="TrainingRouter")
+        self._init_task_queue(None, deployment_name="TrainingRouter", telemetry_model_id=model.name)
         self._startup_async_done = False
 
     async def _complete_startup(self) -> None:
@@ -122,6 +122,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             raise ResourceNotFoundError("Unknown or expired session")
 
     async def native_request(self, request, endpoint):
+        request.state.base_model = self.model.name
         schema = NATIVE_REQUESTS.get(endpoint)
         if schema is None:
             raise ResourceNotFoundError("Unknown training endpoint")
@@ -200,6 +201,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         return await self.proxy.proxy_request(request, f"twinkle/{endpoint}", route["instance_id"], "training-runtime")
 
     async def tinker_request(self, request, endpoint):
+        request.state.base_model = self.model.name
         schema = TINKER_REQUESTS.get(endpoint)
         if schema is None:
             raise ResourceNotFoundError("Unknown training endpoint")

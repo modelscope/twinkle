@@ -360,6 +360,7 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
             await self._complete_startup()
 
     async def _on_request_start(self, request: Request) -> str:
+        request.state.base_model = self.base_model
         return await self.training_request_start(request)
 
     async def shutdown(self) -> None:
