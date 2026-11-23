@@ -379,7 +379,12 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                 iter_stash = getattr(iter_origin, '_stash', None)
 
                 # This will solve the iterator cannot be passed through ray.
-                def __iter__(_self):
+                # ``_dispatch_context`` is absorbed here because these rebuilt bodies are the
+                # actor-side methods Ray captures at create_workers() time -- BEFORE the
+                # remote_function re-decoration below pins the signature. The dispatch path puts
+                # ``_dispatch_context`` on the wire (see _call_replicas), so the actor method must
+                # declare it or Ray's signature validator refuses the call.
+                def __iter__(_self, _dispatch_context=None):
                     if os.environ.get('WORKER_NAME'):
                         # This is a worker, iter keeps in the class, pass nothing to driver
                         _iter = _self.__iter_origin__()
@@ -389,7 +394,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         # This is executed in driver
                         return _self.__iter_origin__()
 
-                def __next__(_self):
+                def __next__(_self, _dispatch_context=None):
                     # Use _self._iter to get the next data
                     # Only one driver can use this at one time
                     try:
