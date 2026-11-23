@@ -17,6 +17,7 @@ import os
 from collections.abc import Iterator
 from typing import Any
 
+from .correlation import telemetry_node
 from .provider import get_meter
 
 try:
@@ -53,6 +54,8 @@ class ResourceMetricsCollector:
 
     def __init__(self) -> None:
         self._started = False
+        self._node = telemetry_node()
+        self._process_attrs = {'node': self._node, 'pid': os.getpid()}
         # Track which gauges were registered so callers (and tests) can
         # introspect what's exported in this process.
         self.registered_gauges: list[str] = []
@@ -112,43 +115,43 @@ class ResourceMetricsCollector:
 
     # ----- callbacks ----------------------------------------------------- #
 
-    @staticmethod
-    def _cpu_utilization_callback(_options: Any) -> Iterator[Any]:
+    def _cpu_utilization_callback(self, _options: Any) -> Iterator[Any]:
         from opentelemetry.metrics import Observation  # type: ignore
 
         if not _PSUTIL_AVAILABLE:
             return iter(())
         try:
             value = float(psutil.cpu_percent(interval=None)) / 100.0
-            return iter([Observation(value)])
+            return iter([Observation(value, self._process_attrs)])
         except Exception:
             return iter(())
 
-    @staticmethod
-    def _memory_usage_callback(_options: Any) -> Iterator[Any]:
+    def _memory_usage_callback(self, _options: Any) -> Iterator[Any]:
         from opentelemetry.metrics import Observation  # type: ignore
 
         if not _PSUTIL_AVAILABLE:
             return iter(())
         try:
-            return iter([Observation(int(psutil.virtual_memory().used))])
+            return iter([Observation(int(psutil.virtual_memory().used), self._process_attrs)])
         except Exception:
             return iter(())
 
-    @staticmethod
-    def _process_memory_callback(_options: Any) -> Iterator[Any]:
+    def _process_memory_callback(self, _options: Any) -> Iterator[Any]:
         from opentelemetry.metrics import Observation  # type: ignore
 
         if not _PSUTIL_AVAILABLE:
             return iter(())
         try:
             rss = psutil.Process(os.getpid()).memory_info().rss
-            return iter([Observation(int(rss))])
+            return iter([Observation(int(rss), self._process_attrs)])
         except Exception:
             return iter(())
 
-    @staticmethod
-    def _gpu_utilization_callback(_options: Any) -> Iterator[Any]:
+    def _gpu_attrs(self, index: int, handle: Any) -> dict[str, str | int]:
+        uuid = pynvml.nvmlDeviceGetUUID(handle)
+        return {'node': self._node, 'gpu_index': index, 'gpu_uuid': uuid.decode() if isinstance(uuid, bytes) else uuid}
+
+    def _gpu_utilization_callback(self, _options: Any) -> Iterator[Any]:
         from opentelemetry.metrics import Observation  # type: ignore
 
         count = _nvml_handle_count()
@@ -157,13 +160,12 @@ class ResourceMetricsCollector:
             try:
                 handle = pynvml.nvmlDeviceGetHandleByIndex(i)
                 util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                out.append(Observation(float(util.gpu) / 100.0, {'gpu_index': i}))
+                out.append(Observation(float(util.gpu) / 100.0, self._gpu_attrs(i, handle)))
             except Exception:
                 continue
         return iter(out)
 
-    @staticmethod
-    def _gpu_memory_callback(_options: Any) -> Iterator[Any]:
+    def _gpu_memory_callback(self, _options: Any) -> Iterator[Any]:
         from opentelemetry.metrics import Observation  # type: ignore
 
         count = _nvml_handle_count()
@@ -172,7 +174,7 @@ class ResourceMetricsCollector:
             try:
                 handle = pynvml.nvmlDeviceGetHandleByIndex(i)
                 mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                out.append(Observation(int(mem.used), {'gpu_index': i}))
+                out.append(Observation(int(mem.used), self._gpu_attrs(i, handle)))
             except Exception:
                 continue
         return iter(out)

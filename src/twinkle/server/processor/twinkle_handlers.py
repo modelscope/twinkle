@@ -23,7 +23,8 @@ import twinkle.protocol.types as types
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.server.middleware.auth import get_session_id_from_request, get_token_from_request
 from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.telemetry.correlation import SESSION_ID, TOKEN_ID
+from twinkle.server.telemetry.correlation import SESSION_ID, USER_ID
+from twinkle.server.telemetry.identity import current_user_id
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 
@@ -96,11 +97,11 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
                 return getattr(processor_module, class_type)(
                     remote_group=_remote_group, device_mesh=_device_mesh, instance_id=processor_id, **resolved_kwargs)
 
-            # Span the primary processor.create op with token + session correlation.
+            # Span the primary processor.create op with user and session correlation.
             with traced_operation(
                     f'processor.create.{processor_type_name}.{class_type}',
                     attrs={
-                        TOKEN_ID: token,
+                        USER_ID: current_user_id.get(),
                         SESSION_ID: session_id,
                     }):
                 processor = await asyncio.get_running_loop().run_in_executor(None, _do_create)
@@ -157,7 +158,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
                 return True, None
 
         # Span the primary processor.call op so each invocation is observable.
-        with traced_operation(f'processor.call.{function_name}', attrs={TOKEN_ID: get_token_from_request(request)}):
+        with traced_operation(f'processor.call.{function_name}', attrs={USER_ID: current_user_id.get()}):
             is_exhausted, result = await asyncio.get_running_loop().run_in_executor(None, _do_call)
 
         if function_name == '__next__':

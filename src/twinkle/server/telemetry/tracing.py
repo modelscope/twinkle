@@ -8,13 +8,13 @@ from fastapi import Request
 from typing import Any
 
 try:
-    from opentelemetry import trace
+    from opentelemetry import context, trace
     from opentelemetry.propagate import extract, inject
     _OTEL_AVAILABLE = True
 except Exception:
     _OTEL_AVAILABLE = False
 
-from .correlation import set_correlation_attrs
+from .correlation import MODEL_ID, USER_ID, set_correlation_attrs
 
 
 def get_tracer(name: str = 'twinkle-server'):
@@ -43,6 +43,18 @@ def get_current_span():
     if not _OTEL_AVAILABLE:
         return _NoopSpan()
     return trace.get_current_span()
+
+
+def get_trace_context():
+    return context.get_current() if _OTEL_AVAILABLE else None
+
+
+def get_trace_id(parent_context: Any = None) -> str | None:
+    if _OTEL_AVAILABLE:
+        span_context = trace.get_current_span(parent_context).get_span_context()
+        if span_context.is_valid and span_context.trace_flags.sampled:
+            return f'{span_context.trace_id:032x}'
+    return None
 
 
 class _NoopSpan:
@@ -82,35 +94,23 @@ def traced_operation(
     name: str,
     *,
     attrs: Mapping[str, Any] | None = None,
+    parent_context: Any = None,
     tracer_name: str = 'twinkle.server.business',
 ) -> Iterator[Any]:
     """Run a business-layer block under one OTEL span.
 
-    The span starts before the block runs and ends after it returns. If the
-    block raises, the exception is recorded on the span, the span status is
-    set to ERROR, the span is ended, and the original exception is re-raised
-    to the caller. When the OTEL SDK is missing, the context manager degrades
-    to a NoOp that runs the block normally and returns the same result it
-    would return when tracing is active.
+    OpenTelemetry records exceptions and closes the span on exit. Without
+    the SDK, the context manager yields a NoOp span.
     """
     if not _OTEL_AVAILABLE:
         yield _NoopSpan()
         return
 
     tracer = trace.get_tracer(tracer_name)
-    with tracer.start_as_current_span(name) as span:
+    with tracer.start_as_current_span(name, context=parent_context) as span:
         if attrs:
             set_correlation_attrs(span, attrs)
-        try:
-            yield span
-        except Exception as exc:
-            try:
-                span.record_exception(exc)
-                span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
-            except Exception:
-                # NEVER let a tracing error mask the underlying exception.
-                pass
-            raise
+        yield span
 
 
 def create_tracing_middleware(service_component: str):
@@ -143,8 +143,6 @@ def create_tracing_middleware(service_component: str):
         tracer = trace.get_tracer(f'twinkle.server.{service_component}')
 
         method = request.method
-        path = request.url.path
-        span_name = f'{method} {path}'
 
         # Continue an upstream trace when the inbound request carries trace
         # headers (e.g. a Gateway -> Model / Gateway -> Sampler hop), so the
@@ -154,19 +152,26 @@ def create_tracing_middleware(service_component: str):
         ctx = extract(request.headers)
 
         with tracer.start_as_current_span(
-                span_name,
+                method,
                 kind=trace.SpanKind.SERVER,
                 context=ctx,
                 attributes={
                     'http.method': method,
-                    'http.url': str(request.url),
-                    'http.route': path,
                     'http.scheme': request.url.scheme,
                     'service.component': service_component,
                 },
         ) as span:
             try:
                 response = await call_next(request)
+                route = getattr(request.scope.get('route'), 'path', None)
+                if route is not None:
+                    span.update_name(f'{method} {route}')
+                    span.set_attribute('http.route', route)
+                set_correlation_attrs(span, {
+                    USER_ID: getattr(request.state, 'user_id', None),
+                    MODEL_ID: getattr(request.state, 'model_id', None),
+                    'twinkle.http_request_id': getattr(request.state, 'request_id', None),
+                })
                 span.set_attribute('http.status_code', response.status_code)
                 if response.status_code >= 400:
                     span.set_status(trace.Status(trace.StatusCode.ERROR))

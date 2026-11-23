@@ -155,7 +155,7 @@ class SessionResourceMixin(ABC):
 
         self._resource_records[resource_id] = self._create_resource_record(token, session_id)
         logger.debug(f'[{self._resource_type}Manager] Registered {self._resource_type} {resource_id} '
-                     f'for token {token[:8]}... (session: {session_id})')
+                     f'(session: {session_id})')
 
     def unregister_resource(self, resource_id: str) -> bool:
         """Unregister a resource from lifecycle tracking.
@@ -167,10 +167,8 @@ class SessionResourceMixin(ABC):
             True if resource was found and removed, False otherwise.
         """
         if resource_id in self._resource_records:
-            info = self._resource_records.pop(resource_id)
-            token = info.get('token')
-            logger.debug(f'[{self._resource_type}Manager] Unregistered {self._resource_type} {resource_id} '
-                         f"for token {token[:8] if token else 'unknown'}...")
+            del self._resource_records[resource_id]
+            logger.debug(f'[{self._resource_type}Manager] Unregistered {self._resource_type} {resource_id}')
             return True
         return False
 

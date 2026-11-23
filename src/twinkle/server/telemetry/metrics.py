@@ -24,6 +24,8 @@ from typing import Any
 from twinkle.server.exceptions import ResourceReleaseError
 from .provider import get_meter
 
+METERED_TASK_TYPES = frozenset({'forward', 'forward_only', 'forward_backward', 'step', 'optim_step', 'sample'})
+
 try:
     from opentelemetry.metrics import Observation
 except Exception:  # pragma: no cover - OTEL not installed; NoopMeter never invokes the callback below.
@@ -111,6 +113,9 @@ class TaskMetrics(BaseModel):
     queue_wait_seconds: _Histogram
     rate_limit_rejections: _Counter
     rate_limiter_active_tokens: _Gauge
+    usage_requests: _Counter
+    usage_input_tokens: _Counter
+    usage_run_seconds: _Counter
 
 
 class TrainingMetrics(BaseModel):
@@ -206,6 +211,13 @@ class MetricsRegistry:
             description='Number of tokens currently tracked by the rate limiter',
         )
 
+        self.usage_requests = meter.create_counter(
+            'twinkle.usage.requests.total', description='Admitted training compute and sampling requests')
+        self.usage_input_tokens = meter.create_counter(
+            'twinkle.usage.input_tokens.total', description='Input tokens of admitted compute requests')
+        self.usage_run_seconds = meter.create_counter(
+            'twinkle.usage.run_seconds.total', description='Execution seconds of admitted compute requests')
+
         # === Managed training ===
         self.training_instances_active = meter.create_up_down_counter(
             'twinkle.training.instances.active', description='Active managed training instances by lifecycle state')
@@ -285,6 +297,9 @@ class MetricsRegistry:
                 queue_wait_seconds=_Histogram(self.task_wait_seconds),
                 rate_limit_rejections=_Counter(self.rate_limit_rejections),
                 rate_limiter_active_tokens=_Gauge(self.rate_limiter_active_tokens),
+                usage_requests=_Counter(self.usage_requests),
+                usage_input_tokens=_Counter(self.usage_input_tokens),
+                usage_run_seconds=_Counter(self.usage_run_seconds),
             )
         return cached
 

@@ -13,7 +13,9 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from twinkle.server.telemetry.metrics import MetricsRegistry
+from twinkle.server.telemetry.metrics import METERED_TASK_TYPES, MetricsRegistry
+
+_OPERATIONS = METERED_TASK_TYPES | {'asample', 'session_heartbeat', 'retrieve_future'}
 
 
 def create_metrics_middleware(deployment: str) -> Callable:
@@ -41,18 +43,15 @@ def create_metrics_middleware(deployment: str) -> Callable:
         status = str(response.status_code)
         # The HTTP verb is the ``method`` label (standard RED semantics); the route template would
         # merge GET/POST and make the label useless for read/write split.
-        method = request.method
+        route_name = request.path_params.get('endpoint') or getattr(request.scope.get('route'), 'name', None)
+        operation = route_name if route_name in _OPERATIONS else 'request'
+        tags = {'deployment': deployment, 'method': request.method, 'operation': operation}
+        for key in ('user_id', 'model_id'):
+            if value := getattr(request.state, key, None):
+                tags[key] = value
         m = MetricsRegistry.get().request_metrics(deployment)
-        m.requests_total.inc(tags={
-            'deployment': deployment,
-            'method': method,
-            'status': status,
-        })
-        m.request_duration_seconds.observe(
-            elapsed, tags={
-                'deployment': deployment,
-                'method': method,
-            })
+        m.requests_total.inc(tags={**tags, 'status': status})
+        m.request_duration_seconds.observe(elapsed, tags=tags)
         return response
 
     return metrics_middleware

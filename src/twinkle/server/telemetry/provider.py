@@ -13,10 +13,13 @@ exposes:
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from twinkle.server.config.telemetry import TelemetryConfig
 from twinkle.utils import get_logger
+
+from .correlation import telemetry_node
 
 logger = get_logger()
 
@@ -137,6 +140,9 @@ def init_telemetry(config: TelemetryConfig) -> None:
     resource_attrs: dict[str, str] = {'service.name': config.service_name}
     if config.resource_attributes:
         resource_attrs.update(config.resource_attributes)
+    resource_attrs['twinkle.node'] = telemetry_node()
+    # OTLP backends need separate cumulative time series before Grafana sums replicas.
+    resource_attrs.setdefault('service.instance.id', uuid.uuid4().hex)
     resource = Resource.create(resource_attrs)
 
     use_console = config.debug or not _OTLP_AVAILABLE

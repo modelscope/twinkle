@@ -110,6 +110,9 @@ class ServerLauncher:
         if not telemetry.enabled:
             return
         from twinkle.server.telemetry import init_telemetry
+        from twinkle.server.telemetry.identity import USER_ID_KEY_ENV, user_id_key
+        if USER_ID_KEY_ENV in os.environ and user_id_key() is None:
+            raise ValueError(f'{USER_ID_KEY_ENV} must be nonempty and distinct from TWINKLE_TOKEN_SALT')
         init_telemetry(telemetry)
         os.environ.update({
             'TWINKLE_TELEMETRY_DEBUG': str(int(telemetry.debug)),
@@ -193,7 +196,10 @@ class ServerLauncher:
         self._sampler_controllers.append(controller)
         ray.get(controller.initialize.remote())
         serve.run(
-            build_sampler_router(self.ray_namespace, pool_id, options), name=app.name, route_prefix=app.route_prefix)
+            build_sampler_router(self.ray_namespace, pool_id, options, model_id=app.args.model_id),
+            name=app.name,
+            route_prefix=app.route_prefix,
+        )
 
     def _deploy_application(self, app_spec: ApplicationSpec) -> None:
         """Model declarations go to the training controller; other apps deploy here."""

@@ -82,22 +82,22 @@
       "type": "timeseries",
       "targets": [
         {
-          "expr": "twinkle_sessions_active",
+          "expr": "sum(twinkle_sessions_active)",
           "legendFormat": "sessions",
           "refId": "A"
         },
         {
-          "expr": "twinkle_models_active",
+          "expr": "sum(twinkle_models_active)",
           "legendFormat": "models",
           "refId": "B"
         },
         {
-          "expr": "twinkle_sampling_sessions_active",
+          "expr": "sum(twinkle_sampling_sessions_active)",
           "legendFormat": "sampling sessions",
           "refId": "C"
         },
         {
-          "expr": "twinkle_futures_active",
+          "expr": "sum(twinkle_futures_active)",
           "legendFormat": "futures",
           "refId": "D"
         }

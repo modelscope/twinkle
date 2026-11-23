@@ -22,13 +22,15 @@ class SamplerRouter:
     # constructor synchronously (ASGIIngressWrapper in ray/serve/api.py) -- an async
     # __init__'s coroutine is never awaited, so none of its body runs and forwarding dies
     # on a missing attribute. Both operations here are plain sync calls anyway.
-    def __init__(self, namespace, pool_id):
+    def __init__(self, namespace, pool_id, model_id):
         import ray
 
         self.state = get_server_state()
+        self.model_id = model_id
         self.controller = ray.get_actor(sampler_controller_name(namespace, pool_id), namespace=namespace)
 
     async def forward(self, request, endpoint):
+        request.state.model_id = self.model_id
         body = await request.body()
         payload: ForwardedRequest = {
             "endpoint": endpoint,
@@ -90,7 +92,7 @@ class SamplerRouter:
         return StreamingResponse(generate(), status_code=reply["status"], headers=headers)
 
 
-def build_sampler_router(namespace, pool_id, deploy_options):
+def build_sampler_router(namespace, pool_id, deploy_options, *, model_id):
     def routes(app, get_self):
         @app.get("/healthz")
         async def health(self=Depends(get_self)):
@@ -107,5 +109,5 @@ def build_sampler_router(namespace, pool_id, deploy_options):
 
     app = build_deployment_app("SamplerRouter", routes)
     return bind_deployment(
-        app, SamplerRouter, deploy_options, deployment_name="SamplerRouter", bind_args=(namespace, pool_id)
+        app, SamplerRouter, deploy_options, deployment_name="SamplerRouter", bind_args=(namespace, pool_id, model_id)
     )

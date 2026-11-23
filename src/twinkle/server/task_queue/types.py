@@ -9,6 +9,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
+from typing import Any
+
+from twinkle.server.telemetry.tracing import get_trace_id
 
 
 @dataclass
@@ -41,3 +44,22 @@ class QueuedTask:
     created_at: float
     on_finished: Callable[[bool, bool], Coroutine] | None = None
     execution_scope: ExecutionScope | None = None
+    user_id: str | None = None
+    trace_context: Any = None
+    base_model: str | None = None
+
+    @property
+    def telemetry_model_id(self) -> str | None:
+        return self.model_id or self.base_model
+
+    def log_fields(self, outcome: str, trace_id: str | None = None) -> dict[str, str]:
+        fields = {
+            'twinkle_model_id': self.telemetry_model_id,
+            'twinkle_request_id': self.request_id,
+            'twinkle_task_type': self.task_type or 'unknown',
+            'twinkle_task_outcome': outcome,
+            'twinkle_user_id': self.user_id,
+            'twinkle_base_model': self.base_model,
+            'twinkle_trace_id': trace_id or get_trace_id(self.trace_context),
+        }
+        return {key: value for key, value in fields.items() if value is not None}

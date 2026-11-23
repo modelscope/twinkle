@@ -1,6 +1,5 @@
 # ---------- Stage 0: grab pre-built binaries ----------
 FROM redis:7.4.9 AS redis
-FROM grafana/otel-lgtm:0.28.0 AS lgtm
 FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda13.0.3-py312-torch2.11.0-vllm0.21.0-modelscope1.36.3-swift4.2.3
 
 # Put the real CUDA runtime ahead of package-private stubs, then keep the forward-compat
@@ -11,8 +10,7 @@ ENV LD_LIBRARY_PATH="/usr/local/cuda-13.0/targets/x86_64-linux/lib:/usr/local/cu
 RUN pip config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simple && \
     pip config set install.trusted-host mirrors.cloud.aliyuncs.com && \
     pip install --no-cache-dir \
-        tinker==0.16.1 \
-        "ray[serve]" && \
+        "ray[serve]>=2.55" && \
     pip install --no-cache-dir --no-deps \
         flash-linear-attention \
         apache-tvm-ffi==0.1.9 \
@@ -22,22 +20,14 @@ RUN pip config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simp
     python -c "import ctypes, os; stub_path = '/usr/local/lib/python3.12/site-packages/tilelang/lib/libcudart_stub.so'; lib = ctypes.CDLL(stub_path); getattr(lib, 'cudaDeviceReset'); print(f'tilelang cudart path: {os.path.realpath(stub_path)}')" && \
     rm -rf /root/.cache /tmp/*
 
-# Clone and install twinkle, checkout to latest v-tag
-RUN git clone https://github.com/modelscope/twinkle.git
 WORKDIR /twinkle
-RUN echo "Available release branches:" && git branch -r -l 'origin/release/*' --sort=-v:refname && \
-    LATEST_RELEASE=$(git branch -r -l 'origin/release/*' --sort=-v:refname | head -n 1 | tr -d ' ') && \
-    echo "Checking out: $LATEST_RELEASE" && \
-    git checkout --track "$LATEST_RELEASE"
+COPY pyproject.toml setup.cfg README.md LICENSE ./
+COPY src/ ./src/
 
 # Install twinkle itself (with server extras: redis + otel + telemetry)
 RUN pip install -e ".[server]" --no-build-isolation
+COPY cookbook/ ./cookbook/
 
 # ---------- Redis server ----------
 COPY --from=redis /usr/local/bin/redis-server /usr/local/bin/redis-server
 COPY --from=redis /usr/local/bin/redis-cli /usr/local/bin/redis-cli
-
-# ---------- Observability: Grafana LGTM stack ----------
-COPY --from=lgtm /otel-lgtm /otel-lgtm
-COPY cookbook/observability/grafana/dashboards/twinkle-overview.json \
-     /otel-lgtm/grafana/conf/provisioning/dashboards/twinkle-overview.json

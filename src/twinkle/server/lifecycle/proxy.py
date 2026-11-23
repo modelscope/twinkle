@@ -123,7 +123,9 @@ class ServiceProxy:
                     yield line
 
     async def proxy_to_model(self, request: Request, endpoint: str, base_model: str) -> Response:
+        request.state.model_id = base_model
         return await self.proxy_request(request, f"tinker/{endpoint}", base_model, "model")
 
     async def proxy_to_sampler(self, request: Request, endpoint: str, base_model: str) -> Response:
+        request.state.model_id = base_model
         return await self.proxy_request(request, f"tinker/{endpoint}", base_model, "sampler")

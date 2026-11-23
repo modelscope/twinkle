@@ -1,9 +1,9 @@
 # Twinkle Observability Stack
 
-A one-container OTLP receiver + dashboard for Twinkle, built on the
+For local development, build the standalone Twinkle LGTM image on top of the
 [`grafana/otel-lgtm`](https://github.com/grafana/docker-otel-lgtm) image.
-That image bundles OTel Collector, Mimir (Prometheus-compatible), Tempo,
-Loki, and Grafana with everything pre-wired — no extra config files needed.
+It bundles OTel Collector, Prometheus, Tempo, Loki, Grafana, and the Twinkle
+Server Overview dashboard.
 
 ## What you get
 
@@ -18,7 +18,7 @@ Loki, and Grafana with everything pre-wired — no extra config files needed.
 ```bash
 # 1. Start the stack
 cd cookbook/observability
-docker compose up -d
+docker compose up -d --build
 
 # 2. Make sure Twinkle has the OTLP exporter
 pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp
@@ -39,6 +39,17 @@ open http://localhost:3000
 ```
 
 Anonymous viewer access is on by default; full access is `admin` / `admin`.
+
+To build just the LGTM image, run this command from the repository root.
+
+```sh
+docker build -t twinkle-lgtm:0.28.0 cookbook/observability
+```
+
+Build the CUDA Twinkle Server image from the repository root with
+`docker build --platform linux/amd64 -t twinkle-server:local .`. The build
+installs the checkout's source and packages its cookbook startup scripts.
+Check out the target branch or tag before building a release image.
 
 The provisioned **Twinkle / Twinkle Server Overview** dashboard shows:
 
@@ -85,14 +96,51 @@ the gauge value directly.
 docker compose down -v   # -v also removes the named volume
 ```
 
-## Production note
+## Dedicated monitoring host
 
-The LGTM all-in-one image is **for local development and demos**. Each backend
-runs single-instance and shares one volume. For production, deploy each
-component (Mimir / Tempo / Loki / Grafana) separately with proper persistent
-storage, replicas, and an OTel Collector tier in front. The OTLP endpoint and
-metric names stay the same, so your `server_config.yaml` and dashboards
-transfer without changes.
+`docker-compose.production.yaml` runs Collector, Tempo, Loki, Mimir, and Grafana
+as separate services on one internal CPU host. Place Docker's named volumes on
+supported persistent block storage with capacity for 30 days of telemetry. Use
+the platform's approved object storage configuration if the storage available
+for telemetry is NFS. Keep Mimir's TSDB and component working directories on
+supported local block storage.
+
+1. Provision a private OTLP listener and a Grafana listener on the administrator
+   network. Allow TCP 4317 from Runtime and TCP 3000 from the managed network only.
+   Keep the business Redis and the three backends on internal networks.
+2. Have the Redis administrator provision a dedicated account for GET on the
+   three snapshot keys in the operations guide. Use the same Redis database and
+   key prefix as Runtime.
+3. Copy `production/usage-limits.example.json` to deployment configuration.
+   Set default rates and optional overrides keyed by the complete fingerprint.
+   Render the dashboard with the existing Runtime Redis key prefix:
+
+   ```sh
+   python3 production/render_dashboard.py /path/to/usage-limits.json /path/to/twinkle-multitenant.json \
+       --redis-key-prefix '<runtime persistence.key_prefix>'
+   ```
+
+4. Set `OBS_OTLP_BIND_IP`, `OBS_GRAFANA_BIND_IP`, `OBS_DASHBOARD_FILE` (the
+   absolute output path above), `OBS_REDIS_URL` (address without credentials),
+   and `OBS_REDIS_USER`. Inject `OBS_REDIS_PASSWORD`, `OBS_GRAFANA_USER`, and
+   `OBS_GRAFANA_PASSWORD` via deployment configuration. The Grafana image
+   installs the pinned Redis data source plugin. For an offline host, stage the
+   signed ARM64 or AMD64 plugin in Grafana's plugin directory before starting.
+
+   ```sh
+   docker compose -f docker-compose.production.yaml up -d
+   ```
+
+5. Merge `production/server_config.yaml` into the existing Runtime config,
+   select the internal Collector address, and inject the same
+   `TWINKLE_TELEMETRY_USER_ID_KEY` into every Runtime worker using a deployment
+   secret. With the Megatron container entrypoint, pass
+   `--server-config /path/to/deployment.yaml` to load the resulting config.
+   The entrypoint supervises Runtime independently of the monitoring stack.
+   Confirm all three signals arrive.
+
+See the [multitenant operations guide](../../docs/source_en/Usage%20Guide/Server%20and%20Client/Multitenant-Operations.md)
+for Redis ACLs, credential handling, dashboard queries, and release checks.
 
 ## Troubleshooting
 

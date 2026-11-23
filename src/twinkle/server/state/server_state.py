@@ -12,11 +12,14 @@ from typing import Any
 from twinkle.server.config.persistence import PersistenceConfig
 from twinkle.server.exceptions import ResourceNotFoundError, ResourceQuotaExceededError
 from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
-                                                  TOKEN_ID)
+                                                  USER_ID)
+from twinkle.server.telemetry.identity import current_user_id, user_fingerprint, user_id_key
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
+from .admin_index import AdminIndex
 from .backend import StateBackend
 from .backend.factory import create_backend
+from .backend.redis_backend import RedisBackend
 from .cleanup_coordinator import ResourceCleanupCoordinator
 from .count_publisher import ResourceCountPublisher
 from .future_manager import FutureManager
@@ -157,6 +160,10 @@ class ServerState:
                 ('active_futures', self._future_mgr),
             ],
             interval=float(metrics_update_interval),
+            admin_index=AdminIndex(
+                self._backend, self._session_mgr, self._model_mgr, self._sampling_mgr,
+                expiration_timeout=expiration_timeout, interval=metrics_update_interval,
+            ) if isinstance(self._backend, RedisBackend) and user_id_key() else None,
         )
         self._cleanup = ResourceCleanupCoordinator(
             self._backend,
@@ -216,12 +223,13 @@ class ServerState:
         session_id = payload.get('session_id') or f'session_{uuid.uuid4().hex}'
         with traced_operation(
                 'server_state.create_session',
-                attrs={SESSION_ID: session_id},
+                attrs={SESSION_ID: session_id, USER_ID: current_user_id.get()},
         ):
             record = SessionRecord(
                 tags=list(payload.get('tags') or []),
                 user_metadata=payload.get('user_metadata') or {},
                 sdk_version=payload.get('sdk_version'),
+                user_id=current_user_id.get(),
             )
             await self._session_mgr.add(session_id, record)
             return session_id
@@ -277,7 +285,7 @@ class ServerState:
                     MODEL_ID: _model_id,
                     BASE_MODEL: payload.get('base_model'),
                     REPLICA_ID: replica_id,
-                    TOKEN_ID: token,
+                    USER_ID: user_fingerprint(token) if token else current_user_id.get(),
                     SESSION_ID: session_id or payload.get('session_id'),
                 },
         ):
@@ -376,7 +384,7 @@ class ServerState:
             ttl=self._processor_quota_ttl(lease_seconds),
         )
         if not isinstance(reservations, dict) or processor_id not in reservations:
-            raise ResourceQuotaExceededError(f'Per-user processor quota ({limit}) reached for token {token[:8]}...')
+            raise ResourceQuotaExceededError(f'Per-user processor quota ({limit}) reached')
 
     async def renew_processor_quota(
         self,
@@ -438,6 +446,7 @@ class ServerState:
                     SAMPLING_SESSION_ID: _sampling_session_id,
                     SESSION_ID: payload.get('session_id'),
                     BASE_MODEL: payload.get('base_model'),
+                    USER_ID: current_user_id.get(),
                 },
         ):
             record = SamplingSessionRecord(
@@ -445,6 +454,7 @@ class ServerState:
                 seq_id=payload.get('sampling_session_seq_id'),
                 base_model=payload.get('base_model'),
                 model_path=payload.get('model_path'),
+                user_id=current_user_id.get(),
             )
             await self._sampling_mgr.add(_sampling_session_id, record)
             return _sampling_session_id

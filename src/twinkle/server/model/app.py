@@ -328,6 +328,7 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
             enable_admission_gate=True,
             on_backend_timeout=self._probe_after_timeout,
             collect_width=len(actors) if actors else 1,
+            telemetry_model_id=self.base_model,
         )
         self.model._ray_get_timeout = self.task_queue_config.effective_execution_timeout
         self._training_states = {}

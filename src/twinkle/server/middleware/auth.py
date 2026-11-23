@@ -5,6 +5,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, H_CLIENT_ID, H_REQUEST_ID, H_SESSION_ID
+from twinkle.server.telemetry.identity import current_user_id, user_fingerprint
 
 _OPENAI_COMPAT_SUFFIXES = ('/chat/completions', '/models')
 
@@ -43,8 +44,12 @@ async def verify_request_token(request: Request, call_next):
     request.state.client_id = request.headers.get(H_CLIENT_ID) or request_id
     request.state.token = token
     request.state.session_id = request.headers.get(H_SESSION_ID) or ''
-    response = await call_next(request)
-    return response
+    request.state.user_id = user_fingerprint(token, request.state.client_id)
+    binding = current_user_id.set(request.state.user_id)
+    try:
+        return await call_next(request)
+    finally:
+        current_user_id.reset(binding)
 
 
 def is_token_valid(token: str) -> bool:

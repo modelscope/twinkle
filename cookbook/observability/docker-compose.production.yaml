@@ -1,0 +1,69 @@
+# Run on the internal monitoring host. Only Grafana and the OTLP receiver bind host ports.
+services:
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.132.0
+    command: ["--config=/etc/collector.yaml"]
+    restart: unless-stopped
+    ports:
+      - "${OBS_OTLP_BIND_IP:?Set the private OTLP IP}:4317:4317"
+    volumes:
+      - ./production/collector.yaml:/etc/collector.yaml:ro
+
+  mimir:
+    image: grafana/mimir:2.17.1
+    command: ["-config.file=/etc/mimir.yaml"]
+    restart: unless-stopped
+    volumes:
+      - ./production/mimir.yaml:/etc/mimir.yaml:ro
+      - mimir:/data
+
+  loki:
+    image: grafana/loki:3.5.5
+    command: ["-config.file=/etc/loki.yaml"]
+    restart: unless-stopped
+    volumes:
+      - ./production/loki.yaml:/etc/loki.yaml:ro
+      - loki:/loki
+
+  tempo:
+    image: grafana/tempo:2.8.2
+    command: ["-config.file=/etc/tempo.yaml"]
+    restart: unless-stopped
+    volumes:
+      - ./production/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo:/var/tempo
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    restart: unless-stopped
+    ports:
+      - "${OBS_GRAFANA_BIND_IP:?Set the managed Grafana IP}:3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SECURITY_ADMIN_USER: "${OBS_GRAFANA_USER:?Set the Grafana admin user}"
+      GF_SECURITY_ADMIN_PASSWORD: "${OBS_GRAFANA_PASSWORD:?Set the Grafana admin password}"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_SYNC: "redis-datasource@2.2.0"
+      OBS_REDIS_URL: "${OBS_REDIS_URL:?Set the internal Redis address}"
+      OBS_REDIS_USER: "${OBS_REDIS_USER:?Set the dedicated Redis username}"
+      OBS_REDIS_PASSWORD: "${OBS_REDIS_PASSWORD:?Set the dedicated Redis password}"
+    volumes:
+      - grafana:/var/lib/grafana
+      - ./production/datasources.yaml:/etc/grafana/provisioning/datasources/twinkle.yaml:ro
+      - ./production/dashboards.yaml:/etc/grafana/provisioning/dashboards/twinkle.yaml:ro
+      - type: bind
+        source: "${OBS_DASHBOARD_FILE:?Render the deployment dashboard first}"
+        target: /var/lib/twinkle-dashboards/twinkle-multitenant.json
+        read_only: true
+        bind:
+          create_host_path: false
+
+volumes:
+  mimir:
+  loki:
+  tempo:
+  grafana:

@@ -181,6 +181,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         self._init_task_queue(
             queue_config,
             deployment_name='Sampler',
+            telemetry_model_id=model_id,
             collect_width=len(actors) if actors else 1,
         )
         # ComputeWorker bounds the client future. Keep collecting the actual
@@ -260,6 +261,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         self.sampling_guard.check_available()
 
     async def _on_request_start(self, request: Request) -> str:
+        request.state.model_id = self.model_id
         await self.state.touch_replica_last_seen(self.replica_id)
         await self._ensure_state_cleanup_started()
         return get_token_from_request(request)

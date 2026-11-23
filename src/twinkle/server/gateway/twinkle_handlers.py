@@ -146,6 +146,7 @@ def _register_gateway_twinkle_routes(app: FastAPI, self_fn: Callable[[], Gateway
             self.state, request_id, after_progress=body.after_progress, owner_token=get_token_from_request(request))
         if outcome.record is None:
             raise ResourceNotFoundError(f'request_id {request_id} not found or expired')
+        request.state.model_id = outcome.record.get('model_id')
         return envelope_from_record(request_id, outcome.record)
 
     @app.post('/twinkle/cancel', response_model=types.CancelResponse)

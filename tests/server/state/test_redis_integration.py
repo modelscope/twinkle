@@ -15,14 +15,18 @@ against the local stack rather than the in-process mock.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pytest
+import pytest_asyncio
 import uuid
 
 from twinkle.server.config.persistence import PersistenceConfig
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.factory import create_backend
 from twinkle.server.state.backend.redis_backend import RedisBackend
+from twinkle.server.state.training_records import TrainingRecord
+from twinkle.server.telemetry.identity import USER_ID_KEY_ENV, current_user_id, user_fingerprint
 
 REDIS_URL = os.environ.get('TWINKLE_TEST_REDIS_URL', 'redis://localhost:6379/0')
 
@@ -59,7 +63,7 @@ def isolation_prefix() -> str:
     return f'twinkle-test-{uuid.uuid4().hex[:8]}::'
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def shared_backend(isolation_prefix: str):
     backend = create_backend(PersistenceConfig(mode='redis', redis_url=REDIS_URL, key_prefix=isolation_prefix))
     yield backend
@@ -101,6 +105,64 @@ def make_state(isolation_prefix: str):
 
 
 # ---------- Cross-worker visibility -------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_cleanup_leader_refreshes_admin_snapshots(shared_backend, monkeypatch):
+    monkeypatch.setenv(USER_ID_KEY_ENV, 'redis-integration-key')
+    state = ServerState(backend=shared_backend, cleanup_interval=1, metrics_update_interval=0.05)
+    token = 'synthetic-redis-owner'
+    user_id = user_fingerprint(token)
+    binding = current_user_id.set(user_id)
+    try:
+        session = await state.create_session({'user_metadata': {'private': 'not-in-snapshot'}})
+        await state.create_sampling_session({'session_id': session, 'model_path': '/private/checkpoint'})
+    finally:
+        current_user_id.reset(binding)
+    legacy_session = await state.create_session({})
+    active = TrainingRecord(training_id='train-1', token=token, session_id=session, base_model='tiny',
+                            controller_epoch='epoch', instance_id='instance', mode='lora', state='ACTIVE',
+                            create_request_id='request', creation_deadline=0, last_activity_at=0)
+    await state.create_training_store('test').reserve(active)
+
+    async def wait_for_snapshot(kind, predicate):
+        async with asyncio.timeout(3):
+            while True:
+                snapshot = await shared_backend.get(f'admin:index:{kind}')
+                if predicate(snapshot):
+                    return snapshot
+                await asyncio.sleep(0.02)
+
+    await state.start_cleanup_task()
+    try:
+        sessions = await wait_for_snapshot('sessions', lambda value: value is not None)
+        assert {row['session_id']: row['user_id'] for row in sessions['rows']} == {
+            session: user_id, legacy_session: None}
+        trainings = await wait_for_snapshot('trainings', lambda value: value is not None)
+        assert trainings['rows'][0]['user_id'] == user_id
+        sampling = await wait_for_snapshot('sampling', lambda value: value is not None)
+        assert sampling['rows'][0]['user_id'] == user_id
+        assert token not in json.dumps([sessions, trainings, sampling])
+        assert 'private' not in json.dumps([sessions, trainings, sampling])
+
+        await state.unload_model(active.training_id)
+        await wait_for_snapshot('trainings', lambda value: value and value['rows'][0]['state'] == 'EMPTY')
+
+        set_value = shared_backend.set
+
+        async def fail_session_snapshot(key, value, ttl=None):
+            if key == 'admin:index:sessions':
+                raise ConnectionError('simulated snapshot write failure')
+            await set_value(key, value, ttl=ttl)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(shared_backend, 'set', fail_session_snapshot)
+            assert await state.touch_session(session)
+            await wait_for_snapshot('sessions', lambda value: value is None)
+            assert await shared_backend.get('admin:index:sampling') is not None
+    finally:
+        await state.stop_cleanup_task()
+    await wait_for_snapshot('sampling', lambda value: value is None)
 
 
 @pytest.mark.asyncio

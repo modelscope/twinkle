@@ -1,0 +1,5 @@
+# Merge into the existing Runtime configuration. Manage the user ID key as a deployment secret.
+telemetry:
+  enabled: true
+  service_name: twinkle-server
+  otlp_endpoint: http://twinkle-monitor.internal:4317
