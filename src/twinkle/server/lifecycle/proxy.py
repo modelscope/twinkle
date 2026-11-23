@@ -81,7 +81,10 @@ class ServiceProxy:
             with trace_http_client(request.method, service_type) as span:
                 inject_context(headers)
                 response = await self.client.request(
-                    method=request.method, url=target_url, content=body_bytes, headers=headers,
+                    method=request.method,
+                    url=target_url,
+                    content=body_bytes,
+                    headers=headers,
                     params=request.query_params,
                 )
                 record_http_status(span, response.status_code, client=True)
@@ -115,7 +118,10 @@ class ServiceProxy:
         with trace_http_client("POST", service_type) as span:
             inject_context(headers)
             async with self.client.stream(
-                method="POST", url=target_url, content=body_bytes, headers=headers,
+                method="POST",
+                url=target_url,
+                content=body_bytes,
+                headers=headers,
             ) as response:
                 record_http_status(span, response.status_code, client=True)
                 if response.status_code >= 400:

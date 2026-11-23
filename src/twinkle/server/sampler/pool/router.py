@@ -68,7 +68,7 @@ class SamplerRouter:
 
             queue = Queue(maxsize=128)
         try:
-            with traced_operation('sampler.forward', attrs={'twinkle.transport': 'ray'}) as span:
+            with traced_operation("sampler.forward", attrs={"twinkle.transport": "ray"}) as span:
                 carrier = {}
                 inject_context(carrier)
                 trace_headers = {key.encode(): value.encode() for key, value in carrier.items()}
