@@ -633,6 +633,34 @@ class RayHelper:
                 RayHelper._collect_arg_refs(getattr(value, field.name), refs)
 
     @staticmethod
+    def anchor_refs(value: Any):
+        """Anchor nested payload ObjectRefs so they outlive this process's local references.
+
+        A stashed payload rides back as a reference nested in a return value. The process that
+        receives it (e.g. a streaming driver reading ``rollout.step``) is only a *borrower*: once
+        it drops its local Python reference -- a group cleared after delivery, a close drain, or
+        the declarative teardown killing the actor -- Ray's reference-counting protocol can free
+        the payload on its owner BEFORE a downstream consumer (the trainer's ``forward_backward``)
+        retrieves it, surfacing as ``ReferenceCountingAssertionError`` (defect129). The race is
+        intermittent because it depends on when the borrower's release reaches the owner relative
+        to the consumer's borrow.
+
+        Submitting a payload-free completion token over the refs registers an independent borrower
+        session (the token task's argument references) that keeps the payload alive until consumed,
+        without fetching any payload into this process. Returns the anchoring :class:`LazyCollect`
+        -- the caller keeps it alive -- or ``None`` when ``value`` carries no reference.
+        """
+        import ray
+        refs: List[Any] = []
+        RayHelper._collect_arg_refs(value, refs)
+        refs = [ref for ref in dict.fromkeys(refs) if isinstance(ref, ray.ObjectRef)]
+        if not refs:
+            return None
+        anchor = LazyCollect(refs, 'none', lambda method, result, device_mesh=None: result, None)
+        anchor.add_done_callback(lambda finished: None)
+        return anchor
+
+    @staticmethod
     def do_get_and_collect(args, kwargs, timeout=None):
         """Resolve nested handles in batches, sharing one timeout and fetching each reference once."""
         import ray

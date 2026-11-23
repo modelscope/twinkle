@@ -422,6 +422,10 @@ class _ContinuousCall:
         self.pending = 0
         self.retries = 0
         self.lock = threading.Lock()
+        # Anchors for stashed payload refs received from replicas (defect129): keep them alive
+        # until a downstream consumer retrieves them, even after this call's bookkeeping drops
+        # its local references or the receiving actor is torn down.
+        self._anchors: List[Any] = []
 
     def start(self):
         count = self.batch_len if self.batch_len is not None else 1
@@ -478,6 +482,13 @@ class _ContinuousCall:
         if exc is not None:
             self._fail(exc)
             return
+        # Anchor any stashed payload refs in the received value so they survive this process
+        # releasing its local references before a downstream consumer retrieves them (defect129).
+        from ._ray.ray_helper import RayHelper
+
+        anchor = RayHelper.anchor_refs(value)
+        if anchor is not None:
+            self._anchors.append(anchor)
         if self.batch_len is None:
             self.results[0] = value
         else:
