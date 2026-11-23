@@ -133,6 +133,7 @@ class FakeTemplate:
     truncation_strategy = 'right'
     enable_thinking = False
     render_delta = Template.render_delta
+    _collapse_system_messages = staticmethod(Template._collapse_system_messages)
     decode_tool_calls = staticmethod(Template.decode_tool_calls)
     _collapse_system_messages = staticmethod(Template._collapse_system_messages)
 

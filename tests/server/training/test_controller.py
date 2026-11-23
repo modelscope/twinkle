@@ -395,13 +395,17 @@ async def test_release_drains_accepted_operation_before_cleanup():
     releasing = asyncio.create_task(controller.release(identity, 'owner'))
     while controller.trainings[identity].state == 'ACTIVE':
         await asyncio.sleep(0)
+    # A retry joins the in-flight drain and cannot report success before the kernel settles.
+    retried = asyncio.create_task(controller.release(identity, 'owner', 'session'))
+    await asyncio.sleep(0)
+    assert not retried.done()
     assert identity in runtime.users
     with pytest.raises(ResourceNotFoundError):
         await controller.admit(identity, 'owner', 'session', 'next')
     await controller.finish_operation(identity, 'op', controller.epoch, executed=True)
     await controller.finish_operation(identity, 'op', controller.epoch, executed=True)
     await controller.wait_for_jobs()
-    await releasing
+    await asyncio.gather(releasing, retried)
     assert not runtime.users and not runtime.allocations
     assert len(runtime.stopped) == 1
 

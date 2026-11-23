@@ -437,7 +437,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
         adapter_state = self.multi_adapter.get_state_dict(adapter_name)
-        return {key: torch_util.to_local_tensor(value).cpu() for key, value in adapter_state.items()}
+        # CPU weights may still share storage with the live slot while an async save is pending.
+        return {key: torch_util.to_local_tensor(value).detach().to('cpu', copy=True)
+                for key, value in adapter_state.items()}
 
     def _optimizer_param_name_mapping(self, adapter_name: str, optimizer: Optimizer) -> Dict[str, str]:
         """Map the tenant's physical LoRA slot to the PEFT ``default`` name."""
@@ -451,12 +453,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                 if checkpoint_name != name:
                     mapping[name] = checkpoint_name
         return mapping
-
-    def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
-        """Slot-pool form of the shared head checkpoint (see TrainableModel)."""
-        if self.task_head_slots is None:
-            return
-        super()._save_task_head_checkpoint(checkpoint_dir, adapter_name)
 
     def _task_head_state(self, adapter_name: Optional[str]) -> Dict[str, Any]:
         """The bound tenant's head weights out of its slot, under slot-independent
@@ -491,8 +487,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._lazy_wrap_model()
         with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
-            if checkpoint_dir is not None:
-                self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
         if dist.is_initialized():
             dist.barrier()
         return checkpoint_dir

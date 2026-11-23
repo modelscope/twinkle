@@ -1455,14 +1455,27 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
 
         Args:
             optimizer_cls: Optimizer class or string name.
-                - Standard PyTorch optimizers: 'AdamW', 'Adam', 'SGD', etc.
-                - 'MegatronDistributed': Use Megatron's distributed optimizer
+                - 'AdamW': Adam with decoupled weight decay.
+                - 'MegatronOptimizer', 'default', 'Adam': use the existing Megatron optimizer configuration.
             **kwargs: Additional arguments.
-                - For standard optimizers: lr, weight_decay, etc.
-                - For MegatronDistributed: use_distributed_optimizer, clip_grad, etc.
+                Learning rate, weight decay and other Megatron optimizer settings.
         """
+        if optimizer_cls and optimizer_cls not in ('MegatronOptimizer', 'default', 'Adam', 'AdamW'):
+            raise NotImplementedError(
+                f'Unsupported optimizer: {optimizer_cls}. Use AdamW or MegatronOptimizer.')
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
+        if optimizer_cls == 'AdamW':
+            if kwargs.pop('optimizer', 'adam') != 'adam' or not kwargs.pop('decoupled_weight_decay', True):
+                raise ValueError('AdamW requires the Megatron Adam optimizer with decoupled weight decay.')
+            kwargs['decoupled_weight_decay'] = True
+            for public_key, native_keys in (('betas', ('adam_beta1', 'adam_beta2')), ('eps', ('adam_eps',))):
+                if public_key in kwargs:
+                    if any(key in kwargs for key in native_keys):
+                        raise ValueError(f'{public_key} conflicts with {native_keys}.')
+                    value = kwargs.pop(public_key)
+                    values = value if public_key == 'betas' else (value,)
+                    kwargs.update(zip(native_keys, values, strict=True))
         if not self._model_wrapped:
             self.model = self.strategy.wrap_model(self.model)
             self._model_wrapped = True
@@ -1476,12 +1489,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             if isinstance(dtype_value, str):
                 kwargs[dtype_key] = getattr(torch, dtype_value)
 
-        # Check if requesting Megatron distributed optimizer
-        if not optimizer_cls or optimizer_cls in ('MegatronOptimizer', 'default', 'Adam'):
-            optimizer_config.optimizer = self._create_megatron_optimizer(**kwargs)  # noqa
-        else:
-            raise NotImplementedError(
-                f'Unsupported optimizer: {optimizer_cls}, only support MegatronOptimizer currently.')
+        optimizer_config.optimizer = self._create_megatron_optimizer(**kwargs)
 
     @remote_function(collect='last_pp_first', lazy_collect=False)
     @timed

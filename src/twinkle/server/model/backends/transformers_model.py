@@ -97,10 +97,37 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
     # ------------------------------------------------------------------
 
     @remote_function(dispatch='slice_dp', collect='tensor_dict')
-    def forward_only(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
-        """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
-        output = super().forward_only(inputs=inputs, **kwargs)
-        return to_cpu_safe_output(output)
+    def forward_only(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory],
+                     distillation_topk: int | None = None, **kwargs):
+        """Forward-only for native clients, with optional compact distillation output."""
+        if distillation_topk is None:
+            return to_cpu_safe_output(super().forward_only(inputs=inputs, **kwargs))
+        if self.device_mesh is not None and (self.device_mesh.tp_world_size > 1 or self.device_mesh.cp_world_size > 1):
+            raise ValueError('Top-K distillation scoring requires TP=CP=1.')
+        adapter_name = kwargs.get('adapter_name')
+        if adapter_name is None:
+            adapter_name = self._get_default_group()
+        if self.optimizer_group[adapter_name].processor.padding_side != 'right':
+            raise ValueError('Top-K sequence scoring requires right padding.')
+        if (kwargs.get('task', 'causal_lm') != 'causal_lm' or kwargs.get('return_logits')
+                or kwargs.get('output_fields') or kwargs.get('output_frame', 'sequence') != 'sequence'):
+            raise ValueError('distillation_topk requests its own output for causal LM sequences.')
+        if isinstance(inputs, dict):
+            inputs = [inputs]
+        if not inputs or any(not row.get('input_ids') or not isinstance(row['input_ids'][0], int) for row in inputs):
+            raise ValueError('distillation_topk requires encoded token sequences.')
+        lengths = [len(feature['input_ids']) for feature in inputs]
+        kwargs['output_fields'] = ('logits',)
+        logits = super().forward_only(inputs=inputs, **kwargs)['logits']
+        if logits.ndim != 3 or not 2 <= distillation_topk <= logits.shape[-1] or logits.shape[1] < max(lengths):
+            raise ValueError('Cannot select Top-K candidates from the teacher logits for this batch.')
+        # Only mass relative to the retained candidates matters to GKDLoss, including at other temperatures.
+        scores, indices = logits.topk(distillation_topk, dim=-1)
+        logprobs = scores.float().log_softmax(dim=-1)
+        return {
+            'teacher_topk_indices': [row[:length] for row, length in zip(indices.tolist(), lengths, strict=True)],
+            'teacher_topk_logprobs': [row[:length] for row, length in zip(logprobs.tolist(), lengths, strict=True)],
+        }
 
     @remote_function(dispatch='slice_dp', collect='tensor_dict')
     def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):

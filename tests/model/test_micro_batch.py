@@ -31,6 +31,42 @@ def test_fixed_micro_batch_plan_keeps_full_batches_and_a_short_tail(
     assert [index for batch in plan for index in batch] == list(range(input_count))
 
 
+@pytest.fixture
+def packed_inputs():
+    return [
+        [{'input_ids': [1]}, {'input_ids': [2]}],
+        ({'input_ids': [1, 2]}, {'input_ids': [3]}),
+        [{'input_ids': [1, 2, 3]}, {'input_ids': [4, 5, 6, 7]}],
+        [{'input_ids': [1]}],
+    ]
+
+
+@pytest.mark.parametrize(('order', 'expected'), [
+    ('none', [[0, 1], [2, 3]]),
+    ('descending', [[2, 3], [0, 1]]),
+    ('ends_small', [[2, 3], [0, 1]]),
+])
+def test_fixed_micro_batch_plan_counts_packed_tokens_for_ordering(packed_inputs, order, expected):
+    config = MicroBatchConfig(micro_batch_size=2, micro_batch_order=order)
+
+    assert [sequence_length(item) for item in packed_inputs] == [2, 3, 7, 1]
+    assert plan_micro_batches(packed_inputs, config, padding_free=True) == expected
+
+
+@pytest.mark.parametrize('packing_algorithm', ['ffd', 'kk'])
+def test_dynamic_micro_batch_plan_respects_packed_token_budget(packed_inputs, packing_algorithm):
+    config = MicroBatchConfig(
+        micro_batch_size=2, dynamic_batching=True, max_tokens_per_micro_batch=7,
+        packing_algorithm=packing_algorithm,
+    )
+
+    plan = plan_micro_batches(packed_inputs, config, padding_free=True)
+
+    assert sorted(index for batch in plan for index in batch) == [0, 1, 2, 3]
+    assert [2] in plan
+    assert all(sum(sequence_length(packed_inputs[index]) for index in batch) <= 7 for batch in plan)
+
+
 @pytest.mark.parametrize('packing_algorithm', ['ffd', 'kk'])
 def test_dynamic_micro_batch_plan_preserves_samples_and_limits_cost(packing_algorithm):
     lengths = [10, 9, 8, 7, 4, 3, 2, 1]

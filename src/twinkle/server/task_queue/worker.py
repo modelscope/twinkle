@@ -349,21 +349,26 @@ class ComputeWorker:
             q.task_done()
 
     async def submit_detached(self, task: QueuedTask, queue_key: str, *, replica_id: str | None,
-                              absolute_deadline: float) -> None:
+                              absolute_deadline: float, submission_fingerprint: str | None = None) -> bool:
         """Own admission, future persistence and startup as one lifecycle."""
         self.reserve_detached()
         wrote_status = False
         try:
-            await self._state.store_future_status(
-                task.request_id,
-                TaskStatus.PENDING.value,
-                task.model_id,
+            fields = dict(
+                model_id=task.model_id,
                 queue_state=QueueState.ACTIVE.value,
                 replica_id=replica_id,
                 absolute_deadline=absolute_deadline,
                 owner_token=task.token)
+            if submission_fingerprint is None:
+                await self._state.store_future_status(task.request_id, TaskStatus.PENDING.value, **fields)
+            elif not await self._state.create_pending_future(
+                    task.request_id, submission_fingerprint=submission_fingerprint, **fields):
+                self.release_detached()
+                return False
             wrote_status = True
             self.run_detached(task, queue_key)
+            return True
         except BaseException:
             self.release_detached()
             if wrote_status:

@@ -540,8 +540,9 @@ class TestCascadeCleanup:
 def test_state_initializes_without_or_with_a_partial_environment_policy(monkeypatch, environment_limit):
     """A missing optional policy must resolve to defaults before field access."""
     import uuid
+
     from tests.server.state.fake_backend import FakeBackend
-    from twinkle.server.config.application_spec import SERVER_STATE_ENV_KEYS
+    from twinkle.server.config.env_propagation import SERVER_STATE_ENV_KEYS
     from twinkle.server.state.server_state import get_server_state
 
     for key in SERVER_STATE_ENV_KEYS:

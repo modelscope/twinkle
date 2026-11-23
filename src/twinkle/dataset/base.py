@@ -14,7 +14,7 @@ from twinkle.perf import timed
 from twinkle.preprocessor import DataFilter, Preprocessor
 from twinkle.template import Template
 from twinkle.template.utils import construct_template
-from twinkle.utils import construct_class, processing_lock
+from twinkle.utils import construct_class, processing_lock, trust_remote_code
 from .writer import AsyncRowWriter, DatasetWriter
 
 try:
@@ -86,8 +86,7 @@ class Dataset(TorchDataset):
         self.datasets = {}
         if dataset_meta is None:
             return
-        trust_remote_code = bool(os.environ.get("TWINKLE_TRUST_REMOTE_CODE", "1"))
-        if not trust_remote_code:
+        if not trust_remote_code():
             kwargs["trust_remote_code"] = False
         self.datasets = {dataset_meta.get_id(): self._load_dataset(dataset_meta, **kwargs)}
 
@@ -354,8 +353,7 @@ class Dataset(TorchDataset):
         Args:
             dataset_meta: The dataset_meta information of the loaded dataset.
         """
-        trust_remote_code = bool(os.environ.get("TWINKLE_TRUST_REMOTE_CODE", "1"))
-        if not trust_remote_code:
+        if not trust_remote_code():
             kwargs["trust_remote_code"] = False
         dataset = self._load_dataset(dataset_meta, **kwargs)
         self.datasets[dataset_meta.get_id()] = dataset

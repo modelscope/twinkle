@@ -12,7 +12,7 @@ from starlette.requests import Request
 from unittest.mock import AsyncMock
 
 from twinkle.server.lifecycle.proxy import ServiceProxy
-from twinkle.protocol.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID
+from twinkle.protocol.headers import H_CLIENT_ID, H_REQUEST_ID
 
 
 def _make_request(headers: list[tuple[bytes, bytes]] | None = None) -> Request:
@@ -40,13 +40,39 @@ def test_build_target_url(route_prefix, host, expected):
     assert proxy._build_target_url('model', 'Qwen', 'tinker/forward') == expected
 
 
-def test_prepare_headers_sets_multiplex_from_request_id():
-    proxy = ServiceProxy(http_options={}, route_prefix='/api/v1')
-    headers = proxy._prepare_headers({H_REQUEST_ID: 'req-1'})
-    assert headers.get(H_MULTIPLEX) == 'req-1'
-    assert headers.get(H_MULTIPLEX_LEGACY) == 'req-1'
-    # ``host`` / ``content-length`` are stripped before forwarding.
-    assert 'host' not in {k.lower() for k in headers}
+@pytest.mark.asyncio
+async def test_forwarding_keeps_request_identity_auth_and_session():
+    proxy = ServiceProxy()
+    request = _make_request([
+        (H_REQUEST_ID.encode(), b'req-1'),
+        (H_CLIENT_ID.lower().encode(), b'client-1'),
+        (b'authorization', b'Bearer owner'),
+        (b'x-twinkle-session-id', b'session'),
+        (b'host', b'original-host'),
+        (b'content-length', b'42'),
+    ])
+    try:
+        headers = proxy._prepare_headers(request.headers)
+    finally:
+        await proxy.close()
+
+    assert headers == {
+        H_REQUEST_ID: 'req-1',
+        H_CLIENT_ID.lower(): 'client-1',
+        'authorization': 'Bearer owner',
+        'x-twinkle-session-id': 'session',
+    }
+
+
+@pytest.mark.asyncio
+async def test_proxy_header_overrides_are_case_insensitive():
+    proxy = ServiceProxy()
+    request = _make_request([(b'twinkle-authorization', b'old'), (b'x-twinkle-client-id', b'client-1')])
+    try:
+        headers = proxy._prepare_headers(request.headers, {'Twinkle-Authorization': 'new', H_CLIENT_ID: 'client-1'})
+    finally:
+        await proxy.close()
+    assert headers == {'twinkle-authorization': 'new', 'x-twinkle-client-id': 'client-1'}
 
 
 @pytest.mark.asyncio
@@ -81,12 +107,15 @@ async def test_proxy_waits_are_bounded_and_timeout_keeps_existing_wire():
 
 
 @pytest.mark.asyncio
-async def test_proxy_request_502_fallback_returns_error_payload():
+async def test_proxy_request_502_returns_forwarded_request_id():
     proxy = ServiceProxy(http_options={'host': 'localhost', 'port': 8000}, route_prefix='/api/v1')
     proxy.client.request = AsyncMock(side_effect=RuntimeError('upstream down'))
-    request = _make_request(headers=[(H_REQUEST_ID.encode(), b'req-9')])
-
-    response = await proxy.proxy_request(request, 'tinker/forward', 'Qwen', 'model', body_override=b'{}')
+    try:
+        response = await proxy.proxy_request(
+            _make_request(), 'twinkle/sample', 'Qwen', 'sampler',
+            body_override=b'{}', extra_headers={H_REQUEST_ID: 'req-9'})
+    finally:
+        await proxy.close()
 
     assert response.status_code == 502
     payload = json.loads(response.body)

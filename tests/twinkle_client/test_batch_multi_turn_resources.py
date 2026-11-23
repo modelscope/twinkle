@@ -1,88 +1,196 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""RolloutResources ownership: partial trajectory setup must still close every owned env.
+"""Run the three Blackjack entry points without model weights or external services."""
 
-Reanchored from cookbook/client/twinkle/multi_turn_rollout.py::prepare_trajectories: the
-cookbook predates the episode-per-session EnvTool API (EnvTool now requires episode_id) and
-the retired ClientMultiTurnRollout, so its module no longer loads (pending migration, tracked
-in the UT audit ledger). The contract under test is the SDK's, not the cookbook's: one owned
-env per trajectory, a failed setup closes every env already owned (and reports close failures
-as exception notes), and the client closes last.
-"""
+import json
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from tempfile import mkdtemp
+from threading import Lock
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
-from twinkle_agentic.envs import EnvTool
-from twinkle_agentic.tools.tool_manager import ToolManager
-from twinkle_client.resources import RolloutResources
+from cookbook.client.async_rl import e2b_multi_turn_grpo as e2b
+from cookbook.client.async_rl import streaming_multi_turn_grpo as streaming
+from cookbook.client.twinkle import multi_turn_rollout as batch
+from tests.twinkle_agentic.test_token_utils import FakeTemplate, FakeTokenizer
+from twinkle.data_format import validate_trajectory
+from twinkle.data_format.sampling import SampleResponse, SampledSequence
+from twinkle.template.contract import shift
+from twinkle_agentic.utils.token_utils import append_ids
+from twinkle_client.http import ClientContext, ClientTransport
+from twinkle_client.manager import TwinkleClient
 
 
-def _prepare_trajectories(n_trajectories, resources, env_factory):
-    """One independent env + play tool per trajectory, mirroring the cookbook's shape."""
-    trajectories, tool_managers, env_tools_list, environments = [], [], [], []
-    for index in range(n_trajectories):
-        env = resources.own_environment(env_factory())
-        environments.append(env)
-        initial_observation = env.reset().observation
-        env_tools = [EnvTool(env, f'episode-{index}', tool_name='play', description='Take an action.')]
-        tool_manager = ToolManager(env_tools)
-        trajectories.append({
-            'messages': [
-                {'role': 'system', 'content': 'You are a skilled blackjack player.'},
-                {'role': 'user', 'content': initial_observation},
-            ],
-            'tools': tool_manager.tool_infos(),
-        })
-        tool_managers.append(tool_manager)
-        env_tools_list.append(env_tools)
-    return trajectories, tool_managers, env_tools_list, environments
+class OfflineTemplate(FakeTemplate):
+
+    def render_delta(self, _messages, _observations, **_):
+        return self.tokenizer.encode('\n')
+
+    def finalize_appended_features(self, rows):
+        return [shift(row) for row in rows]
+
+    def parse_tool_call(self, text):
+        if text not in ('hit', 'stand'):
+            return []
+        return [{'id': 'play', 'type': 'function', 'function': {'name': 'play', 'arguments': {'action': text}}}]
+
+    def tool_call_errors(self, text):
+        return []
 
 
-@pytest.mark.parametrize('fail_setup', [False, True])
-def test_batch_recipe_owns_partial_setup_and_attempts_every_close(fail_setup):
-    envs, closed = [], []
+@pytest.fixture
+def local_sandbox(monkeypatch, tmp_path):
+    """Run the uploaded game in an isolated temporary directory, replacing only the E2B transport."""
+    pytest.importorskip('pyspiel')
+    monkeypatch.setenv('E2B_API_KEY', 'offline-test')
+    sandboxes = []
 
-    class Env:
-        def __init__(self):
-            self.index = len(envs)
-            envs.append(self)
+    def create(_env):
+        workspace = Path(mkdtemp(dir=tmp_path))
+        killed = Mock()
+        sandbox = SimpleNamespace(
+            files=SimpleNamespace(write=lambda path, text: Path(path).write_text(text)),
+            kill=killed,
+        )
 
-        def reset(self):
-            if fail_setup and self.index == 2:
-                raise RuntimeError('setup failed')
-            return SimpleNamespace(observation=f'hand-{self.index}')
+        def execute(command, _cwd, _timeout):
+            if command.startswith('python3 -m pip install '):
+                return 0, ''  # Use the locally installed OpenSpiel wheel.
+            result = subprocess.run([sys.executable, *shlex.split(command)[1:]], cwd=workspace,
+                                    capture_output=True, text=True, check=False, timeout=20)
+            return result.returncode, result.stdout + result.stderr
 
-        def ensure_idle(self):
-            pass
+        state = SimpleNamespace(sandbox=sandbox, sandbox_id=workspace.name, workspace=str(workspace), execute=execute)
+        sandboxes.append(state)
+        return state
 
-        def shutdown(self):
-            # RolloutResources releases owned envs through the Env lifecycle's shutdown().
-            closed.append(self.index)
-            if fail_setup and self.index == 0:
-                raise RuntimeError('close failed')
+    monkeypatch.setattr(e2b.E2BBlackjackEnv, '_create', create)
+    return sandboxes
 
-    client = SimpleNamespace(close=lambda: closed.append('client'))
+
+@pytest.mark.parametrize('entry', ['batch', 'streaming', 'e2b'])
+@pytest.mark.parametrize('outcome', ['trained', 'zero-updates', 'interrupted'])
+def test_blackjack_cookbooks_offline(entry, outcome, monkeypatch, request):
+    sandboxes = []
+    if entry == 'e2b':
+        sandboxes = request.getfixturevalue('local_sandbox')
+        env = e2b.E2BBlackjackEnv()
+    else:
+        pytest.importorskip('openspiel_env')
+        env = streaming.BlackjackEnv()
+
+    tokenizer = FakeTokenizer()
+    tokenizer.encode(''.join(chr(i) for i in range(32, 127)) + '\n')
+    template = OfflineTemplate(tokenizer)
+    lock = Lock()
+    opening_ids, requests = {}, []
+    env.shutdown = Mock(wraps=env.shutdown)
+    calls, policy_names, batches, logs = [], [], [], []
+
+    class Session:
+        live = set()
+
+        def post(self, url, *, data=None, json=None, **kwargs):
+            endpoint = url.rsplit('/', 1)[-1]
+            body = json if data is None else decode_json(data)
+            calls.append(endpoint)
+            if endpoint == 'create':
+                response = {'training_handles': True}
+            else:
+                result = None
+                if endpoint == 'add_adapter_to_model':
+                    self.live.add('training-1')
+                    result = {'training_id': 'training-1', 'adapter_name': body['adapter_name']}
+                elif endpoint == 'save':
+                    policy_names.append(body['name'])
+                    result = {'twinkle_path': f'twinkle://{body["name"]}'}
+                elif endpoint == 'forward_backward':
+                    batches.append(body['inputs'])
+                    result = {'result': {}}
+                elif endpoint == 'calculate_metric':
+                    result = {'result': {}}
+                elif endpoint == 'remove_adapter':
+                    self.live.remove(body['training_id'])
+                response = {'request_id': endpoint, 'status': 'completed', 'result': result}
+            return SimpleNamespace(ok=True, status_code=200, json=lambda: response)
+
+        def close(self):
+            assert not self.live
+            calls.append('close')
+
+    decode_json = json.loads
+    session = Session()
+    client = TwinkleClient(transport=ClientTransport(
+        ClientContext(base_url='http://offline-test', api_key='offline-test-key'), session=session))
+
+    def sample(inputs, params, *, adapter_uri, **kwargs):
+        feature, = inputs
+        episode = feature['episode_id']
+        observations = [m['content'] for m in feature['messages'] if m['role'] == 'tool']
+        with lock:
+            index = opening_ids.setdefault(episode, len(opening_ids))
+            requests.append(adapter_uri)
+        if outcome == 'zero-updates' or observations and observations[-1].endswith('Game over: True.'):
+            decoded = 'finished'
+        else:
+            decoded = 'hit' if not observations and index % 2 else 'stand'
+        ids = tokenizer.encode(decoded)
+        extended = append_ids(feature, ids, template, trainable=True)
+        return [SampleResponse(sequences=[SampledSequence(
+            tokens=ids, logprobs=[[(token, -0.25)] for token in ids], stop_reason='stop',
+            decoded=decoded, new_input_feature=extended,
+        )])]
+
+    sampler = SimpleNamespace(sample=sample, set_template=lambda *args, **kwargs: None)
+    monkeypatch.setattr(client, 'sampler', lambda _: sampler)
+    monkeypatch.setattr(streaming, 'Qwen3_5Template', lambda **_: template)
+    monkeypatch.setattr(streaming.logger, 'info', logs.append)
+    monkeypatch.setattr(streaming, 'init_twinkle_client', lambda: client)
+    monkeypatch.setattr(batch, 'init_twinkle_client', lambda: client)
+    monkeypatch.setattr(batch, 'BlackjackEnv', lambda: env)
+    for recipe in (streaming, batch):
+        monkeypatch.setattr(recipe, 'BASE_SEED', 20261110)
+        monkeypatch.setattr(recipe, 'MAX_GROUPS', 2)
+        monkeypatch.setattr(recipe, 'MAX_STEPS', 2)
 
     def run():
-        with RolloutResources(lambda: client) as resources:
-            rows, managers, tools, environments = _prepare_trajectories(3, resources, Env)
-            assert environments == envs
-            assert [row['messages'][1]['content'] for row in rows] == ['hand-0', 'hand-1', 'hand-2']
-            assert len({id(manager) for manager in managers}) == 3
-            assert [tool[0].session[0] for tool in tools] == envs
-            assert [tool[0].tool_info()['function']['name'] for tool in tools] == ['play'] * 3
+        if entry == 'batch':
+            batch.train()
+        else:
+            (e2b.train if entry == 'e2b' else streaming.train)(lambda: env)
 
-    if fail_setup:
-        with pytest.raises(RuntimeError, match='setup failed') as caught:
+    if outcome == 'interrupted':
+        def interrupt(*args):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(streaming, 'train_batch', interrupt)
+        monkeypatch.setattr(batch, 'train_batch', interrupt)
+        with pytest.raises(KeyboardInterrupt):
             run()
-        assert any('close failed' in note for note in caught.value.__notes__)
     else:
         run()
-    assert closed == [0, 1, 2, 'client']
 
-
-# Deleted: test_batch_train_keeps_policy_and_training_steps_visible drove the cookbook train()
-# over the retired ClientMultiTurnRollout call shape (per-call adapter_uri + drain). That rollout
-# API was folded into HTTPSampler + local MultiTurnRollout; the surviving contract (policy
-# publication ordering, step/save visibility, failure stopping admission) is pinned by
-# test_client_orchestrated_grpo.py and the reanchored scoped-operations recipe test.
+    updates = int(outcome == 'trained')
+    assert calls.count('forward_backward') == calls.count('clip_grad_and_step') == updates
+    assert len(policy_names) == updates + 1
+    assert set(requests) == {f'twinkle://{name}' for name in policy_names}
+    assert any(f'optimizer_updates={updates} latest_lora=twinkle://{policy_names[-1]}' in row for row in logs)
+    if not updates:
+        assert any('No training updates' in row for row in logs)
+    for rows in batches:
+        assert {row['rewards']['env'] for row in rows} == {-1.0, 1.0}
+        assert {row['turns'] for row in rows} == {2, 3}
+        assert len({row['episode_id'] for row in rows}) == len(rows)
+        for row in rows:
+            validate_trajectory(row)
+            assert len(row['rollout_logps']) == len(row['advantages']) == len(row['response_token_ids'])
+            assert all(value * row['rewards']['env'] > 0 for value in row['advantages'])
+    assert not env._sessions
+    env.shutdown.assert_called_once()
+    assert calls[-2:] == ['remove_adapter', 'close']
+    for sandbox in sandboxes:
+        sandbox.sandbox.kill.assert_called_once()

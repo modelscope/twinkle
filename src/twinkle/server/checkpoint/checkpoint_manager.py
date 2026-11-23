@@ -664,3 +664,9 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         if resolved.checkpoint_dir is None:
             return path
         return (Path(resolved.checkpoint_dir) / resolved.checkpoint_name).as_posix()
+
+    def resolve_upload_dir(self, path: str) -> str:
+        """Resolve an owned checkpoint or a local path inside the caller's save directory."""
+        if path.startswith(self.path_prefix):
+            return self.resolve_checkpoint_dir(path)
+        return str(ensure_inside(self.training_run_manager.get_base_dir(), Path(path)))

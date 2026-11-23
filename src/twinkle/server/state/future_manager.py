@@ -106,6 +106,23 @@ class FutureTransitions:
         return {**existing, 'status': 'running', 'queue_state': 'active', 'updated_at': now}
 
     @staticmethod
+    def fail_replica(existing: dict | None, *, replica_id: str, failure: dict, now: str) -> dict | None:
+        if (existing is None or existing.get('replica_id') != replica_id
+                or existing.get('status') in FutureTransitions.terminal):
+            return None
+        return {**existing, 'status': 'failed', 'result': None, 'failure': failure, 'updated_at': now}
+
+    @staticmethod
+    def report_progress(existing: dict | None, *, progress: dict) -> dict | None:
+        if existing is None or existing.get('status') != 'running':
+            return None
+        previous = existing.get('progress') or {}
+        if all(previous.get(key) == value for key, value in progress.items()):
+            return None
+        snapshot = {**progress, 'sequence': previous.get('sequence', 0) + 1}
+        return {**existing, 'progress': snapshot}
+
+    @staticmethod
     def cancel(existing: dict | None, *, failure: dict, now: str) -> dict | None:
         """Atomic transform: cancel iff the task has not started (pending/queued).
 
@@ -130,6 +147,11 @@ class FutureManager(BaseManager[FutureRecord]):
         super().__init__(backend, 'future::', FutureRecord, expiration_timeout)
 
     # ----- Future-specific operations -----
+
+    async def create_pending(self, request_id: str, **fields: Any) -> bool:
+        """Register a deterministically named future without overwriting another submitter's record."""
+        record = FutureRecord(status='pending', **fields)
+        return await self._backend.set_nx(self._make_key(request_id), record.model_dump())
 
     async def store_status(
         self,
@@ -192,6 +214,18 @@ class FutureManager(BaseManager[FutureRecord]):
             functools.partial(FutureTransitions.start, now=_now_iso()),
             return_changed=True,
         )
+
+    async def fail_replica(self, replica_id: str, failure: FutureFailureRecord) -> None:
+        """Settle work after its replica is confirmed stopped, without contacting it."""
+        transform = functools.partial(
+            FutureTransitions.fail_replica, replica_id=replica_id, failure=failure.model_dump(), now=_now_iso())
+        for request_id, record in (await self.get_all()).items():
+            if record.replica_id == replica_id and record.status not in TERMINAL_STATUSES:
+                await self._backend.update_atomic(self._make_key(request_id), transform)
+
+    async def report_progress(self, request_id: str, progress: dict[str, Any]) -> None:
+        await self._backend.update_atomic(
+            self._make_key(request_id), functools.partial(FutureTransitions.report_progress, progress=progress))
 
     async def cancel_if_pending(self, request_id: str) -> str | None:
         """Cancel a task iff it has not started; return the resulting status.

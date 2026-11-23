@@ -8,7 +8,9 @@ therefore intentionally carries **no** underscore prefix.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Optional
+from typing import Any, Literal
+
+from pydantic import Field
 
 from .base import ResponseModel, StrictRequest
 from .errors import ErrorPayload, QueueState
@@ -29,15 +31,10 @@ TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED.value, TaskStatus.FAILED.val
 
 
 class RetrieveFutureRequest(StrictRequest):
-    """Body of ``POST /twinkle/retrieve_future``.
-
-    ``request_id`` is the only field: the caller already knows which adapter it
-    targeted, so no ``model_id`` is needed to correlate the reply. A brand-new
-    endpoint with no legacy clients, so it takes the strict base (unknown fields
-    fail loudly) rather than tolerating extras.
-    """
+    """Long-poll for a terminal task or progress newer than the optional cursor."""
 
     request_id: str
+    after_progress: int | None = Field(default=None, ge=0)
 
 
 class CancelRequest(StrictRequest):
@@ -61,6 +58,16 @@ class CancelResponse(ResponseModel):
 
     cancelled: bool
     state: str
+
+
+class UploadProgress(ResponseModel):
+    """Latest upload snapshot. Transfer bytes can be lower than committed bytes after deduplication."""
+
+    sequence: int
+    stage: Literal['preparing', 'uploading', 'batch_committed', 'batch_failed']
+    uploaded_bytes: int = 0
+    total_bytes: int | None = None
+    committed_bytes: int = 0
 
 
 class TaskEnvelope(ResponseModel):
@@ -88,3 +95,4 @@ class TaskEnvelope(ResponseModel):
     error: ErrorPayload | None = None  # set iff status == 'failed'
     queue_state: QueueState | None = None
     queue_state_reason: str | None = None
+    progress: UploadProgress | None = None

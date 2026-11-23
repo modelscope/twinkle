@@ -36,7 +36,7 @@ async def test_encode_retains_execution_ownership_and_blocks_weight_mutation():
     owner.sampler = SimpleNamespace(encode=encode)
     owner.call_backend = call_backend
     runtime = SamplerRuntime(owner)
-    mutation = completion = None
+    mutation = None
     try:
         reply = await runtime.invoke('encode', {
             'endpoint': 'twinkle/encode', 'method': 'POST',
@@ -47,23 +47,26 @@ async def test_encode_retains_execution_ownership_and_blocks_weight_mutation():
         await asyncio.wait_for(entered.wait(), 1)
         scope = runtime._operations['encode'].scope
         assert scope.request_ids and scope.jobs
-        completion = asyncio.create_task(runtime.wait_operation('encode'))
+        assert not await runtime.operation_done('encode')
 
         async def update():
             mutated.set()
 
         mutation = asyncio.create_task(owner.sampling_guard.run(update, exclusive=True))
         await asyncio.sleep(0.02)
-        assert not completion.done() and not mutated.is_set()
+        assert not await runtime.operation_done('encode') and not mutated.is_set()
         release.set()
-        await asyncio.wait_for(asyncio.gather(completion, mutation), 1)
+        await asyncio.wait_for(mutation, 1)
+        await asyncio.wait_for(runtime._operations['encode'].task, 1)
+        assert await runtime.operation_done('encode')
         result = await owner.state.get_future(next(iter(scope.request_ids)))
         assert result['status'] == 'completed'
         assert result['result'] == {'data': [[0.25, 0.75]]}
         assert mutated.is_set()
     finally:
         release.set()
-        await asyncio.gather(*(task for task in (completion, mutation) if task), return_exceptions=True)
+        if mutation is not None:
+            await asyncio.gather(mutation, return_exceptions=True)
         await owner._compute_worker.stop()
 
 
@@ -150,7 +153,7 @@ async def test_runtime_does_not_certify_an_unconfirmed_cancel_ack():
     runtime._operations['cancelled'] = SamplingOperation(ExecutionScope(), task)
     guard.invalidate_weights(RuntimeError('cancel ACK preceded actual generation exit'))
     with pytest.raises(BackendBusyError):
-        await runtime.wait_operation('cancelled')
+        await runtime.operation_done('cancelled')
     assert 'cancelled' in runtime._operations
 
 
@@ -201,7 +204,8 @@ async def test_cold_lora_config_does_not_block_sampler_health(monkeypatch):
         assert not invocation.done() and not calls
         release.set()
         assert (await invocation)['status'] == 200
-        await runtime.wait_operation('configuration')
+        await runtime._operations['configuration'].task
+        assert await runtime.operation_done('configuration')
         assert len(calls) == 1
     finally:
         release.set()

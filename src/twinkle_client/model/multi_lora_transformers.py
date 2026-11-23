@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import itertools
-import logging
+import json
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -13,13 +13,15 @@ if TYPE_CHECKING:
 
 from twinkle.protocol.types import model as model_types
 from twinkle.protocol.types.component import DataRef
-from twinkle_client._request_builder import build_request
+from twinkle.protocol.types.lifecycle import UploadProgress
+from twinkle.utils.logger import get_logger
+from twinkle_client._request_builder import build_request, to_wire_value
 from twinkle_client.exceptions import TwinkleHTTPError
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
 from twinkle_client.operations import _guarded_operation
 
-logger = logging.getLogger('twinkle_client')
+logger = get_logger()
 
 
 def _data_refs(inputs: DataRef | list[DataRef]) -> list[dict[str, Any]]:
@@ -129,7 +131,7 @@ class MultiLoraTransformersModel:
         return {**values, 'adapter_name': name, 'training_id': training_id}
 
     @_guarded_operation
-    def _submit(self, endpoint: str, model_cls, response_cls, **values):
+    def _submit(self, endpoint: str, model_cls, response_cls, *, on_progress=None, **values):
         """Validate once, then send with a stable handle and retry identity."""
         if issubclass(model_cls, model_types.TrainingRequest):
             values = self._training_values(values)
@@ -140,7 +142,8 @@ class MultiLoraTransformersModel:
         body = build_request(model_cls, **values)
         self._ensure_created()
         response = self._transport.post_model(f'{self.server_url}/{endpoint}', body)
-        result = self._await_task(response, response_cls)
+        progress_args = {} if on_progress is None else {'on_progress': on_progress}
+        result = self._await_task(response, response_cls, **progress_args)
         with self._training_lock:
             if endpoint in {'step', 'clip_grad_and_step'}:
                 self._completed_step_calls += 1
@@ -148,7 +151,7 @@ class MultiLoraTransformersModel:
                 self._last_checkpoint = result
         return result
 
-    def _await_task(self, response, model_cls):
+    def _await_task(self, response, model_cls, *, on_progress=None):
         """Resolve a Submit_Endpoint response through the Client_Future_Layer.
 
         Blocks until the task is terminal and returns the deserialized ``model_cls``
@@ -156,7 +159,7 @@ class MultiLoraTransformersModel:
         Keeps every public method's synchronous signature unchanged.
         """
         from twinkle_client._future import resolve_response
-        return resolve_response(response, model_cls, transport=self._transport)
+        return resolve_response(response, model_cls, transport=self._transport, on_progress=on_progress)
 
     def _next_seq_id(self) -> int:
         """Reserve the next monotonic seq_id for a stateful op (dedup key with session)."""
@@ -185,7 +188,10 @@ class MultiLoraTransformersModel:
         if isinstance(config, Mapping):
             from peft import LoraConfig
 
-            config = LoraConfig(**config)
+            validated = LoraConfig(**config)
+            # Only send the requested options. Client PEFT defaults can include fields
+            # that the server's PEFT version does not know. Admission also needs the rank.
+            config = json.dumps({**to_wire_value(config), 'r': validated.r, '_TWINKLE_TYPE_': 'LoraConfig'})
         save_dir = kwargs.pop('save_dir', None)
         if save_dir:
             save_dir = Path(save_dir).expanduser().resolve().as_posix()
@@ -210,6 +216,10 @@ class MultiLoraTransformersModel:
             with self._training_lock:
                 self._training_ids[adapter_name] = result.training_id
                 self.adapter_name = adapter_name
+            scope = self._transport._operation_scope
+            if scope is not None:
+                scope.own_training(
+                    result.training_id, lambda: self._release_adapter(adapter_name, result.training_id, missing_ok=True))
             return result.training_id
         finally:
             with self._training_changed:
@@ -239,14 +249,22 @@ class MultiLoraTransformersModel:
         name = adapter_name or self.adapter_name
         with self._training_lock:
             training_id = self._training_ids.get(name)
+        self._release_adapter(name, training_id)
+
+    def _release_adapter(self, name, training_id, missing_ok=False):
+        missing_error = None
         try:
             self._submit('remove_adapter', model_types.AdapterRequest, None, adapter_name=name, training_id=training_id)
         except TwinkleHTTPError as exc:
-            if exc.status_code == 404:
-                self._forget_training(name, training_id)
-            # A missing handle is unusable, but does not certify device release.
-            raise
+            if exc.status_code != 404 or exc.error_code != 404:
+                raise
+            missing_error = exc
         self._forget_training(name, training_id)
+        scope = self._transport._operation_scope
+        if scope is not None:
+            scope.forget_training(training_id)
+        if missing_error is not None and not missing_ok:
+            raise missing_error
 
     def _forget_training(self, name: str, training_id: str) -> None:
         """A late response must never erase a newer same-name binding."""
@@ -471,7 +489,10 @@ class MultiLoraTransformersModel:
         checkpoint_dir: str,
         hub_model_id: str,
         hub_token: str | None = None,
-    ) -> None:
+        *,
+        client_upload_id: str | None = None,
+        on_progress: Callable[[UploadProgress], None] | None = None,
+    ) -> model_types.UploadToHubResponse | None:
         """Upload model checkpoint to hub.
 
         Submits the upload task and blocks (via the Client_Future_Layer) until it
@@ -481,13 +502,30 @@ class MultiLoraTransformersModel:
             checkpoint_dir: The directory path of the checkpoint to upload.
             hub_model_id: The hub model id.
             hub_token: The hub token (optional).
+            client_upload_id: Save a unique ID before submitting to reconnect
+                after a client disconnect. Repeat the same call with that ID
+                and the same checkpoint and destination while the task is retained.
+                If the retained task failed, use a new ID to start a new upload.
+            on_progress: Receive the latest upload snapshots on the calling thread.
+                By default the SDK logs those snapshots.
+
+        Returns the repository ID and immutable commit revision. Older servers
+        that do not send a receipt return ``None``.
         """
+        def log_progress(progress: UploadProgress) -> None:
+            total = '?' if progress.total_bytes is None else progress.total_bytes
+            logger.info('[upload_to_hub] %s: %d/%s bytes transferred, %d bytes committed',
+                        progress.stage, progress.uploaded_bytes, total, progress.committed_bytes)
+
         logger.info('[upload_to_hub] submitting upload, waiting for completion...')
-        self._submit(
+        result = self._submit(
             'upload_to_hub',
             model_types.UploadToHubRequest,
             None,
+            on_progress=on_progress if on_progress is not None else log_progress,
             checkpoint_dir=checkpoint_dir,
             hub_model_id=hub_model_id,
-            hub_token=hub_token)
+            hub_token=hub_token,
+            client_upload_id=client_upload_id)
         logger.info('[upload_to_hub] upload completed successfully.')
+        return model_types.UploadToHubResponse.model_validate(result) if result is not None else None

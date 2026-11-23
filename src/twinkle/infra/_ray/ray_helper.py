@@ -739,6 +739,8 @@ class RayHelper:
         for index, placement in enumerate(placements):
             worker_name = f'{key}-{index}' if suffix is None else f'{key}-{suffix}-{index}'
             env_vars = os.environ.copy()
+            # Ray sets the local raylet PID on the destination node.
+            env_vars.pop('RAY_RAYLET_PID', None)
             env_vars.update({
                 'WORLD_SIZE': str(world_size),
                 'RANK': str(index),

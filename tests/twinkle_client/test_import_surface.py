@@ -65,5 +65,6 @@ def test_multi_turn_import_does_not_start_ray_or_load_optional_sandbox_engine() 
     # stay lightweight.
     result = _run_import_probe(
         "import json, sys; from twinkle_client.rollout import HTTPSampler, ClientCheckpointManager; "
+        "from twinkle_agentic.rollout import MultiTurnRollout; "
         "print(json.dumps({name: name in sys.modules for name in ('ray', 'e2b', 'vllm.engine', 'transfer_queue')}))")
     assert result == {'ray': False, 'e2b': False, 'vllm.engine': False, 'transfer_queue': False}
