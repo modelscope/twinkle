@@ -30,8 +30,11 @@ os.environ['NCCL_CUMEM_ENABLE'] = '0'
 
 MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen2-0.5B-Instruct')
 
-pytestmark = pytest.mark.skip(
-    reason='Heavy sglang e2e test (model load + 1-2 GPUs); not viable on dual-V100 CI, run manually.')
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.accel(1),
+    pytest.mark.skipif(importlib.util.find_spec('sglang') is None, reason='sglang not installed'),
+]
 
 
 def log(msg):

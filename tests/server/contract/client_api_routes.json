@@ -561,6 +561,13 @@
       "response": "TaskEnvelope",
       "statusCode": 200
     },
+    "POST /twinkle/stop_training": {
+      "body": [
+        "AdapterRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
     "POST /twinkle/upload_to_hub": {
       "body": [
         "UploadToHubRequest"

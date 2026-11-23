@@ -313,5 +313,5 @@ def test_router_schemas_match_model_runtime_routes():
     for protocol, schemas in [('twinkle', NATIVE_REQUESTS), ('tinker', TINKER_REQUESTS)]:
         endpoints = {route.path.rsplit('/', 1)[-1] for route in app.routes
                      if route.path.startswith(f'/{protocol}/') and 'POST' in route.methods}
-        # stop_training is handled by the pool and never forwarded to the runtime.
-        assert endpoints == set(schemas) - {'stop_training'}
+        # The runtime registers a rejection stub for lifecycle operations owned by the pool.
+        assert endpoints == set(schemas)

@@ -25,7 +25,7 @@ from twinkle.model.transformers.transformers import TransformersModel
 def _wrapper(tmp_path, *, rank_files=(), master=False, rank=0):
     ckpt = tmp_path / 'ckpt'
     ckpt.mkdir()
-    (ckpt / 'trainer_state.json').write_text(json.dumps({'cur_step': 15, 'gradient_accumulation_steps': 4}))
+    (ckpt / 'trainer_state.json').write_text(json.dumps({'cur_step': 16, 'gradient_accumulation_steps': 4}))
     for name in rank_files:
         (ckpt / name).write_bytes(b'rank-stream')
     if master:
@@ -50,7 +50,7 @@ def test_master_fallback_loads_master_and_warns_rank0(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         state, loaded, ckpt = _wrapper(tmp_path, master=True, rank=0)
     assert loaded == [str(ckpt / 'rng_state.pt')]
-    assert state['cur_step'] == 15
+    assert state['cur_step'] == 16
     text = caplog.text
     assert 'single master-written RNG state' in text
     assert 'rank 0 replays' in text
@@ -67,7 +67,7 @@ def test_no_rng_state_proceeds_without_load_or_warning(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         state, loaded, _ = _wrapper(tmp_path, rank=0)
     assert loaded == []
-    assert state['cur_step'] == 15
+    assert state['cur_step'] == 16
     assert 'single master-written RNG state' not in caplog.text
 
 

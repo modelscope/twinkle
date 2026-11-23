@@ -85,7 +85,7 @@ class CheckpointWriterRankTest(unittest.TestCase):
                     wrapper._task_head_state = Mock(return_value={})
                     wrapper.submit_async_write = Mock()
                     with patch(f'{module}.Platform.is_master', return_value=rank == 0), \
-                            patch(f'{module}.copy_checkpoint_args'), patch(f'{module}.rotate_checkpoints'):
+                            patch(f'{module}.stage_checkpoint_args'), patch(f'{module}.rotate_checkpoints'):
                         result = inspect.unwrap(TransformersModel.save)(
                             wrapper, name='checkpoint-final', output_dir='/unused',
                             save_optimizer=True, async_save=async_save)
@@ -95,7 +95,7 @@ class CheckpointWriterRankTest(unittest.TestCase):
                         self.assertEqual(wrapper._save_training_state.call_args.kwargs['defer_trainer_state'],
                                          async_save)
                         wrapper._task_head_state.assert_called_once_with('')
-                        if async_save and rank == 0:
+                        if async_save:
                             model.save_pretrained.assert_not_called()
                             wrapper.submit_async_write.assert_called_once()
                             wrapper.submit_async_write.call_args.args[0]()
@@ -120,6 +120,36 @@ class CheckpointWriterRankTest(unittest.TestCase):
 
         wrapper.strategy.get_full_state_dict.assert_not_called()
         wrapper.strategy.unwrap_model.assert_not_called()
+
+    def test_non_master_async_object_storage_flushes_before_deferred_seal(self):
+        module = 'twinkle.model.transformers.transformers'
+        wrapper = object.__new__(TransformersModel)
+        model = Mock()
+        wrapper.__dict__['model'] = model
+        wrapper.strategy = Mock()
+        wrapper.strategy.unwrap_model.return_value = model
+        wrapper.optimizer_group = {'': SimpleNamespace(cur_step=1)}
+        wrapper._task_head_state = Mock(return_value={})
+        wrapper.submit_async_write = Mock()
+        target = 's3://test-bucket/output/checkpoint-1'
+        lease = Mock(path='/unused/staging', target=target, storage=SimpleNamespace(remote=True))
+
+        with patch(f'{module}.Platform.is_master', return_value=False), \
+                patch(f'{module}.Storage.from_url') as storage:
+            storage.return_value.write_lease.return_value = lease
+            result = inspect.unwrap(TransformersModel.save)(
+                wrapper, output_dir='s3://test-bucket/output', async_save=True)
+            self.assertEqual(result, target)
+            wrapper._task_head_state.assert_called_once_with('')
+            self.assertEqual(wrapper._pending_write_leases, [lease])
+
+            lease.flush_files.assert_not_called()
+            wrapper.submit_async_write.call_args.args[0]()
+            lease.flush_files.assert_called_once_with()
+            model.save_pretrained.assert_not_called()
+            lease.seal.assert_not_called()
+            wrapper.wait_async_saves()
+            lease.seal.assert_called_once_with()
 
 
 if __name__ == '__main__':

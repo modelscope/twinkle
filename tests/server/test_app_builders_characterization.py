@@ -124,7 +124,8 @@ def test_gateway_builder_characterization(monkeypatch) -> None:
     from twinkle.server.gateway import app as gateway_mod
 
     gateway = SimpleNamespace(api_key='t', route_prefix='')
-    monkeypatch.setattr(serve, 'get_replica_context', lambda: SimpleNamespace(servable_object=gateway))
+    monkeypatch.setattr(serve, 'get_replica_context', lambda: SimpleNamespace(
+        servable_object=gateway, replica_id=SimpleNamespace(unique_id='replica-test')))
     res = _capture_builder(
         monkeypatch,
         gateway_mod.build_gateway_app,
@@ -134,7 +135,7 @@ def test_gateway_builder_characterization(monkeypatch) -> None:
     assert _route_set(res.app) == _baseline_route_set('gateway')
     assert TestClient(res.app).post('/twinkle/create_session', json={}).status_code == 401
     _assert_auth_middleware_effect(res.app)
-    _assert_middleware_lifo_order(res.app, expect_cleanup=True)
+    _assert_middleware_lifo_order(res.app, expect_cleanup=True, expect_api_key=True)
 
 
 def test_model_builder_characterization(monkeypatch) -> None:
@@ -281,16 +282,22 @@ def _registered_http_middleware_names(app: FastAPI) -> list[str]:
     return names
 
 
-def _assert_middleware_lifo_order(app: FastAPI, *, expect_cleanup: bool, expect_replica_id: bool = False) -> None:
+def _assert_middleware_lifo_order(app: FastAPI,
+                                  *,
+                                  expect_cleanup: bool,
+                                  expect_replica_id: bool = False,
+                                  expect_api_key: bool = False) -> None:
     """Assert the scaffold middleware stack preserves the intended LIFO order.
 
     ``user_middleware`` is ordered OUTERMOST → INNERMOST (Starlette prepends
     each new entry). Model and Sampler add ``inject_replica_id`` after the
-    scaffold stack, making it the outermost middleware when enabled.
+    scaffold stack, making it the outermost middleware when enabled; the
+    gateway adds ``require_api_key`` last, wrapping the whole scaffold stack
+    so a key-rejected request short-circuits before any handler runs.
     """
     names = _registered_http_middleware_names(app)
     expected = []
-    if expect_cleanup:
+    if expect_api_key:
         expected.append('require_api_key')
     if expect_replica_id:
         expected.append('inject_replica_id')

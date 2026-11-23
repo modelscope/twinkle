@@ -38,7 +38,11 @@ def _ray_runtime():
     ray = pytest.importorskip('ray')
     already_running = ray.is_initialized()
     if not already_running:
+        # address='local' forces a fresh head: a stale /tmp/ray/ray_current_cluster left by a
+        # killed/shut-down run would otherwise make ray.init() auto-connect to a dead cluster
+        # and reject num_cpus ("When connecting to an existing cluster...").
         ray.init(
+            address='local',
             ignore_reinit_error=True,
             num_cpus=2,
             log_to_driver=False,

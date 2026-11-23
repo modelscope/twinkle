@@ -1,7 +1,6 @@
 import asyncio
 from dataclasses import asdict
-from peft import PeftConfig
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle.protocol.json_utils import json_safe
@@ -14,6 +13,9 @@ from twinkle_client._request_builder import build_request
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
 from twinkle_client.operations import _guarded_operation
+
+if TYPE_CHECKING:
+    from peft import PeftConfig
 
 
 # Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
@@ -63,8 +65,10 @@ class vLLMSampler:
         return resolve_response(response, model_cls, transport=self._transport)
 
     @_guarded_operation
-    def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs) -> SamplerAddAdapterResponse:
+    def add_adapter_to_sampler(self, adapter_name: str, config: 'PeftConfig', **kwargs) -> SamplerAddAdapterResponse:
         """Add a new adapter to the sampler."""
+        # peft pulls torch; keep it out of the module import surface (CPU-only client contract).
+        from peft import PeftConfig
         if isinstance(config, PeftConfig):
             config = config.__dict__
         body = build_request(SamplerAddAdapterRequest, adapter_name=adapter_name, config=config, **kwargs)

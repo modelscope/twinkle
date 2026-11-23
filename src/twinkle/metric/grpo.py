@@ -51,6 +51,10 @@ class GRPOMetric(Metric):
         self.sum_clip_low: float = 0.0
         self.sum_clip_high: float = 0.0
         self.clip_n_total: float = 0.0
+        # Unconditional ratio out-of-bound counts (the data off-policy diagnostic, independent
+        # of the advantage-sign gate the clip-ACTION statistic uses).
+        self.sum_oob_low: float = 0.0
+        self.sum_oob_high: float = 0.0
         self.high_kl_records: list = []
         self._gsi_cursor: int = 0
         # 异常 token 探针：logp 尾部统计 + 与采样端的对账。
@@ -235,6 +239,14 @@ class GRPOMetric(Metric):
                 self.max_token_ratio = cur_max_ratio
         self.has_old = True
 
+        # Unconditional token-level out-of-bound rate: how far the batch has drifted from the
+        # rollout policy, regardless of whether the clip/rejection actually acts on that token
+        # (the sign-gated clip statistic below answers a different question). Every variant
+        # inherits it; for CISPO/DIS it coincides with their unconditional clip statistic.
+        ratio = torch.exp(d)
+        self.sum_oob_low += float(((ratio < 1 - self.epsilon).float() * mask_f).sum().item())
+        self.sum_oob_high += float(((ratio > 1 + self.epsilon_high).float() * mask_f).sum().item())
+
         # Clip stats: gated by subclass (token-level / seq-level / unconditional).
         if adv_slice is not None:
             adv_aligned = align_logps_to_mask(adv_slice, mask, logps_f.dtype)
@@ -407,6 +419,8 @@ class GRPOMetric(Metric):
             'sum_clip_low': self.sum_clip_low,
             'sum_clip_high': self.sum_clip_high,
             'clip_n_total': self.clip_n_total,
+            'sum_oob_low': self.sum_oob_low,
+            'sum_oob_high': self.sum_oob_high,
             'min_new_logp': self.min_new_logp,
             'n_logp_lt5': self.n_logp_lt5,
             'n_logp_lt10': self.n_logp_lt10,
@@ -444,6 +458,8 @@ class GRPOMetric(Metric):
             results['train/approx_kl'] = mean_kl
             results['train/token_kl_max'] = global_max_kl
             results['train/token_ratio_max'] = global_max_ratio
+            results['train/ratio_oob_low'] = sum(r['sum_oob_low'] for r in all_results) / n_total
+            results['train/ratio_oob_high'] = sum(r['sum_oob_high'] for r in all_results) / n_total
 
         n_ent = sum(r.get('n_entropy_tokens', 0) for r in all_results)
         if n_ent > 0:
@@ -519,3 +535,13 @@ class CISPOMetric(GRPOMetric):
         self.sum_clip_low += float((is_low.float() * mask_f).sum().item())
         self.sum_clip_high += float((is_high.float() * mask_f).sum().item())
         self.clip_n_total += float(mask_f.sum().item())
+
+
+class DISMetric(CISPOMetric):
+    """DIS metric: the rejection rate IS the unconditional out-of-bound rate (a rejected token
+    is exactly one outside the trust interval), so CISPO's sign-free clip statistic applies.
+    An unset epsilon_high keeps DIS's wide 5.0 upper bound (mirroring DISLoss), NOT the base
+    family's fallback-to-epsilon -- the reported bound must match the loss's rejection bound."""
+
+    def __init__(self, *args, epsilon_high: Optional[float] = None, **kwargs):
+        super().__init__(*args, epsilon_high=5.0 if epsilon_high is None else epsilon_high, **kwargs)

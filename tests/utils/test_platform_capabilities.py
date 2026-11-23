@@ -64,7 +64,12 @@ def test_device_module_dispatch():
     """The torch.<x> namespace used by the Torch API chain comes from the platform."""
     import torch
 
-    assert GPU.device_module() is torch.cuda
+    # GPU.device_module() is availability-gated: torch.cuda on a CUDA host, None otherwise
+    # (the CPU-tier run must not require a visible device).
+    if torch.cuda.is_available():
+        assert GPU.device_module() is torch.cuda
+    else:
+        assert GPU.device_module() is None
     assert GPU.supports_device_ipc() is True
     # NPU cannot be probed on this host (npu-smi absent); pin that the hooks are
     # explicit overrides so the delegating implementations cannot be lost silently.

@@ -10,7 +10,7 @@ from .dro import DROLoss
 from .geo_mean import GeoMeanLoss
 from .gkd import GKDLoss
 from .gpg_loss import GPGLoss
-from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, PPOLoss, REALLoss, SAPOLoss
+from .grpo import BNPOLoss, CISPOLoss, DISLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, PPOLoss, REALLoss, SAPOLoss
 from .kl_cov import KLCovLoss
 from .infonce import ContrastiveLoss, CosineSimilarityLoss, EmbeddingLoss, InfonceLoss, OnlineContrastiveLoss
 from .liger_fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
@@ -43,6 +43,7 @@ torch_loss_mapping = {
     'gspo': GSPOLoss,
     'sapo': SAPOLoss,
     'cispo': CISPOLoss,
+    'dis': DISLoss,
     'bnpo': BNPOLoss,
     'dr_grpo': DRGRPOLoss,
     'real': REALLoss,

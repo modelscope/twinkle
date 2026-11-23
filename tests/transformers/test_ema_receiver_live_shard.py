@@ -40,12 +40,17 @@ class _Feed:
 
 
 def _shard(ref):
+    from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import fully_shard
+    # Explicit CPU mesh: current torch's fully_shard default mesh picks cuda whenever CUDA is
+    # visible, even over a gloo PG -- the cuda collective on gloo then SIGSEGVs. This gate's
+    # contract is the CPU/gloo blend math, so pin the mesh to the PG's actual device.
+    cpu_mesh = init_device_mesh('cpu', (2,))
     for layer in ref.model.layers:
-        fully_shard(layer)
-    fully_shard(ref.model.embed_tokens)
-    fully_shard(ref.lm_head)
-    fully_shard(ref)
+        fully_shard(layer, mesh=cpu_mesh)
+    fully_shard(ref.model.embed_tokens, mesh=cpu_mesh)
+    fully_shard(ref.lm_head, mesh=cpu_mesh)
+    fully_shard(ref, mesh=cpu_mesh)
 
 
 def _gate(rank, directory):
@@ -57,7 +62,8 @@ def _gate(rank, directory):
     from twinkle.model.transformers.transformers import TransformersModel
     from twinkle.utils.framework import Torch
 
-    os.environ.update(RANK=str(rank), LOCAL_RANK='0', WORLD_SIZE='2')
+    os.environ.update(RANK=str(rank), LOCAL_RANK='0', WORLD_SIZE='2', ACCELERATE_USE_CPU='true',
+                      MASTER_ADDR='127.0.0.1', MASTER_PORT='29500')
     os.environ.pop('LOCAL_WORLD_SIZE', None)
     dist.init_process_group('gloo', init_method=f'file://{directory}/pg', rank=rank, world_size=2,
                             timeout=timedelta(seconds=60))
