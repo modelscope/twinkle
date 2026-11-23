@@ -7,7 +7,7 @@
 # swift's family loader (see server_config.yaml's `model_loader`), and the client
 # just addresses it by its public name.
 #
-# The server must be running first (see run_server.sh / server.py).
+# Start the server with `twinkle-server launch -c cookbook/client/swift_model/server_config.yaml`.
 
 import dotenv
 

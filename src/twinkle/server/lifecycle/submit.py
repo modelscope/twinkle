@@ -6,19 +6,23 @@ The Inline_Fast_Path wait itself (``submit_and_peek``) lives on
 queue state; this module owns the request-shaped pieces around it.
 """
 from __future__ import annotations
-
 import uuid
 from collections.abc import Callable, Coroutine
-from fastapi import Request
 from typing import TYPE_CHECKING, Any
+
+from fastapi import Request
 
 from twinkle.data_format import InputFeature, Trajectory, is_encoded
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.types.base import FieldRole, fields_with_role
 from twinkle.protocol.types.data import VLM_TENSOR_FIELDS, export_batch
 from twinkle.protocol.types.lifecycle import TaskEnvelope
-from twinkle.protocol.types.model import (AdapterRequest, DataPlaneForwardRequest, ForwardBackwardTaskRequest, SaveRequest,
-                                          TrainingRequest)
+from twinkle.protocol.types.model import (
+    AdapterRequest,
+    DataPlaneForwardRequest,
+    ForwardBackwardTaskRequest,
+    TrainingRequest,
+)
 from twinkle.server.middleware.auth import get_session_id_from_request
 from twinkle.server.validation import assert_request_supported
 
@@ -125,10 +129,10 @@ def input_metrics(self: DataParallelDeployment, body: Any, *, data_parallel: boo
 
 
 def resolve_twinkle_adapter_name(request: Request, adapter_name: str | None) -> str | None:
-    """Build a stable per-session adapter name, falling back to request_id for older clients."""
+    """Build an adapter name scoped to the session or client."""
     if adapter_name is None or adapter_name == '':
         return None
-    owner_id = get_session_id_from_request(request) or request.state.request_id
+    owner_id = get_session_id_from_request(request) or request.state.client_id
     return owner_id + '-' + adapter_name
 
 
@@ -207,9 +211,6 @@ async def run_submit(
     # loss. That is a silent wrong-result bug, i.e. the exact failure this dedup
     # exists to prevent, one level up. ----
     sequenced = isinstance(body, (AdapterRequest, ForwardBackwardTaskRequest, DataPlaneForwardRequest))
-    if isinstance(body, SaveRequest) and (request_id := body.tracked_request_id()) is not None:
-        schedule_kwargs['request_id'] = request_id
-        schedule_kwargs['dedup_key'] = f'tracked-save::{request_id}'
     return await submit_training_task(
         self,
         _task,
@@ -228,31 +229,21 @@ async def submit_training_task(self,
                                training_id: str,
                                stream: str,
                                seq_id: int | None,
-                               dedup_key: str | None = None,
                                peek: bool = False,
                                **kwargs):
     """Submit with explicit request identity; retain claims once any future was written."""
     request_id = kwargs.pop('request_id', None) or f'req_{uuid.uuid4().hex}'
-    if dedup_key is not None:
-        prior = await self.state.claim_seq(dedup_key, request_id, int(self.sequence_retention_s))
-        if prior is None and await self.state.get_future(request_id) is not None:
-            prior = request_id
-    elif seq_id is not None:
+    if seq_id is not None:
         prior = await self.state.claim_training_seq(training_id, stream, seq_id, request_id, self.sequence_retention_s)
-    else:
-        prior = None
-    if prior is not None:
-        if peek:
-            return await self._peek_terminal(prior, fallback_status='pending')
-        return {'request_id': prior, 'model_id': training_id}
+        if prior is not None:
+            if peek:
+                return await self._peek_terminal(prior, fallback_status='pending')
+            return {'request_id': prior, 'model_id': training_id}
     submit = self.submit_and_peek if peek else self.schedule_task
     try:
         return await submit(factory, model_id=training_id, request_id=request_id, **kwargs)
     except Exception:
         # A failed response after enqueue must not allow the same update to run twice.
-        if (dedup_key is not None or seq_id is not None) and await self.state.get_future(request_id) is None:
-            if dedup_key is not None:
-                await self.state.release_seq(dedup_key)
-            else:
-                await self.state.release_training_seq(training_id, stream, seq_id, request_id)
+        if seq_id is not None and await self.state.get_future(request_id) is None:
+            await self.state.release_training_seq(training_id, stream, seq_id, request_id)
         raise

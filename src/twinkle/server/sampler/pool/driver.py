@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from twinkle.server.config.application_spec import SamplerArgs
-from twinkle.server.config.resources import ResourceOptions
+from twinkle.server.config.resource_options import ResourceOptions
 from twinkle.server.resources.runtime import RayRuntime
 from twinkle.server.state import get_server_state
 from twinkle.server.state.models import FutureFailureRecord, RuntimeContext
@@ -75,7 +75,12 @@ class SamplerDriver:
 
     async def wait_operation(self, instance, ticket):
         handle = await self.handle(instance)
-        await handle.wait_operation.remote(ticket)
+        # Each RPC returns immediately; sleep outside Serve so health checks
+        # can reach the replica even when every generation is still running.
+        delay = 0.02
+        while not await handle.operation_done.remote(ticket):
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 0.2)
 
     async def load_weights(self, instance, path):
         handle = await self.handle(instance)
@@ -90,22 +95,17 @@ class SamplerDriver:
         name = instance.application or self.runtime.pool.name(
             f"sampling_{self.pool_id}_{instance.epoch}", instance.identity
         )
-        futures = []
-        try:
-            async with asyncio.timeout(5):
-                handle = await self.handle(instance)
-                futures = await handle.pending_futures.remote()
-        except Exception:
-            pass
         await self.runtime.shutdown(instance.identity, name)
+        # Idle instances have no work to settle. Orphan recovery only knows
+        # the identity, so it must check persisted ownership too.
+        if not getattr(instance, "requests", True):
+            return
         failure = FutureFailureRecord(
             reason_code="orphaned_replica",
             attribution="server",
             message="Sampler instance stopped; retry with the checkpoint path.",
         )
-        state = get_server_state()
-        for request_id in futures:
-            await state.store_future_status(request_id, "failed", None, failure=failure)
+        await get_server_state().futures.fail_replica(instance.identity, failure)
 
     async def recover_orphans(self):
         import re

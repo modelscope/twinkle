@@ -5,8 +5,11 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from starlette.requests import Request
 
 from twinkle.server.config.application_spec import SamplerArgs
+from twinkle.server.lifecycle.submit import resolve_twinkle_adapter_name
+from twinkle.server.middleware.auth import verify_request_token
 from twinkle.server.sampler.pool.controller import SamplerController
 
 
@@ -487,18 +490,45 @@ async def test_control_timeout_retains_unknown_allocations_then_recovers():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(('identity_headers', 'request_ids', 'scope'), [
+    ([], [b'legacy-id', b'legacy-id'], 'legacy-id'),
+    ([(b'x-twinkle-client-id', b'client-id')], [b'req-a', b'req-b'], 'client-id'),
+    ([(b'x-twinkle-client-id', b'client-id'), (b'x-twinkle-session-id', b'session-id')],
+     [b'req-a', b'req-b'], 'session-id'),
+])
+async def test_adapter_name_and_replay_use_the_same_stable_scope(identity_headers, request_ids, scope):
+    endpoint = 'twinkle/add_adapter_to_sampler'
+    token = b'Bearer token'
+    for request_id in request_ids:
+        headers = [(b'x-request-id', request_id), (b'authorization', token), *identity_headers]
+        incoming = Request({'type': 'http', 'path': f'/{endpoint}', 'headers': headers})
+
+        async def resolve(req):
+            assert req.state.request_id == request_id.decode()
+            return resolve_twinkle_adapter_name(req, 'adapter')
+
+        assert await verify_request_token(incoming, resolve) == f'{scope}-adapter'
+        action = {'endpoint': endpoint, 'headers': headers, 'body': b'{"adapter_name":"adapter"}'}
+        assert SamplerController._action_key(action) == (endpoint, token, scope.encode(), 'adapter')
+
+
+@pytest.mark.asyncio
 async def test_replay_compacts_setters_per_owner_without_crossing_patch():
     pool, driver, _ = setup(minimum=1)
     driver.finish.set()
     try:
         for index in range(12):
             await pool.request(request('twinkle/set_template', {'template_cls': f'T{index}'}))
-        for owner in ('one', 'two'):
-            for rank in (4, 8):
+        sessions = [('one', 'session-a', (2, 4)), ('one', 'session-b', (4, 8)), ('two', None, (8, 16))]
+        for owner, session, ranks in sessions:
+            for rank in ranks:
                 payload = request('twinkle/add_adapter_to_sampler', {'adapter_name': 'same', 'config': {'r': rank}})
+                if session:
+                    payload['headers'] = [(b'x-request-id', f'request-{rank}'.encode()),
+                                          (b'x-twinkle-session-id', session.encode())]
                 payload['headers'].append((b'twinkle-authorization', owner.encode()))
                 await pool.request(payload)
-        assert len(pool._actions) == 3
+        assert len(pool._actions) == 4
         await pool.request(request('twinkle/apply_patch', {'patch_cls': 'P'}))
         await pool.request(request('twinkle/set_template', {'template_cls': 'AfterPatch'}))
         await pool.request(request('twinkle/unload_adapter_paths', {'adapter_paths': ['unused']}))
@@ -507,9 +537,10 @@ async def test_replay_compacts_setters_per_owner_without_crossing_patch():
         replay = [p for identity, p in driver.calls if identity == instance.identity]
         assert [p['endpoint'] for p in replay] == [
             'twinkle/set_template', 'twinkle/add_adapter_to_sampler', 'twinkle/add_adapter_to_sampler',
-            'twinkle/apply_patch', 'twinkle/set_template']
+            'twinkle/add_adapter_to_sampler', 'twinkle/apply_patch', 'twinkle/set_template']
         assert json.loads(replay[0]['body'])['template_cls'] == 'T11'
-        assert all(json.loads(p['body'])['config']['r'] == 8 for p in replay[1:3])
+        assert [(dict(p['headers']).get(b'x-twinkle-session-id'), json.loads(p['body'])['config']['r'])
+                for p in replay[1:4]] == [(b'session-a', 4), (b'session-b', 8), (None, 16)]
         assert json.loads(replay[-1]['body'])['template_cls'] == 'AfterPatch'
     finally:
         await pool.shutdown()

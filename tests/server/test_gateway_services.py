@@ -5,6 +5,9 @@ import ast
 import asyncio
 from pathlib import Path
 
+import pytest
+
+from twinkle.server.exceptions import ResourceNotFoundError
 from twinkle.server.gateway import use_cases as services
 
 
@@ -36,6 +39,13 @@ def test_poll_future_returns_canonical_terminal_record(monkeypatch):
     assert outcome.record == {'status': 'completed', 'result': None}
 
 
+def test_poll_future_checks_ownership_even_if_task_appears_during_wait(monkeypatch):
+    monkeypatch.setattr(services.asyncio, 'sleep', _no_sleep)
+    state = _State([None, {'status': 'completed', 'owner_token': 'owner', 'result': {'revision': 'private'}}])
+    with pytest.raises(ResourceNotFoundError):
+        asyncio.run(services.poll_future(state, 'upload', owner_token='other'))
+
+
 def test_gateway_services_do_not_import_protocol_models():
     path = Path(services.__file__)
     tree = ast.parse(path.read_text(), filename=str(path))
@@ -56,7 +66,7 @@ def _parity_client(monkeypatch, canonical_record):
 
     from twinkle.server.gateway import tinker_handlers, twinkle_handlers
 
-    async def _fixed_poll(_state, _request_id):
+    async def _fixed_poll(_state, _request_id, **_kwargs):
         return services.FuturePollResult(record=canonical_record, timed_out=False)
 
     app = FastAPI()

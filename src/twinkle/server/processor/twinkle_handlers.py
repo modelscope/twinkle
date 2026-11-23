@@ -43,7 +43,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
     async def create(
         request: Request, body: types.ProcessorCreateRequest,
         self: ProcessorManagement = Depends(self_fn)) -> types.ProcessorCreateResponse:
-        await self._ensure_sticky()
+        await self._ensure_resource_cleanup_started()
 
         processor_type_name = body.processor_type
         class_type = body.class_type
@@ -124,7 +124,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
     async def call(
         request: Request, body: types.ProcessorCallRequest,
         self: ProcessorManagement = Depends(self_fn)) -> types.ProcessorCallResponse:
-        await self._ensure_sticky()
+        await self._ensure_resource_cleanup_started()
 
         processor_id = body.processor_id
         function_name = body.function

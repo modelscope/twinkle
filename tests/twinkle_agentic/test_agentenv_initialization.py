@@ -34,9 +34,12 @@ def test_initialization_checks_exit_codes_and_cleans_up_on_failure(monkeypatch, 
             # The failed sandbox is cleaned up, and no usable session is left behind.
             assert killed
             assert 'ep1' not in env._sessions
+        if failed_command is None:
+            env.close('ep1')
+            assert not killed
+            assert any(state.sandbox is sandbox for state in env._idle)
     finally:
-        env.close('ep1')
-    if failed_command is None:
-        # Close empties the workspace but keeps the sandbox for the next episode.
-        assert not killed
-        assert any(state.sandbox is sandbox for state in env._idle)
+        env.shutdown()
+    assert not env._sessions
+    assert not env._idle
+    assert killed == [True]

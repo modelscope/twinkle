@@ -115,6 +115,7 @@ class GAEAdvantage(Advantage):
         *,
         gamma: Optional[float] = None,
         gae_lambda: Optional[float] = None,
+        gae_lambda_alpha: Optional[float] = None,
         normalize: Optional[bool] = None,
         **kwargs,
     ) -> Tuple[List[List[float]], List[List[float]]]:
@@ -122,13 +123,19 @@ class GAEAdvantage(Advantage):
 
         ``values[i]`` is sample i's per-token value estimates; ``rewards[i]`` is its per-token
         rewards (the same length) or one scalar terminal reward, placed on its last token.
-        ``gamma`` / ``gae_lambda`` / ``normalize`` override the constructor's for this call;
+        ``gamma`` / ``gae_lambda`` / ``gae_lambda_alpha`` / ``normalize`` override the constructor's
+        for this call; ``gae_lambda_alpha`` (positive) replaces the fixed lambda per row with
+        ``1 - 1 / (alpha * row_length)`` clamped to [0, 1] (SAO's length-adaptive lambda: long
+        responses lean toward lambda=1 for low bias, short ones toward 0 for low variance);
         ``normalize`` whitens the advantages over every response token of the batch.
         """
         import torch
 
         gamma = self.gamma if gamma is None else _check_unit('gamma', float(gamma))
         gae_lambda = self.gae_lambda if gae_lambda is None else _check_unit('gae_lambda', float(gae_lambda))
+        alpha = self.gae_lambda_alpha if gae_lambda_alpha is None else float(gae_lambda_alpha)
+        if alpha is not None and alpha <= 0:
+            raise ValueError(f'gae_lambda_alpha must be positive, got {alpha}.')
         should_normalize = self.normalize if normalize is None else normalize
         if len(rewards) != len(values):
             raise ValueError(f'{len(rewards)} reward rows for {len(values)} value rows.')
@@ -155,11 +162,14 @@ class GAEAdvantage(Advantage):
 
         advantages = torch.zeros_like(rewards_t)
         for batch_idx, length in enumerate(lengths):
+            lambda_value = gae_lambda
+            if alpha is not None and length > 0:
+                lambda_value = min(1.0, max(0.0, 1.0 - 1.0 / (alpha * length)))
             last_gae = rewards_t.new_zeros(())
             for pos in range(length - 1, -1, -1):
                 next_value = values_t[batch_idx, pos + 1] if pos + 1 < length else rewards_t.new_zeros(())
                 delta = rewards_t[batch_idx, pos] + gamma * next_value - values_t[batch_idx, pos]
-                last_gae = delta + gamma * gae_lambda * last_gae
+                last_gae = delta + gamma * lambda_value * last_gae
                 advantages[batch_idx, pos] = last_gae
 
         returns = advantages + values_t

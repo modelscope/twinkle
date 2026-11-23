@@ -19,8 +19,7 @@ user-supplied argument.
 """
 from __future__ import annotations
 
-from hashlib import sha256
-from pydantic import UUID4, Field, JsonValue, field_validator, model_validator
+from pydantic import Field, JsonValue, StrictInt, field_validator, model_validator
 from typing import Any, Dict, List, Optional, Union
 
 from .base import ResponseModel, StrictRequest, backend_kwarg, backend_only, passthrough
@@ -147,6 +146,11 @@ class ForwardOnlyRequest(_InlineForwardBase):
     """
 
     disable_lora: bool | None = backend_kwarg(default=None)
+    continuation_token_ids: list[list[StrictInt]] | None = Field(
+        default=None, description='One exact, already-generated reply per text trajectory to score')
+    distillation_topk: StrictInt | None = backend_only(
+        'transformers', default=None, ge=2,
+        description='Return only the top token IDs and their logprobs normalized over those candidates')
 
 
 class ForwardBackwardTaskRequest(_InlineForwardBase):
@@ -276,17 +280,10 @@ class ApplyPatchRequest(TrainingRequest):
 
 class SaveRequest(TrainingRequest):
     name: str | None = None
-    client_save_id: UUID4 | None = None
     save_optimizer: bool = False
     is_sampler: bool = False  # If True, delete existing sampler weights before saving
     consumed_train_samples: int | None = backend_kwarg(default=None, ge=0)
     merge_lora: bool | None = backend_only('megatron', default=None)
-
-    def tracked_request_id(self) -> str | None:
-        if self.client_save_id is None:
-            return None
-        digest = sha256(f'{self.training_id}:{self.client_save_id.hex}'.encode()).hexdigest()
-        return f'req_{digest}'
 
 
 class LoadRequest(TrainingRequest):
@@ -326,6 +323,7 @@ class UploadToHubRequest(StrictRequest):
     checkpoint_dir: str | dict[str, Any]
     hub_model_id: str
     hub_token: str | None = None
+    client_upload_id: str | None = Field(default=None, min_length=1, max_length=128)
 
     @field_validator('checkpoint_dir', mode='before')
     @classmethod
@@ -388,6 +386,11 @@ class GetTrainConfigsResponse(ResponseModel):
 class CalculateMetricResponse(ResponseModel):
     """Response for /calculate_metric endpoint (returns Dict)."""
     result: dict[str, Any]
+
+
+class UploadToHubResponse(ResponseModel):
+    repo_id: str
+    revision: str
 
 
 class SaveResponse(ResponseModel):

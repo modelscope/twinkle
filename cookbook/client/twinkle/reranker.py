@@ -15,7 +15,7 @@
 # Before running (from the repository root):
 #   1. python cookbook/client/twinkle/prepare_seq_cls_model.py --num-labels 1 --output-dir output/Qwen3.5-4B-reranker
 #   2. ray start --head --num-gpus=2
-#   3. python -m twinkle.server launch --config cookbook/client/server/transformer/server_config_seq_cls.yaml
+#   3. twinkle-server launch -c cookbook/client/server/transformer/server_config_seq_cls.yaml
 
 import dotenv
 import os

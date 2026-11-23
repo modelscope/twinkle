@@ -37,7 +37,8 @@ def _wrap_frozen_reference(rank, directory):
     from twinkle.model.transformers.strategy.accelerate import AccelerateStrategy
     from twinkle.utils.framework import Torch
 
-    os.environ.update(RANK=str(rank), LOCAL_RANK='0', WORLD_SIZE='2')
+    os.environ.update(RANK=str(rank), LOCAL_RANK='0', WORLD_SIZE='2', ACCELERATE_USE_CPU='true',
+                      MASTER_ADDR='127.0.0.1', MASTER_PORT='29500')
     os.environ.pop('LOCAL_WORLD_SIZE', None)
     dist.init_process_group('gloo', init_method=f'file://{directory}/pg', rank=rank, world_size=2,
                             timeout=timedelta(seconds=60))
@@ -52,6 +53,13 @@ def _wrap_frozen_reference(rank, directory):
             from accelerate.utils import DistributedType
             strategy.accelerator.state.distributed_type = DistributedType.FSDP
             strategy.accelerator.state.fsdp_plugin = strategy._fsdp_config_from_device_mesh(mesh, None, False)
+            # accelerate's fsdp2_prepare_model shards on state.device_mesh; without one, fully_shard
+            # builds its DEFAULT mesh, which current torch pins to cuda whenever CUDA is visible --
+            # moving this CPU/gloo reference to cuda:0. Hand it the CPU mesh the gate runs on.
+            from accelerate import ParallelismConfig
+            from torch.distributed.device_mesh import init_device_mesh
+            strategy.accelerator.state.parallelism_config = ParallelismConfig(dp_shard_size=2)
+            strategy.accelerator.state.device_mesh = init_device_mesh('cpu', (2,), mesh_dim_names=('dp_shard_cp',))
             config = Qwen2Config(vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
                                  num_attention_heads=2, num_key_value_heads=1, max_position_embeddings=64)
             torch.manual_seed(7)

@@ -103,8 +103,13 @@ def test_transformers_batch_context_loss_matches_independent_micro_batch_computa
 
 @pytest.fixture
 def megatron_model(monkeypatch):
+    from twinkle import Platform
     from twinkle.model.megatron.megatron import MegatronModel
 
+    # CPU-tier contract (same pin as the transformers harness tests in test_grpo_micro_batch):
+    # the processor moves tensors to Platform.get_local_device(), which on a GPU host resolves
+    # to cuda even under CUDA_VISIBLE_DEVICES=''.
+    monkeypatch.setattr(Platform, 'get_local_device', lambda *args, **kwargs: torch.device('cpu'))
     # MCore is optional on CPU; stop after input batching and before scheduler setup.
     core = ModuleType('megatron.core')
     core.parallel_state = SimpleNamespace()

@@ -34,6 +34,7 @@ class TrainingRuntime:
     """Execute controller-owned training handles on one allocated backend."""
 
     training_context: TrainingRuntimeContext
+    _startup_template: dict | None
 
     _training_states: dict[str, TrainingExecutionState]
 
@@ -168,12 +169,14 @@ class TrainingRuntime:
 
                     config = await asyncio.to_thread(build_lora_config)
                     await self.call_backend(self.model.add_adapter_to_model, adapter_name=adapter, config_or_dir=config)
-                await self.call_backend(
-                    self.model.set_template,
-                    get_template_for_model(self.base_model),
-                    adapter_name=backend_adapter,
-                    model_id=self.base_model,
-                )
+            if self._startup_template is not None or request.client_type != "twinkle":
+                template = dict(self._startup_template) if self._startup_template is not None else {
+                    "template_cls": get_template_for_model(self.base_model),
+                    "model_id": self.base_model,
+                }
+                template_cls = template.pop("template_cls")
+                await self.call_backend(self.model.set_template, template_cls, adapter_name=backend_adapter, **template)
+            if request.client_type != "twinkle":
                 await self.call_backend(self.model.set_processor, "InputProcessor", adapter_name=backend_adapter)
                 await self.call_backend(self.model.set_optimizer, "Adam", adapter_name=backend_adapter)
 

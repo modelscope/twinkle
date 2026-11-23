@@ -3,8 +3,8 @@
 
 Shared by the server handler and the twinkle client. Field roles follow
 :mod:`twinkle.protocol.types.base`; the sampler handlers pass everything they need
-explicitly, so these requests carry control fields and -- for the template setter --
-one passthrough region, and no free-floating backend kwargs.
+explicitly. Template and patch requests each declare a passthrough region for
+plugin arguments.
 
 Class names carry a ``Sampler`` prefix wherever ``model.py`` already owns the bare
 name (``AddAdapterRequest``, ``SetTemplateRequest``, ``CreateResponse`` and their
@@ -17,7 +17,8 @@ matching :mod:`twinkle.protocol.types.processor`.
 """
 from __future__ import annotations
 
-from pydantic import Field, JsonValue
+from hmac import digest
+from pydantic import UUID4, Field, JsonValue
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from .base import ResponseModel, StrictRequest, passthrough
@@ -38,10 +39,17 @@ class SampleRequest(StrictRequest):
     inputs: WireInputBatch = Field(..., description='Trajectory or InputFeature entries to sample from')
     sampling_params: dict[str, JsonValue] | None = Field(
         None, description='Sampling parameters (max_tokens, temperature, num_samples, etc.)')
+    client_sample_id: UUID4 | None = None
     adapter_name: str = Field('', description='Adapter name for LoRA inference')
     adapter_uri: str | None = Field(None, description='Adapter URI (twinkle:// path or local path) for LoRA inference')
     token_only: bool = Field(
         False, description='Return sampled tokens/logprobs only; encoded inputs are engine ids, media alongside')
+
+    def tracked_request_id(self, token: str) -> str | None:
+        if self.client_sample_id is None:
+            return None
+        identity = digest(token.encode(), self.client_sample_id.bytes, 'sha256')
+        return f'req_sample_{identity.hex()}'
 
 
 class SampledSequenceModel(ResponseModel):
@@ -50,6 +58,7 @@ class SampledSequenceModel(ResponseModel):
     tokens: list[int] = Field(..., description='Token IDs of the sampled sequence')
     logprobs: list[list[tuple[int, float]] | None] | None = Field(None, description='Per-token log-probabilities')
     decoded: str | None = Field(None, description='Decoded text of the sampled sequence')
+    text: str | None = Field(None, description='Assistant content parsed by the serving template')
     new_input_feature: dict[str, Any] | None = Field(
         None, description='Updated InputFeature after sampling (input_ids, labels, etc.)')
 
@@ -91,6 +100,12 @@ class SamplerSetTemplateRequest(StrictRequest):
 class SamplerSetTemplateResponse(ResponseModel):
     """Response body for the sampler /set_template endpoint."""
     status: str = 'ok'
+
+
+class SamplerApplyPatchRequest(StrictRequest):
+    """Apply a patch to the sampler instance."""
+    patch_cls: str
+    init_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class SamplerAddAdapterRequest(StrictRequest):

@@ -13,15 +13,15 @@ Top-level fields use their current names with no aliases for legacy names
 offending name pointed at.
 """
 from __future__ import annotations
-
 from pathlib import Path
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from twinkle.server.exceptions import ConfigParseError
 from .application_spec import ApplicationSpec, HttpOptions
 from .persistence import PersistenceConfig
-from .resources import ResourceOptions
+from .resource_options import ResourceOptions
 from .task_queue import TaskQueueConfig
 from .telemetry import TelemetryConfig
 from .training import TrainingConfig, TrainingModelConfig
@@ -34,6 +34,8 @@ class ServerConfig(BaseModel):
 
     ray_namespace: str | None = None
     proxy_location: str | None = None
+    trust_remote_code: bool | None = Field(
+        default=None, description='Set TWINKLE_TRUST_REMOTE_CODE for the launcher and default Ray worker environment.')
     http_options: HttpOptions = Field(default_factory=HttpOptions)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)

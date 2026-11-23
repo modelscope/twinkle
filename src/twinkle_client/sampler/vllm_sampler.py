@@ -1,18 +1,22 @@
 import asyncio
 from dataclasses import asdict
-from peft import PeftConfig
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from uuid import uuid4
 
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
 from twinkle.protocol.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
-                                            SampleResponseModel, SampleResponseModelList, SamplerSetTemplateRequest,
+                                            SampleResponseModel, SampleResponseModelList, SamplerApplyPatchRequest,
+                                            SamplerSetTemplateRequest,
                                             SamplerSetTemplateResponse)
 from twinkle_client._request_builder import build_request
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
 from twinkle_client.operations import _guarded_operation
+
+if TYPE_CHECKING:
+    from peft import PeftConfig
 
 
 # Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
@@ -62,8 +66,10 @@ class vLLMSampler:
         return resolve_response(response, model_cls, transport=self._transport)
 
     @_guarded_operation
-    def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig, **kwargs) -> SamplerAddAdapterResponse:
+    def add_adapter_to_sampler(self, adapter_name: str, config: 'PeftConfig', **kwargs) -> SamplerAddAdapterResponse:
         """Add a new adapter to the sampler."""
+        # peft pulls torch; keep it out of the module import surface (CPU-only client contract).
+        from peft import PeftConfig
         if isinstance(config, PeftConfig):
             config = config.__dict__
         body = build_request(SamplerAddAdapterRequest, adapter_name=adapter_name, config=config, **kwargs)
@@ -110,10 +116,14 @@ class vLLMSampler:
         url = f'{self.server_url}/sample'
         body = build_request(
             SampleRequest, inputs=_json_safe(inputs), sampling_params=self._sampling_params(sampling_params, num_samples),
-            adapter_name=adapter_name, adapter_uri=adapter_uri, token_only=token_only)
+            adapter_name=adapter_name, adapter_uri=adapter_uri, token_only=token_only,
+            client_sample_id=uuid4() if on_outcome_unknown is not None else None)
         if on_outcome_unknown is not None:
             from twinkle_client._future import submit_tracked_task
-            return submit_tracked_task(self._transport, url, body, SampleResponseModelList, on_outcome_unknown).samples
+
+            request_id = body.tracked_request_id(self._transport.context.api_key)
+            return submit_tracked_task(
+                self._transport, url, body, SampleResponseModelList, on_outcome_unknown, request_id=request_id).samples
         response = self._transport.post_model(url, body)
         return self._await_task(response, SampleResponseModelList).samples
 
@@ -210,7 +220,6 @@ class vLLMSampler:
 
     @_guarded_operation
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
-        """Apply a patch to the model."""
-        from twinkle.protocol.types.model import ApplyPatchRequest
-        body = build_request(ApplyPatchRequest, patch_cls=patch_cls, adapter_name=self.adapter_name or '', **kwargs)
+        """Apply a patch to the sampler instance."""
+        body = build_request(SamplerApplyPatchRequest, patch_cls=patch_cls, **kwargs)
         self._transport.post_model(f'{self.server_url}/apply_patch', body)

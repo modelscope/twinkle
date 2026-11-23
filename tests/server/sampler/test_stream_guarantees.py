@@ -36,7 +36,6 @@ async def test_sampler_request_refreshes_replica_liveness():
     service = SamplerManagement.__new__(SamplerManagement)
     service.replica_id = 'sampler-replica'
     service.state = SimpleNamespace(touch_replica_last_seen=AsyncMock())
-    service._ensure_sticky = AsyncMock()
     service._ensure_state_cleanup_started = AsyncMock()
     request = SimpleNamespace(
         headers={'Authorization': 'Bearer token'}, state=SimpleNamespace(token='token'))
@@ -49,6 +48,7 @@ async def test_sampler_request_refreshes_replica_liveness():
 async def test_stream_without_actor_returns_structured_error():
     service = SimpleNamespace(
         sampler=SimpleNamespace(_actors=[]),
+        deploy_adapters={},
         _on_request_start=AsyncMock(return_value='token'),
     )
     app = FastAPI()

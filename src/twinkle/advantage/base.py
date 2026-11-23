@@ -304,6 +304,7 @@ class Advantage:
                  f_norm: float = 1.0,
                  gamma: float = 1.0,
                  gae_lambda: float = 0.95,
+                 gae_lambda_alpha: Optional[float] = None,
                  normalize: bool = True,
                  kl_coef: float = 0.0,
                  segment_discount: float = 1.0) -> None:
@@ -315,7 +316,8 @@ class Advantage:
         + its ``rlsd_*`` / ``teacher_kl_coef`` knobs (per-token reweighting), ``sdar_loss_coef``
         (teacher-lane requirement for the loss), ``rollout_importance_sampling_mode`` /
         ``log_rollout_offpolicy_metrics`` (the pre-update policy lane and its diagnostics),
-        ``f_norm`` (gpg). GAE knobs: ``gamma`` / ``gae_lambda`` / ``normalize`` / ``kl_coef``
+        ``f_norm`` (gpg). GAE knobs: ``gamma`` / ``gae_lambda`` / ``gae_lambda_alpha`` (length-adaptive
+        lambda, overrides the fixed ``gae_lambda`` per row) / ``normalize`` / ``kl_coef``
         (token-reward KL) / ``kl_kind`` (k1, per-token). PPO passes ``kl_kind='k1'``; GRPO keeps
         the k3 default.
         """
@@ -352,6 +354,7 @@ class Advantage:
                 unused.append(('kl_kind', kl_kind not in ('k1', 'k3')))
         else:
             unused = [('gamma', gamma != 1.0), ('gae_lambda', gae_lambda != 0.95),
+                      ('gae_lambda_alpha', gae_lambda_alpha is not None),
                       ('normalize', not normalize), ('kl_coef', kl_coef != 0.0)]
             if not kl_in_reward:
                 # kl_kind is read only by the kl_in_reward fold in __call__, and 'k3' is this
@@ -402,6 +405,11 @@ class Advantage:
         self.kl_coef = kl_coef
         self.gamma = _check_unit('gamma', float(gamma))
         self.gae_lambda = _check_unit('gae_lambda', float(gae_lambda))
+        # Length-adaptive GAE lambda (SAO): lambda_i = 1 - 1 / (alpha * len_i), clamped to [0, 1].
+        # None keeps the fixed gae_lambda; a positive alpha overrides it per response row.
+        if gae_lambda_alpha is not None and gae_lambda_alpha <= 0:
+            raise ValueError(f'gae_lambda_alpha must be positive, got {gae_lambda_alpha}.')
+        self.gae_lambda_alpha = gae_lambda_alpha
         # An episode delivered as several rows (collected segments) shares one advantage; this
         # discounts an earlier row's share by the trainable tokens its episode still generates
         # after it (CompactionRL's trajectory-position correction, gamma-only): 1.0 -- the

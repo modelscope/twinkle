@@ -349,21 +349,29 @@ class ComputeWorker:
             q.task_done()
 
     async def submit_detached(self, task: QueuedTask, queue_key: str, *, replica_id: str | None,
-                              absolute_deadline: float) -> None:
+                              absolute_deadline: float, submission_fingerprint: str | None = None,
+                              track_execution: bool = False) -> bool:
         """Own admission, future persistence and startup as one lifecycle."""
         self.reserve_detached()
         wrote_status = False
         try:
-            await self._state.store_future_status(
-                task.request_id,
-                TaskStatus.PENDING.value,
-                task.model_id,
+            fields = dict(
+                model_id=task.model_id,
                 queue_state=QueueState.ACTIVE.value,
                 replica_id=replica_id,
                 absolute_deadline=absolute_deadline,
                 owner_token=task.token)
+            if track_execution:
+                fields['execution_finished'] = False
+            if submission_fingerprint is None:
+                await self._state.store_future_status(task.request_id, TaskStatus.PENDING.value, **fields)
+            elif not await self._state.create_pending_future(
+                    task.request_id, submission_fingerprint=submission_fingerprint, **fields):
+                self.release_detached()
+                return False
             wrote_status = True
-            self.run_detached(task, queue_key)
+            self.run_detached(task, queue_key, track_execution=track_execution)
+            return True
         except BaseException:
             self.release_detached()
             if wrote_status:
@@ -384,7 +392,7 @@ class ComputeWorker:
     def release_detached(self) -> None:
         self._detached_reserved -= 1
 
-    def run_detached(self, task: QueuedTask, queue_key: str) -> None:
+    def run_detached(self, task: QueuedTask, queue_key: str, *, track_execution: bool = False) -> None:
         """Start ``task`` now, beside the serial loop instead of in its turn.
 
         For backends that batch concurrent requests themselves (vLLM). The task
@@ -420,6 +428,8 @@ class ComputeWorker:
                             break
                     if not execution.cancelled():
                         execution.exception()
+                if track_execution:
+                    await self._state.mark_future_execution_finished(task.request_id)
 
         running = asyncio.create_task(run())
         self._detached_tasks[running] = task

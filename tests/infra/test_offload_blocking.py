@@ -64,7 +64,7 @@ _Actor = ray.remote(max_concurrency=256)(_Component)
 
 @pytest.fixture(scope='module', autouse=True)
 def _ray_and_ray_mode():
-    ray.init(ignore_reinit_error=True, num_cpus=4, include_dashboard=False, logging_level='ERROR')
+    ray.init(address='local', ignore_reinit_error=True, num_cpus=4, include_dashboard=False, logging_level='ERROR')
     prev = infra._mode
     infra._mode = 'ray'
     try:

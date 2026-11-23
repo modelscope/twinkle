@@ -7,7 +7,7 @@ import logging
 import time
 from copy import deepcopy
 
-from twinkle.server.config.resources import build_worker_env_vars
+from twinkle.server.config.env_propagation import build_worker_env_vars
 from twinkle.server.exceptions import ResourceReleaseError
 from .allocation import DevicePool
 from .instances import InstanceLifecycle

@@ -2,13 +2,15 @@
 """Instance-owned HTTP transport."""
 from __future__ import annotations
 
+import uuid
+
 import requests
 from collections.abc import Mapping
 from requests.adapters import HTTPAdapter
 from typing import Any
 from urllib3.util.retry import Retry
 
-from twinkle.protocol.headers import build_routing_headers
+from twinkle.protocol.headers import H_SESSION_ID, build_request_headers
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 from twinkle_client._request_builder import to_wire_value
 from twinkle_client.exceptions import TwinkleClientValidationError, TwinkleHTTPError
@@ -156,9 +158,10 @@ class ClientTransport:
         return f'{self._context.base_url}/{path_or_url.lstrip("/")}'
 
     def _headers(self, additional_headers: Mapping[str, str] | None = None) -> dict[str, str]:
-        headers = build_routing_headers(self._context.routing_id, f'Bearer {self._context.api_key}')
+        headers = build_request_headers(
+            uuid.uuid4().hex, f'Bearer {self._context.api_key}', client_id=self._context.client_id)
         if self._context.session_id:
-            headers['X-Twinkle-Session-Id'] = self._context.session_id
+            headers[H_SESSION_ID] = self._context.session_id
         if additional_headers:
             headers.update(additional_headers)
         return headers

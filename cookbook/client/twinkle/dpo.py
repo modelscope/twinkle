@@ -2,7 +2,7 @@
 #
 # This script demonstrates how to fine-tune a language model using DPO
 # through the Twinkle client-server architecture.
-# The server must be running first (see server.py and server_config.yaml).
+# Start the server with `twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml`.
 
 # Step 1: Load environment variables from a .env file (e.g., API tokens)
 import dotenv

@@ -30,6 +30,7 @@ from twinkle.hub import HubOperation
 from twinkle.protocol.types import ResolvedLoadPath
 from twinkle.server.exceptions import RequestRejectedError
 from twinkle.utils.parallel import FileLock, acquire_lock, release_lock
+from twinkle.utils.storage import is_remote_url
 from .paths import CHECKPOINT_INFO_FILENAME, ensure_inside, validate_user_path
 from .training_run_manager import BaseFileManager, BaseTrainingRunManager
 
@@ -592,6 +593,11 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         for nonstandard service URIs are preserved.
         """
         if not adapter_uri.startswith(self.path_prefix):
+            if is_remote_url(adapter_uri):
+                raise ValueError(
+                    f'object-store checkpoint paths are not supported server-side: '
+                    f'{adapter_uri}. The server stores checkpoints on local disk and hands out '
+                    'twinkle:// URIs; write to oss:// / s3:// from a local/ray run instead.')
             return 'default', adapter_uri
 
         parsed = self.parse_path(adapter_uri)
@@ -612,6 +618,11 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         Malformed service URIs and unavailable checkpoints raise ValueError.
         """
         if not path.startswith(self.path_prefix):
+            if is_remote_url(path):
+                raise ValueError(
+                    f'object-store checkpoint paths are not supported server-side: {path}. '
+                    'The server stores checkpoints on local disk and hands out twinkle:// URIs; '
+                    'load from oss:// / s3:// in a local/ray run instead.')
             return ResolvedLoadPath(
                 checkpoint_name=path,
                 checkpoint_dir=None,
@@ -653,3 +664,9 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         if resolved.checkpoint_dir is None:
             return path
         return (Path(resolved.checkpoint_dir) / resolved.checkpoint_name).as_posix()
+
+    def resolve_upload_dir(self, path: str) -> str:
+        """Resolve an owned checkpoint or a local path inside the caller's save directory."""
+        if path.startswith(self.path_prefix):
+            return self.resolve_checkpoint_dir(path)
+        return str(ensure_inside(self.training_run_manager.get_base_dir(), Path(path)))

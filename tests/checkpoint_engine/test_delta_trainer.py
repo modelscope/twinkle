@@ -76,8 +76,11 @@ def test_gather_slot_entries_sub_rounds_world1():
 
     owns_pg = not dist.is_initialized()
     if owns_pg:
+        from twinkle.utils.network import find_free_port
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29512")
+        # Free port, not a fixed one: parallel CI slots (or a concurrent pytest batch) on the
+        # same host would otherwise collide on the TCPStore listen (EADDRINUSE).
+        os.environ["MASTER_PORT"] = str(find_free_port())
         dist.init_process_group(backend="gloo", rank=0, world_size=1)
     try:
         torch.manual_seed(7)

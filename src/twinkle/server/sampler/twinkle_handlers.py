@@ -9,6 +9,7 @@ endpoints.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from collections.abc import Callable, Mapping
@@ -131,6 +132,7 @@ def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
                 tokens=list(sequence.tokens),
                 logprobs=list(sequence.logprobs) if sequence.logprobs is not None else None,
                 decoded=sequence.decoded,
+                text=sequence.new_state.messages[-1].get('content') if sequence.new_state is not None else None,
                 new_input_feature=(_serialize_input_feature(sequence.new_input_feature)
                                    if sequence.new_input_feature is not None else None),
             ) for sequence in response.sequences
@@ -276,12 +278,24 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         # Calculate metrics for queue scheduling. The body is wire-validated, so the
         # entries are models and ``input_ids`` is absent or a list of ints.
         input_tokens = sum(len(getattr(entry, 'input_ids', None) or ()) for entry in body.inputs)
-        return await self.submit_concurrent_and_peek(
+        request_id = body.tracked_request_id(token)
+        schedule = {}
+        if request_id is not None:
+            fingerprint = hashlib.sha256(f'{request.url.path}\n{body.model_dump_json()}'.encode()).hexdigest()
+            schedule = dict(request_id=request_id, submission_fingerprint=fingerprint, track_execution=True)
+
+        reply = await self.submit_concurrent_and_peek(
             _task,
             token=token,
             input_tokens=input_tokens,
             task_type='sample',
-            execution_scope=request_execution_scope(request))
+            execution_scope=request_execution_scope(request),
+            **schedule)
+        if request_id is not None:
+            record = await self.state.get_future(request_id)
+            if record is not None and record.get('submission_fingerprint') != fingerprint:
+                raise RequestRejectedError('client_sample_id is already bound to a different sampler request')
+        return reply
 
     @app.post('/twinkle/sample_to_data_plane', response_model=types.TaskEnvelope)
     async def sample_to_data_plane(
@@ -448,8 +462,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
     @app.post('/twinkle/apply_patch')
     async def apply_patch(
-            request: Request,
-            body: types.ApplyPatchRequest,
+            body: sampler_types.SamplerApplyPatchRequest,
             self: SamplerManagement = Depends(self_fn),
     ) -> None:
         patch_cls = deserialize_object(body.patch_cls)

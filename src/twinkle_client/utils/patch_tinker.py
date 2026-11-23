@@ -1,22 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""
-Patch tinker's internal_client_holder to bypass model_path prefix validation.
-
-This module patches the _create_sampling_session method to allow model_path
-without the 'tinker://' prefix requirement, and patches AsyncTinker.__init__
-to bypass the 'tml-' prefix validation for api_key.
-"""
+"""Adapt the pinned Tinker SDK to Twinkle authentication and training."""
 
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Union
+from typing import Any, Mapping
 
-from twinkle.protocol.headers import build_routing_headers
-from twinkle_client.http.context import get_api_key, get_request_id
+from twinkle.protocol.headers import build_request_headers
+from twinkle_client.http.context import capture_transport
 
 _patched = False
-_loss_fn_config_patched = False
 
 
 async def _create_sampling_session(self, model_path: str | None = None, base_model: str | None = None) -> str:
@@ -122,13 +115,12 @@ def _make_patched_service_client_init(original):
 
     def _patched_service_client_init(self, user_metadata=None, **kwargs):
         """Patched version of ServiceClient.__init__ that injects Twinkle-specific headers."""
-        # Resolve api_key with the same priority order used by AsyncTinker:
-        #   1. explicit kwarg  2. TINKER_API_KEY env var  3. TWINKLE_SERVER_TOKEN env var
+        context = capture_transport().context
         api_key = kwargs.get('api_key')
         if api_key is None:
-            api_key = get_api_key()
+            api_key = context.api_key
 
-        twinkle_headers = build_routing_headers(get_request_id(), 'Bearer ' + api_key)
+        twinkle_headers = build_request_headers(context.client_id, 'Bearer ' + api_key, client_id=context.client_id)
         # Merge: caller-supplied default_headers take precedence over twinkle_headers
         user_default_headers = kwargs.pop('default_headers', {})
         kwargs['default_headers'] = twinkle_headers | user_default_headers
@@ -201,7 +193,7 @@ def patch_tinker():
     1. InternalClientHolder._create_sampling_session to bypass 'tinker://' prefix validation
     2. AsyncTinker.__init__ to bypass 'tml-' prefix validation for api_key
     3. ParsedCheckpointTinkerPath.from_tinker_path to support both 'tinker://' and 'twinkle://' prefixes
-    4. _get_default_headers to inject Twinkle-specific headers
+    4. ServiceClient.__init__ to inject Twinkle-specific headers
     5. ServiceClient.create_full_training_client to enable full-parameter (non-LoRA) training
 
     This patch is idempotent - calling it multiple times has no additional effect.
