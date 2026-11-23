@@ -49,7 +49,6 @@ class PackedSeqParams:
     cp_scatter_cache: object = None
 
 
-@remote_class()
 def _record_collated(inputs, padding_side: str) -> None:
     """Save the batch AFTER collation when ``TWINKLE_COLLATED_PROBE`` names a directory.
 
@@ -88,6 +87,7 @@ def _record_collated(inputs, padding_side: str) -> None:
                os.path.join(root, f'collated.{os.getpid()}.{index:05d}.pt'))
 
 
+@remote_class()
 class InputProcessor:
     padding_map = {
         "input_ids": 0,

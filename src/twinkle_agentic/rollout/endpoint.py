@@ -234,7 +234,15 @@ class PolicyEndpoint(ABC):
             except ValueError as e:
                 return JSONResponse({'error': {'message': str(e)}}, status_code=400)
             request = EndpointRequest(messages=messages, tools=tools, params=params)
-            pending.put(request)
+            with self._lock:
+                # Re-check under the lock: close(key) pops the queue under this same lock, and a
+                # put landing after its drain would orphan the request -- its reply would never
+                # resolve and this coroutine would hang forever.
+                if self._queues.get(key) is not pending:
+                    return JSONResponse(
+                        {'error': {'message': f'episode {key!r} ended before this request was answered'}},
+                        status_code=401)
+                pending.put(request)
             try:
                 reply = await asyncio.wrap_future(request.reply)
             except Exception as e:  # noqa

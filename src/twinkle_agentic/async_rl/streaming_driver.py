@@ -550,8 +550,8 @@ class StreamingDriver:
             return {'handed': self._handed, 'prompts_drawn': self._prompt_seq}
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
-    def close(self) -> None:
-        """Stop admitting, stop the episodes in flight and end the background thread."""
+    def close(self) -> dict:
+        """Stop admitting, finish shutdown, and return terminal statistics before releasing the worker."""
         with self._lock:
             self._closed = True
             episodes = [episode for group in self._groups.values()
@@ -565,6 +565,9 @@ class StreamingDriver:
                     logger.warning(f'StreamingDriver.close: stopping {episode.episode_id} failed: {exc}')
         if self._thread is not None:
             self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                raise TimeoutError('Streaming driver did not finish shutdown within 10 seconds.')
+        return self.stats()
 
     # ------------------------------------------------------------------ background loop
 

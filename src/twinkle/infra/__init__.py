@@ -16,8 +16,7 @@ from twinkle.notifier import Notifier
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, get_logger, requires
 
 from . import _torch_setup
-from .dispatch import _collect_func, _dispatch_args, _get_device_mesh_param_name, _prepare_lazy_collect, \
-    remote_class, remote_function
+from .dispatch import _collect_func, _dispatch_args, _get_device_mesh_param_name, remote_class, remote_function
 
 __all__ = ['get_device_placement', 'initialize', 'remote_class', 'remote_function', 'shutdown']
 

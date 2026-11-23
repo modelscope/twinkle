@@ -661,6 +661,8 @@ class DeviceGroup:
     gpus_per_worker: int = 1
     visible_devices: Optional[Union[List[str], List[int], str, int]] = None
     shared: bool = False
+    #: Node addresses paired with visible_devices for a view of an existing allocation.
+    node_addresses: Optional[List[str]] = None
     _device_mesh: Dict[str, DeviceMesh] = field(default_factory=dict)
 
 

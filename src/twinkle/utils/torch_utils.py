@@ -37,6 +37,37 @@ def clone_state_dict_to_cpu(state_dict: Mapping[str, Any]) -> dict:
     return cloned
 
 
+def values_agree(existing, row_values) -> bool:
+    """Compare an explicit value against per-row values element-wise.
+
+    A bare ``existing != row_values`` traps on tensors: tensor != list yields an element-wise
+    bool tensor whose truthiness raises even when both sides carry identical values. Compare
+    row-wise instead, with torch.equal for tensor pairs; differing shapes (e.g. a padded 2D
+    value against ragged rows) count as disagreement -- the caller must pass one form. A scalar
+    ``existing`` agrees only with a single row.
+    """
+    import torch
+    if torch.is_tensor(existing):
+        if existing.dim() == 0 or existing.shape[0] != len(row_values):
+            return False
+        pairs = zip((existing[i] for i in range(existing.shape[0])), row_values)
+    elif isinstance(existing, (list, tuple)):
+        if len(existing) != len(row_values):
+            return False
+        pairs = zip(existing, row_values)
+    else:
+        return len(row_values) == 1 and bool(existing == row_values[0])
+    for left, right in pairs:
+        if torch.is_tensor(left) or torch.is_tensor(right):
+            left_t = torch.as_tensor(left)
+            right_t = torch.as_tensor(right)
+            if left_t.shape != right_t.shape or not torch.equal(left_t, right_t):
+                return False
+        elif left != right:
+            return False
+    return True
+
+
 def pad_sequence_to_length(
     tensor: 'torch.Tensor',
     max_seq_len: int,

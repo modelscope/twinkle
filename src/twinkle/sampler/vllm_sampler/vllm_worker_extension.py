@@ -58,28 +58,13 @@ def _cuda_visible_device(device: torch.device) -> str:
     return selectors[device_index]
 
 
-def _ray_node_manager_address() -> str:
-    """The ray node address of the worker's node, as ``ray.nodes()`` reports it.
-
-    The delta receiver placement (``checkpoint_engine/delta/rollout/mixin.py``) looks the
-    worker's node up by ``ray.nodes()[...]['NodeManagerAddress']``. Reporting an independently
-    discovered interface IP (``find_node_ip`` picks the alphabetically-first non-virtual NIC)
-    diverges from ray's address on multi-NIC hosts -- ray binds the default-route NIC -- and the
-    lookup raises ``KeyError`` (defect111). Use ray's own address so the two sides always agree;
-    fall back to ``find_node_ip`` only when ray is not initialized (local single-process mode).
-    """
-    import ray
-    try:
-        # Ray actor/worker processes connect via the raylet without calling ray.init(), so
-        # ray.is_initialized() is False there even though the runtime context and GCS client
-        # are live. Use the runtime context directly; fall back only if it is unavailable.
-        ctx = ray.get_runtime_context()
-        node_id = ctx.get_node_id() if hasattr(ctx, 'get_node_id') else ctx.node_id
-        for node in ray.nodes():
-            if node.get('NodeID') == node_id and node.get('Alive'):
-                return node['NodeManagerAddress']
-    except Exception:
-        pass
+def _worker_node_address() -> str:
+    """Use this process's initialization address; standalone engines discover their local interface."""
+    address = os.environ.get('TWINKLE_NODE_IP')
+    if address:
+        return address
+    if os.environ.get('WORKER_NAME'):
+        raise RuntimeError('Distributed workers require TWINKLE_NODE_IP from their initialization context.')
     from twinkle.utils import find_node_ip
     return find_node_ip()
 
@@ -179,7 +164,7 @@ class TwinkleWorkerExtension:
 
     def delta_receiver_metadata(self) -> 'DeltaWorkerMetadata':
         return {
-            'node_ip': _ray_node_manager_address(),
+            'node_ip': _worker_node_address(),
             'device_uuid': str(torch.cuda.get_device_properties(self.device).uuid),
             'cuda_visible_device': _cuda_visible_device(self.device),
             'zmq_handle': self.delta_ipc_endpoint(),

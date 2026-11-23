@@ -289,13 +289,14 @@ class VLLMEngine(BaseSamplerEngine):
         # The sender owns the reusable bucket and IPC handle across updates.
         self._weight_sender = None
 
+        # defect58 part②: a parent-death pipe keeps every EngineCore subprocess tied to this
+        # process -- the kernel closes the write end when THIS process dies (even SIGKILL) and the
+        # child exits on EOF, so a dead raylet can no longer strand the GPU's memory.
+        from .engine_core_reaper import install_engine_core_parent_watch
+        install_engine_core_parent_watch()
+
         # Initialize engine
         self.engine = self._create_engine()
-
-        # defect58 part②: record EngineCore subprocess PIDs so the driver can reap them directly if
-        # the raylet dies first and sampler.shutdown() (a ray RPC) can no longer reach this actor.
-        from .engine_core_reaper import record_engine_core_pids
-        record_engine_core_pids(self.engine)
 
         # Tokenizer is lazy loaded via get_tokenizer()
         self._tokenizer = None

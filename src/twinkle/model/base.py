@@ -329,6 +329,11 @@ class TrainableModel(ABC):
             self._async_write_executor = None
             executor.shutdown(wait=True)
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def close(self) -> None:
+        """Finish outstanding checkpoint writes before releasing this model's replicas."""
+        self.shutdown_async_saves()
+
     def __del__(self):
         # Best-effort: an unjoined in-flight write at teardown loses the checkpoint silently otherwise.
         executor = getattr(self, '_async_write_executor', None)
@@ -415,6 +420,13 @@ class TrainableModel(ABC):
     @abstractmethod
     def add_metric(self, metric_cls: Union[Metric, str], is_training: Optional[bool] = None, **kwargs) -> None:
         ...
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def perf_on(self, *, profiler_spec=None):
+        """Enable profiling on this model's unwrapped modules."""
+        from twinkle.perf import Perf
+        model = self.strategy.unwrap_model(self.model)
+        self._profiler = Perf.enable_process(model=model, profiler_spec=profiler_spec)
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def memory_stats(self, *, synchronize: bool = False) -> dict[str, int]:
@@ -610,6 +622,7 @@ class TrainableModel(ABC):
             return inputs, kwargs
         _record_rollout_identity(rows)
         if lift:
+            from twinkle.utils.torch_utils import values_agree
             kwargs = dict(kwargs)
             for field in _LIFTED_TRAJECTORY_FIELDS:
                 row_values = [row.get(field) for row in rows]
@@ -622,7 +635,7 @@ class TrainableModel(ABC):
                 existing = kwargs.get(field)
                 if existing is None:
                     kwargs[field] = row_values
-                elif existing != row_values:
+                elif not values_agree(existing, row_values):
                     # Both sides present: the explicit kwarg wins only when it repeats the same
                     # values; a silent override would mask a stale parallel list.
                     raise ValueError(

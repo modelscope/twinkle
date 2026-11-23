@@ -183,32 +183,75 @@ async def _stream_queue(q, sentinel, request_id: str, total_timeout: float, sing
             pass
 
 
-async def _await_futures(futures: List[Any]):
+async def _await_futures(service: SamplerManagement, futures: List[Any], request_ids: List[str]):
     """Collect submit futures off the event loop (``result()`` blocks); the first failure is raised.
 
     Each future is the sampler's submit return: waiting on it is a LOCAL operation on the handle --
-    no per-status RPC round trip. Siblings of a failed request run to their own end on the engine.
+    no per-status RPC round trip. On failure the group's result is discarded, so its siblings are
+    aborted instead of running to an end nobody reads; each stop is isolated so one failure cannot
+    block the rest, and the original exception is what propagates.
     """
     loop = asyncio.get_running_loop()
-    results = await asyncio.gather(*[loop.run_in_executor(None, future.result) for future in futures])
-    return [response for result in results for response in result]
+    waiters = [loop.run_in_executor(None, future.result) for future in futures]
+    results_task = asyncio.gather(*waiters)
+    try:
+        results = await asyncio.shield(results_task)
+        return [response for result in results for response in result]
+    except BaseException:
+        await _abort_group(service, waiters, request_ids)
+        if results_task.done() and not results_task.cancelled():
+            results_task.exception()
+        raise
+
+
+async def _abort_group(service, waiters, request_ids):
+    """Keep the sampling guard until accepted submissions settle or the backend is invalidated."""
+    async def settle():
+        try:
+            async with asyncio.timeout(service.task_queue_config.effective_execution_timeout):
+                try:
+                    await service.call_backend(service.sampler.abort_requests, request_ids)
+                except Exception as error:
+                    logger.warning('Failed to abort sibling generations %s', request_ids, exc_info=True)
+                    service.sampling_guard.invalidate_weights(error)
+                await asyncio.shield(asyncio.gather(*waiters, return_exceptions=True))
+        except BaseException as error:
+            service.sampling_guard.invalidate_weights(error)
+            logger.warning('Sibling generations did not settle: %s', request_ids, exc_info=True)
+
+    await _finish_cleanup(asyncio.create_task(settle()))
+
+
+async def _finish_cleanup(task):
+    """Defer repeated caller cancellation until the cleanup task has terminated."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
 
 
 def _submit_group(service: SamplerManagement, inputs: List[Any], params: Any, *,
-                  adapter_name: str, adapter_path: Optional[str]) -> List[Any]:
-    """Submit one generation per input; returns the futures in input order.
+                  adapter_name: str, adapter_path: Optional[str],
+                  futures: Optional[List[Any]] = None,
+                  request_ids: Optional[List[str]] = None) -> tuple[List[Any], List[str]]:
+    """Submit one generation per input; returns (futures, request_ids) in input order.
 
     Synchronous on purpose: the caller wraps it in ``call_backend`` (the backend gate's executor),
     which is also what hands each future back across the event-loop boundary. Each trajectory gets
-    a request_id here, which the engine uses as its request id.
+    a request_id here, which the engine uses as its request id; the ids come back alongside the
+    futures so a failed group can abort its siblings by the same ids.
     """
-    futures: List[Any] = []
+    futures = [] if futures is None else futures
+    request_ids = [] if request_ids is None else request_ids
     for entry in inputs:
         trajectory = dict(entry)
         trajectory.setdefault('request_id', uuid.uuid4().hex)
+        request_ids.append(trajectory['request_id'])
         futures.append(service.sampler.submit(trajectory, params, adapter_name=adapter_name,
                                               adapter_path=adapter_path))
-    return futures
+    return futures, request_ids
 
 
 def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -322,10 +365,30 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             # result is the DataRef. One submit per input (num_samples rides SamplingParams),
             # each handing back a future the handler awaits locally -- no per-status RPC.
             async def generate():
-                futures = await self.call_backend(
+                futures, request_ids = [], []
+                submission = asyncio.create_task(self.call_backend(
                     _submit_group, self, inputs, params,
-                    adapter_name=full_adapter_name, adapter_path=adapter_path)
-                return await _await_futures(futures)
+                    adapter_name=full_adapter_name, adapter_path=adapter_path,
+                    futures=futures, request_ids=request_ids))
+                try:
+                    await asyncio.shield(submission)
+                except BaseException:
+                    async def settle_submission():
+                        try:
+                            async with asyncio.timeout(self.task_queue_config.effective_execution_timeout):
+                                await asyncio.shield(submission)
+                        except BaseException as error:
+                            if not submission.done():
+                                self.sampling_guard.invalidate_weights(error)
+                            if submission.done() and not submission.cancelled():
+                                submission.exception()
+                        loop = asyncio.get_running_loop()
+                        waiters = [loop.run_in_executor(None, future.result) for future in futures]
+                        await _abort_group(self, waiters, request_ids)
+
+                    await _finish_cleanup(asyncio.create_task(settle_submission()))
+                    raise
+                return await _await_futures(self, futures, request_ids)
 
             responses = await self.sampling_guard.run(generate)
             rows, tags = _build_rollout_rows_and_tags(

@@ -14,6 +14,7 @@ import inspect
 import os
 import threading
 import time
+import uuid
 import weakref
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -407,8 +408,7 @@ class _ContinuousCall:
     results in the caller's order (a list for a list call, the single result otherwise).
     """
 
-    def __init__(self, view: _PoolView, func_name: str, args, kwargs, batch_len: Optional[int], sticky_value,
-                 has_ref: bool):
+    def __init__(self, view: _PoolView, func_name: str, args, kwargs, batch_len: Optional[int], sticky_value):
         self.view = view
         self.remote_name = _WORKER_ASYNC_PREFIX + func_name
         self.func_name = func_name
@@ -416,7 +416,7 @@ class _ContinuousCall:
         self.kwargs = kwargs
         self.batch_len = batch_len
         self.sticky_value = sticky_value
-        self.has_ref = has_ref
+        self.call_id = uuid.uuid4().hex
         self.future: Future = Future()
         self.results: List[Any] = [None] * (batch_len or 1)
         self.pending = 0
@@ -446,9 +446,7 @@ class _ContinuousCall:
                 sub_args, sub_kwargs = self.args, dict(self.kwargs)
             else:
                 sub_args, sub_kwargs = _cw_sub_args(self.args, self.kwargs, part, self.batch_len)
-            if self.has_ref:
-                # The worker materialises nested refs itself; one worker means no re-slicing there.
-                sub_kwargs['_dispatch_context'] = (1, 0, True)
+            sub_kwargs['_dispatch_context'] = self.call_id
             try:
                 ref = getattr(actor, self.remote_name).remote(*sub_args, **sub_kwargs)
             except BaseException as exc:  # noqa
@@ -462,14 +460,21 @@ class _ContinuousCall:
 
     def _on_part(self, worker_id, part, value, exc):
         self.view.release(worker_id, len(part))
-        if exc is not None and _is_retryable(exc) and self.retries < _CW_MAX_RETRIES:
+        if exc is not None and _is_retryable(exc):
             import ray
 
-            self.view.evict(worker_id, dead=isinstance(exc, ray.exceptions.RayActorError))
+            # Check-and-increment under one lock: concurrent failure callbacks must not both
+            # read the pre-increment count and slip past the retry cap together.
             with self.lock:
-                self.retries += 1
-            _retry_executor().submit(self._submit, part, True)
-            return
+                if self.retries >= _CW_MAX_RETRIES:
+                    retry = False
+                else:
+                    self.retries += 1
+                    retry = True
+            if retry:
+                self.view.evict(worker_id, dead=isinstance(exc, ray.exceptions.RayActorError))
+                _retry_executor().submit(self._submit, part, True)
+                return
         if exc is not None:
             self._fail(exc)
             return

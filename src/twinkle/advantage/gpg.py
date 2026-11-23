@@ -26,7 +26,7 @@ class GPGAdvantage(Advantage):
 
     _reads_f_norm = True
 
-    @remote_function(execute='first', collect='first', stash=(0,))
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=(0,))
     def __call__(self, trajs, **kwargs):
         """Trajectories and forward lanes in, training-target columns out -- see :class:`Advantage`."""
         return self._call(trajs, **kwargs)

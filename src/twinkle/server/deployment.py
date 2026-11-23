@@ -46,6 +46,38 @@ from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 
+
+_SERVE_PATCH_APPLIED = False
+
+
+def _normalized_request_context(self, app_name, handle, route, proxy_request, internal_request_id):
+    """Accept normalized multiplexing headers without changing other request context fields."""
+    from ray.serve._private.constants import SERVE_MULTIPLEXED_MODEL_ID
+    from ray.serve import context
+
+    info = {'route': route, 'app_name': app_name, '_internal_request_id': internal_request_id,
+            'is_http_request': True}
+    for key, value in proxy_request.headers:
+        name = key.decode()
+        if name.replace('-', '_') == SERVE_MULTIPLEXED_MODEL_ID:
+            model_id = value.decode()
+            handle = handle.options(multiplexed_model_id=model_id)
+            info['multiplexed_model_id'] = model_id
+        if name in ('x-request-id', 'x-ray-serve-request-id'):
+            info['request_id'] = value.decode()
+    context._serve_request_context.set(context._RequestContext(**info))
+    return handle, info.get('request_id')
+
+
+def apply_ray_serve_patches():
+    """Install the server's HTTP header adaptation in this process."""
+    global _SERVE_PATCH_APPLIED
+    if _SERVE_PATCH_APPLIED:
+        return
+    from ray.serve._private.proxy import HTTPProxy
+    HTTPProxy.setup_request_context_and_handle = _normalized_request_context
+    _SERVE_PATCH_APPLIED = True
+
 # Type aliases for the per-builder customization points.
 RegisterRoutes = Callable[[FastAPI, Callable[[], Any]], None]
 OnShutdown = Callable[[Any], Awaitable[None]]
