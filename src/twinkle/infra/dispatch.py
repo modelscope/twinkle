@@ -938,7 +938,14 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         # what lets the ref-carrying dispatch path put it on the wire. The body's own parameters are
         # kept in the pin rather than replaced with a var-args form, so ``inspect.signature`` stays
         # honest for anyone reading the component.
-        _params = list(inspect.signature(func).parameters.values())
+        # Ray reads ``inspect.signature(inspect.unwrap(method))`` and unwrap descends the WHOLE
+        # ``__wrapped__`` chain to the innermost body. An intermediate decorator (``@timed`` under
+        # ``@remote_function``, e.g. CheckpointEngineMixin.send_weights_to_vllm) inserts a
+        # ``__wrapped__`` layer: a pin on ``func`` (the timed wrapper) is bypassed because unwrap
+        # lands on the undecorated body, whose signature lacks ``_dispatch_context`` and Ray refuses
+        # the dispatch kwarg. Pin the innermost body that unwrap actually lands on.
+        _body = inspect.unwrap(func)
+        _params = list(inspect.signature(_body).parameters.values())
         if not any(_p.name == '_dispatch_context' for _p in _params):
             _context = inspect.Parameter('_dispatch_context', inspect.Parameter.KEYWORD_ONLY,
                                          default=None)
@@ -946,7 +953,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             _at = next((_i for _i, _p in enumerate(_params)
                         if _p.kind is inspect.Parameter.VAR_KEYWORD), len(_params))
             _params.insert(_at, _context)
-        func.__signature__ = inspect.Signature(parameters=_params)
+        _body.__signature__ = inspect.Signature(parameters=_params)
 
         # ``self`` must be declared here: Ray extracts an actor method's signature with
         # ``extract_signature(func, ignore_first=True)``, which drops the first parameter on the
