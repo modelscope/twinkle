@@ -26,13 +26,16 @@ These instructions help AI agents work productively in this repo. Focus on concr
 - **Hub usage:** `HubOperation` routes to HF or ModelScope by `hf://` or `ms://` prefixes. Dataset/model download/push helpers in [src/twinkle/hub/hub.py](../src/twinkle/hub/hub.py).
 - **Plugin loading:** Use `Plugin.load_plugin(id, Base)` for remote code from hubs; guarded by `trust_remote_code()` to prevent unsafe execution. See [src/twinkle/utils/loader.py](../src/twinkle/utils/loader.py).
 - **Multi-LoRA conventions:**
-  - `MultiLoraTransformersModel` manages multiple LoRA adapters on a shared base model. Adapter training keeps the base weights frozen.
+  - `MultiLoraTransformersModel` wraps a base Transformers model via `MultiAdapter` to manage multiple LoRA adapters.
+  - FSDP is unsupported for Multi-LoRA (`fsdp_world_size == 1` enforced). Adapter params are strictly controlled to avoid training base weights.
   - Adapter ops are routed through remote functions and grouped by DP process groups.
 
 ## Developer Workflows
-- **Install:** For a development server with Ray Serve, run `python -m pip install -e '.[server,rl]'`.
+- **Install:** Python 3.11+. Install with Poetry or pip.
+  - Poetry: `poetry install --with transformers,ray`
+  - Pip (editable): `pip install -e .[transformers,ray]`
 - **Run tests:**
-  - Unit tests: `python -m pytest tests/infra/test_infra_graph.py`
+  - Unit tests: `python -m unittest tests/infra/test_infra_graph.py`
 - **Local single-process dev:**
   - Initialize infra: `twinkle.initialize(mode='local', seed=42)`
   - Inspect device placement: call `twinkle.infra.get_device_placement()`.
@@ -42,7 +45,7 @@ These instructions help AI agents work productively in this repo. Focus on concr
     - `cd cookbook/client/server/megatron`
     - `twinkle-server launch -c server_config.yaml`
     - Check `http_options` in the YAML for the listening address and port.
-  - Model routes include `/add_adapter_to_model` and `/forward_backward`. See [src/twinkle/server/model/twinkle_handlers.py](../src/twinkle/server/model/twinkle_handlers.py).
+  - Model app binds `MultiLoraTransformersModel` and exposes routes like `/add_adapter_to_model`, `/forward`, `/calculate_loss`, etc. See [src/twinkle/server/model/twinkle_handlers.py](../src/twinkle/server/model/twinkle_handlers.py).
 - **vLLM inference:** Use `VLLMEngine` with engine args; LoRA weight sync via `patch.vllm_lora_weights`. See [src/twinkle/sampler/vllm_sampler/vllm_engine.py](../src/twinkle/sampler/vllm_sampler/vllm_engine.py).
 
 ## Conventions & Gotchas

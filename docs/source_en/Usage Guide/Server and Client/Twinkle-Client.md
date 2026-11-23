@@ -242,7 +242,7 @@ export TWINKLE_DISTILL_SERVER_STUDENT_PATH=/server/path/to/student-model
 python cookbook/client/twinkle/online_distillation.py --method opd-rl --model distill-student --steps 4
 ```
 
-Switch to `--method gkd` to run GKD. By default, the teacher returns its 32 most likely tokens at each position, with probabilities normalized over those candidates. Set `--gkd-top-k 64` to compare more candidates. `--gkd-top-k 0` requests the full vocabulary for a small reference run and can produce large HTTP payloads. Compare accuracy and output length on the same held-out questions in `eval=before` and `eval=after`. Four steps demonstrate the flow. Match the training example count and evaluation settings and use multiple seeds to compare learning.
+Switch to `--method gkd` to run GKD. By default, the teacher returns its 32 most likely tokens at each position, with probabilities normalized over those candidates. Set `--gkd-top-k 64` to compare more candidates. Compare accuracy and output length on the same held-out questions in `eval=before` and `eval=after`. Four steps demonstrate the flow. Match the training example count and evaluation settings and use multiple seeds to compare learning.
 
 (client-async-grpo)=
 ## Client-side Async GRPO

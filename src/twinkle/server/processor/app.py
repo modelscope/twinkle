@@ -79,13 +79,14 @@ class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
         if callable(close):
             await asyncio.to_thread(close)
         self.resource_dict.pop(processor_id, None)
+        # A failed quota release must leave the closed processor unregistered.
+        self.unregister_resource(processor_id)
         if info is not None:
             await self.state.release_processor_quota(
                 info['token'],
                 processor_id,
                 lease_seconds=self._processor_quota_lease_seconds,
             )
-        self.unregister_resource(processor_id)
 
 
 def build_processor_app(ncpu_proc_per_node: int,

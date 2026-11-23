@@ -74,20 +74,8 @@ def response_scores(model, rows, token_rows, **kwargs):
 
 def distillation_signal(method, model, teacher, pairs, sequences, features, *, gkd_top_k=GKD_TOP_K):
     if method == 'gkd':
-        if gkd_top_k:
-            # Score the exact encoded rows used for training. The teacher returns only K candidates per position.
-            return teacher.forward_only(inputs=features, distillation_topk=gkd_top_k).result
-        # Explicit full-vocabulary comparison for short, small batches.
-        result = teacher.forward_only(inputs=features, return_logits=True).result
-        batch_size = len(features)
-        length = max(len(feature['input_ids']) for feature in features)
-        logits = np.asarray(result['logits'], dtype=np.float32)
-        if logits.ndim == 2:
-            logits = logits[None, ...]
-        if logits.ndim != 3 or logits.shape[:2] != (batch_size, length):
-            raise RuntimeError(
-                f'Expected teacher logits shaped [{batch_size}, {length}, vocab_size], got {logits.shape}.')
-        return {'teacher_logits': logits.tolist()}
+        # Score the exact encoded rows used for training. The teacher returns K candidates per position.
+        return teacher.forward_only(inputs=features, distillation_topk=gkd_top_k).result
 
     token_rows = [seq.tokens for seq in sequences]
     if method == 'opd-rl':
@@ -194,14 +182,14 @@ if __name__ == '__main__':
     parser.add_argument('--model', default=STUDENT_NAME, help='Student model name published by the server')
     parser.add_argument('--batch-size', type=int, help='Training examples per step (default: 1 for GKD, 2 otherwise)')
     parser.add_argument('--gkd-top-k', type=int, default=GKD_TOP_K,
-                        help='Teacher candidates per token position (default: %(default)s; 0 for full vocabulary)')
+                        help='Teacher candidates per token position (default: %(default)s)')
     args = parser.parse_args()
     if args.steps < 1 or not 1 <= args.eval_size <= 64:
         parser.error('steps must be positive and eval-size must be between 1 and 64')
     if args.batch_size is not None and args.batch_size < 1:
         parser.error('batch-size must be positive')
-    if args.gkd_top_k < 0 or args.gkd_top_k == 1:
-        parser.error('gkd-top-k must be 0 or at least 2')
+    if args.gkd_top_k < 2:
+        parser.error('gkd-top-k must be at least 2')
     student_path = os.getenv('TWINKLE_DISTILL_STUDENT_PATH')
     teacher_path = os.getenv('TWINKLE_DISTILL_TEACHER_PATH')
     if args.method != 'opsd' and not student_path:

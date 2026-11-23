@@ -242,7 +242,7 @@ export TWINKLE_DISTILL_SERVER_STUDENT_PATH=/server/path/to/student-model
 python cookbook/client/twinkle/online_distillation.py --method opd-rl --model distill-student --steps 4
 ```
 
-将方法改为 `gkd` 可运行 GKD。教师默认在每个位置选出最可能的 32 个 token，概率在这 32 个候选内归一化。用 `--gkd-top-k 64` 可以比较更多候选。`--gkd-top-k 0` 用于小规模的完整词表对照，请求体可能很大。比较 `eval=before` 和 `eval=after` 的同一批题，检查答对数和输出长度。四步用于学会跑流程。比较收益时需要匹配训练样本数和评测设置，并用多个种子复跑。
+将方法改为 `gkd` 可运行 GKD。教师默认在每个位置选出最可能的 32 个 token，概率在这 32 个候选内归一化。用 `--gkd-top-k 64` 可以比较更多候选。比较 `eval=before` 和 `eval=after` 的同一批题，检查答对数和输出长度。四步用于学会跑流程。比较收益时需要匹配训练样本数和评测设置，并用多个种子复跑。
 
 (client-async-grpo)=
 ## 客户端异步 GRPO
