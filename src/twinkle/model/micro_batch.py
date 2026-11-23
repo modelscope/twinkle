@@ -54,7 +54,10 @@ class MicroBatchConfig:
         )
 
 
-def sequence_length(model_input: dict[str, Any]) -> int:
+def sequence_length(model_input: dict[str, Any] | list | tuple) -> int:
+    """Return the token count of one encoded row or packed group."""
+    if isinstance(model_input, (list, tuple)):
+        return sum(sequence_length(item) for item in model_input)
     input_ids = model_input["input_ids"]
     return int(input_ids.shape[-1]) if hasattr(input_ids, "shape") else len(input_ids)
 
@@ -197,7 +200,7 @@ def _reorder_micro_batches(
 
 
 def plan_micro_batches(
-    inputs: list[dict[str, Any]],
+    inputs: list[dict[str, Any] | list | tuple],
     config: MicroBatchConfig,
     *,
     padding_free: bool,
@@ -212,8 +215,6 @@ def plan_micro_batches(
     """
     if not inputs:
         raise ValueError("cannot plan micro-batches for empty inputs")
-    if not config.dynamic_batching and config.micro_batch_order == "none":
-        return _fixed_plan(len(inputs), config.micro_batch_size)
     lengths = [sequence_length(model_input) for model_input in inputs]
     return plan_micro_batches_for_lengths(
         lengths, config, padding_free=padding_free, min_micro_batches=min_micro_batches
