@@ -1,8 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Initialize server configuration, deploy applications, and own their shutdown."""
 from __future__ import annotations
-
-import json
 import os
 import signal
 import threading
@@ -11,43 +9,28 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import json
+
 from twinkle import get_logger
 from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map, extract_model_alias
-from twinkle.patch.ray_serve import apply_ray_serve_patches
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.application_spec import ApplicationSpec
-from twinkle.server.config.resources import build_propagated_env_vars, build_worker_env_vars
+from twinkle.server.config.env_propagation import build_propagated_env_vars, build_worker_env_vars
+from twinkle.utils.loader import WORKER_SETUP_HOOK
 from .builder_registry import get_builders, resolve_builder
 
 logger = get_logger()
 
 
-def _worker_setup_hook() -> None:
-    """Ray ``worker_process_setup_hook``: apply the Serve patches, then the env-var hook.
-
-    Composes the two things every twinkle worker may need at process start: the Ray Serve
-    monkey-patches (proxy actors) and :func:`twinkle.utils.loader.run_worker_setup_hook`
-    (startup plugin registration, driven by ``TWINKLE_WORKER_SETUP_HOOK``). Keeping them in one
-    job-level hook is what makes the composition reach every worker process -- Ray only honours
-    ``worker_process_setup_hook`` at ``ray.init`` time, not per actor.
-    """
-    from twinkle.patch.ray_serve import _apply_patch_in_worker_process
-    from twinkle.utils.loader import run_worker_setup_hook
-
-    _apply_patch_in_worker_process()
-    run_worker_setup_hook()
-
-
 def build_ray_runtime_env() -> dict[str, Any]:
     """The ``runtime_env`` every Ray worker in a twinkle server needs.
 
-    Bundles the Ray Serve monkey-patches (which must be re-applied inside worker processes such as the
-    Serve ProxyActor) and the env-var worker setup hook with the telemetry/persistence env vars
+    Bundles the worker setup hook with the telemetry/persistence env vars
     propagated from the driver. Shared by the launcher's own ``ray.init`` and by any caller that starts
     a local Ray head before handing off to :func:`launch_server` (e.g. swift's deploy recipe), so both
     seed worker processes identically rather than each re-deriving the merge.
     """
-    runtime_env = {'worker_process_setup_hook': 'twinkle.server.launcher.server_launcher._worker_setup_hook'}
+    runtime_env = {'worker_process_setup_hook': WORKER_SETUP_HOOK}
     propagated_env_vars = build_propagated_env_vars()
     if propagated_env_vars:
         merged_env_vars = dict(runtime_env.get('env_vars') or {})
@@ -60,7 +43,7 @@ def ensure_ray_cluster(*, namespace: str, address: str | None = None) -> None:
     """Bring up (or attach to) the Ray runtime a Serve deployment needs.
 
     The deploy-side entry for Ray bring-up: with no cluster running this starts a local head seeded
-    with :func:`build_ray_runtime_env` (the patches Ray Serve's proxy actors need); ``address='auto'``
+    with :func:`build_ray_runtime_env`; ``address='auto'``
     attaches to an existing cluster instead. Idempotent -- an already-initialized runtime is left
     untouched. Both the launcher itself and a caller that starts the head before handing off to
     :func:`launch_server` (e.g. swift's deploy recipe) go through here, so worker seeding stays
@@ -106,6 +89,8 @@ class ServerLauncher:
         return resolve_builder(import_path, self._get_builders())
 
     def _configure_environment(self) -> None:
+        if self.config.trust_remote_code is not None:
+            os.environ['TWINKLE_TRUST_REMOTE_CODE'] = '1' if self.config.trust_remote_code else '0'
         if any(app.import_path in ('model', 'sampler') for app in self.config.applications):
             os.environ['TWINKLE_STATE_RAY_NAMESPACE'] = self.ray_namespace
         os.environ.update(self.config.persistence.to_env_vars())
@@ -295,6 +280,7 @@ class ServerLauncher:
 
     def _shutdown(self, *, raise_errors: bool = True) -> None:
         from functools import partial
+
         from ray import serve
 
         from twinkle.server.telemetry import flush_telemetry_safely
@@ -324,7 +310,6 @@ class ServerLauncher:
         if not self.config.applications:
             logger.warning('No applications configured')
             return
-        apply_ray_serve_patches()
         self._configure_environment()
         self._init_ray()
         try:

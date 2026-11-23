@@ -6,7 +6,8 @@ from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
 from twinkle.protocol.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
-                                            SampleResponseModel, SampleResponseModelList, SamplerSetTemplateRequest,
+                                            SampleResponseModel, SampleResponseModelList, SamplerApplyPatchRequest,
+                                            SamplerSetTemplateRequest,
                                             SamplerSetTemplateResponse)
 from twinkle_client._request_builder import build_request
 from twinkle_client.http import ClientTransport
@@ -214,7 +215,6 @@ class vLLMSampler:
 
     @_guarded_operation
     def apply_patch(self, patch_cls: str, **kwargs) -> None:
-        """Apply a patch to the model."""
-        from twinkle.protocol.types.model import ApplyPatchRequest
-        body = build_request(ApplyPatchRequest, patch_cls=patch_cls, adapter_name=self.adapter_name or '', **kwargs)
+        """Apply a patch to the sampler instance."""
+        body = build_request(SamplerApplyPatchRequest, patch_cls=patch_cls, **kwargs)
         self._transport.post_model(f'{self.server_url}/apply_patch', body)

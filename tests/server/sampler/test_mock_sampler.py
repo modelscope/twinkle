@@ -210,8 +210,36 @@ def test_default_new_input_feature_appends_sampled_tokens() -> None:
     assert 'input_ids' in seq.new_input_feature
     assert seq.new_input_feature['input_ids'] == [1, 2, 3] + list(seq.tokens)
     # Prior context stays non-trainable; sampled tokens are trainable (their ids).
-    assert seq.new_input_feature['labels'] == [-100, -100, -100] + list(seq.tokens)
+    assert seq.new_input_feature['labels'] == [-100, -100] + list(seq.tokens) + [-100]
+    assert seq.new_input_feature['completion_mask'] == [0, 0, 1, 1, 1, 1, 0]
     assert seq.new_input_feature['length'] == 3 + len(seq.tokens)
+    second = s.sample(seq.new_input_feature, SamplingParams(max_tokens=2))[0].sequences[0]
+    assert second.new_input_feature['labels'] == [-100, -100] + seq.tokens + second.tokens + [-100]
+
+
+def test_set_template_does_not_resolve_model_assets():
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from twinkle.server.sampler.concurrency import SamplerConcurrency
+    from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
+
+    async def call_backend(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    sampler = MockSampler('model')
+    service = SimpleNamespace(sampler=sampler, _template_pinned=False,
+                              sampling_guard=SamplerConcurrency(), call_backend=call_backend)
+    app = FastAPI()
+    _register_twinkle_sampler_routes(app, lambda: service)
+    with TestClient(app) as client:
+        response = client.post('/twinkle/set_template', json={
+            'template_cls': 'Qwen3_5Template', 'init_kwargs': {'model_id': 'model'},
+        })
+    assert response.status_code == 200, response.text
+    assert sampler.sample(InputFeature(input_ids=[1, 2]), SamplingParams(max_tokens=2))
 
 
 def test_default_backward_compatible_stop_reason_and_decoded() -> None:

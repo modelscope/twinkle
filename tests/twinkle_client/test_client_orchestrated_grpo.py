@@ -1,218 +1,125 @@
-from __future__ import annotations
+from threading import Lock
+from types import SimpleNamespace
 
-import asyncio
-import importlib.util
-import sys
-from pathlib import Path
-
-from twinkle.protocol.types import DataRef
-
-MODULE_PATH = (Path(__file__).parents[2] / 'cookbook' / 'client' / 'async_rl' / 'client_orchestrated_grpo.py')
+from cookbook.client.async_rl import client_orchestrated_grpo as recipe
+from cookbook.client.twinkle import short_math_grpo
+from twinkle.data_format import SampleResponse, SampledSequence
+from twinkle.dataset import DatasetMeta
 
 
-def _load_module():
-    spec = importlib.util.spec_from_file_location('client_orchestrated_grpo', MODULE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+class _Template:
+    """One prompt token and one generated token, with labels in output order."""
+
+    truncation_strategy = 'delete'
+
+    def encode(self, trajectory, **kwargs):
+        return {**trajectory, 'input_ids': [10], 'labels': [-100], 'length': 1}
+
+    @staticmethod
+    def parse_tool_call(text):
+        return []
+
+    tool_call_errors = parse_tool_call
 
 
-def test_rollout_and_train_overlap_with_fifo_policy_publication(monkeypatch, capsys) -> None:
-    module = _load_module()
-    monkeypatch.setattr(module, 'BATCH_SIZE', 2)
-    monkeypatch.setattr(module, 'NUM_GENERATIONS', 2)
-    monkeypatch.setattr(module, 'TRAIN_MINI_BATCH_SIZE', 2)
-    monkeypatch.setattr(module, 'MAX_STALENESS', 1)
-    monkeypatch.setattr(module, 'MAX_PARTITIONS', 3)
+def test_streaming_grpo_uses_sampled_tokens_and_publishes_only_after_updates(monkeypatch):
+    saved, trained, sampled = [], [], []
+    closed, lock = [], Lock()
 
-    first_train_started = asyncio.Event()
-    rollout_snapshots = []
-    events = []
+    class Model:
+        completed_step_calls = 0
 
-    async def fake_rollout(_sampler, prompt, policy, _semaphore, _group_id):
-        name = prompt['name']
-        rollout_snapshots.append((name, policy.version, policy.adapter_uri))
-        events.append(f'rollout-start:{name}')
-        if name == 'p0-g1':
-            await first_train_started.wait()
-        events.append(f'rollout-done:{name}')
-        return DataRef(
-            ref_id=name,
-            size=module.NUM_GENERATIONS,
-            fields=['train_input', 'sampled_logprobs', 'decoded'],
-            kind='rollout',
-        )
+        def save(self, name, *, save_optimizer):
+            assert not save_optimizer
+            saved.append(name)
+            return SimpleNamespace(twinkle_path=name)
 
-    monkeypatch.setattr(module, 'rollout_group', fake_rollout)
-    monkeypatch.setattr(module, 'GSM8KAccuracyReward', lambda: lambda rows: [1.0] * len(rows))
-    monkeypatch.setattr(
-        module,
-        'GRPOAdvantage',
-        lambda: lambda rewards, **_kwargs: [1.0, -1.0],
-    )
+        def forward_backward(self, *, inputs):
+            trained.append(inputs)
 
-    class FakeModel:
+        def clip_grad_and_step(self, **kwargs):
+            self.completed_step_calls += 1
 
-        def __init__(self):
-            self.saved = []
-            self.steps = 0
-            self.forward_backward_kwargs = []
+        def calculate_metric(self, **kwargs):
+            return {}
 
-        async def save(self, name):
-            self.saved.append(name)
-            return {'twinkle_path': f'/checkpoints/{name}'}
+    model = Model()
+    monkeypatch.setattr(Model, 'add_adapter_to_model', lambda *args, **kwargs: None, raising=False)
+    for method in ('set_loss', 'set_optimizer', 'set_processor', 'set_template'):
+        monkeypatch.setattr(Model, method, lambda *args, **kwargs: None, raising=False)
 
-        async def forward_backward_from_data_plane(self, _refs, **kwargs):
-            self.forward_backward_kwargs.append(kwargs)
-            events.append('train')
-            first_train_started.set()
+    def sample(inputs, params, *, adapter_uri, **kwargs):
+        (entry,) = inputs
+        assert params.num_samples == 1 and params.logprobs == 1
+        question = entry['messages'][-1]['content']
+        with lock:
+            index = sum(prompt == question for prompt, _ in sampled)
+            sampled.append((question, adapter_uri))
+        correct = question == 'same reward' or index == 0
+        token = 20 if correct else 21
+        feature = {**entry, 'input_ids': [10, token], 'labels': [token, -100], 'length': 2}
+        reply = r'\boxed{1}' if correct else r'\boxed{0}'
+        return [SampleResponse(sequences=[SampledSequence(
+            stop_reason='stop', tokens=[token], decoded=reply,
+            logprobs=[[(token, -0.5)]], new_input_feature=feature)])]
 
-        async def clip_grad_and_step(self, **_kwargs):
-            self.steps += 1
+    sampler = SimpleNamespace(set_template=lambda *args, **kwargs: None, sample=sample)
+    client = SimpleNamespace(model=lambda _: model, sampler=lambda _: sampler, close=lambda: closed.append(True))
+    monkeypatch.setattr(recipe, 'init_twinkle_client', lambda: client)
+    monkeypatch.setattr(recipe, 'Qwen3_5Template', lambda **kwargs: _Template())
+    monkeypatch.setattr(recipe, 'NUM_GENERATIONS', 2)
+    monkeypatch.setattr(recipe, 'MAX_STEPS', 2)
+    data = DatasetMeta(data=[{'question': question, 'answer': '#### 1'}
+                             for question in ('same reward', 'different rewards')])
+    monkeypatch.setattr(recipe, 'DatasetMeta', lambda *args, **kwargs: data)
 
-        async def calculate_metric(self, **_kwargs):
-            return {'result': {'loss': 1.0 / self.steps, 'grad_norm': 0.5}}
+    recipe.train()
 
-    class FakeDataPlane:
-
-        def __init__(self):
-            self.released = []
-
-        async def aget(self, ref, *, fields=None):
-            assert fields == ['decoded']
-            return [{'decoded': f'{ref.ref_id}-{index}'} for index in range(ref.size)]
-
-        async def aappend(self, ref, rows, **_kwargs):
-            return ref.model_copy(update={'fields': [*ref.fields, *rows[0]]})
-
-        async def arelease(self, ref):
-            self.released.append(ref)
-
-    async def run():
-        model = FakeModel()
-        data_plane = FakeDataPlane()
-        batches = [
-            [{
-                'name': 'p0-g0'
-            }, {
-                'name': 'p0-g1'
-            }],
-            [{
-                'name': 'p1-g0'
-            }, {
-                'name': 'p1-g1'
-            }],
-            [{
-                'name': 'p2-g0'
-            }, {
-                'name': 'p2-g1'
-            }],
-        ]
-        await module.run_grpo(batches, model, object(), data_plane)
-        return model, data_plane
-
-    model, data_plane = asyncio.run(run())
-
-    assert events.index('train') < events.index('rollout-done:p0-g1')
-    assert model.saved == ['policy-0', 'policy-1', 'policy-2', 'policy-3']
-    assert model.steps == 6
-    assert all(kwargs['input_field'] == 'train_input' for kwargs in model.forward_backward_kwargs)
-    assert all(kwargs['kwarg_fields'] == {
-        'old_logps': 'sampled_logprobs',
-        'advantages': 'advantage',
-    } for kwargs in model.forward_backward_kwargs)
-    assert len(data_plane.released) == 6
-
-    snapshots = {name: (version, uri) for name, version, uri in rollout_snapshots}
-    assert snapshots['p0-g0'] == (0, '/checkpoints/policy-0')
-    assert snapshots['p1-g0'] == (0, '/checkpoints/policy-0')
-    assert snapshots['p2-g0'][0] in (1, 2)
-    assert snapshots['p2-g0'][1] == f'/checkpoints/policy-{snapshots["p2-g0"][0]}'
-    output = capsys.readouterr().out
-    assert 'optimizer_step=1' in output
-    assert 'loss=1.0' in output
-    assert 'grad_norm=0.5' in output
+    assert model.completed_step_calls == len(trained) == 1
+    assert len(saved) == 2 and saved[0].endswith('-0') and saved[1].endswith('-1')
+    assert len(sampled) == 4 and {uri for _, uri in sampled} == {saved[0]}
+    nonzero = trained[0]
+    assert {row['response_token_ids'][0] for row in nonzero} == {20, 21}
+    for row in nonzero:
+        token, = row['response_token_ids']
+        assert row['labels'] == [token, -100]
+        assert row['old_logps'] == [-0.5]
+        assert (row['advantages'][0] > 0) == (token == 20)
+    assert closed == [True]
 
 
-def test_younger_rollout_failure_stops_admission(monkeypatch) -> None:
-    module = _load_module()
-    monkeypatch.setattr(module, 'BATCH_SIZE', 1)
-    monkeypatch.setattr(module, 'NUM_GENERATIONS', 1)
-    monkeypatch.setattr(module, 'TRAIN_MINI_BATCH_SIZE', 1)
-    monkeypatch.setattr(module, 'MAX_STALENESS', 1)
-    monkeypatch.setattr(module, 'MAX_PARTITIONS', 3)
+def test_sync_grpo_trains_with_correctness_gated_brevity_and_sampled_logprobs(monkeypatch):
+    prompts = [{'user_data': [('ground_truth', '1')]}]
+    replies = [r'\boxed{1}', r'\boxed{0}']
+    sequences = [SampledSequence(
+        stop_reason='stop', tokens=[token], decoded=reply,
+        logprobs=[[(token, -0.5)]], new_input_feature={'input_ids': [10, token], 'labels': [token, -100]})
+        for token, reply in zip((20, 21), replies)]
+    calls = []
+    model = SimpleNamespace(
+        save=lambda **kwargs: SimpleNamespace(twinkle_path='policy'),
+        forward_backward=lambda **kwargs: calls.append(kwargs),
+        clip_grad_and_step=lambda: calls.append('update'),
+        calculate_metric=lambda **kwargs: SimpleNamespace(result={}))
+    for method in ('add_adapter_to_model', 'set_loss', 'set_optimizer', 'set_processor', 'set_template'):
+        setattr(model, method, lambda *args, **kwargs: None)
+    sampler = SimpleNamespace(set_template=lambda *args, **kwargs: None,
+                              sample=lambda **kwargs: [SampleResponse(sequences=sequences)])
+    client = SimpleNamespace(model=lambda _: model, sampler=lambda _: sampler,
+                             close=lambda: calls.append('closed'))
+    monkeypatch.setattr(short_math_grpo, 'init_twinkle_client', lambda: client)
+    monkeypatch.setattr(short_math_grpo, 'create_gsm8k_dataset', lambda: None)
+    monkeypatch.setattr(short_math_grpo, 'DataLoader', lambda **kwargs: [prompts])
+    monkeypatch.setattr(short_math_grpo, 'NUM_GENERATIONS', 2)
+    monkeypatch.setattr(short_math_grpo, 'MAX_STEPS', 1)
 
-    started = []
+    short_math_grpo.train()
 
-    async def fake_rollout(_sampler, prompt, _policy, _semaphore, _group_id):
-        name = prompt['name']
-        started.append(name)
-        if name == 'p1':
-            raise RuntimeError('rollout failed')
-        return DataRef(
-            ref_id=name,
-            size=1,
-            fields=['train_input', 'sampled_logprobs', 'decoded'],
-            kind='rollout',
-        )
-
-    monkeypatch.setattr(module, 'rollout_group', fake_rollout)
-    monkeypatch.setattr(module, 'GSM8KAccuracyReward', lambda: lambda rows: [1.0])
-    monkeypatch.setattr(module, 'GRPOAdvantage', lambda: lambda rewards, **_kwargs: [1.0])
-
-    class FakeModel:
-
-        def __init__(self):
-            self.saved = []
-
-        async def save(self, name):
-            self.saved.append(name)
-            return {'twinkle_path': name}
-
-        async def forward_backward(self, _ref, **_kwargs):
-            return None
-
-        async def clip_grad_and_step(self, **_kwargs):
-            return None
-
-        async def calculate_metric(self, **_kwargs):
-            return {'result': {'loss': 1.0}}
-
-    class FakeDataPlane:
-
-        async def aget(self, ref, *, fields=None):
-            assert fields == ['decoded']
-            return [{'decoded': ref.ref_id}]
-
-        async def aappend(self, ref, rows, **_kwargs):
-            return ref.model_copy(update={'fields': [*ref.fields, *rows[0]]})
-
-        async def arelease(self, _ref):
-            return None
-
-    async def run():
-        model = FakeModel()
-        try:
-            await module.run_grpo(
-                [[{
-                    'name': 'p0'
-                }], [{
-                    'name': 'p1'
-                }], [{
-                    'name': 'p2'
-                }]],
-                model,
-                object(),
-                FakeDataPlane(),
-            )
-        except RuntimeError as error:
-            assert str(error) == 'rollout failed'
-        else:
-            raise AssertionError('expected the younger rollout failure')
-        return model
-
-    model = asyncio.run(run())
-    assert started == ['p0', 'p1']
-    assert model.saved == ['policy-0']
+    backward, update, close = calls
+    assert backward['inputs'] == [sequence.new_input_feature for sequence in sequences]
+    assert backward['old_logps'] == [[-0.5], [-0.5]]
+    assert backward['advantages'][0] > 0 > backward['advantages'][1]
+    assert (update, close) == ('update', 'closed')
+    assert short_math_grpo.compute_rewards([
+        {'messages': [{'role': 'assistant', 'content': reply}], **prompts[0]} for reply in replies
+    ])[0] == [1.25, 0.0]

@@ -77,8 +77,7 @@ def translate_chat_request(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
     """Translate an OpenAI chat completion request body to a SampleRequest dict.
 
     Returns:
-        (sample_request_dict, sticky_key) where sticky_key is the model field
-        used for Ray Serve multiplex routing.
+        ``(sample_request_dict, model)`` where model is the requested model name.
 
     Raises:
         ValueError: If required fields are missing or invalid.
@@ -225,7 +224,7 @@ def translate_completion_request(body: dict[str, Any]) -> tuple[dict[str, Any], 
     the chat bool + ``top_logprobs`` pair), so it is mapped on its own after the shared extractor.
 
     Returns:
-        ``(sample_request_dict, sticky_key)`` -- same contract as :func:`translate_chat_request`.
+        ``(sample_request_dict, model)`` -- same contract as :func:`translate_chat_request`.
 
     Raises:
         ValueError: If ``model`` or ``prompt`` is missing or invalid, or ``echo`` / ``suffix`` is
@@ -347,7 +346,7 @@ def translate_embedding_request(body: dict[str, Any]) -> tuple[dict[str, Any], s
     into ``pooling_params`` when set; ``task`` is fixed to ``embed``.
 
     Returns:
-        ``(encode_request_dict, sticky_key)``.
+        ``(encode_request_dict, model)``.
 
     Raises:
         ValueError: If ``model`` or ``input`` is missing or invalid.
@@ -407,7 +406,7 @@ def translate_infer_request(body: Any) -> tuple[dict[str, Any], str]:
     per-token logprobs, so a request that forgot to ask for them would still need them.
 
     Returns:
-        ``(sample_request_dict, sticky_key)`` where sticky_key is the resolved model name.
+        ``(sample_request_dict, model)`` where model is the resolved model name.
 
     Raises:
         ValueError: If no infer requests are present or an entry lacks ``messages``.
