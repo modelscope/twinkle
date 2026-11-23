@@ -44,6 +44,6 @@ vLLMSampler 使用 vLLM 引擎进行高效推理,支持高吞吐量的批量采�
 
 详见: [vLLMSampler](vLLMSampler.md)
 
-服务端配置使用 `sampler_type: vllm` 进行标准采样，异步 RL 使用 `vllm_async`，`mock` 用于测试。旧的 [TorchSampler](TorchSampler.md) 示例已不可用。
+标准采样使用 `sampler_type: vllm`，{ref}`客户端流式 GRPO 示例 <client-async-grpo>` 也使用这一配置。采样和训练由客户端的 `StreamingDriver` 调度。`mock` 用于测试。旧的 [TorchSampler](TorchSampler.md) 示例已不可用。
 
 > 在 RLHF 训练中,采样器通常与 Actor 模型分离,使用不同的硬件资源,避免推理和训练相互干扰。

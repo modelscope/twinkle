@@ -146,8 +146,19 @@ def test_unset_optionals_stay_off_the_wire():
     assert payload == {'training_id': 'training-a', 'inputs': [{'input_ids': [1]}], 'adapter_name': 'a', 'loss_kwargs': {}}
 
 
-def test_a_lora_config_is_serialized_to_the_form_the_server_decodes():
+def test_a_lora_config_is_serialized_to_the_form_the_server_decodes(monkeypatch):
+    import builtins
+
     from peft import LoraConfig
+
+    import_module = builtins.__import__
+
+    def without_dataset(name, *args, **kwargs):
+        if name == 'twinkle.dataset':
+            pytest.fail('LoRA requests should not load datasets or templates')
+        return import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', without_dataset)
     wire = to_wire_value(LoraConfig(target_modules='all-linear'))
     assert isinstance(wire, str) and 'LoraConfig' in wire
 
@@ -156,6 +167,26 @@ def test_binary_values_are_rejected_by_legacy_serializer():
     for value in (b'raw', bytearray(b'raw'), memoryview(b'raw')):
         with pytest.raises(TypeError, match='Unsupported binary object'):
             serialize_object(value)
+
+
+def test_lora_mapping_does_not_send_local_peft_defaults(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from twinkle_client.http import ClientContext, ClientTransport
+    from twinkle_client.model import MultiLoraTransformersModel
+
+    calls = []
+
+    def submit(_model, *args, config, **kwargs):
+        calls.append(json.loads(config))
+        return SimpleNamespace(training_id='training-a')
+
+    monkeypatch.setattr(MultiLoraTransformersModel, '_submit', submit)
+    transport = ClientTransport(ClientContext(base_url='http://unit-test', api_key='unit-test-key'))
+    model = MultiLoraTransformersModel('test', transport=transport)
+    model.add_adapter_to_model('slot', {'target_modules': ['q_proj']})
+    assert calls == [{'_TWINKLE_TYPE_': 'LoraConfig', 'target_modules': ['q_proj'], 'r': 8}]
 
 
 def test_a_component_handle_is_sent_as_its_id():

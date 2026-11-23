@@ -18,6 +18,24 @@ from .zmq_pubsub import connect_subscriber, start_publisher
 logger = get_logger()
 
 
+def recv_delta_manifest(socket: zmq.Socket, topic: str, auth_key: str = '', *, where: str = '') -> Any:
+    """Read the next plain-pickle delta manifest, draining stale rendezvous wire-probes.
+
+    The rendezvous (``_rendezvous_subscribers``) re-publishes an HMAC-signed probe on
+    ``topic + '__wire_probe__'`` until every receiver acks via the TCPStore, so a fast
+    receiver's SUB queue can hold extra probes after it consumes one in init_process_group.
+    The delta manifest channel is plain pickle on ``topic`` (pipeline ``send_pyobj``); reading
+    the next message blindly would unpickle a leftover probe's ``HMAC_sig || pickle`` and kill
+    the receiver. Skip any non-manifest topic by consuming its auth-signed probe payload,
+    mirroring ``BroadcastOperation._run``'s stale-probe drain.
+    """
+    while True:
+        msg_topic = socket.recv_string()
+        if msg_topic == topic:
+            return socket.recv_pyobj()
+        recv_auth_pyobj(socket, auth_key, where=where or 'delta.recv.drain_probe')
+
+
 @dataclass
 class MasterMetadata:
     zmq_ip: str

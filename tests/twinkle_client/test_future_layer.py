@@ -6,13 +6,15 @@
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import requests
 
 from twinkle_client import _future
 from twinkle_client.exceptions import TaskFailedError, TaskRecordLostError, TaskWaitTimeoutError
 from twinkle.protocol.types.errors import ErrorPayload
-from twinkle.protocol.types.lifecycle import TaskEnvelope
+from twinkle.protocol.types.lifecycle import TaskEnvelope, UploadProgress
 
 
 class _Model:
@@ -79,15 +81,45 @@ def test_model_cls_none_returns_none_result(monkeypatch):
 
 def test_non_terminal_submit_polls_until_terminal(monkeypatch):
     replies = [_running(), _running(), _completed({'ok': 1})]
-    monkeypatch.setattr(_future, '_post_retrieve', lambda _r, _transport: replies.pop(0))
+    monkeypatch.setattr(_future, '_post_retrieve', lambda _r, _transport, **_: replies.pop(0))
     out = _future.resolve(_running(), model_cls=_Model)
     assert out.result == {'ok': 1}
     assert replies == []
 
 
+@pytest.mark.parametrize('legacy', [False, True])
+def test_upload_poll_cursor_and_legacy_response(monkeypatch, legacy):
+    seen = []
+    running = _running()
+    if legacy:
+        payload = running.model_dump(exclude={'progress'})
+        replies = [(_completed(None), {})]
+    else:
+        payload = running.model_dump()
+        uploading = running.model_copy(update={
+            'progress': UploadProgress(sequence=2, stage='uploading', uploaded_bytes=5, total_bytes=10)})
+        completed = TaskEnvelope(
+            request_id='r', status='completed', result={'repo_id': 'owner/model', 'revision': 'sha'},
+            progress=UploadProgress(sequence=4, stage='batch_committed', uploaded_bytes=10, total_bytes=10,
+                                    committed_bytes=10))
+        replies = [(uploading, {'after_progress': 0}), (uploading, {'after_progress': 2}),
+                   (completed, {'after_progress': 2})]
+
+    def retrieve(_request_id, _transport, *, http_request_id, **kwargs):
+        reply, expected = replies.pop(0)
+        assert kwargs == expected
+        return reply
+
+    monkeypatch.setattr(_future, '_post_retrieve', retrieve)
+    receipt = _future.resolve_response(SimpleNamespace(json=lambda: payload), None, on_progress=seen.append)
+    assert [p.stage for p in seen] == ([] if legacy else ['uploading', 'batch_committed'])
+    assert receipt == (None if legacy else {'repo_id': 'owner/model', 'revision': 'sha'})
+    assert replies == []
+
+
 def test_404_is_bounded_then_raises_record_lost(monkeypatch):
 
-    def _always_404(_request_id, _transport):
+    def _always_404(_request_id, _transport, **_):
         e = requests.HTTPError('404')
         e.status_code = 404
         raise e
@@ -100,7 +132,7 @@ def test_404_is_bounded_then_raises_record_lost(monkeypatch):
 def test_transport_5xx_is_bounded_then_reraises(monkeypatch):
     monkeypatch.setattr(_future.time, 'sleep', lambda _s: None)  # no real backoff sleeps
 
-    def _always_503(_request_id, _transport):
+    def _always_503(_request_id, _transport, **_):
         e = requests.HTTPError('503')
         e.status_code = 503
         raise e
@@ -111,25 +143,32 @@ def test_transport_5xx_is_bounded_then_reraises(monkeypatch):
 
 
 def test_connection_error_is_retried_then_succeeds(monkeypatch):
-    monkeypatch.setattr(_future.time, 'sleep', lambda _s: None)
-    replies = [requests.ConnectionError('reset'), _completed({'ok': True})]
+    from twinkle_client.http import ClientContext, ClientTransport
 
-    def _next(_request_id, _transport):
+    monkeypatch.setattr(_future.time, 'sleep', lambda _s: None)
+    replies = [requests.ConnectionError('reset'), _running(), _completed({'ok': True})]
+    seen = []
+
+    def post(url, *, headers, json, **_):
+        seen.append(headers['x-request-id'])
+        assert json == {'request_id': 'r'}
         value = replies.pop(0)
         if isinstance(value, BaseException):
             raise value
-        return value
+        return SimpleNamespace(status_code=200, ok=True, json=value.model_dump)
 
-    monkeypatch.setattr(_future, '_post_retrieve', _next)
-    out = _future.resolve(_running(), model_cls=_Model)
+    transport = ClientTransport(ClientContext('http://server', 'key'), session=SimpleNamespace(post=post))
+    out = _future.resolve(_running(), model_cls=_Model, transport=transport)
     assert out.result == {'ok': True}
+    assert len(seen) == 3
+    assert seen[0] == seen[1] != seen[2]
 
 
 def test_connection_error_is_bounded_then_reraised(monkeypatch):
     monkeypatch.setattr(_future.time, 'sleep', lambda _s: None)
     calls = 0
 
-    def _always_fails(_request_id, _transport):
+    def _always_fails(_request_id, _transport, **_):
         nonlocal calls
         calls += 1
         raise requests.ConnectionError('reset')
@@ -142,7 +181,7 @@ def test_connection_error_is_bounded_then_reraised(monkeypatch):
 
 def test_non_retryable_4xx_reraises_immediately(monkeypatch):
 
-    def _400(_request_id, _transport):
+    def _400(_request_id, _transport, **_):
         e = requests.HTTPError('400')
         e.status_code = 400
         raise e
@@ -163,7 +202,7 @@ def test_success_resets_both_retry_counters(monkeypatch):
     """A successful reply zeroes both counters, so intermittent 404s never sum up."""
     seq = []
 
-    def _mixed(_request_id, _transport):
+    def _mixed(_request_id, _transport, **_):
         seq.append(1)
         n = len(seq)
         if n in (1, 2, 4, 5):  # 404s interleaved with a success at n==3

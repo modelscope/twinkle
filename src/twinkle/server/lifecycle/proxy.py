@@ -8,7 +8,7 @@ import httpx
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
-from twinkle.protocol.headers import H_MULTIPLEX, H_MULTIPLEX_LEGACY, H_REQUEST_ID, H_REQUEST_ID_LEGACY
+from twinkle.protocol.headers import H_REQUEST_ID
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.telemetry.tracing import inject_context
@@ -56,16 +56,12 @@ class ServiceProxy:
         scheme = "https" if self.http_options.get("ssl_certfile") else "http"
         return f"{scheme}://{host}:{port}{self.route_prefix.rstrip('/')}/{service_type}/{base_model}/{endpoint}"
 
-    def _prepare_headers(self, request_headers) -> dict[str, str]:
+    def _prepare_headers(self, request_headers, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
         headers = dict(request_headers)
         headers.pop("host", None)
         headers.pop("content-length", None)
-        request_id = request_headers.get(H_REQUEST_ID) or request_headers.get(H_REQUEST_ID_LEGACY)
-        if request_id is not None and not request_headers.get(H_MULTIPLEX_LEGACY):
-            headers[H_MULTIPLEX_LEGACY] = request_id
-        if request_id is not None:
-            headers.setdefault(H_REQUEST_ID, request_id)
-            headers.setdefault(H_MULTIPLEX, request_id)
+        if extra_headers:
+            headers.update((name.lower(), value) for name, value in extra_headers.items())
         return headers
 
     async def proxy_request(
@@ -80,9 +76,7 @@ class ServiceProxy:
     ) -> Response:
         body_bytes = body_override if body_override is not None else await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
-        headers = self._prepare_headers(request.headers)
-        if extra_headers:
-            headers.update(extra_headers)
+        headers = self._prepare_headers(request.headers, extra_headers)
         inject_context(headers)
         try:
             response = await self.client.request(
@@ -96,7 +90,7 @@ class ServiceProxy:
             )
         except Exception as exc:
             logger.error("Proxy error: %s", str(exc), exc_info=True)
-            request_id = request.headers.get(H_REQUEST_ID) or request.headers.get(H_REQUEST_ID_LEGACY) or ""
+            request_id = headers.get(H_REQUEST_ID, "")
             payload = ErrorPayload(
                 error=f"Proxy Error: {exc}", category=ErrorCategory.Server, error_code=502, request_id=request_id
             )
@@ -114,9 +108,7 @@ class ServiceProxy:
     ):
         body_bytes = body_override if body_override is not None else await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
-        headers = self._prepare_headers(request.headers)
-        if extra_headers:
-            headers.update(extra_headers)
+        headers = self._prepare_headers(request.headers, extra_headers)
         inject_context(headers)
         async with self.client.stream(method="POST", url=target_url, content=body_bytes, headers=headers) as response:
             if response.status_code >= 400:

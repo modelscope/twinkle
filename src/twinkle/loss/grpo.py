@@ -923,6 +923,69 @@ class CISPOLoss(GRPOLoss):
         return (per_token_loss * loss_mask).sum() / num_items
 
 
+class DISLoss(CISPOLoss):
+    """
+    DIS (double-sided importance sampling, SAO) Loss.
+
+    From SAO: https://github.com/modelscope/twinkle/pull/269.
+
+    The rejection-form sibling of CISPO: a token whose current/rollout ratio leaves the trust
+    interval ``(1 - epsilon, 1 + epsilon_high)`` gets ZERO weight instead of being clamped to a
+    boundary, so off-policy tokens contribute no gradient at all. The interval is deliberately
+    wider than PPO's clip (defaults 0.3 / 5.0): it rejects only genuinely stale tokens. Shares
+    CISPO's IS-weighted policy-gradient form and token-mean aggregation. Token-level IS only;
+    the base path reads the ratio without the base family's ±5 clamp (rejection is the stability
+    mechanism that clamp replaces).
+
+    Args:
+        epsilon: Lower trust bound offset; must be in [0, 1).
+        epsilon_high: Upper trust bound offset; must be non-negative.
+        detach_importance_weight: Stop-gradient through the IS weight (the SAO default); False
+            lets gradients flow through the ratio as well.
+    """
+
+    def __init__(
+        self,
+        epsilon: float = 0.3,
+        epsilon_high: float = 5.0,
+        detach_importance_weight: bool = True,
+        **kwargs,
+    ):
+        if not 0.0 <= epsilon < 1.0:
+            raise ValueError(f'DIS epsilon must be in [0, 1), got {epsilon}.')
+        if epsilon_high < 0.0:
+            raise ValueError(f'DIS epsilon_high must be non-negative, got {epsilon_high}.')
+        if kwargs.get('importance_sampling_level', 'token') != 'token':
+            raise ValueError('DIS is a token-level trust-region objective; importance_sampling_level '
+                             'must be "token".')
+        super().__init__(epsilon=epsilon, epsilon_high=epsilon_high, **kwargs)
+        self.detach_importance_weight = detach_importance_weight
+
+    def _compute_log_importance_weights(self, per_token_logps, per_token_old_logps, loss_mask):
+        # No ±5 clamp: it would cap the ratio at exp(5)≈148 and silently ADMIT tokens a wider
+        # trust bound (epsilon_high > exp(5) - 1) must reject. The ±80 bound only keeps exp finite:
+        # with detach_importance_weight=False, an inf ratio would backprop 0 * inf = nan through
+        # torch.where's unselected branch and poison the whole batch gradient. exp(80)≈5.5e34 stays
+        # rejected for any realistic bound, and trusted tokens (|d| < ~2) are untouched, so the
+        # forward loss is unchanged.
+        return (per_token_logps - per_token_old_logps).clamp(min=-80.0, max=80.0)
+
+    def _compute_per_token_loss(
+        self,
+        ratio: 'torch.Tensor',
+        advantages: 'torch.Tensor',
+        per_token_logps: 'torch.Tensor',
+    ) -> 'torch.Tensor':
+        """Zero-weighted (rejected) outside the trust interval, IS-weighted policy gradient inside."""
+        import torch
+
+        trusted = (ratio > 1 - self.epsilon) & (ratio < 1 + self.epsilon_high)
+        weight = torch.where(trusted, ratio, torch.zeros_like(ratio))
+        if self.detach_importance_weight:
+            weight = weight.detach()
+        return -weight * advantages * per_token_logps
+
+
 class BNPOLoss(GRPOLoss):
     """
     BNPO (Batch-Normalized Policy Optimization) Loss.

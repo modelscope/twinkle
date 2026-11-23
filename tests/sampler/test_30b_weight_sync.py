@@ -27,6 +27,27 @@ os.environ['NCCL_CUMEM_ENABLE'] = '0'
 
 MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen3-30B-A3B-Base')
 
+# Tiering instead of a hard skip: daily-only, needs 3 GPUs at the pytest defaults
+# (2 model + 1 sampler). The 30B MoE weights must already be cached -- this suite's
+# contract is streaming-sync OOM/hang on a large MoE, not downloading 60GB in CI.
+SKIP_MODEL_DOWNLOAD = os.getenv('SKIP_MODEL_DOWNLOAD', 'false').lower() == 'true'
+
+
+def _model_cached():
+    try:
+        from modelscope.hub.snapshot_download import snapshot_download
+        return bool(snapshot_download(MODEL_ID, local_files_only=True))
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.accel(3),
+    pytest.mark.skipif(SKIP_MODEL_DOWNLOAD or not _model_cached(),
+                       reason='30B MoE weights not cached (or SKIP_MODEL_DOWNLOAD set)'),
+]
+
 # For MoE models, vLLM does not support LoRA on expert layers.
 # Only target attention QKV + output projection.
 LORA_TARGET_MODULES = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
@@ -48,7 +69,6 @@ def get_model_path():
     return MODEL_ID
 
 
-@pytest.mark.skip(reason='Requires 4+ GPUs and 30B model, run manually: python tests/sampler/test_30b_weight_sync.py')
 def test_weight_sync(model_gpus: int = 2, sampler_gpus: int = 1, vllm_tp: int = 1):
     from peft import LoraConfig
 

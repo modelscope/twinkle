@@ -6,7 +6,7 @@ import glob
 import os
 from safetensors import SafetensorError
 
-from twinkle.exceptions import FullWeightLoadError
+from twinkle.utils import FullWeightLoadError
 from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.task_queue.backend_gate import BACKEND_TIMEOUT_EXCEPTIONS
 

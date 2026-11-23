@@ -79,7 +79,11 @@ def _force_packed_linear_attention(model: torch.nn.Module, position_ids: torch.T
 
     def _make_packed_forward(real_position_ids: torch.Tensor):
 
-        def _packed_forward(mod, hidden_states, cache_params=None, cache_position=None, attention_mask=None):
+        def _packed_forward(mod, hidden_states, cache_params=None, cache_position=None, attention_mask=None,
+                            **kwargs):
+            # transformers >=5.12 forwards the decoder layer's generation-side kwargs (use_cache,
+            # output_attentions, ...) into the token mixer; the packed training baseline never
+            # consumes them, but the signature must admit them.
             packed_ctx = SimpleNamespace(
                 world_size=1,
                 sp_world_size=1,
@@ -459,11 +463,35 @@ if __name__ == '__main__':
     pytest.main([__file__])
 
 
+def _pin_cpu_torch_kernels():
+    """Force the pure-torch kernel surface for this CPU worker's process.
+
+    transformers >= 5.12 binds the causal_conv1d/fla GPU kernels unconditionally at
+    module import whenever the packages are installed (no device check), and
+    FusedRMSNormGated even queries torch.cuda.current_device() at construction -- both
+    die on CPU. This test's contract is the torch-fallback SP path, so null the kernel
+    globals BEFORE model construction (instance attributes bind from them in __init__)
+    and in twinkle's SP kernel selector. Spawned subprocess only; no leak to other tests.
+    """
+    from importlib import import_module
+    modeling = import_module('transformers.models.qwen3_5.modeling_qwen3_5')
+    modeling.causal_conv1d_fn = None
+    modeling.causal_conv1d_update = None
+    modeling.chunk_gated_delta_rule = None
+    modeling.fused_recurrent_gated_delta_rule = None
+    modeling.FusedRMSNormGated = None
+    from twinkle.model.transformers.strategy.sequence_parallel import linear_attention_sp as sp_mod
+    sp_mod._FLA_CAUSAL_CONV1D_FN = None
+    sp_mod._FLA_CHUNK_GATED_DELTA_RULE = None
+    sp_mod._CAUSAL_CONV1D_FN = None
+
+
 def _qwen35_cpu_worker(rank, port, layer_types, padded=False):
     from types import SimpleNamespace
     from torch.utils.checkpoint import DefaultDeviceType
     DefaultDeviceType.set_device_type('cpu')
     torch.set_num_threads(1)
+    _pin_cpu_torch_kernels()
     dist.init_process_group('gloo', init_method=f'tcp://127.0.0.1:{port}', rank=rank, world_size=2)
     try:
         torch.manual_seed(92)

@@ -241,14 +241,11 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     async def invoke(self, ticket, payload, stream_queue=None):
         return await self.request_runtime.invoke(ticket, payload, stream_queue)
 
-    async def wait_operation(self, ticket):
-        await self.request_runtime.wait_operation(ticket)
+    async def operation_done(self, ticket):
+        return await self.request_runtime.operation_done(ticket)
 
     async def install_base_weights(self, path):
         await self.request_runtime.install_base_weights(path)
-
-    async def pending_futures(self):
-        return await self.request_runtime.pending_futures()
 
     async def runtime_identity(self):
         return await self.request_runtime.runtime_identity()

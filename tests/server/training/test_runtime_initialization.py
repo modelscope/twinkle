@@ -34,7 +34,7 @@ async def test_configuration_deserialization_does_not_block_event_loop(monkeypat
         return await factory()
 
     runtime = SimpleNamespace(_run_lifecycle_operation=serial, resolve_model_adapter_name=lambda _: '',
-                              _training_states={}, is_full_mode=True)
+                              _training_states={}, _startup_template=None, is_full_mode=True)
     request = CreateTraining(base_model='small', mode='full', token='owner', session_id='session', create_key='key',
                              client_type='twinkle', payload={'adapter_name': 'same', 'config': None})
     initializing = asyncio.create_task(TrainingRuntime.initialize_training(

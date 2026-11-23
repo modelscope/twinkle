@@ -12,6 +12,8 @@ Twinkle 的 DPO 扩展也使用 `importance_sampling`，要求**每条** datum �
 
 ## 初始化
 
+在仓库根目录运行 `python -m pip install -e '.[client]'`，安装 Twinkle 锁定的 Tinker SDK 版本。
+
 ```python
 # 在导入 ServiceClient 之前，先初始化 Tinker 客户端
 from twinkle import init_tinker_client
@@ -35,8 +37,8 @@ for item in service_client.get_server_capabilities().supported_models:
 
 调用 `init_tinker_client` 时，会自动执行以下操作：
 
-1. **Patch Tinker SDK**：绕过 Tinker 的 `tinker://` 前缀校验，使其可以连接到标准 HTTP 地址
-2. **设置请求头**：注入 `X-Ray-Serve-Request-Id` 和 `Authorization` 等必要的认证头
+1. 让 Tinker 接受 Twinkle API 令牌和 `twinkle://` checkpoint 路径。
+2. 自动添加 Twinkle Server 所需的认证信息和请求头。
 
 初始化之后，导入 `from tinker import ServiceClient` 即可连接到 Twinkle Server。训练代码可复用已支持的接口，但需要遵守上述 loss 兼容范围。
 

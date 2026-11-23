@@ -61,10 +61,15 @@ class HTTPSampler:
             raise RuntimeError(f'the server returned {len(responses)} responses for one prompt.')
         response = responses[0]
         if media:
-            echoed = getattr(response, 'prompt_token_ids_echoed', False)
-            expected = entry['input_ids'] if echoed else list(item.feature['input_ids'])
-            if response.prompt_token_ids != expected:
-                prefix = 'request' if echoed else 'expanded training prompt'
+            echoed = getattr(response, 'prompt_token_ids_echoed', None)
+            request_ids = entry['input_ids']
+            training_ids = list(item.feature['input_ids'])
+            prompt_ids = response.prompt_token_ids
+            # Older SGLang servers echoed the request but omitted the flag.
+            legacy_echo = echoed is None and prompt_ids == request_ids
+            expected = request_ids if echoed is True else training_ids
+            if prompt_ids != expected and not legacy_echo:
+                prefix = 'request' if echoed is True else 'expanded training prompt'
                 raise ValueError(f'Remote sampler prompt_token_ids do not match the {prefix}. '
                                  'Check that the training and sampler media processors use the same settings.')
         sequences = []
@@ -74,7 +79,7 @@ class HTTPSampler:
                 completion = self.template.append_completion(item, tokens)
                 feature = dict(completion.state.feature)
                 for key, refs in wire_media.items():
-                    if _is_raw_media(feature.get(key)):
+                    if key not in feature or _is_raw_media(feature[key]):
                         feature[key] = refs
                 sequences.append(SampledSequence(
                     stop_reason=seq.stop_reason, tokens=tokens, logprobs=seq.logprobs,

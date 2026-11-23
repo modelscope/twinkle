@@ -81,6 +81,8 @@ class FutureRecord(BaseModel):
     failure: FutureFailureRecord | None = None
     queue_state: str | None = None
     queue_state_reason: str | None = None
+    progress: dict[str, Any] | None = None
+    submission_fingerprint: str | None = None
     # Replica ownership and deadline are fixed when the record is created.
     replica_id: str | None = None
     absolute_deadline: float | None = None

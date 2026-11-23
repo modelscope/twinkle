@@ -517,10 +517,16 @@ def _run_precision_worker(rank: int,
             device_type=backend_config['device_type'],
         )
         strategy = _make_strategy(sp_model, device_mesh, int(case['ulysses_size']))
-        processed_inputs = strategy.prepare_model_inputs({
-            'input_ids': input_ids, 'position_ids': position_ids, 'labels': labels,
-            'attention_mask': attention_mask,
-        })
+        # Derived ring (rp > 1) only accepts padding-free inputs: SP-alignment padding would
+        # otherwise surface as masked padding in the synthesized attention mask. Unpadded
+        # batches enter through the product's padding_free path (cu_seqlens from position_ids).
+        ring_padding_free = case['expected_mode'] in ('cp_only', 'cp_sp') and attention_mask is None
+        processed_inputs = strategy.prepare_model_inputs(
+            {
+                'input_ids': input_ids, 'position_ids': position_ids, 'labels': labels,
+                'attention_mask': attention_mask,
+            },
+            padding_free=ring_padding_free)
         local_labels = processed_inputs['labels']
 
         sp_model.zero_grad(set_to_none=True)
@@ -995,12 +1001,32 @@ def test_sp_weak_registry_does_not_retain_the_model():
 
 @pytest.mark.parametrize('backend', ['eager', 'flash_attention_2', 'flash_attention_3'])
 def test_sp_rejects_unsupported_backend_before_building_groups(backend):
+    from transformers.modeling_flash_attention_utils import is_flash_attn_available
+    from transformers.utils import is_flash_attn_2_available, is_flash_attn_3_available
+
+    from twinkle import Platform
     from twinkle.model.transformers.strategy.sequence_parallel import SequenceParallel
     model = LlamaForCausalLM(LlamaConfig(vocab_size=16, hidden_size=8, intermediate_size=16,
                                         num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2))
     model.config._attn_implementation = backend
-    with pytest.raises(NotImplementedError, match='unsupported attention|kernel unavailable'):
-        SequenceParallel().prepare(2, model, SimpleNamespace(pad_token_id=0))
+    # Current contract: fa2/fa3 are SUPPORTED when their kernel is available on the target
+    # accelerator (the gate judges the target, not the pre-placement CPU model). Such a backend
+    # passes the gate and only fails later at mesh init; unsupported/unavailable ones must be
+    # rejected at the gate, before any group is built.
+    device = Platform.get_platform().device_prefix()
+    if backend == 'flash_attention_2':
+        kernel_available = device in ('cuda', 'npu') and (
+            is_flash_attn_2_available() if device == 'cuda' else is_flash_attn_available())
+    elif backend == 'flash_attention_3':
+        kernel_available = device == 'cuda' and is_flash_attn_3_available()
+    else:
+        kernel_available = False
+    if kernel_available:
+        with pytest.raises(RuntimeError, match='DeviceMesh'):
+            SequenceParallel().prepare(2, model, SimpleNamespace(pad_token_id=0))
+    else:
+        with pytest.raises(NotImplementedError, match='unsupported attention|kernel unavailable'):
+            SequenceParallel().prepare(2, model, SimpleNamespace(pad_token_id=0))
 
 
 def test_single_local_token_value_keeps_its_sequence_axis():

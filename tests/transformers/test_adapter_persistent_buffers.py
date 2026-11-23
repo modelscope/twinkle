@@ -21,9 +21,17 @@ def test_adapter_checkpoint_keeps_only_selected_persistent_buffers(tmp_path):
     model = get_peft_model(base, LoraConfig(r=2, target_modules=['q_proj'],
                            modules_to_save=['head']), adapter_name='decision')
     model.add_adapter('other', LoraConfig(r=2, target_modules=['q_proj'], modules_to_save=['head']))
-    params = {k: v.detach().cpu() for k, v in model.named_parameters()
-              if '.decision.' in k and ('lora_' in k or '.modules_to_save.' in k)}
-    strategy = SimpleNamespace(unwrap_model=lambda m: m, get_adapter_state_dict=lambda m, a: dict(params))
+    # Mirror the real strategy collector (AccelerateStrategy.get_adapter_state_dict): local
+    # params + persistent buffers, filtered to saveable keys of THIS adapter. The unit under
+    # test is the save-path normalization and the reload roundtrip, not a hand-picked param set.
+    from twinkle.model.state_dict_utils import collect_local_state, is_saveable_adapter_key
+
+    def _collect(m, adapter_name):
+        state = collect_local_state(m, include_buffers=True)
+        return {k: v.detach().cpu() for k, v in state.items()
+                if is_saveable_adapter_key(k) and f'.{adapter_name}.' in k}
+
+    strategy = SimpleNamespace(unwrap_model=lambda m: m, get_adapter_state_dict=_collect)
     wrapper = SimpleNamespace(strategy=strategy, model=model)
     saved = TransformersModel._get_adapter_state_dict_for_save(wrapper, 'decision')
     assert saved['base_model.model.head.temperature'].item() == 2

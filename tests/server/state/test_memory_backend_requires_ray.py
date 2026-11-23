@@ -35,7 +35,11 @@ def _own_ray_lifecycle():
     if ray.is_initialized():
         ray.shutdown()
     if was_running:
+        # address='local': the session head we just shut down can leave a stale
+        # ray_current_cluster file; auto-detection would connect to the dead cluster and
+        # reject num_cpus, breaking every downstream test that needs the session runtime.
         ray.init(
+            address='local',
             ignore_reinit_error=True,
             num_cpus=2,
             log_to_driver=False,

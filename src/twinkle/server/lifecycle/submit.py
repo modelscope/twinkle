@@ -6,19 +6,23 @@ The Inline_Fast_Path wait itself (``submit_and_peek``) lives on
 queue state; this module owns the request-shaped pieces around it.
 """
 from __future__ import annotations
-
 import uuid
 from collections.abc import Callable, Coroutine
-from fastapi import Request
 from typing import TYPE_CHECKING, Any
+
+from fastapi import Request
 
 from twinkle.data_format import InputFeature, Trajectory, is_encoded
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.types.base import FieldRole, fields_with_role
 from twinkle.protocol.types.data import VLM_TENSOR_FIELDS, export_batch
 from twinkle.protocol.types.lifecycle import TaskEnvelope
-from twinkle.protocol.types.model import (AdapterRequest, DataPlaneForwardRequest, ForwardBackwardTaskRequest,
-                                          TrainingRequest)
+from twinkle.protocol.types.model import (
+    AdapterRequest,
+    DataPlaneForwardRequest,
+    ForwardBackwardTaskRequest,
+    TrainingRequest,
+)
 from twinkle.server.middleware.auth import get_session_id_from_request
 from twinkle.server.validation import assert_request_supported
 
@@ -130,10 +134,10 @@ def input_metrics(self: DataParallelDeployment, body: Any, *, data_parallel: boo
 
 
 def resolve_twinkle_adapter_name(request: Request, adapter_name: str | None) -> str | None:
-    """Build a stable per-session adapter name, falling back to request_id for older clients."""
+    """Build an adapter name scoped to the session or client."""
     if adapter_name is None or adapter_name == '':
         return None
-    owner_id = get_session_id_from_request(request) or request.state.request_id
+    owner_id = get_session_id_from_request(request) or request.state.client_id
     return owner_id + '-' + adapter_name
 
 

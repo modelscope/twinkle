@@ -3,7 +3,7 @@
 # Serves the two bases written by cookbook/client/twinkle/prepare_seq_cls_model.py.
 # Launch from the repository root so the relative model paths resolve (one GPU per model):
 #   ray start --head --num-gpus=2
-#   python -m twinkle.server launch --config cookbook/client/server/transformer/server_config_seq_cls.yaml
+#   twinkle-server launch -c cookbook/client/server/transformer/server_config_seq_cls.yaml
 # Then run cookbook/client/twinkle/reranker.py and cookbook/client/twinkle/seq_cls.py.
 
 http_options:

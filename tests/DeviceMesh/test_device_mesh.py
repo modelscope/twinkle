@@ -207,3 +207,48 @@ class TestDeviceMeshRanks:
                     # data_rank formula: dp_rank * fsdp_world_size + fsdp_rank
                     expected_data_rank = dp_idx * 3 + fsdp_idx
                     assert mesh.data_rank == expected_data_rank
+
+
+class TestFromSizesTileGuard:
+    """defect81 gate: declared axes must tile world_size, checked BEFORE the reshape.
+
+    PLAN (case | input | expected | failure it kills):
+    1 under-declared no residual | fsdp2, world4 | ValueError 'does not tile' | bare numpy
+      'cannot reshape' preempting the caller's size guard (NRA178 exact old red)
+    2 exact tiling | fsdp2 dp2, world4 | mesh (2,2) | over-rejection of the correct spec
+    3 residual divisible | fsdp2 dp-1, world4 | dp inferred 2, mesh (2,2) | residual-axis
+      false rejection
+    4 residual not divisible | fsdp3 dp-1, world4 | ValueError 'does not tile' | numpy
+      reshape crash on a non-divisible residual
+    5 over-declared | fsdp2 dp4, world4 | ValueError 'does not tile' | silently truncating
+      ranks to a smaller mesh
+    6 auto-expansion | fsdp2, world default | world becomes 2, GREEN | breaking the
+      world_size-only caller path
+    Reverse-verify: deleting the pre-reshape guard turns 1/4/5 into bare numpy ValueError
+    (message lacks 'does not tile'); 2/3/6 stay GREEN.
+    """
+
+    def test_under_declared_no_residual_fails_actionably(self):
+        with pytest.raises(ValueError, match='does not tile world_size=4'):
+            DeviceMesh.from_sizes(world_size=4, fsdp_size=2)
+
+    def test_exact_tiling_passes(self):
+        mesh = DeviceMesh.from_sizes(world_size=4, fsdp_size=2, dp_size=2)
+        assert mesh.mesh.shape == (2, 2)
+
+    def test_residual_divisible_infers_axis(self):
+        mesh = DeviceMesh.from_sizes(world_size=4, fsdp_size=2, dp_size=-1)
+        assert mesh.mesh.shape == (2, 2)
+        assert mesh.dp_world_size == 2
+
+    def test_residual_not_divisible_fails_actionably(self):
+        with pytest.raises(ValueError, match='does not tile world_size=4'):
+            DeviceMesh.from_sizes(world_size=4, fsdp_size=3, dp_size=-1)
+
+    def test_over_declared_fails_actionably(self):
+        with pytest.raises(ValueError, match='does not tile world_size=4'):
+            DeviceMesh.from_sizes(world_size=4, fsdp_size=2, dp_size=4)
+
+    def test_auto_expansion_unchanged(self):
+        mesh = DeviceMesh.from_sizes(fsdp_size=2)
+        assert mesh.world_size == 2

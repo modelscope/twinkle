@@ -88,8 +88,7 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
                               self: GatewayServer = Depends(self_fn)) -> Any:
         """Retrieve the result of an async task with long polling."""
         request_id = body.request_id
-        await self.state.assert_future_owner(request_id, get_token_from_request(request))
-        outcome = await poll_future(self.state, request_id)
+        outcome = await poll_future(self.state, request_id, owner_token=get_token_from_request(request))
         record = outcome.record
         if outcome.timed_out:
             response_data: dict[str, Any] = {'type': 'try_again'}
