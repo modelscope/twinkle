@@ -212,6 +212,8 @@ def plan_micro_batches(
     """
     if not inputs:
         raise ValueError("cannot plan micro-batches for empty inputs")
+    if not config.dynamic_batching and config.micro_batch_order == "none":
+        return _fixed_plan(len(inputs), config.micro_batch_size)
     lengths = [sequence_length(model_input) for model_input in inputs]
     return plan_micro_batches_for_lengths(
         lengths, config, padding_free=padding_free, min_micro_batches=min_micro_batches
