@@ -69,8 +69,9 @@ empty row list and a count of zero. Requests without a token appear as
   node** narrows the node metrics. Queue depth is global across tenants
   and models. **Serve ingress wait p95** measures waiting for an HTTP
   replica (optional Ray scrape). **Compute queue wait p95** starts at
-  task admission. For a cold sampler, inspect the `sampler.forward` span
-  for the post-assignment wait.
+  task admission. For a cold sampler, compare the start of
+  `sampler.forward` with `task_queue.execute`. If the connection drops,
+  the forwarding span can end while the sampler is still warming up.
 - Usage includes admitted training compute and ordinary sampling requests.
   Retries that replay an accepted request contribute once. For a manual retry
   of Twinkle `sample` or `asample` after a timeout, reuse the original
