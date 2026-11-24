@@ -3182,6 +3182,29 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _task_head_is_master(self) -> bool:
         return Platform.is_master()
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def save_scoring_head_sidecar(self, checkpoint_dir: str, save_weights: bool = True) -> bool:
+        """Persist the attached decision scoring head beside a checkpoint, worker-side.
+
+        The decision_checkpoint callback binds the driver's Ray proxy, which has no
+        ``_modules`` tree (the head lives on the workers), so head discovery and
+        ``head.save_pretrained`` must run here rather than on the stub. Only the master
+        rank writes the sidecar, matching the checkpoint save's ``Platform.is_master``
+        guard; the single-head decision readout is replicated, not a LoRA target.
+        """
+        if not self._task_head_is_master():
+            return False
+        host = self._task_head_host()
+        head = None
+        for name, module in host.named_modules():
+            if name in ('scoring_head', 'task_head') or name.endswith(('.scoring_head', '.task_head')):
+                head = module
+                break
+        if head is None:
+            return False
+        head.save_pretrained(checkpoint_dir, save_weights=save_weights)
+        return True
+
     def _add_task_head(self, adapter_name: str, task, task_head_loader=None, num_labels=None) -> None:
         """Build one task head worker-side and register it per adapter.
 
