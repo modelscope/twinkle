@@ -15,6 +15,7 @@ from tests.server.state.fake_backend import FakeBackend
 from twinkle.server.checkpoint import paths
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.exceptions import BackendBusyError
+from twinkle.server.identity import USER_ID_KEY_ENV, current_tenant_fingerprint, tenant_fingerprint
 from twinkle.server.lifecycle.submit import submit_training_task
 from twinkle.server.middleware.auth import get_token_from_request, verify_request_token
 from twinkle.server.processor.twinkle_handlers import _register_processor_routes
@@ -22,7 +23,6 @@ from twinkle.server.state.server_state import ServerState
 from twinkle.server.task_queue.mixin import TaskQueueMixin
 from twinkle.server.telemetry import metrics, resource_metrics
 from twinkle.server.telemetry.http_middleware import create_metrics_middleware
-from twinkle.server.identity import USER_ID_KEY_ENV, current_tenant_fingerprint, tenant_fingerprint
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.utils.logger import get_logger
 
