@@ -263,11 +263,13 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
                  backend: str,
                  queue_config: TaskQueueConfig | None = None,
                  data_plane_url: str | None = None,
+                 telemetry_model_id: str | None = None,
                  **kwargs):
         self._startup_args = (model_id, nproc_per_node, device_group, device_mesh, backend,
                               queue_config, data_plane_url)
         self._startup_kwargs = kwargs
         self._startup_async_done = False
+        self._telemetry_model_id = telemetry_model_id or model_id
 
     async def _complete_startup(self) -> None:
         """The constructor's startup body (see the class docstring for why it lives here)."""
@@ -328,7 +330,7 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
             enable_admission_gate=True,
             on_backend_timeout=self._probe_after_timeout,
             collect_width=len(actors) if actors else 1,
-            telemetry_model_id=self.base_model,
+            telemetry_model_id=self._telemetry_model_id,
         )
         self.model._ray_get_timeout = self.task_queue_config.effective_execution_timeout
         self._training_states = {}
@@ -360,7 +362,7 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
             await self._complete_startup()
 
     async def _on_request_start(self, request: Request) -> str:
-        request.state.base_model = self.base_model
+        request.state.base_model = self._telemetry_model_id
         return await self.training_request_start(request)
 
     async def shutdown(self) -> None:

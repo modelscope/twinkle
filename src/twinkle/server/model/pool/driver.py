@@ -74,6 +74,7 @@ class RayInstanceDriver:
         options = self.runtime.deployment_options(spec.deploy_options, name, spec.env_vars)
         app = build_model_app(
             model_id=spec.model_id,
+            telemetry_model_id=instance.base_model,
             backend=spec.backend,
             nproc_per_node=spec.config.num_devices,
             device_group={"name": "model", "ranks": spec.config.num_devices, "device_type": spec.device_type},
