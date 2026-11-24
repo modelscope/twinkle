@@ -2,13 +2,14 @@
 """Ray composition for the sampling controller and its owned driver."""
 
 import asyncio
+import logging
 from copy import deepcopy
 
 from twinkle.server.config.application_spec import SamplerArgs
-from twinkle.utils.logger import get_logger
+from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized, shutdown_telemetry_safely
 from .controller import SamplerController
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 def create_controller_actor():
@@ -18,9 +19,11 @@ def create_controller_actor():
 
     @ray.remote(num_cpus=0.1, max_restarts=-1, max_task_retries=0)
     class SamplerControllerActor(SamplerController):
-        def __init__(self, values, namespace, pool_id, options, budgets):
+        def __init__(self, values, namespace, pool_id, options, budgets, base_model):
+            ensure_telemetry_initialized()
             args = SamplerArgs.model_validate(values)
-            super().__init__(args, SamplerDriver(args, namespace, pool_id, options, budgets), budgets)
+            driver = SamplerDriver(args, namespace, pool_id, options, budgets, base_model=base_model)
+            super().__init__(args, driver, budgets)
 
         async def initialize(self):
             await super().initialize()
@@ -28,13 +31,16 @@ def create_controller_actor():
                 self._monitor_task = asyncio.create_task(self._monitor())
 
         async def shutdown(self):
-            await super().shutdown()
-            await self.driver.runtime.wait_for_cleanup()
+            try:
+                await super().shutdown()
+                await self.driver.runtime.wait_for_cleanup()
+            finally:
+                await asyncio.to_thread(shutdown_telemetry_safely)
 
     return SamplerControllerActor
 
 
-def create_sampler_controller(spec, namespace, budgets, env):
+def create_sampler_controller(spec, namespace, budgets, env, *, base_model):
     """Driver-only composition. Each compute instance owns its external allocation."""
     from .controller import sampler_controller_name, sampling_pool_id
 
@@ -55,7 +61,7 @@ def create_sampler_controller(spec, namespace, budgets, env):
     controller = (
         create_controller_actor()
         .options(name=name, namespace=namespace, lifetime="detached", runtime_env=runtime_env)
-        .remote(spec.args.model_dump(), namespace, pool_id, options, budgets)
+        .remote(spec.args.model_dump(), namespace, pool_id, options, budgets, base_model)
     )
     return controller, options, pool_id
 

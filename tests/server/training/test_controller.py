@@ -322,7 +322,10 @@ async def test_full_and_lora_isolation_and_device_reuse():
 
 
 @pytest.mark.asyncio
-async def test_capacity_failure_is_terminal_and_does_not_hold_quota():
+async def test_capacity_failure_is_terminal_and_does_not_hold_quota(monkeypatch):
+    rejections = []
+    monkeypatch.setattr('twinkle.server.model.pool.controller.record_admission_rejection',
+                        lambda reason, **_: rejections.append(reason))
     controller, state, runtime, _ = await setup(devices=2)
     await create(controller, state, 1, mode='full')
     ref = await controller.create(request(2, mode='full'))
@@ -333,6 +336,8 @@ async def test_capacity_failure_is_terminal_and_does_not_hold_quota():
     assert await state._backend.get('token_count::owner') == 1
     assert len(runtime.allocations) == 1
     assert await controller.create(request(2, mode='full')) == ref
+
+    assert rejections == ['capacity']
 
 
 @pytest.mark.asyncio
@@ -349,7 +354,10 @@ async def test_create_idempotency_and_changed_payload_conflict():
 
 
 @pytest.mark.asyncio
-async def test_pending_creates_count_toward_quota():
+async def test_pending_creates_count_toward_quota(monkeypatch):
+    rejections = []
+    monkeypatch.setattr('twinkle.server.model.pool.controller.record_admission_rejection',
+                        lambda reason, **_: rejections.append(reason))
     controller, state, runtime, _ = await setup(quota=1)
     runtime.start_gate.clear()
     first = await controller.create(request(1))
@@ -360,6 +368,9 @@ async def test_pending_creates_count_toward_quota():
     await controller.wait_for_jobs()
     assert (await state.get_future(first['request_id']))['status'] == 'completed'
     assert len(runtime.users) == 1
+
+    assert await controller.create(request(2)) == second
+    assert rejections == ['quota']
 
 
 @pytest.mark.asyncio

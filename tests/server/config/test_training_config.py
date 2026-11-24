@@ -346,6 +346,8 @@ async def test_configured_options_reach_runtime_with_one_controller_owned_replic
     monkeypatch.setattr(importlib.import_module('ray.util.placement_group'), 'get_placement_group', lambda name: 'pg')
     monkeypatch.setattr(serve, 'run', lambda *args, **kwargs: None)
     await driver.deploy(instance, driver.config.get(model.name, 'lora'))
+    assert captured['model_id'] == model.model_id
+    assert captured['telemetry_base_model'] == model.name
     options = captured['deploy_options']
     assert options['num_replicas'] == 1 and 'autoscaling_config' not in options
     assert options['max_ongoing_requests'] == 17

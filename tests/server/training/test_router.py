@@ -37,6 +37,7 @@ async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(m
     checkpoint = (manager.training_run_manager.get_base_dir() if owned else tmp_path) / 'checkpoint'
     checkpoint.mkdir(parents=True)
     router = TrainingRouter.__new__(TrainingRouter)
+    router.model = SimpleNamespace(name='public-model')
     router.state = ServerState(backend=FakeBackend())
     router.store = router.state.create_training_store('upload-test')
     router.replica_id = 'router'
@@ -91,6 +92,7 @@ async def test_upload_keeps_its_receipt_when_progress_cannot_be_written(monkeypa
     checkpoint = create_checkpoint_manager('owner', client_type='twinkle').training_run_manager.get_base_dir() / 'saved'
     checkpoint.mkdir(parents=True)
     router = TrainingRouter.__new__(TrainingRouter)
+    router.model = SimpleNamespace(name='public-model')
     router.state = ServerState(backend=FakeBackend())
     router.store = router.state.create_training_store('upload-test')
     router.replica_id = 'router'
@@ -147,6 +149,7 @@ async def test_keyed_upload_reconnects_to_original_task(monkeypatch, tmp_path):
             return created
 
     router = TrainingRouter.__new__(TrainingRouter)
+    router.model = SimpleNamespace(name='public-model')
     router.state = ServerState(backend=PausedBackend())
     router.replica_id = 'router'
     router._init_task_queue()

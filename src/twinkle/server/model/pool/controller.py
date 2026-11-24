@@ -19,6 +19,7 @@ from twinkle.server.exceptions import (
     ResourceQuotaExceededError,
     TrainingExpiredError,
 )
+from twinkle.server.identity import tenant_fingerprint
 from twinkle.server.resources.allocation import CapacityUnavailableError
 from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.state.models import FutureFailureRecord
@@ -32,7 +33,8 @@ from twinkle.server.state.training_records import (
     TrainingRoute,
 )
 from twinkle.server.state.training_store import TrainingStore
-from twinkle.server.telemetry.metrics import TrainingInstanceMetrics, TrainingInstanceSnapshot, get_training_metrics
+from twinkle.server.telemetry.admission import record_admission_rejection
+from twinkle.server.telemetry.metrics import MetricsRegistry, TrainingInstanceMetrics, TrainingInstanceSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +98,7 @@ class TrainingController:
         self._failed_instances: dict[str, FutureFailureRecord] = {}
         self._lock = asyncio.Lock()
         self._ready = False
-        self._metrics = get_training_metrics()
+        self._metrics = MetricsRegistry.get()
         self._instance_metrics = TrainingInstanceMetrics(self._metrics)
 
     def _instance_metric_tags(self, instance: InstanceRecord) -> dict[str, str]:
@@ -269,7 +271,9 @@ class TrainingController:
             await self.fail_instance(instance.instance_id, failure_for(exc))
             raise
         finally:
-            self._metrics.startup_seconds.observe(time.monotonic() - started, tags={**tags, "status": status})
+            self._metrics.training_startup_seconds.record(
+                time.monotonic() - started, attributes={**tags, "status": status}
+            )
 
     def _select(self, spec: TrainingModelConfig) -> InstanceRecord | None:
         candidates = [
@@ -360,8 +364,21 @@ class TrainingController:
                     training.state = "FAILED"
                     training.terminal_reason = failure_for(exc).reason_code
                     await self.store.retire(training)
-                await self.store.future(request_id, "failed", training_id, failure=failure_for(exc))
+                await self._fail_creation(request_id, training_id, failure_for(exc), request.token, request.base_model)
             return {"request_id": request_id}
+
+    async def _fail_creation(
+        self, request_id: str, training_id: str, failure: FutureFailureRecord, token: str, base_model: str
+    ) -> None:
+        if await self.store.future(request_id, "failed", training_id, failure=failure):
+            reason = {"resource_quota_exceeded": "quota", "capacity_unavailable": "capacity"}.get(failure.reason_code)
+            if reason is not None:
+                record_admission_rejection(
+                    reason,
+                    deployment="TrainingController",
+                    fingerprint=tenant_fingerprint(token),
+                    base_model=base_model,
+                )
 
     async def _create_user(self, training: TrainingRecord, request: CreateTraining) -> None:
         instance = self.instances[training.instance_id]
@@ -401,8 +418,9 @@ class TrainingController:
                 await self.store.future(training.create_request_id, "completed", training.training_id, result=result)
         except Exception as exc:
             if training.state not in TERMINAL_TRAINING:
-                await self.store.future(
-                    training.create_request_id, "failed", training.training_id, failure=failure_for(exc)
+                await self._fail_creation(
+                    training.create_request_id, training.training_id, failure_for(exc),
+                    training.token, training.base_model,
                 )
                 async with self._lock:
                     training.state = "CLOSING"
@@ -649,18 +667,21 @@ class TrainingController:
                 self._report_instance_metrics()
                 tags = self._instance_metric_tags(instance)
                 if entered_quarantine:
-                    self._metrics.quarantined_total.inc(
-                        tags={
+                    self._metrics.training_quarantined_total.add(
+                        1,
+                        attributes={
                             "backend": tags["backend"],
                             "mode": tags["mode"],
                             "reason": TrainingInstanceMetrics.quarantine_reason(exc),
                         }
                     )
-            self._metrics.shutdown_seconds.observe(time.monotonic() - started, tags={**timing_tags, "status": "error"})
+            self._metrics.training_shutdown_seconds.record(
+                time.monotonic() - started, attributes={**timing_tags, "status": "error"}
+            )
 
         async def stopped():
-            self._metrics.shutdown_seconds.observe(
-                time.monotonic() - started, tags={**timing_tags, "status": "success"}
+            self._metrics.training_shutdown_seconds.record(
+                time.monotonic() - started, attributes={**timing_tags, "status": "success"}
             )
             await self._retire_instance(instance)
 
@@ -680,7 +701,10 @@ class TrainingController:
             for training_id in list(instance.training_ids):
                 training = self.trainings[training_id]
                 if failure is not None:
-                    for request_id in (training.create_request_id, *training.pending_operation_ids):
+                    await self._fail_creation(
+                        training.create_request_id, training_id, failure, training.token, training.base_model,
+                    )
+                    for request_id in training.pending_operation_ids:
                         await self.store.future(request_id, "failed", training_id, failure=failure)
                 terminal = training.model_copy(
                     deep=True,
@@ -732,7 +756,10 @@ class TrainingController:
                     await self.store.save_training(closing)
                     training.state = "CLOSING"
                     training.terminal_reason = failure.reason_code
-                    for request_id in (training.create_request_id, *training.pending_operation_ids):
+                    await self._fail_creation(
+                        training.create_request_id, training_id, failure, training.token, training.base_model,
+                    )
+                    for request_id in training.pending_operation_ids:
                         await self.store.future(request_id, "failed", training_id, failure=failure)
             await self.lifecycle.cancel_start(instance_id)
         finally:

@@ -2,14 +2,68 @@
 """Adapt the pinned Tinker SDK to Twinkle authentication and training."""
 
 from __future__ import annotations
-
 import os
+from contextvars import ContextVar
+from dataclasses import dataclass
+from functools import wraps
 from typing import Any, Mapping
 
 from twinkle.protocol.headers import build_request_headers
 from twinkle_client.http.context import capture_transport
 
 _patched = False
+
+
+@dataclass
+class _SampleCall:
+    sequence: int | None = None
+
+
+_sample_call: ContextVar[_SampleCall | None] = ContextVar('tinker_sample_call', default=None)
+
+
+def _sampling_retry_handler(base):
+    class SamplingRetryHandler(base):
+        async def execute(self, func, *args, **kwargs):
+            binding = _sample_call.set(_SampleCall())
+            try:
+                return await super().execute(func, *args, **kwargs)
+            finally:
+                _sample_call.reset(binding)
+
+    return SamplingRetryHandler
+
+
+def _stable_sampling_request(original):
+    @wraps(original)
+    async def asample(self, *, request, **kwargs):
+        # Tinker 0.16.1 allocates seq_id inside the retry loop. Reuse the first
+        # one for this logical call, including a retry after result polling.
+        if (call := _sample_call.get()) is not None:
+            if call.sequence is None:
+                call.sequence = request.seq_id
+            elif request.seq_id != call.sequence:
+                request = request.model_copy(update={'seq_id': call.sequence})
+        return await original(self, request=request, **kwargs)
+
+    return asample
+
+
+def _restore_sampling_client(state):
+    from tinker.lib.public_interfaces.sampling_client import _unpickle_sampling_client
+
+    patch_tinker()
+    return _unpickle_sampling_client(state)
+
+
+def _sampling_client_reduce(original):
+    @wraps(original)
+    def reduce(self):
+        # A spawned SDK sidecar also needs the sampling compatibility patch.
+        _, args = original(self)
+        return _restore_sampling_client, args
+
+    return reduce
 
 
 async def _create_sampling_session(self, model_path: str | None = None, base_model: str | None = None) -> str:
@@ -195,6 +249,7 @@ def patch_tinker():
     3. ParsedCheckpointTinkerPath.from_tinker_path to support both 'tinker://' and 'twinkle://' prefixes
     4. ServiceClient.__init__ to inject Twinkle-specific headers
     5. ServiceClient.create_full_training_client to enable full-parameter (non-LoRA) training
+    6. SamplingClient to reuse one request sequence across SDK retries
 
     This patch is idempotent - calling it multiple times has no additional effect.
     """
@@ -222,6 +277,13 @@ def patch_tinker():
         # Patch 5: add a full-parameter (non-LoRA) training-client entrypoint.
         ServiceClient.create_full_training_client = _create_full_training_client
         ServiceClient.create_full_training_client_async = _create_full_training_client_async
+
+        from tinker.lib.public_interfaces import sampling_client
+        from tinker.resources.sampling import AsyncSamplingResource
+
+        sampling_client.RetryHandler = _sampling_retry_handler(sampling_client.RetryHandler)
+        sampling_client.SamplingClient.__reduce__ = _sampling_client_reduce(sampling_client.SamplingClient.__reduce__)
+        AsyncSamplingResource.asample = _stable_sampling_request(AsyncSamplingResource.asample)
 
         _patched = True
     except ImportError:

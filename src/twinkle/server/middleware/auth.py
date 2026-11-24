@@ -5,6 +5,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, H_CLIENT_ID, H_REQUEST_ID, H_SESSION_ID
+from twinkle.server.identity import current_tenant_fingerprint, tenant_fingerprint
 
 _OPENAI_COMPAT_SUFFIXES = ('/chat/completions', '/models')
 
@@ -40,11 +41,16 @@ async def verify_request_token(request: Request, call_next):
         return JSONResponse(status_code=400, content={'detail': f'Missing {H_REQUEST_ID} header'})
 
     request.state.request_id = request_id
-    request.state.client_id = request.headers.get(H_CLIENT_ID) or request_id
+    client_id = request.headers.get(H_CLIENT_ID)
+    request.state.client_id = client_id or request_id
     request.state.token = token
     request.state.session_id = request.headers.get(H_SESSION_ID) or ''
-    response = await call_next(request)
-    return response
+    request.state.tenant_fingerprint = tenant_fingerprint(token)
+    binding = current_tenant_fingerprint.set(request.state.tenant_fingerprint)
+    try:
+        return await call_next(request)
+    finally:
+        current_tenant_fingerprint.reset(binding)
 
 
 def is_token_valid(token: str) -> bool:

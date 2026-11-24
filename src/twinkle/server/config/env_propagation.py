@@ -3,13 +3,12 @@
 
 import os
 
+from .telemetry import TELEMETRY_WORKER_ENV_KEYS
+
 SHARED_WORKER_ENV_KEYS: tuple[str, ...] = (
     "TWINKLE_STATE_RAY_NAMESPACE",
-    "TWINKLE_TELEMETRY_ENABLED",
-    "TWINKLE_TELEMETRY_DEBUG",
-    "TWINKLE_TELEMETRY_SERVICE",
-    "TWINKLE_TELEMETRY_ENDPOINT",
-    "TWINKLE_TELEMETRY_INTERVAL",
+    *TELEMETRY_WORKER_ENV_KEYS,
+    "TWINKLE_TELEMETRY_USER_ID_KEY",
     "TWINKLE_MODEL_ID_ALIASES",
     "TWINKLE_TRUST_REMOTE_CODE",
     # Must reach every backend worker (RayRuntime.deployment_options), not just the

@@ -585,6 +585,17 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         except Exception:
             return None
 
+    def sampling_training_id(self, adapter_uri: str) -> str | None:
+        """Identify a published checkpoint in this caller’s own training directory."""
+        parsed = self.parse_path(adapter_uri)
+        if parsed is None:
+            return None
+        try:
+            checkpoint = self.get(parsed.training_run_id, parsed.checkpoint_id)
+        except ValueError:
+            return None
+        return parsed.training_run_id if checkpoint is not None else None
+
     def parse_adapter_uri(self, adapter_uri: str) -> tuple[str, str]:
         """Return the run ID and sampler backend path.
 

@@ -1,0 +1,141 @@
+# Multitenant operations
+
+## Configure observability
+
+Follow [Start the training operations dashboard](https://github.com/modelscope/twinkle/tree/main/cookbook/observability#start-the-training-operations-dashboard)
+for both local and self-hosted use. The Compose example runs Collector, Tempo,
+Loki, Mimir, and Grafana with persistent storage.
+Set `telemetry.otlp_endpoint` to a Collector reachable from Runtime. Choose a
+retention period and storage backend for your deployment. The example retains
+30 days of data. Keep Mimir's TSDB and working directories on supported block
+storage. Restrict access to the Collector and Redis, and require authentication
+for Grafana.
+
+Set the same `TWINKLE_TELEMETRY_USER_ID_KEY` in every Runtime process. Use a
+randomly generated secret separate from `TWINKLE_TOKEN_SALT`. When the key is
+absent, tenant attribution and Redis snapshots are disabled. Rotating the key
+changes the fingerprint. Existing telemetry and previously attributed sessions
+keep their original fingerprints until they expire or the sessions are recreated.
+Checkpoint directories keep their existing format.
+
+## Redis access
+
+Provision a dedicated Redis account against the same database as Runtime.
+Apply the exact `persistence.key_prefix` when provisioning the dashboard and
+the ACL. This example assumes an empty prefix and Redis database 0.
+
+```text
+ACL SETUSER twinkle-grafana reset on >DEPLOYMENT_SECRET ~admin:index:sessions ~admin:index:trainings ~admin:index:sampling +get
+```
+
+Supply the password through your secret manager. Verify the
+Grafana data source can read all three keys with GET. Also verify that the same
+account cannot read any business key, write, or enumerate keys with SCAN or KEYS.
+The Runtime cleanup leader refreshes the snapshots at `metrics_update_interval`
+(15 seconds by default). Each snapshot has a generation time and a TTL of
+three refresh intervals, rounded up to seconds. Empty snapshots contain an
+empty row list and a count of zero. Requests without a token appear as
+**Unattributed** and can be selected with `unassigned`.
+
+## Find a training and investigate an error
+
+1. Select the time range and open **Current trainings** or **Recent training
+   activity**. **Training snapshot** shows the last refresh and total live
+   trainings before filters. A fresh snapshot with zero trainings is empty.
+   A fresh snapshot with a positive count and an empty filtered table has no
+   matches. **Unavailable** indicates a missing or expired snapshot. A data
+   source error indicates a failed Redis read. Historical logs and traces
+   remain independently searchable.
+2. Click the **Training ID** to open **Training task logs** with that training
+   and time range. GRPO rollouts using that training’s published checkpoint
+   appear as `sample`. Base-weight sampling has no checkpoint training ID.
+   Use **Log outcome** to narrow to failures, refusals, or
+   timeouts. To search a longer log history, open the logs panel in **Explore**.
+3. Expand a log and choose **View trace**, or open **Runtime task traces**.
+   The execution span shows queue wait, execution time, outcome and error type.
+   For a known task ID, search Tempo with
+   `{ span.twinkle.task_id = "req_..." }`, or filter Loki with
+   `{service_name="runtime-service"} | twinkle_task_id = "req_..."`.
+   **Logs for this span** searches by the task ID. From the span's **Links**,
+   open **Node GPU utilization** or **Node CPU utilization** to inspect the
+   device's node around that execution.
+
+## Check tenant usage and resources
+
+- **User fingerprint prefix** accepts a fingerprint or its prefix. The
+  full value appears as `twinkle.tenant_fingerprint` in a task trace.
+  **Base model** and the fingerprint filter apply to training and usage.
+  **Training ID** narrows the training and diagnostic panels. **Resource
+  node** narrows the node metrics. Queue depth is global across tenants
+  and models. **Serve ingress wait p95** measures waiting for an HTTP
+  replica (optional Ray scrape). **Serve ingress waits over 1 s** shows the
+  estimated tail count in each five-minute window. **Compute queue wait p95**
+  starts at task admission. Open the task trace and select
+  `sampler.wait_for_replica` to see how long the sampling pool took to select
+  a replica, including a cold start. This span keeps measuring after the
+  original client connection closes.
+- Usage includes admitted training compute and ordinary sampling requests.
+  Retries that replay an accepted request contribute once. For a manual retry
+  of Twinkle `sample` or `asample` after a timeout, reuse the original
+  `idempotency_key` and input while the receipt is retained. Input token
+  counts use token IDs known at admission. The Tinker SDK keeps the sampling
+  sequence across automatic retries when initialized with `init_tinker_client()`.
+  Execution seconds sum task duration across replicas. The time-range totals use Prometheus `increase()`
+  estimates. Each time series needs two samples in the selected range.
+  Activity already included in the first sample of a new series can be missed,
+  especially for a tenant making only a few requests.
+  Heartbeats and polling appear separately. These rates and Runtime HTTP p95
+  are service-level metrics across tenants.
+- **Business admission rejections / second** groups rate limits, quota and
+  unavailable capacity. A rejected training creation can arrive as a
+  failed future over HTTP 200. Replaying that receipt or reading it again
+  adds no rejection. **Recorded business rejections** shows the latest
+  cumulative counts from live processes, including the first observed rejection.
+  The legacy HTTP 429 metric remains available in Explore.
+- The two deployment references are requests per second and input tokens
+  per second. Grafana compares five-minute rates against the same references
+  for every tenant and highlights the corresponding panels.
+- CPU and GPU metrics are emitted once per node and backend destination.
+  RSS is per process. Interpret GPU charts as physical device usage by node
+  and UUID. Attribute a device to a model only when its allocation is exclusive.
+- **Drilldown → Traces** shows span rates, errors and latency using the
+  Tempo local-blocks processor. **Drilldown → Logs** shows service and label
+  activity. Use **Last Runtime metric received** to check exporter freshness
+  and confirm trace and log ingestion separately.
+
+## Maintainer guide
+
+| Field | Origin and use |
+| --- | --- |
+| `base_model` | Public model name from deployment configuration. Use it to filter usage and training. |
+| `training_id` | Training handle. Training requests supply it at enqueue. Normal rollout sampling gets it from a published checkpoint owned by the caller. |
+| `task_id` | ID of the accepted task, returned as `request_id` in the future receipt. Use it to join span and log details. |
+| `tenant_fingerprint` | An opaque fingerprint of the caller's token. With a telemetry key configured, requests without a token use `unassigned`. |
+
+For a missing signal, check **Last Runtime metric received**, then check the
+Runtime endpoint and Collector logs. Follow the signal to Mimir for metrics,
+Loki for logs, or Tempo for traces, before checking the Grafana filters. Redis
+serves the current resource tables. Historical logs and traces can be queried
+during a Redis outage.
+
+Keep the Runtime workers at the default log level, INFO, to populate **Recent
+training activity** and show successful tasks in **Training task logs**.
+`LOG_LEVEL=WARNING` suppresses INFO task events before they reach Loki. In Loki
+Explore, expand a task log to see its Python module in `scope_name`.
+
+For a code change, start at `server/telemetry/worker_init.py` for per-process
+startup, `server/task_queue/types.py` for the task's correlation fields, and
+`server/task_queue/worker.py` for admission metrics and execution spans.
+HTTP metrics count each hop. A business rejection is counted at the HTTP error
+boundary or the first failed training receipt. Task outcomes are recorded
+after admission. `ResourceMetricsCollector` observes node CPU/GPU and process
+memory. `ResourceSnapshotPublisher` publishes current business state from the
+cleanup leader.
+
+## Verify the deployment
+
+Confirm that Runtime metrics, logs, and traces arrive. Check the configured
+retention and query stored samples after restarting the backends. Verify Grafana
+authentication, Redis permissions, and device identity labels. Use the Twinkle
+and Tinker clients to exercise session creation, heartbeat, sampling, and result
+retrieval through your deployment's API endpoint.

@@ -5,6 +5,8 @@
 H_REQUEST_ID = 'x-request-id'
 H_CLIENT_ID = 'X-Twinkle-Client-Id'
 H_SESSION_ID = 'X-Twinkle-Session-Id'
+H_SAMPLE_IDEMPOTENCY_KEY = 'Idempotency-Key'
+H_SAMPLE_IDEMPOTENCY_SUPPORTED = 'X-Twinkle-Sample-Idempotency'
 
 # -- auth --
 H_AUTH = 'Authorization'

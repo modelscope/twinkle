@@ -132,7 +132,7 @@ def test_startup_rollback_preserves_startup_error_and_cleans_all_owners(monkeypa
 
     monkeypatch.setattr(launcher, '_deploy_application', deploy)
     monkeypatch.setattr(launcher, '_stop_training_controller', failed_cleanup)
-    monkeypatch.setattr('twinkle.server.telemetry.flush_telemetry_safely', lambda: calls.append('telemetry'))
+    monkeypatch.setattr('twinkle.server.telemetry.shutdown_telemetry_safely', lambda: calls.append('telemetry'))
     with pytest.raises(ValueError) as caught:
         launcher.launch()
     assert caught.value is error

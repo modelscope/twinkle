@@ -6,7 +6,7 @@ import random
 from collections.abc import Callable
 from typing import Any
 
-from twinkle.server.telemetry.metrics import get_state_backend_metrics
+from twinkle.server.telemetry.metrics import MetricsRegistry
 from .base import ConcurrencyError, StateBackend
 
 try:
@@ -41,7 +41,7 @@ class RedisBackend(StateBackend):
             raise ImportError('redis package required. Install with: pip install redis')
         self._client = aioredis.from_url(redis_url, decode_responses=True)
         self._prefix = key_prefix
-        self._metrics = get_state_backend_metrics()
+        self._metrics = MetricsRegistry.get()
 
     def _make_key(self, key: str) -> str:
         """Add namespace prefix to key."""
@@ -150,7 +150,7 @@ class RedisBackend(StateBackend):
                     new_value = transform(current)
                     if new_value is None:
                         await pipe.unwatch()
-                        self._metrics.update_atomic_retries.observe(attempt)
+                        self._metrics.redis_update_atomic_retries.record(attempt)
                         return False if return_changed else current
                     pipe.multi()
                     if ttl is not None:
@@ -159,7 +159,7 @@ class RedisBackend(StateBackend):
                         pipe.set(real_key, json.dumps(new_value))
                     executing = True
                     await pipe.execute()
-                    self._metrics.update_atomic_retries.observe(attempt)
+                    self._metrics.redis_update_atomic_retries.record(attempt)
                     return True if return_changed else new_value
                 except WatchError as exc:
                     # redis-py also wraps a lost watched connection as WatchError.
@@ -169,7 +169,7 @@ class RedisBackend(StateBackend):
                                                        ('A ConnectionError occurred', 'A TimeoutError occurred')))
                     if executing and transport_failure:
                         raise RedisConnectionError('Atomic update outcome could not be confirmed') from exc
-                    self._metrics.update_atomic_conflicts.inc()
+                    self._metrics.redis_update_atomic_conflicts.add(1)
                     backoff = min(
                         _UPDATE_ATOMIC_BASE_BACKOFF_SECONDS * (2**attempt),
                         _UPDATE_ATOMIC_MAX_BACKOFF_SECONDS,
@@ -183,7 +183,7 @@ class RedisBackend(StateBackend):
                         raise
                     # Before EXEC there was no mutation, so reconnecting is safe.
                     await asyncio.sleep(0.05 * connection_failures)
-        self._metrics.update_atomic_retries.observe(_UPDATE_ATOMIC_MAX_RETRIES)
+        self._metrics.redis_update_atomic_retries.record(_UPDATE_ATOMIC_MAX_RETRIES)
         raise ConcurrencyError(f'update_atomic exhausted {_UPDATE_ATOMIC_MAX_RETRIES} retries on key {key!r}')
 
     async def mget(self, keys: list[str]) -> list[Any | None]:
