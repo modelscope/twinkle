@@ -346,7 +346,7 @@
       "id": 20,
       "type": "stat",
       "title": "Estimated accepted requests",
-      "description": "Estimated increase over the selected range, summed across observed replicas. A series needs at least two samples.",
+      "description": "Estimated increase across replicas. Each series needs two samples. Activity already included in its first sample can be missed.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 0, "y": 38, "w": 8, "h": 5},
       "fieldConfig": {
@@ -374,7 +374,7 @@
       "id": 2,
       "type": "stat",
       "title": "Estimated input tokens",
-      "description": "Estimated increase over the selected range, summed across observed replicas. A series needs at least two samples.",
+      "description": "Estimated increase across replicas. Each series needs two samples. Activity already included in its first sample can be missed.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 8, "y": 38, "w": 8, "h": 5},
       "fieldConfig": {
@@ -401,7 +401,7 @@
       "id": 5,
       "type": "stat",
       "title": "Estimated execution seconds",
-      "description": "Estimated increase over the selected range, summed across observed replicas. A series needs at least two samples.",
+      "description": "Estimated increase across replicas. Each series needs two samples. Activity already included in its first sample can be missed.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 16, "y": 38, "w": 8, "h": 5},
       "fieldConfig": {

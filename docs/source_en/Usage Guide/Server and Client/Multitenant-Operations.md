@@ -71,6 +71,8 @@ empty row list and a count of zero. Requests without a token appear as
   use token IDs known at admission. Execution seconds sum task duration
   across replicas. The time-range totals use Prometheus `increase()`
   estimates. Each time series needs two samples in the selected range.
+  Activity already included in the first sample of a new series can be missed,
+  especially for a tenant making only a few requests.
   Heartbeats, polling and origin HTTP 429 responses appear separately.
 - The two deployment references are requests per second and input tokens
   per second. Grafana compares five-minute rates against the same references
