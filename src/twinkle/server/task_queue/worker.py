@@ -8,6 +8,7 @@ a round-robin policy.
 """
 from __future__ import annotations
 import asyncio
+import logging
 import time
 import traceback
 from collections import deque
@@ -40,14 +41,13 @@ from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.task_queue.backend_gate import BACKEND_TIMEOUT_EXCEPTIONS
 from twinkle.server.telemetry.metrics import METERED_TASK_TYPES
 from twinkle.server.telemetry.tracing import get_trace_id, set_span_error, traced_operation
-from twinkle.utils.logger import get_logger
 from .types import QueuedTask
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
     from twinkle.server.telemetry.metrics import MetricsRegistry
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 def _exception_summary(exc: BaseException) -> str:

@@ -2,6 +2,7 @@
 """Shared HTTP forwarding between services; independent of gateway and training controller."""
 
 from __future__ import annotations
+import logging
 from typing import Any, TypedDict
 
 import httpx
@@ -12,9 +13,8 @@ from twinkle.protocol.headers import H_REQUEST_ID
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.telemetry.tracing import inject_context, record_http_status, trace_http_client
-from twinkle.utils.logger import get_logger
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 class ForwardedRequest(TypedDict):

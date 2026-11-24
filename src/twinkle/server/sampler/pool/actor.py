@@ -2,14 +2,14 @@
 """Ray composition for the sampling controller and its owned driver."""
 
 import asyncio
+import logging
 from copy import deepcopy
 
 from twinkle.server.config.application_spec import SamplerArgs
 from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized, shutdown_telemetry_safely
-from twinkle.utils.logger import get_logger
 from .controller import SamplerController
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 def create_controller_actor():

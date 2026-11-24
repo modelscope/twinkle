@@ -6,11 +6,12 @@ All endpoints are prefixed /* and registered via _register_gateway_tinker_routes
 self_fn is injected via FastAPI Depends to obtain the GatewayServer instance at request time.
 """
 from __future__ import annotations
-
+import logging
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from tinker import types
-from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import GatewayServer
@@ -19,12 +20,10 @@ from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.lifecycle.envelope import error_payload_from_failure
 from twinkle.server.middleware.auth import get_token_from_request
-from twinkle.utils.logger import get_logger
-from .use_cases import delete_checkpoint
+from .use_cases import delete_checkpoint, get_weights_info, list_checkpoints, list_training_runs, poll_future
 from .use_cases import get_training_run as get_training_run_use_case
-from .use_cases import get_weights_info, list_checkpoints, list_training_runs, poll_future
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 def _tinker_error_from_failure(stored: Any, *, request_id: str) -> dict[str, Any]:

@@ -329,7 +329,7 @@
         {
           "refId": "A",
           "queryType": "traceql",
-          "query": "{ name = \"task_queue.execute\" && span.twinkle.training_id != nil && span.twinkle.training_id =~ \"^(${training_id:regex}).*$\" && span.twinkle.tenant_fingerprint =~ \"^(${tenant_fingerprint:regex}).*$\" && span.twinkle.base_model =~ \"^${base_model:regex}$\" }",
+          "query": "{ name = \"task_queue.execute\" && span.twinkle.training_id != nil && span.twinkle.training_id =~ \"^(${training_id:regex}).*$\" && span.twinkle.base_model =~ \"^${base_model:regex}$\" && \"${tenant_fingerprint:regex}\" = \"\" } || { name = \"task_queue.execute\" && span.twinkle.training_id != nil && span.twinkle.training_id =~ \"^(${training_id:regex}).*$\" && span.twinkle.base_model =~ \"^${base_model:regex}$\" && span.twinkle.tenant_fingerprint =~ \"^(${tenant_fingerprint:regex}).*$\" }",
           "limit": 25
         }
       ]
@@ -549,7 +549,7 @@
       "id": 7,
       "type": "timeseries",
       "title": "Runtime HTTP latency p95",
-      "description": "",
+      "description": "HTTP request latency across tenants for the selected base model.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 0, "y": 74, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
@@ -557,7 +557,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le, deployment, base_model) (rate(twinkle_http_request_duration_seconds_bucket{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, deployment, base_model) (rate(twinkle_http_request_duration_seconds_bucket{base_model=~\"${base_model:regex}\"}[5m])))",
           "legendFormat": "{{deployment}} {{base_model}}"
         }
       ]
@@ -867,7 +867,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "Heartbeats and result polls / second",
-      "description": "",
+      "description": "Service activity across all tenants.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 0, "y": 125, "w": 24, "h": 8},
       "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
@@ -875,7 +875,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (operation) (rate(twinkle_http_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",operation=~\"session_heartbeat|retrieve_future\",status!=\"429\"}[5m]))",
+          "expr": "sum by (operation) (rate(twinkle_http_requests_total{operation=~\"session_heartbeat|retrieve_future\",status!=\"429\"}[5m]))",
           "legendFormat": "{{operation}}"
         }
       ]

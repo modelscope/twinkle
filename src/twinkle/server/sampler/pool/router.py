@@ -58,7 +58,8 @@ class SamplerRouter:
                     if record is not None:
                         request.state.task_id = submission.request_id
                         if endpoint == "twinkle/sample":
-                            return JSONResponse(envelope_from_record(submission.request_id, record).model_dump(mode="json"))
+                            envelope = envelope_from_record(submission.request_id, record)
+                            return JSONResponse(envelope.model_dump(mode="json"))
                         return JSONResponse({"request_id": submission.request_id, "model_id": None})
             # The existing handler remains responsible for its validation/wire errors.
             path = data.get("adapter_uri") or data.get("model_path")

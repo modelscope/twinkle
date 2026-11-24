@@ -4,6 +4,7 @@
 from __future__ import annotations
 import asyncio
 import hashlib
+import logging
 import math
 import time
 import uuid
@@ -25,9 +26,8 @@ from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.sampler.concurrency import SamplerConcurrency
 from twinkle.server.sampler.submission import SampleSubmission
 from twinkle.server.telemetry.tracing import extract_context, traced_operation
-from twinkle.utils.logger import get_logger
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 _CONTROL_ENDPOINTS = frozenset(
     {"twinkle/set_template", "twinkle/add_adapter_to_sampler", "twinkle/apply_patch", "twinkle/unload_adapter_paths"}
 )
@@ -254,7 +254,10 @@ class SamplerController:
         if endpoint == "twinkle/create":
             return {
                 "status": 200,
-                "headers": [(b"content-type", b"application/json"), (H_SAMPLE_IDEMPOTENCY_SUPPORTED.lower().encode(), b"1")],
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (H_SAMPLE_IDEMPOTENCY_SUPPORTED.lower().encode(), b"1"),
+                ],
                 "body": b'{"status":"ok"}',
             }
         control = endpoint in _CONTROL_ENDPOINTS

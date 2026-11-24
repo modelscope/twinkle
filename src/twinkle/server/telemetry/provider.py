@@ -163,7 +163,7 @@ def init_telemetry(config: TelemetryConfig) -> bool:
         resource_attrs.update(config.resource_attributes)
     resource_attrs['twinkle.node'] = telemetry_node()
     # OTLP backends need separate cumulative time series before Grafana sums replicas.
-    resource_attrs.setdefault('service.instance.id', uuid.uuid4().hex)
+    resource_attrs['service.instance.id'] = uuid.uuid4().hex
     resource = Resource.create(resource_attrs)
 
     use_console = config.debug or not _OTLP_AVAILABLE

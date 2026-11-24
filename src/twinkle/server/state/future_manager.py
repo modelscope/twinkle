@@ -1,11 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 import functools
+import hmac
 import time
 from typing import Any
 
 from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES
+from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
 from twinkle.utils.logger import get_logger
 from .backend.base import StateBackend
 from .base import BaseManager
@@ -148,10 +149,25 @@ class FutureManager(BaseManager[FutureRecord]):
 
     # ----- Future-specific operations -----
 
-    async def create_pending(self, request_id: str, **fields: Any) -> bool:
+    async def create_pending(self, request_id: str, *, submission_fingerprint: str, **fields: Any) -> bool:
         """Register a deterministically named future without overwriting another submitter's record."""
-        record = FutureRecord(status='pending', **fields)
-        return await self._backend.set_nx(self._make_key(request_id), record.model_dump())
+        record = FutureRecord(status='pending', submission_fingerprint=submission_fingerprint, **fields)
+        if await self._backend.set_nx(self._make_key(request_id), record.model_dump()):
+            return True
+        if await self.get_submission(request_id, submission_fingerprint, record.owner_token) is None:
+            raise ResourceNotFoundError('Submission receipt expired')
+        return False
+
+    async def get_submission(self, request_id: str, fingerprint: str, token: str | None) -> FutureRecord | None:
+        """A retained receipt can only replay the same payload for its owner."""
+        record = await self.get(request_id)
+        if record is None:
+            return None
+        if (record.owner_token or '') != (token or ''):
+            raise ResourceNotFoundError('Unknown future')
+        if not hmac.compare_digest(record.submission_fingerprint or '', fingerprint):
+            raise RequestRejectedError('Idempotency key was already used for a different submission')
+        return record
 
     async def store_status(
         self,

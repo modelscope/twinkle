@@ -3,8 +3,9 @@
 
 import hashlib
 import hmac
-import json
 from typing import NamedTuple
+
+import json
 
 from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY
 from twinkle.server.exceptions import RequestRejectedError
@@ -35,10 +36,5 @@ def sample_submission(request, endpoint, base_model, body) -> SampleSubmission |
 
 
 async def existing_sample(state, submission, token):
-    request_id, fingerprint = submission
-    record = await state.get_future(request_id)
-    if record is not None and (
-            (record.get('owner_token') or '') != token
-            or not hmac.compare_digest(record.get('submission_fingerprint') or '', fingerprint)):
-        raise RequestRejectedError('Sample idempotency key was already used for a different submission')
-    return record
+    record = await state.futures.get_submission(submission.request_id, submission.fingerprint, token)
+    return record.model_dump() if record is not None else None

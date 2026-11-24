@@ -78,12 +78,14 @@ empty row list and a count of zero. Requests without a token appear as
   Retries that replay an accepted request contribute once. For a manual retry
   of Twinkle `sample` or `asample` after a timeout, reuse the original
   `idempotency_key` and input while the receipt is retained. Input token
-  counts use token IDs known at admission. Execution seconds sum task duration
-  across replicas. The time-range totals use Prometheus `increase()`
+  counts use token IDs known at admission. The Tinker SDK keeps the sampling
+  sequence across automatic retries when initialized with `init_tinker_client()`.
+  Execution seconds sum task duration across replicas. The time-range totals use Prometheus `increase()`
   estimates. Each time series needs two samples in the selected range.
   Activity already included in the first sample of a new series can be missed,
   especially for a tenant making only a few requests.
-  Heartbeats and polling appear separately.
+  Heartbeats and polling appear separately. These rates and Runtime HTTP p95
+  are service-level metrics across tenants.
 - **Business admission rejections / second** groups rate limits, quota and
   unavailable capacity. A rejected training creation can arrive as a
   failed future over HTTP 200. Replaying that receipt or reading it again
@@ -115,6 +117,11 @@ Runtime endpoint and Collector logs. Follow the signal to Mimir for metrics,
 Loki for logs, or Tempo for traces, before checking the Grafana filters. Redis
 serves the current resource tables. Historical logs and traces can be queried
 during a Redis outage.
+
+Keep the Runtime workers at the default log level, INFO, to populate **Recent
+training activity** and show successful tasks in **Training task logs**.
+`LOG_LEVEL=WARNING` suppresses INFO task events before they reach Loki. In Loki
+Explore, expand a task log to see its Python module in `scope_name`.
 
 For a code change, start at `server/telemetry/worker_init.py` for per-process
 startup, `server/task_queue/types.py` for the task's correlation fields, and

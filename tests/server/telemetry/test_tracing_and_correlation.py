@@ -207,6 +207,7 @@ def test_pipeline_exports_once_and_keeps_early_gauge_callbacks(monkeypatch) -> N
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
     from opentelemetry.util._once import Once
 
+    from twinkle.server.task_queue.worker import logger as task_logger
     from twinkle.server.telemetry import provider
     from twinkle.server.telemetry.metrics import MetricsRegistry
 
@@ -223,15 +224,20 @@ def test_pipeline_exports_once_and_keeps_early_gauge_callbacks(monkeypatch) -> N
     monkeypatch.setattr(provider, 'OTLPLogExporter', lambda **_: sink)
     monkeypatch.setattr(provider, 'PeriodicExportingMetricReader', lambda *_, **__: reader)
 
-    config = TelemetryConfig(enabled=True, service_name='audit', export_interval_ms=100)
+    config = TelemetryConfig(
+        enabled=True, service_name='audit', export_interval_ms=100,
+        resource_attributes={'service.instance.id': 'shared', 'deployment.environment.name': 'test'},
+    )
     try:
         assert provider.init_telemetry(config)
         assert provider.init_telemetry(config)
         assert MetricsRegistry.get() is early
         early.set_resource_count('active_sessions', 7)
         early.request_duration_seconds.record(0.08)
-        data = {m.name: m.data.data_points for r in reader.get_metrics_data().resource_metrics
-                for scope in r.scope_metrics for m in scope.metrics}
+        resource, = reader.get_metrics_data().resource_metrics
+        assert resource.resource.attributes['deployment.environment.name'] == 'test'
+        assert resource.resource.attributes['service.instance.id'] != 'shared'
+        data = {m.name: m.data.data_points for scope in resource.scope_metrics for m in scope.metrics}
         assert [p.value for p in data['twinkle.sessions.active']] == [7]
         assert [p.value for p in data['twinkle.telemetry.heartbeat']] == [1]
         bounds = data['twinkle.http.request.duration_seconds'][0].explicit_bounds
@@ -242,17 +248,22 @@ def test_pipeline_exports_once_and_keeps_early_gauge_callbacks(monkeypatch) -> N
             context = span.get_span_context()
             root.warning('stdlib audit')
             logging.getLogger('twinkle').warning('twinkle audit')
+            task_logger.info('task audit', extra={'twinkle_task_id': 'req-audit'})
             logging.getLogger('opentelemetry.audit').warning('transport audit')
             try:
                 raise ValueError('private error text')
             except ValueError:
                 root.exception('private error text')
         provider._logger_provider.force_flush()
-        records = [entry.log_record for entry in sink.get_finished_logs()]
-        for body in ('stdlib audit', 'twinkle audit'):
+        exported = sink.get_finished_logs()
+        records = [entry.log_record for entry in exported]
+        for body in ('stdlib audit', 'twinkle audit', 'task audit'):
             record, = [r for r in records if r.body == body]
             assert record.trace_id == context.trace_id
             assert record.span_id == context.span_id
+        task_entry, = [entry for entry in exported if entry.log_record.body == 'task audit']
+        assert task_entry.instrumentation_scope.name == 'twinkle.server.task_queue.worker'
+        assert task_entry.log_record.attributes['twinkle_task_id'] == 'req-audit'
         assert not any(r.body == 'transport audit' for r in records)
         failure, = [r for r in records if r.attributes.get('error_type') == 'ValueError']
         assert failure.body == 'Operation failed'

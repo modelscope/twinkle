@@ -26,6 +26,7 @@ the per-builder execution order exactly
 wrapping the full response path when enabled.
 """
 from __future__ import annotations
+import logging
 import traceback
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -49,9 +50,8 @@ from twinkle.server.task_errors import build_error_payload
 from twinkle.server.telemetry.admission import record_admission_rejection
 from twinkle.server.telemetry.http_middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
-from twinkle.utils.logger import get_logger
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 # Type aliases for the per-builder customization points.
 RegisterRoutes = Callable[[FastAPI, Callable[[], Any]], None]

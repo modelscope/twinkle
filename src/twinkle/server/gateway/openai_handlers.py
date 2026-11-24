@@ -8,6 +8,7 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 """
 from __future__ import annotations
 import asyncio
+import logging
 import os
 import secrets
 import time
@@ -36,7 +37,6 @@ import httpx
 
 import twinkle.protocol.types as types
 from twinkle.server.utils import get_template_for_model
-from twinkle.utils.logger import get_logger
 from .openai_bridge import (
     make_error,
     translate_chat_request,
@@ -52,7 +52,7 @@ from .openai_bridge import (
 )
 from .use_cases import poll_future
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 _OPENAI_SAMPLE_TIMEOUT_ENV = 'TWINKLE_OPENAI_SAMPLE_TIMEOUT'

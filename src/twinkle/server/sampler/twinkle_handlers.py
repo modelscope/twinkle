@@ -7,14 +7,15 @@ inheritance relationship with the deployment class. Provides /twinkle/* sampler
 endpoints.
 """
 from __future__ import annotations
-
 import asyncio
-import json
+import logging
 import uuid
 from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Any, List, Optional
+
+import json
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
-from typing import TYPE_CHECKING, Any, List, Optional
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
@@ -27,18 +28,17 @@ from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTE
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
+from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
-from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.sampler.submission import existing_sample, sample_submission
 from twinkle.server.sampler.weights import resolve_sampler_weights, sample_with_weights
 from twinkle.server.task_errors import task_error_payload
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
-from twinkle.utils.logger import get_logger
 from .runtime import request_execution_scope
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 #: Sentinel for a value that cannot cross the HTTP boundary and must be omitted from its container.

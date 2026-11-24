@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import logging
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -112,6 +113,10 @@ async def test_usage_is_recorded_once_at_admission(
     async def session_heartbeat():
         return {}
 
+    @app.get('/healthz')
+    async def healthz():
+        return {}
+
     @app.post('/poll')
     async def retrieve_future():
         return {}
@@ -143,6 +148,9 @@ async def test_usage_is_recorded_once_at_admission(
             response = await client.post(
                 '/twinkle/call', json={'processor_id': 'pid:processor-1', 'function': 'process', 'call_kwargs': {}})
             assert response.json() == {'result': 'processed'}
+            for probe_token in ('probe-a', 'probe-b'):
+                response = await client.get('/healthz', headers={'Authorization': f'Bearer {probe_token}'})
+                assert response.status_code == 200
 
         instruments = {
             metric.name: metric.data.data_points
@@ -150,6 +158,11 @@ async def test_usage_is_recorded_once_at_admission(
             for scope in resource.scope_metrics for metric in scope.metrics
         }
         requests = instruments['twinkle.usage.requests.total']
+        for name in ('twinkle.http.requests.total', 'twinkle.http.request.duration_seconds'):
+            assert all('tenant_fingerprint' not in point.attributes for point in instruments[name])
+        probes, = [point for point in instruments['twinkle.http.requests.total']
+                   if point.attributes['method'] == 'GET']
+        assert probes.value == 2
         assert {point.attributes['task_type']: point.value for point in requests} == {
             'forward_backward': 1, 'clip_grad_and_step': 2, 'sample': 1}
         assert sum(point.value for point in instruments['twinkle.usage.input_tokens.total']) == 8
@@ -159,7 +172,7 @@ async def test_usage_is_recorded_once_at_admission(
         assert {point.attributes['tenant_fingerprint'] for point in requests} == {user_id}
         http = [point.attributes for point in instruments['twinkle.http.requests.total']]
         assert {'session_heartbeat', 'retrieve_future'}.issubset({attrs['operation'] for attrs in http})
-        assert any(attrs['status'] == '429' and attrs['tenant_fingerprint'] == user_id for attrs in http)
+        assert any(attrs['status'] == '429' and attrs['response_origin'] == 'local' for attrs in http)
 
         spans = in_memory_span_exporter.get_finished_spans()
         executions = [span for span in spans if span.name == 'task_queue.execute']
@@ -240,6 +253,11 @@ async def test_training_logs_link_each_outcome_to_its_training(caplog, in_memory
                 current_tenant_fingerprint.reset(binding)
             records = [record for record in caplog.records if getattr(record, 'twinkle_task_id', None) == request_id]
             assert [record.twinkle_task_outcome for record in records] == ['queued', expected]
+            assert [record.name for record in records] == [
+                'twinkle.server.task_queue.mixin',
+                'twinkle.server.task_queue.worker',
+            ]
+            assert [Path(record.pathname).name for record in records] == ['mixin.py', 'worker.py']
             assert {record.twinkle_training_id for record in records} == {model_id}
             assert {record.twinkle_tenant_fingerprint for record in records} == {fingerprint}
             assert {record.twinkle_task_type for record in records} == {'forward_backward'}

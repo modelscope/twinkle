@@ -7,6 +7,7 @@ and continuous batching internally.
 """
 from __future__ import annotations
 import asyncio
+import logging
 import time
 import uuid
 from collections.abc import Callable, Coroutine
@@ -22,7 +23,6 @@ from twinkle.server.lifecycle.poll_config import long_poll_window
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.telemetry.metrics import MetricsRegistry
 from twinkle.server.telemetry.tracing import get_trace_context
-from twinkle.utils.logger import get_logger
 from .backend_gate import BackendGate
 from .rate_limiter import RateLimiter
 from .types import ExecutionScope, QueuedTask
@@ -31,7 +31,7 @@ from .worker import ComputeWorker
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 class TaskQueueMixin:

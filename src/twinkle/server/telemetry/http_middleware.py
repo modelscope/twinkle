@@ -46,8 +46,6 @@ def create_metrics_middleware(deployment: str) -> Callable:
                 route_name = request.path_params.get('endpoint') or getattr(request.scope.get('route'), 'name', None)
                 operation = route_name if route_name in _OPERATIONS else 'request'
                 tags = {'deployment': deployment, 'method': request.method, 'operation': operation}
-                if fingerprint := getattr(request.state, 'tenant_fingerprint', None):
-                    tags['tenant_fingerprint'] = fingerprint
                 if base_model := getattr(request.state, 'base_model', None):
                     tags['base_model'] = base_model
                 m = MetricsRegistry.get()
