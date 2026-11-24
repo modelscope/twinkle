@@ -415,7 +415,12 @@ class Template:
     def _roll_labels(self, input_feature: InputFeature) -> list[InputFeature]:
         if "input_ids" not in input_feature:
             return [input_feature]
-        input_feature["labels"] = shift_values(input_feature["labels"], -100)
+        labels = input_feature["labels"]
+        # Embedding/pooling templates produce labels whose first position is a real token id,
+        # not -100: there is no next-token prediction to shift for. Skip the roll for those.
+        if len(labels) > 0 and labels[0] != -100:
+            return [input_feature]
+        input_feature["labels"] = shift_values(labels, -100)
         if "completion_mask" in input_feature:
             input_feature["completion_mask"] = shift_values(input_feature["completion_mask"], 0)
         return [input_feature]
