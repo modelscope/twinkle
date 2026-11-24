@@ -292,6 +292,7 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
         # constructor never receives it; re-injected into ctor_kwargs so the
         # backend builder can pick the full vs LoRA wrapper class.
         self.train_mode = kwargs.pop('train_mode', 'lora')
+        self._startup_template = kwargs.pop('template', None)
         # ``model_loader`` arrives as an import spec (plain data across the Ray boundary); resolve it to
         # the loader object here, in the replica, right before construction. ``None`` (unset, or no
         # family matched) leaves the generic AutoConfig/AutoModel path untouched.

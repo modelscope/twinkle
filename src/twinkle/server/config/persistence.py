@@ -1,19 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Persistence backend configuration model."""
 from __future__ import annotations
-
 import os
-from pydantic import BaseModel, ConfigDict
 from typing import Literal
 
-# Env var keys propagated by the launcher so that any Ray worker can rebuild
-# the same PersistenceConfig regardless of which deployment initializes the
-# ServerState actor first.
-PERSISTENCE_ENV_KEYS: tuple[str, ...] = (
-    'TWINKLE_PERSISTENCE_MODE',
-    'TWINKLE_PERSISTENCE_REDIS_URL',
-    'TWINKLE_PERSISTENCE_KEY_PREFIX',
-)
+from pydantic import BaseModel, ConfigDict
 
 
 class PersistenceConfig(BaseModel):

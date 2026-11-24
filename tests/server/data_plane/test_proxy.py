@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from twinkle.server.data_plane.proxy import DataPlaneProxy
@@ -53,9 +55,7 @@ async def test_proxy_routes_by_data_ref_without_tenant_identity() -> None:
     put_headers = proxy.client.calls[1][1]['headers']
     append_headers = proxy.client.calls[2][1]['headers']
     assert proxy.client.calls[0][1]['json']['fields'] == ['value']
-    assert get_headers[H_REQUEST_ID] == 'data-ref-input'
-    assert put_headers[H_REQUEST_ID] == 'data-put-model-output'
-    assert append_headers[H_REQUEST_ID] == 'data-append-input'
+    assert len({uuid.UUID(headers[H_REQUEST_ID]) for headers in (get_headers, put_headers, append_headers)}) == 3
     assert get_headers[H_AUTH] == get_headers[H_AUTH_TWINKLE] == ''
     assert put_headers[H_AUTH] == put_headers[H_AUTH_TWINKLE] == ''
     assert append_headers[H_AUTH] == append_headers[H_AUTH_TWINKLE] == ''

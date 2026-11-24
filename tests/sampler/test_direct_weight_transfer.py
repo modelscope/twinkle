@@ -11,6 +11,8 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
+from twinkle.utils import Platform
+
 
 def test_owned_direct_ipc_mapping_survives_queued_loader_reads(monkeypatch):
     """Quantized/owned loaders must finish reads before dropping foreign IPC mappings."""
@@ -55,12 +57,13 @@ def test_owned_direct_ipc_mapping_survives_queued_loader_reads(monkeypatch):
     monkeypatch.setattr(extension.Platform, 'get_platform', lambda: NS(ensure_ipc_reducer=lambda: None))
     monkeypatch.setattr(extension.Torch, 'synchronize', synchronize)
     monkeypatch.setattr(extension.Torch, 'ipc_collect', lambda: None)
+    monkeypatch.setattr('twinkle.patch.vllm_weight_loader.patch_lora_weight_loader', lambda: None)
     worker.update_weights_from_ipc(zmq_handle='ipc:///unused', independent=True)
     assert events.index('load_finished') > events.index('load')
     assert references[-1]() is None
 
 
-def receive(rank, rendezvous, endpoints, directory, independent=False):
+def receive(rank, rendezvous, endpoints, directory, independent=False, device_type='cuda'):
     import torch.distributed as dist
     import vllm.distributed
 
@@ -68,7 +71,7 @@ def receive(rank, rendezvous, endpoints, directory, independent=False):
 
     os.environ['LOCAL_RANK'] = str(rank)
     os.environ['TWINKLE_VLLM_IPC_TIMEOUT_S'] = '30'
-    torch.cuda.set_device(rank)
+    Platform.get_platform().device_module().set_device(rank)
     dist.init_process_group('gloo', init_method=rendezvous, rank=rank, world_size=2)
     vllm.distributed.get_tp_group = lambda: NS(cpu_group=dist.group.WORLD, ranks=[0, 1])
 
@@ -80,18 +83,23 @@ def receive(rank, rendezvous, endpoints, directory, independent=False):
 
     worker = Receiver()
     worker.rank = worker.local_rank = rank
-    worker.device = torch.device('cuda', rank)
-    worker.model_runner = NS(parallel_config=NS(tensor_parallel_size=2))
+    worker.device = torch.device(device_type, rank)
+    worker.model_runner = NS(model=torch.nn.Module(), parallel_config=NS(tensor_parallel_size=2))
+    device_ipc = Platform.get_platform().supports_device_ipc()
     pointers = []
     try:
         for step, endpoint in enumerate(endpoints):
             worker.loaded = {}
-            worker.update_weights_from_ipc(
-                zmq_handle=endpoint[rank] if independent else endpoint,
-                auth_key='test-key', independent=independent)
+            if independent:
+                worker._weight_sync_target = {
+                    'device_uuid': Platform.get_vllm_device_uuid(rank), 'endpoint': endpoint[rank]}
+                worker.update_weights_direct([worker._weight_sync_target], auth_key='test-key')
+            else:
+                worker.update_weights_from_ipc(
+                    zmq_handle=endpoint, auth_key='test-key', use_shm=not device_ipc)
             torch.save({name: tensor.cpu() for name, tensor in worker.loaded.items()},
                        Path(directory) / f'rank{rank}-step{step}.pt')
-            pointers.append(worker._twinkle_ipc_buffer.data_ptr())
+            pointers.append(worker._twinkle_ipc_buffer.data_ptr() if device_ipc else None)
         torch.save(pointers, Path(directory) / f'pointers{rank}.pt')
     finally:
         worker._twinkle_ipc_buffer = None
@@ -99,18 +107,24 @@ def receive(rank, rendezvous, endpoints, directory, independent=False):
 
 
 @pytest.mark.parametrize('independent', [False, True])
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason='Two devices required to validate TP peer mappings')
+@pytest.mark.accel(2)
 def test_direct_authenticated_multi_bucket_transfer_and_reused_buffer(tmp_path, monkeypatch, independent):
     import torch.multiprocessing as mp
 
     from twinkle.sampler.vllm_sampler.weight_transfer import VLLMWeightSender
 
+    platform = Platform.get_platform()
+    device_type = platform.device_prefix()
+    if device_type not in ('cuda', 'npu'):
+        pytest.skip('Direct vLLM transfer requires CUDA or NPU')
+    if device_type == 'npu' and not independent:
+        pytest.skip('Ascend uses the per-device direct path, without cross-device IPC mapping')
     monkeypatch.setenv('TWINKLE_VLLM_IPC_TIMEOUT_S', '30')
-    torch.cuda.set_device(0)
+    platform.device_module().set_device(0)
     weights = [
-        ('large', torch.randn(1024, 1024, dtype=torch.bfloat16, device='cuda')),
-        ('transposed', torch.randn(64, 128, device='cuda').T),
-        ('small', torch.randn(17, device='cuda', dtype=torch.float16)),
+        ('large', torch.randn(1024, 1024, dtype=torch.bfloat16, device=device_type)),
+        ('transposed', torch.randn(64, 128, device=device_type).T),
+        ('small', torch.randn(17, device=device_type, dtype=torch.float16)),
     ]
     tag = uuid.uuid4().hex
     endpoints = [
@@ -118,24 +132,24 @@ def test_direct_authenticated_multi_bucket_transfer_and_reused_buffer(tmp_path, 
         if independent else f'ipc:///tmp/twinkle-test-{tag}-{step}.sock' for step in range(3)]
     context = mp.get_context('spawn')
     workers = [context.Process(target=receive, args=(
-        rank, 'file://' + str(tmp_path / 'gloo'), endpoints, str(tmp_path), independent)) for rank in range(2)]
+        rank, 'file://' + str(tmp_path / 'gloo'), endpoints, str(tmp_path), independent, device_type)) for rank in range(2)]
     for child in workers:
         child.start()
     send_errors = []
 
     def send(rank):
         try:
-            with torch.cuda.device(rank):
-                sender = VLLMWeightSender()
-                for step, endpoint in enumerate(endpoints):
-                    payload = [(name, tensor.to(rank)) for name, tensor in weights] if step < 2 else []
-                    if step == 0:
-                        payload = [(name, tensor.cpu()) for name, tensor in weights]
-                    asyncio.run(sender.update_weights(
-                        payload, bucket_size_mb=1,
-                        zmq_handle=endpoint[rank] if independent else endpoint,
-                        auth_key='test-key', device=torch.device('cuda', rank),
-                        direct_large_tensors=independent))
+            platform.device_module().set_device(rank)
+            sender = VLLMWeightSender()
+            for step, endpoint in enumerate(endpoints):
+                payload = [(name, tensor.to(device_type + ':' + str(rank))) for name, tensor in weights] if step < 2 else []
+                if step == 0:
+                    payload = [(name, tensor.cpu()) for name, tensor in weights]
+                asyncio.run(sender.update_weights(
+                    payload, bucket_size_mb=1,
+                    zmq_handle=endpoint[rank] if independent else endpoint,
+                    auth_key='test-key', device=torch.device(device_type, rank),
+                    direct_large_tensors=independent))
         except BaseException as exc:
             send_errors.append(exc)
 
@@ -165,3 +179,87 @@ def test_direct_authenticated_multi_bucket_transfer_and_reused_buffer(tmp_path, 
             if child.is_alive():
                 child.terminate()
                 child.join(timeout=10)
+
+
+def _drive_chunked_receive(monkeypatch, *, oom_assembly):
+    """Drive the real ``_receive_weights_from_ipc`` chunked path on one CUDA worker.
+
+    ``oom_assembly=True`` makes the full-tensor GPU assembly allocation raise OutOfMemoryError,
+    simulating a colocated low-headroom sync (defect117 e2e init-crash); the small IPC bucket
+    still maps fine, so only the assembly buffer is starved. Oracle = loaded bytes == source.
+    """
+    from twinkle.sampler.vllm_sampler import vllm_worker_extension as extension
+    dev = torch.device('cuda', 0)
+    src = torch.arange(256, dtype=torch.float32, device=dev)
+    total = src.numel() * src.element_size()
+    half = total // 2
+    bucket = src.view(torch.uint8).clone()
+    meta = iter(['bucket', {'bucket_meta': [
+        {'name': 'w', 'dtype': torch.float32, 'shape': (256,), 'offset': 0,
+         'nbytes': half, 'chunk_offset': 0, 'total_nbytes': total},
+        {'name': 'w', 'dtype': torch.float32, 'shape': (256,), 'offset': half,
+         'nbytes': total - half, 'chunk_offset': half, 'total_nbytes': total}], 'is_last': True}])
+    loaded, devices = {}, []
+
+    class Receiver(extension.TwinkleWorkerExtension):
+        def _load_weights(self, weights, **kwargs):
+            for name, t in weights:
+                devices.append(t.device.type)
+                loaded[name] = t.detach().to('cpu', copy=True)
+
+    class Socket:
+        def connect(self, e):
+            pass
+
+        def send(self, d):
+            pass
+
+        def close(self):
+            pass
+
+    worker = object.__new__(Receiver)
+    worker.device = dev
+    worker.rank = worker.local_rank = 0
+    worker.model_runner = NS(parallel_config=NS(tensor_parallel_size=1))
+    worker._zmq_ctx = NS(socket=lambda *a: Socket())
+    monkeypatch.setattr(extension, '_rebuild_ipc', lambda h, d: bucket)
+    monkeypatch.setattr(extension, '_ipc_handle_signature', lambda h: 'sig')
+    monkeypatch.setattr(extension, 'configure_zmq_socket', lambda *a, **k: None)
+    monkeypatch.setattr('twinkle.checkpoint_engine.zmq_auth.recv_auth_pyobj', lambda *a: next(meta))
+    monkeypatch.setattr(extension.Platform, 'get_platform', lambda: NS(ensure_ipc_reducer=lambda: None))
+    monkeypatch.setattr(extension.Torch, 'synchronize', lambda d: None)
+    monkeypatch.setattr(extension.Torch, 'ipc_collect', lambda: None)
+    monkeypatch.setattr('twinkle.patch.vllm_weight_loader.patch_lora_weight_loader', lambda: None)
+    if oom_assembly:
+        real_empty = torch.empty
+
+        def oom_empty(size, *a, **k):
+            dev_arg = k.get('device')
+            if dev_arg is not None and torch.device(dev_arg).type == 'cuda' and size == total:
+                raise torch.OutOfMemoryError(
+                    'CUDA out of memory. Tried to allocate %.2f GiB.' % (total / 2**30))
+            return real_empty(size, *a, **k)
+
+        monkeypatch.setattr(extension.torch, 'empty', oom_empty)
+    worker.update_weights_from_ipc(zmq_handle='ipc:///unused', independent=True)
+    return loaded, devices, src
+
+
+@pytest.mark.accel(1)
+def test_chunked_assembly_oom_falls_back_to_cpu(monkeypatch):
+    """Low-headroom chunked sync assembles on CPU instead of crashing the engine (defect117)."""
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA headroom gate')
+    loaded, devices, src = _drive_chunked_receive(monkeypatch, oom_assembly=True)
+    assert torch.equal(loaded['w'], src.cpu())
+    assert devices == ['cpu']
+
+
+@pytest.mark.accel(1)
+def test_chunked_assembly_stays_gpu_when_headroom_ok(monkeypatch):
+    """Normal-headroom chunked sync keeps the GPU assembly (no always-CPU perf regression)."""
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA headroom gate')
+    loaded, devices, src = _drive_chunked_receive(monkeypatch, oom_assembly=False)
+    assert torch.equal(loaded['w'], src.cpu())
+    assert devices == ['cuda']

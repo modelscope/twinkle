@@ -30,12 +30,12 @@ class ClientContext:
     base_url: str
     api_key: str
     session_id: str | None = None
-    routing_id: str = ''
+    client_id: str = ''
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'base_url', _normalize_base_url(self.base_url))
-        if not self.routing_id:
-            object.__setattr__(self, 'routing_id', uuid.uuid4().hex)
+        if not self.client_id:
+            object.__setattr__(self, 'client_id', uuid.uuid4().hex)
 
 
 _default_lock = threading.RLock()
@@ -87,13 +87,3 @@ def clear_default_transport(transport: ClientTransport) -> None:
     with _default_lock:
         if _default_transport is transport:
             _default_transport = None
-
-
-# Private compatibility seam for the deferred Tinker monkey patch. New Twinkle code
-# must use ClientTransport directly; these names are intentionally not re-exported.
-def get_api_key() -> str:
-    return capture_transport().context.api_key
-
-
-def get_request_id() -> str:
-    return capture_transport().context.routing_id

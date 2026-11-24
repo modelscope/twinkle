@@ -11,9 +11,9 @@ nothing checks decays into a false claim -- as happened with "a consistency test
 the two sets are equal", which was written in a docstring while no such test existed.
 """
 from __future__ import annotations
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SRC = _REPO_ROOT / 'src' / 'twinkle'

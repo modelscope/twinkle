@@ -18,6 +18,7 @@ import platform
 import re
 import signal
 import torch
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from twinkle import get_logger
@@ -55,6 +56,32 @@ def _cuda_visible_device(device: torch.device) -> str:
     if not 0 <= device_index < len(selectors) or not selectors[device_index] or selectors[device_index] == '-1':
         raise ValueError(f'Cannot map CUDA device {device_index} to CUDA_VISIBLE_DEVICES={visible_devices!r}')
     return selectors[device_index]
+
+
+def _ray_node_manager_address() -> str:
+    """The ray node address of the worker's node, as ``ray.nodes()`` reports it.
+
+    The delta receiver placement (``checkpoint_engine/delta/rollout/mixin.py``) looks the
+    worker's node up by ``ray.nodes()[...]['NodeManagerAddress']``. Reporting an independently
+    discovered interface IP (``find_node_ip`` picks the alphabetically-first non-virtual NIC)
+    diverges from ray's address on multi-NIC hosts -- ray binds the default-route NIC -- and the
+    lookup raises ``KeyError`` (defect111). Use ray's own address so the two sides always agree;
+    fall back to ``find_node_ip`` only when ray is not initialized (local single-process mode).
+    """
+    import ray
+    try:
+        # Ray actor/worker processes connect via the raylet without calling ray.init(), so
+        # ray.is_initialized() is False there even though the runtime context and GCS client
+        # are live. Use the runtime context directly; fall back only if it is unavailable.
+        ctx = ray.get_runtime_context()
+        node_id = ctx.get_node_id() if hasattr(ctx, 'get_node_id') else ctx.node_id
+        for node in ray.nodes():
+            if node.get('NodeID') == node_id and node.get('Alive'):
+                return node['NodeManagerAddress']
+    except Exception:
+        pass
+    from twinkle.utils import find_node_ip
+    return find_node_ip()
 
 
 # Constants for the RL training LoRA adapter identity.
@@ -151,9 +178,8 @@ class TwinkleWorkerExtension:
         return self._delta_ipc_endpoint
 
     def delta_receiver_metadata(self) -> 'DeltaWorkerMetadata':
-        from twinkle.utils import find_node_ip
         return {
-            'node_ip': find_node_ip(),
+            'node_ip': _ray_node_manager_address(),
             'device_uuid': str(torch.cuda.get_device_properties(self.device).uuid),
             'cuda_visible_device': _cuda_visible_device(self.device),
             'zmq_handle': self.delta_ipc_endpoint(),
@@ -218,7 +244,8 @@ class TwinkleWorkerExtension:
                       if row['device_uuid'] == self.weight_sync_metadata()['device_uuid'])
         return self.update_weights_from_ipc(
             peft_config=peft_config, zmq_handle=target['endpoint'], auth_key=auth_key,
-            base_sync_done=base_sync_done, independent=True)
+            base_sync_done=base_sync_done, independent=True,
+            use_shm=not Platform.get_platform().supports_device_ipc())
 
     @streaming_weight_sync()
     def update_weights_from_ipc(
@@ -229,6 +256,21 @@ class TwinkleWorkerExtension:
         zmq_handle: Optional[str] = None,
         auth_key: str = '',
         independent: bool = False,
+    ) -> None:
+        """Receive one complete bucketed sync, including expert layout restoration."""
+        with self._reload_moe_weights(peft_config, base_sync_done):
+            self._receive_weights_from_ipc(
+                peft_config=peft_config, base_sync_done=base_sync_done, use_shm=use_shm,
+                zmq_handle=zmq_handle, auth_key=auth_key, independent=independent)
+
+    def _receive_weights_from_ipc(
+        self,
+        peft_config,
+        base_sync_done,
+        use_shm,
+        zmq_handle,
+        auth_key,
+        independent,
     ) -> None:
         """Receive and load weights via ZMQ + device IPC/SHM.
 
@@ -276,7 +318,8 @@ class TwinkleWorkerExtension:
         is_driver = independent or (tp_rank == 0)
         # Shared TP receivers also finish loading and barrier before acknowledging reuse.
         borrow_bucket = (not use_shm and not (peft_config and base_sync_done)
-                         and getattr(self, '_quant_reload_state', None) is None)
+                         and getattr(self, '_quant_reload_state', None) is None
+                         and not getattr(self, '_moe_reload_active', False))
 
         if tp_size > 1:
             # Use vLLM's built-in TP cpu group for object broadcasts.
@@ -402,6 +445,9 @@ class TwinkleWorkerExtension:
                 shape = shape if isinstance(shape, torch.Size) else torch.Size(shape)
                 if meta.get('handle') is not None:
                     tensor = _rebuild_ipc(meta['handle'], self.device.index)
+                    if getattr(self, '_moe_reload_active', False):
+                        # Layerwise loaders may retain this tensor across buckets.
+                        tensor = tensor.clone()
                     weights.append((name, tensor))
                     continue
                 offset = int(meta['offset'])
@@ -419,14 +465,25 @@ class TwinkleWorkerExtension:
                     else:
                         tensor = raw_u8.view(dtype=dtype).view(shape)
                         if not borrow_bucket:
-                            tensor = tensor.clone()
+                            try:
+                                tensor = tensor.clone()
+                            except torch.OutOfMemoryError:
+                                tensor = tensor.to('cpu', copy=True)
                     weights.append((name, tensor))
                     continue
 
                 state = partial_tensors.get(name)
                 if state is None:
+                    # Colocated low-headroom sync: the full-tensor assembly buffer can exceed the
+                    # free GPU memory left after the trainer + engine weights (defect117). Fall back
+                    # to CPU so the receive completes instead of crashing the EngineCore; the bucket
+                    # copy_ below already crosses devices, and _load_weights stages onto the target.
+                    try:
+                        assembly = torch.empty(total_nbytes, dtype=torch.uint8, device=buffer.device)
+                    except torch.OutOfMemoryError:
+                        assembly = torch.empty(total_nbytes, dtype=torch.uint8, device='cpu')
                     state = {
-                        'buffer': torch.empty(total_nbytes, dtype=torch.uint8, device=buffer.device),
+                        'buffer': assembly,
                         'dtype': dtype,
                         'shape': shape,
                         'total': total_nbytes,
@@ -452,8 +509,13 @@ class TwinkleWorkerExtension:
                     assembled = state['buffer'].view(dtype=state['dtype']).view(state['shape'])
                     if use_shm:
                         tensor = assembled
+                    elif borrow_bucket:
+                        tensor = assembled
                     else:
-                        tensor = assembled if borrow_bucket else assembled.clone()
+                        try:
+                            tensor = assembled.clone()
+                        except torch.OutOfMemoryError:
+                            tensor = assembled.to('cpu', copy=True)
                     weights.append((name, tensor))
                     del partial_tensors[name]
 
@@ -558,7 +620,8 @@ class TwinkleWorkerExtension:
             self.device = torch.device(Torch.get_device(getattr(self, 'local_rank', None)))
 
         weight_list = list(weights.items())
-        self._load_weights(weight_list, peft_config=peft_config, base_sync_done=base_sync_done)
+        with self._reload_moe_weights(peft_config, base_sync_done):
+            self._load_weights(weight_list, peft_config=peft_config, base_sync_done=base_sync_done)
 
         gc.collect()
         Torch.empty_cache()
@@ -566,6 +629,43 @@ class TwinkleWorkerExtension:
     # -----------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------
+
+    @contextmanager
+    def _reload_moe_weights(self, peft_config, base_sync_done):
+        """Reload Ascend experts in checkpoint layout, then restore their live kernel storage."""
+        device = getattr(self, 'device', None)
+        device_type = device.type if device is not None else Platform.device_prefix()
+        if (device_type != 'npu' or (peft_config and base_sync_done)
+                or getattr(self, '_quant_reload_state', None) is not None):
+            yield
+            return
+
+        # Ascend transposes even unquantized experts after the initial load. Feeding HF
+        # tensors directly to those parameters makes the TP loader slice the wrong axes.
+        experts = [module for module in self.model_runner.model.modules()
+                   if 'w13_weight' in module._parameters and 'w2_weight' in module._parameters]
+        if not experts:
+            yield
+            return
+
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
+        from vllm.model_executor.model_loader.reload import finalize_layerwise_reload, initialize_layerwise_reload
+
+        experts = [module for module in experts
+                   if isinstance(getattr(module, 'quant_method', None), UnquantizedFusedMoEMethod)]
+        self._moe_reload_active = bool(experts)
+        try:
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                for module in experts:
+                    initialize_layerwise_reload(module)
+                yield
+                for module in experts:
+                    finalize_layerwise_reload(module, self.model_runner.model_config)
+                if experts:
+                    Torch.synchronize(self.device)
+        finally:
+            self._moe_reload_active = False
 
     @staticmethod
     def _convert_peft_to_vllm_lora_name(name: str) -> str:

@@ -35,7 +35,8 @@ from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, Sampl
 from twinkle.hub import HubOperation
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
-from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.base import (ModelLoaderProtocol, TrainableModel, rotate_checkpoints, stage_checkpoint_args,
+                                write_task_head_checkpoint)
 from twinkle.model.state_dict_utils import normalize_adapter_keys
 from twinkle.model.micro_batch import (
     MicroBatchConfig,
@@ -60,11 +61,28 @@ from twinkle.utils import (construct_class, get_logger, prepare_replayed_selecti
                            replayed_selective_log_softmax, selective_log_softmax, torch_util)
 from twinkle.utils.framework import Torch
 from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
+from twinkle.utils.storage import Storage, is_remote_url, to_local, write_dir
 from twinkle.utils.transformers_utils import filter_from_config_kwargs
 
 logger = get_logger()
 
 CHECKPOINT_ADAPTER_NAME = 'default'
+
+
+def _tied_duplicate_names(config, model) -> set:
+    """State-dict names repeated because they share one tensor (tie_word_embeddings).
+
+    Keyed off the config rather than runtime storage identity: the sharing can be broken apart
+    mid-run (an optimizer step or an FSDP all-gather may materialise the head as its own tensor).
+    The flag can sit on a nested ``text_config`` for multimodal shells, so check both. Drop the
+    head, keep the embedding: the receiver's traversal reaches the nested embedding first.
+    """
+    tied = getattr(config, 'tie_word_embeddings', None)
+    if tied is None:
+        tied = getattr(getattr(config, 'text_config', None), 'tie_word_embeddings', None)
+    if not tied:
+        return set()
+    return {name for name in model.state_dict() if name.split('.')[-2:-1] == ['lm_head']}
 
 
 def _no_sync_context(model, should_sync):
@@ -1039,7 +1057,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # per-token patch path produces.
             return {'logits': out} if torch.is_tensor(out) else out
 
-        handle = unwrapped_model.register_forward_hook(_readout, with_kwargs=True)
+        # Run the head before FSDP reshards its parameters and installs backward hooks
+        # on the returned tensors, so both the forward and backward see the head.
+        handle = unwrapped_model.register_forward_hook(_readout, with_kwargs=True, prepend=True)
         try:
             return self.model(**inputs, use_cache=False)
         finally:
@@ -2508,8 +2528,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         init_lora_weights = config.init_lora_weights
         config.init_lora_weights = True
         try:
-            os.makedirs(initial_dir, exist_ok=True)
-            model.save_pretrained(initial_dir)
+            with write_dir(initial_dir) as local:
+                model.save_pretrained(local)
         finally:
             config.init_lora_weights = init_lora_weights
         return True
@@ -2532,9 +2552,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # The conversion loads the initial snapshot through peft's inject_adapter, which freezes the
         # active adapter as a side effect; save + restore the requires_grad flags around it.
         requires_grad_state = {name: p.requires_grad for name, p in model.named_parameters()}
-        os.makedirs(os.path.dirname(converted_dir), exist_ok=True)
-        model.save_pretrained(
-            converted_dir, path_initial_model_for_weight_conversion=os.path.abspath(initial_model_dir))
+        with write_dir(converted_dir) as local:
+            model.save_pretrained(
+                local, path_initial_model_for_weight_conversion=os.path.abspath(to_local(initial_model_dir)))
         # peft replaces the adapter's config entry during conversion; restore the live one.
         model.peft_config[adapter_name] = saved_config
         for name, p in model.named_parameters():
@@ -2575,11 +2595,22 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return
         if kwargs.get('save_optimizer', False):
             self._validate_training_state_save(adapter_name)
+        # A local destination leases checkpoint_dir itself (the existing I/O runs in
+        # place); a remote one stages locally and flushes into the object store.
+        lease = Storage.from_url(checkpoint_dir).write_lease(
+            checkpoint_dir, markers=('trainer_state.json',) if kwargs.get('save_optimizer', False) else ())
+        lease.rotate = lambda: rotate_checkpoints(output_dir, lease.target, save_total_limit)
+        checkpoint_dir = lease.path
         if isinstance(self.strategy, NativeFSDPStrategy) and self.strategy.use_rank0_pretrained_broadcast():
             # Initial adapter snapshots precede the first forward. Materialize on every
             # rank before state-dict collectives: non-source ranks still hold meta tensors.
             self._lazy_wrap_model()
         model = self.strategy.unwrap_model(self.model)
+        is_peft = isinstance(model, PeftModel)
+        if is_peft and max_shard_size != '5GB':
+            raise NotImplementedError(
+                'max_shard_size is not supported for PEFT adapter checkpoints; remove the option or save a '
+                'full-model checkpoint.')
         save_kwargs = {
             'safe_serialization': safe_serialization,
             'max_shard_size': max_shard_size,
@@ -2589,6 +2620,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             processed_state_dict = self.strategy.get_full_state_dict(self.model)
         else:
             processed_state_dict = self._get_adapter_state_dict_for_save(adapter_name)
+
+        # Capture the head while all ranks participate and the tenant still owns its slot.
+        head_state = self._task_head_state(adapter_name)
+        is_master = Platform.is_master()
+        tokenizer = self._checkpoint_processor(adapter_name) if is_master else None
+        peft_config = model.peft_config[adapter_name] if is_master and is_peft else None
 
         # The optimizer/scheduler/scaler/rng state goes through the strategy's save protocol (deepspeed's
         # engine.save_checkpoint / FSDP2's get_optimizer_state_dict perform collectives), so it stays on
@@ -2603,49 +2640,42 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 defer_trainer_state=async_save,
             )
 
-        def _write_weights() -> None:
-            """Pure file I/O over the staged CPU payloads; no collectives, no device tensors."""
-            if isinstance(model, PeftModel):
-                if max_shard_size != '5GB':
-                    raise NotImplementedError(
-                        'max_shard_size is not supported for PEFT adapter checkpoints; remove the option or save a '
-                        'full-model checkpoint.')
-                if Platform.is_master():
-                    model.peft_config[adapter_name].save_pretrained(checkpoint_dir)
-                    contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
-                    if safe_serialization:
-                        save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
-                    else:
-                        torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
-            elif Platform.is_master():
+        deferred = list(self._deferred_trainer_state_writes)
+
+        def _write_checkpoint() -> None:
+            if not is_master:
+                return
+            if peft_config is not None:
+                peft_config.save_pretrained(checkpoint_dir)
+                contiguous_dict = {k: v.contiguous() for k, v in processed_state_dict.items()}
+                if safe_serialization:
+                    save_file(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.safetensors'))
+                else:
+                    torch.save(contiguous_dict, os.path.join(checkpoint_dir, 'adapter_model.bin'))
+            else:
                 # Transformers' is_main_process only guards metadata/cleanup, not weight
                 # shard writes. Gather state on every rank above, but write it only once.
                 model.save_pretrained(
                     checkpoint_dir, state_dict=processed_state_dict, is_main_process=True,
                     **save_kwargs)
+            tokenizer.save_pretrained(checkpoint_dir)
+            write_task_head_checkpoint(checkpoint_dir, head_state)
+            stage_checkpoint_args(output_dir, lease)
+            for write in deferred:
+                write()
 
         if async_save:
-            # trainer_state.json doubles as the completion marker a resume reads; the deferred writes run
-            # last so a crash mid-write leaves a directory the resume path cannot mistake for complete.
-            deferred = list(self._deferred_trainer_state_writes)
-
+            # All ranks join previous saves in order and flush their own staged files.
             def _write_tail() -> None:
-                _write_weights()
-                self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
-                self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
-                copy_checkpoint_args(output_dir, checkpoint_dir)
-                for write in deferred:
-                    write()
-                rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
+                _write_checkpoint()
+                lease.flush_files()
 
             self.submit_async_write(_write_tail)
+            self._defer_lease_seal(lease)
         else:
-            _write_weights()
-            self._save_tokenizer(checkpoint_dir, adapter_name=adapter_name)
-            self._save_task_head_checkpoint(checkpoint_dir, adapter_name)
-            copy_checkpoint_args(output_dir, checkpoint_dir)
-            rotate_checkpoints(output_dir, checkpoint_dir, save_total_limit)
-        return checkpoint_dir
+            _write_checkpoint()
+            lease.commit()
+        return lease.target
 
     def _get_adapter_state_dict_for_save(self, adapter_name: str) -> dict:
         """Return PEFT-normalized adapter state dict for saving."""
@@ -2750,15 +2780,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 os.path.join(output_dir, 'scaler.pt'),
             )
 
+    def _checkpoint_processor(self, adapter_name):
+        template = self.optimizer_group[adapter_name].template
+        return self._default_tokenizer if template is None else template.processor
+
     def _save_tokenizer(self, output_dir, **kwargs):
-        adapter_name = kwargs.pop('adapter_name', _default_adapter_name)
-        optimizer_config = self.optimizer_group[adapter_name]
-        template_ins = optimizer_config.template
         if Platform.is_master():
-            if template_ins is not None:
-                template_ins.processor.save_pretrained(output_dir)
-            else:
-                self._default_tokenizer.save_pretrained(output_dir)
+            self._checkpoint_processor(kwargs.get('adapter_name', _default_adapter_name)).save_pretrained(output_dir)
 
     @remote_function()
     @timed
@@ -2776,14 +2804,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 
         if output_dir is None:
-            if os.path.exists(name):
+            if is_remote_url(name):
+                checkpoint_dir = to_local(name)
+            elif os.path.exists(name):
                 checkpoint_dir = name
             else:
                 # load from hub
                 token = kwargs.pop('token', None)
                 checkpoint_dir = HubOperation.download_model(name, token=token)
         else:
-            checkpoint_dir = os.path.join(output_dir, name)
+            checkpoint_dir = to_local(os.path.join(output_dir, name))
         model = self.strategy.unwrap_model(self.model)
         if isinstance(model, PeftModel):
             adapter_weights = load_peft_weights(checkpoint_dir, device='cpu')
@@ -2939,6 +2969,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 device_module.set_rng_state(device_rng_state)
 
     def _restore_training_state(self, checkpoint_dir, *, adapter_name=''):
+        checkpoint_dir = to_local(checkpoint_dir, require=('trainer_state.json',))
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
@@ -3421,6 +3452,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         model_keys: List[str] = None,
         **kwargs,
     ):
+        if isinstance(self.strategy, NativeFSDPStrategy) and self.strategy.use_rank0_pretrained_broadcast():
+            # Initial publication can precede the first forward. Every rank must finish
+            # FSDP sharding/broadcast before reading weights: non-source ranks are on meta.
+            self._lazy_wrap_model()
         if adapter_name is None:
             adapter_name = self._get_default_group()
         # Get state dict from unwrapped model. Key shaping (PEFT segment stripping,
@@ -3434,32 +3469,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 tensor = tensor.to(Torch.get_device(None), non_blocking=True)
             return Torch.to_local_tensor(tensor)
 
-        def _tied_duplicate_names() -> set:
-            """Names the HF state_dict repeats because they share one tensor, which must not be sent.
-
-            With ``tie_word_embeddings`` the LM head and the input embedding are the SAME tensor, so
-            the state_dict lists it twice (``lm_head.weight`` and ``*.embed_tokens.weight``). vLLM
-            loads only the name its module traversal reaches first and records the other as a skipped
-            alias, then asserts the canonical one did load
-            (``AutoWeightsLoader._check_skipped_aliases``). Sending both makes that check fail, and
-            the duplicate is redundant anyway because one write covers both.
-
-            Keyed off the config rather than runtime storage identity: the sharing can be broken
-            apart mid-run (an optimizer step or an FSDP all-gather may materialise the head as its
-            own tensor), which would make a storage probe stop matching after the first sync. The
-            flag can sit on a nested ``text_config`` for multimodal shells, so check both.
-            """
-            config = getattr(self, 'hf_config', None)
-            if config is None:
-                return set()
-            tied = getattr(config, 'tie_word_embeddings', None)
-            if tied is None:
-                tied = getattr(getattr(config, 'text_config', None), 'tie_word_embeddings', None)
-            if not tied:
-                return set()
-            # Drop the head, keep the embedding: vLLM's traversal reaches the nested embedding first,
-            # making it the canonical name that ``_check_skipped_aliases`` wants to see loaded.
-            return {name for name in model.state_dict() if name.split('.')[-2:-1] == ['lm_head']}
+        def _local_tied_names() -> set:
+            return _tied_duplicate_names(getattr(self, 'hf_config', None), model)
 
         # ZeRO-3 partitions parameters, so every branch below would otherwise read an empty local
         # shard: the base sync walks state_dict(), the LoRA-only sync walks the adapter state dict,
@@ -3473,7 +3484,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if gather is not None:
             gather(self.model, list(model.parameters()))
 
-        _tied_duplicates = _tied_duplicate_names()
+        _tied_duplicates = _local_tied_names()
 
         if base_sync_done and adapter_name:
             if merge_and_sync:
@@ -3563,8 +3574,38 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """
         from twinkle.utils.framework import Torch
         model = self.strategy.unwrap_model(self.model)
+        if isinstance(model, PeftModel):
+            yield from self._local_lora_merged_generator(model)
+            return
         for name, tensor in model.state_dict().items():
             yield name, Torch.to_local_tensor(tensor)
+
+    def _local_lora_merged_generator(self, model):
+        """LoRA merge for paired EMA onto a bare (non-PEFT) reference.
+
+        The reference's state dict carries canonical names and no adapter tensors, so yielding
+        PEFT-prefixed names (or lora_A/lora_B) KeyErrors on the receiver's first lookup. Fold the
+        adapter into the base weight and yield canonical names. The merge runs in the transport's
+        tensor space: ``Torch.to_local_tensor`` gathers a DTensor to its full tensor (the same call
+        the receiver's ``_get_local_state_dict`` makes), so W, A and B are gathered consistently and
+        ``W + (B @ A) * scaling`` is the ordinary full-model merge. Out-of-place: the live policy
+        parameters must stay unmerged for continued training.
+        """
+        from twinkle.utils.framework import Torch
+        tied = _tied_duplicate_names(getattr(self, 'hf_config', None), model)
+        for name, tensor in model.state_dict().items():
+            if is_lora_key(name) or name in tied:
+                continue
+            if name.endswith('.base_layer.weight'):
+                module = model.get_submodule(name[:-len('.base_layer.weight')])
+                merged = Torch.to_local_tensor(tensor)
+                for adapter in module.lora_A:
+                    a = Torch.to_local_tensor(module.lora_A[adapter].weight)
+                    b = Torch.to_local_tensor(module.lora_B[adapter].weight)
+                    merged = merged + (b @ a) * module.scaling[adapter]
+            else:
+                merged = Torch.to_local_tensor(tensor)
+            yield normalize_param_name(name, keep_base_layer=False), merged
 
     def _get_local_state_dict(self):
         """Return {name: param} for this rank's local shard (used by EMA receiver and naive sync)."""

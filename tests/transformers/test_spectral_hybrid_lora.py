@@ -326,6 +326,7 @@ def test_accelerate_fsdp_optimizer_save_and_load_ignore_sharded_plugin_options(t
 
 
 def test_native_fsdp_optimizer_remaps_logical_slot_to_current_slot(tmp_path, monkeypatch):
+    from types import SimpleNamespace
     from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
     from twinkle.utils.platforms import Platform
     import torch.distributed.checkpoint.state_dict as state_dict_api
@@ -356,8 +357,12 @@ def test_native_fsdp_optimizer_remaps_logical_slot_to_current_slot(tmp_path, mon
     saved_state = torch.load(checkpoint, map_location='cpu', weights_only=True)
     assert list(saved_state['state']) == [logical_name]
 
+    # load_optimizer_checkpoint reads model.named_parameters() to prune explicitly-empty Adam
+    # slots after DCP load; model the current-slot parameter so that contract is exercised.
+    current_param = torch.nn.Parameter(torch.zeros(1))
+    fake_model = SimpleNamespace(named_parameters=lambda: iter([(current_name, current_param)]))
     strategy.load_optimizer_checkpoint(
-        object(), object(), str(checkpoint), param_name_mapping={logical_name: current_name})
+        fake_model, object(), str(checkpoint), param_name_mapping={logical_name: current_name})
     assert list(calls['load']['state']) == [current_name]
     assert calls['load']['param_groups'][0]['params'] == [current_name]
 
@@ -468,7 +473,7 @@ def test_server_hybrid_config_is_strict():
             'allocation_path': '/shared/allocation.json',
             'default_lr_fft': -1.0,
         })
-    with pytest.raises(ValidationError, match='only supported by the transformers backend'):
+    with pytest.raises(ValidationError, match='hybrid requires the transformers backend'):
         ModelArgs(**{**base, 'backend': 'megatron'}, hybrid={
             'allocation_path': '/shared/allocation.json',
         })
@@ -1112,6 +1117,10 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
             return False
 
         @staticmethod
+        def owns_update_step():
+            return False
+
+        @staticmethod
         def save_optimizer_checkpoint(_model, optimizer, output_path, *, param_name_mapping=None):
             from twinkle.model.state_dict_utils import remap_optimizer_state_names
             state = optimizer.state_dict()
@@ -1143,7 +1152,7 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
     }])
 
     group = SimpleNamespace(
-        cur_step=3,
+        cur_step=4,
         gradient_accumulation_steps=2,
         adapter_config=hybrid.tenant_config,
         optimizer=optimizer,
@@ -1151,6 +1160,7 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
         scaler=None,
         train_status=SimpleNamespace(loss_value=None, num_tokens=0),
         do_grad_sync=lambda: True,
+        require_finalized=lambda operation: None,
     )
     wrapper = object.__new__(SpectralHybridTransformersModel)
     wrapper.multi_adapter = manager
@@ -1162,7 +1172,7 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
     object.__setattr__(wrapper, '_save_tokenizer', lambda *_args, **_kwargs: None)
 
     checkpoint = wrapper._save_spectral_hybrid(
-        'checkpoint-3',
+        'checkpoint-4',
         str(tmp_path),
         1,
         'hybrid',
@@ -1170,10 +1180,10 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
         consumed_train_samples=17,
     )
 
-    assert (tmp_path / 'checkpoint-3' / 'config.json').is_file()
-    assert (tmp_path / 'checkpoint-3' / 'model.safetensors').is_file()
-    assert not (tmp_path / 'checkpoint-3' / 'adapter_config.json').exists()
-    training_dir = tmp_path / 'checkpoint-3' / 'twinkle_training_state'
+    assert (tmp_path / 'checkpoint-4' / 'config.json').is_file()
+    assert (tmp_path / 'checkpoint-4' / 'model.safetensors').is_file()
+    assert not (tmp_path / 'checkpoint-4' / 'adapter_config.json').exists()
+    training_dir = tmp_path / 'checkpoint-4' / 'twinkle_training_state'
     assert (training_dir / 'adapter_config.json').is_file()
     assert '"twinkle_adapter_mode": "hybrid"' in (training_dir / 'adapter_config.json').read_text()
     assert (training_dir / 'adapter_model.safetensors').is_file()
@@ -1189,7 +1199,7 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
     progress = wrapper._resume_spectral_hybrid(checkpoint, 'hybrid', resume_only_model=True)
     assert torch.equal(fft_layer.weight, expected_fft)
     assert progress == {
-        'cur_step': 3,
+        'cur_step': 4,
         'consumed_train_samples': 17,
         'gradient_accumulation_steps': 2,
         'component_states': {},
@@ -1217,7 +1227,7 @@ def test_hybrid_save_writes_deployable_model_and_lossless_training_state(tmp_pat
     assert not (training_only_dir / 'model.safetensors').exists()
     assert not (training_only_dir / 'config.json').exists()
 
-    wrapper._save_spectral_hybrid('checkpoint-3', str(tmp_path), 1, 'hybrid', save_optimizer=False)
+    wrapper._save_spectral_hybrid('checkpoint-4', str(tmp_path), 1, 'hybrid', save_optimizer=False)
     assert not training_dir.exists()
 
 
@@ -1238,6 +1248,10 @@ def test_hybrid_optimizer_resume_matches_uninterrupted_training(tmp_path):
 
         @staticmethod
         def needs_wrapped_optimizer_state():
+            return False
+
+        @staticmethod
+        def owns_update_step():
             return False
 
         @staticmethod
@@ -1282,6 +1296,7 @@ def test_hybrid_optimizer_resume_matches_uninterrupted_training(tmp_path):
             scaler=None,
             train_status=SimpleNamespace(loss_value=None, num_tokens=0),
             do_grad_sync=lambda: True,
+            require_finalized=lambda operation: None,
         )
         wrapper.optimizer_group = {'hybrid': group}
         wrapper.hf_config = PretrainedConfig()

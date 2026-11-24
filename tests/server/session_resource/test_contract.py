@@ -6,7 +6,7 @@ from unittest import mock
 
 import pytest
 
-from twinkle.server.exceptions import RequestRejectedError
+from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
 from twinkle.server.session_resource.base import SessionResourceMixin
 from twinkle.server.session_resource.processor import ProcessorManagerMixin
 
@@ -100,3 +100,36 @@ def test_worker_restart_does_not_restore_local_resources() -> None:
     old.register_resource('r1', 'token', 'session')
     restarted = _ResourceManager(_State())
     assert restarted.get_resource_info('r1') is None
+
+
+@pytest.mark.asyncio
+async def test_processor_remains_unavailable_when_quota_release_fails() -> None:
+    from twinkle.server.processor.app import ProcessorManagement
+
+    manager = ProcessorManagement.__new__(ProcessorManagement)
+    manager._init_processor_manager()
+    processor = mock.Mock()
+    manager.resource_dict = {'p1': processor}
+    manager.register_resource('p1', 'token', 'session')
+    manager.state = mock.Mock(
+        get_session_last_heartbeat=mock.AsyncMock(side_effect=[None, 100.0]),
+        release_processor_quota=mock.AsyncMock(side_effect=ConnectionError('quota backend unavailable')),
+        renew_processor_quota=mock.AsyncMock(return_value=True),
+    )
+    manager._resource_countdown_running = True
+    ticks = iter((True, False))
+
+    async def next_tick(_delay):
+        manager._resource_countdown_running = next(ticks)
+
+    with (
+        mock.patch('twinkle.server.session_resource.base.asyncio.sleep', side_effect=next_tick),
+        mock.patch('twinkle.server.session_resource.base.time.time', return_value=100.0),
+    ):
+        await manager._resource_countdown_loop()
+
+    processor.close.assert_called_once_with()
+    manager.state.release_processor_quota.assert_awaited_once()
+    with pytest.raises(ResourceNotFoundError):
+        manager.assert_resource_exists('p1')
+    manager.state.renew_processor_quota.assert_not_awaited()

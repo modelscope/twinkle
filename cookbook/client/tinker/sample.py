@@ -2,7 +2,7 @@
 #
 # This script demonstrates how to use a previously trained LoRA checkpoint
 # for text generation (sampling) via the Tinker-compatible client API.
-# The server must be running first (see server.py and server_config.yaml).
+# Start the server with `twinkle-server launch -c cookbook/client/server/transformer/server_config.yaml`.
 
 import os
 from tinker import types

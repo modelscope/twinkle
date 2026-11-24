@@ -127,13 +127,17 @@ class SamplerRuntime:
         record.task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
         return await asyncio.shield(reply)
 
-    async def wait_operation(self, ticket):
+    async def operation_done(self, ticket) -> bool:
+        """Check physical completion without holding a Serve slot while generation runs."""
         record = self._operations.get(ticket)
         if record is None:
             raise ResourceNotFoundError("Unknown sampling operation")
-        await asyncio.shield(record.task)
+        if not record.task.done():
+            return False
+        record.task.result()
         self.owner.sampling_guard.check_available()
         self._operations.pop(ticket, None)
+        return True
 
     async def install_base_weights(self, path):
         from .weights import resolve_sampler_weights
@@ -141,9 +145,6 @@ class SamplerRuntime:
         await self.owner.sampling_guard.run(
             lambda: resolve_sampler_weights(self.owner, path, full_checkpoint=True), exclusive=True
         )
-
-    async def pending_futures(self):
-        return list({identity for record in self._operations.values() for identity in record.scope.request_ids})
 
     async def runtime_identity(self):
         import ray

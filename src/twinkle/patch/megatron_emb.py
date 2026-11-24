@@ -140,6 +140,10 @@ class MegatronHiddenPassthroughPatch(Patch):
             if owner is None:
                 continue
             output_layer = owner.output_layer
+            if output_layer is None:
+                # mcore-bridge's embedding build is headless (output_layer=None) and already
+                # emits hidden states, so there is nothing to pass through.
+                continue
             origin_forward = output_layer.forward
             output_layer.forward = MethodType(_identity_output_layer, output_layer)
             self._patched.append((output_layer, origin_forward))

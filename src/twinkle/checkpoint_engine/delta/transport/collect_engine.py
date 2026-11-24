@@ -27,6 +27,7 @@ import json
 import torch
 
 from .pipeline import DeltaSyncMixin
+from ...weight_keys import record_delta_flush_fingerprint
 
 
 def _spec_tensor(spec: dict, device: str) -> torch.Tensor:
@@ -57,6 +58,7 @@ class DeltaCollectEngine(DeltaSyncMixin):
         self.rank = 0
         self.is_master = False
         self._collected: list[tuple[list[tuple[str, torch.Tensor]], bool]] = []
+        self._delta_fp_send_seq = 0
 
     # ---- lifecycle (no rendezvous, no process group, no sockets) ----
     def prepare(self):
@@ -90,6 +92,8 @@ class DeltaCollectEngine(DeltaSyncMixin):
             ('__positions__', flush.positions_cpu.to('cpu')),
             ('__values__', flush.values_gpu.to('cpu')),
         ]
+        record_delta_flush_fingerprint('send', self._delta_fp_send_seq, named, self.rank)
+        self._delta_fp_send_seq += 1
         self._collected.append((named, bool(is_last)))
 
     def _publish_values_flush(self, params, values, is_last: bool) -> None:
@@ -105,6 +109,8 @@ class DeltaCollectEngine(DeltaSyncMixin):
                  'checksum': int(_checksum(empty_pos, values))}, 'cpu')),
             ('__values__', values.to('cpu')),
         ]
+        record_delta_flush_fingerprint('send', self._delta_fp_send_seq, named, self.rank)
+        self._delta_fp_send_seq += 1
         self._collected.append((named, bool(is_last)))
 
     def _publish_terminal(self, first: bool) -> None:

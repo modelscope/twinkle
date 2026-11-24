@@ -12,10 +12,9 @@ calls back for them. The scores land on ``facts['scores']`` -- one row-shaped en
 (``rewards.orm`` / ``rewards.baseline``, optionally ``prm_segments``) -- and meet the rows again
 inside the advantage worker, which receives both.
 
-How far ahead of the trainer the driver runs is bounded by the policy version ``v`` (the checkpoint
-manager's sync count): the rows admitted and not dropped never exceed
-``(v + max_staleness + 1) * sync_interval * batch_size``. A group older than ``max_staleness``
-versions when it is handed out is dropped.
+Admission runs a bounded window ahead of the batches already trained or skipped. Weight syncs and
+requests for the next batch can both advance the admission window. Only policy versions determine
+whether a group is older than ``max_staleness`` at delivery.
 
 All the waiting happens through completion callbacks: every step / score Future puts itself on one
 queue when it finishes, and the driver's thread only reads that queue, so its cost does not grow
@@ -30,7 +29,8 @@ import random
 import threading
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
+from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
@@ -58,6 +58,13 @@ def _record_driver_probe(event: str, episode_id: str = '', **fields: Any) -> Non
     step future resolved, whether its completion reached the event queue, and whether the loop
     that drains the queue is still turning. Without it the two possible causes -- a future that
     never resolves and a queue that is never drained -- are indistinguishable from outside.
+
+    Beyond that hand-off the same stream is the driver's seam event log: admission rounds
+    (``admit``), queue completions (``event_dequeued`` / ``handle``), score submissions and
+    arrivals (``score_submitted``; ``handle`` kind=orm/prm), a group becoming ready
+    (``group_ready``) and a batch handed to the trainer (``batch_handed``) -- the within-step
+    ordering the slow-injection efficiency oracles assert on, with ``t`` stamps from the same
+    monotonic clock.
     """
     import json
     import os
@@ -229,6 +236,8 @@ class StreamingDriver:
     #: One ``adjust`` call still running past this many seconds is reported as stuck: it hung
     #: inside the adapter holding its lock, so rebalancing is down until the call returns.
     ADJUST_STUCK_TIMEOUT = 300.0
+    #: Bound concurrent stop calls while allowing other episodes to close during a slow stop.
+    CLOSE_STOP_WORKERS = 8
     #: No-slot retry backoff: exponential from NO_SLOT_BASE_DELAY, capped at NO_SLOT_MAX_DELAY, plus
     #: uniform jitter in [0, NO_SLOT_JITTER] so many groups hitting a full pool at once do not retry in
     #: lockstep (a sentinel storm). The wall-clock ceiling is the per-instance max_no_slot_wait.
@@ -297,8 +306,14 @@ class StreamingDriver:
         self.max_no_slot_wait = max_no_slot_wait
 
         self._lock = threading.Condition()
+        self._close_lock = threading.Lock()
+        self._close_future: Future | None = None
+        self._close_waiting_on = ''
+        self._closing_episodes: dict[str, _Episode] = {}
+        self._pending: dict[Any, tuple[str, _Episode]] = {}
         self._events: 'queue.Queue[Tuple[Any, ...]]' = queue.Queue()
         self._ready: deque = deque()
+        self._stale_groups: deque[_Group] = deque()
         self._ready_rows = 0
         self._thread: Optional[threading.Thread] = None
         self._closed = False
@@ -311,6 +326,7 @@ class StreamingDriver:
         self._live = 0
         self._inflight = 0
         self._handed = 0
+        self._consumed_batches = 0
         self._version = 0
         self._base_version = 0
         self._failures: deque = deque(maxlen=self.FAILURE_WINDOW)
@@ -370,7 +386,11 @@ class StreamingDriver:
         # the trainer may have synced just before asking: judge staleness against that version
         version = self._read_version()
         with self._lock:
+            if self._closed:
+                return None
             self._version = max(self._version, version)
+            # The next pull acknowledges the last delivery, even if the trainer skipped its update.
+            self._consumed_batches = self._handed
             short = self._ready_rows < self.batch_size
         # the trainer waits from here on: its devices may be lent until the batch is ready
         lending = None
@@ -382,17 +402,8 @@ class StreamingDriver:
         self._lending = lending
         try:
             with self._lock:
-                while True:
-                    if self._error is not None:
-                        raise self._error
-                    if self.max_steps is not None and self._handed >= self.max_steps:
-                        return None
-                    self._drop_stale()
-                    if self._ready_rows >= self.batch_size:
-                        break
-                    if self._exhausted and self._inflight == 0:
-                        return None
-                    self._lock.wait(0.5)
+                if not self._wait_for_batch():
+                    return None
         finally:
             if self.cluster_adapter is not None:
                 settle = time.monotonic()
@@ -410,7 +421,10 @@ class StreamingDriver:
         # the tokens, so the event thread is never held up; collecting and counting move
         # together, so the batch is never half-published.
         with self._lock:
-            self._drop_stale()
+            # A policy sync during reclaim can invalidate the batch we waited for.
+            # Wait for its replacement before consuming a training step.
+            if not self._wait_for_batch():
+                return None
             if self.checkpoint_manager is not None:
                 # Same-window backstop the old whole-group min(version) drop provided: after _drop_stale
                 # every ready member is within max_staleness of the current version, so a group's own
@@ -457,7 +471,23 @@ class StreamingDriver:
             self._lock.notify_all()
         self._returned_at = time.monotonic()
         self._wait_time = self._returned_at - started
+        _record_driver_probe('batch_handed', rows=len(trajs), handed=self._handed, waited=self._wait_time)
         return trajs, _sample_facts(samples, scores, version_spans)
+
+    def _wait_for_batch(self) -> bool:
+        """Wait under the condition lock, rechecking staleness before delivery."""
+        while not self._closed:
+            if self._error is not None:
+                raise self._error
+            if self.max_steps is not None and self._handed >= self.max_steps:
+                return False
+            self._drop_stale()
+            if self._ready_rows >= self.batch_size:
+                return True
+            if self._exhausted and self._inflight == 0 and not self._groups:
+                return False
+            self._lock.wait(0.5)
+        return False
 
     def _score_update(self, episode: _Episode) -> Dict[str, Any]:
         """One row's light score entry, off the private bookkeeping -- never written onto the row.
@@ -519,7 +549,9 @@ class StreamingDriver:
                 group.missing += 1
                 self._live -= 1
                 self._counters['dropped_stale'] += 1
-            self._settle(group)
+            # A policy change noticed by the trainer can trigger regeneration.
+            # Only the background thread submits and records its new futures.
+            self._stale_groups.append(group)
         self._ready = kept
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
@@ -542,27 +574,153 @@ class StreamingDriver:
             return {'handed': self._handed, 'prompts_drawn': self._prompt_seq}
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
-    def close(self) -> None:
-        """Stop admitting, stop the episodes in flight and end the background thread."""
+    def close(self, timeout: float = 30.0) -> None:
+        """Wait up to timeout seconds for cleanup; retry close to confirm settlement.
+
+        Raises:
+            TimeoutError: Cleanup did not settle before the deadline.
+            BaseExceptionGroup: One or more rollout episodes failed to close.
+        """
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('close timeout must be finite and positive')
+        deadline = time.monotonic() + timeout
+        with self._close_lock:
+            drain = self._close_future
+            if drain is None or (drain.done() and drain.exception() is not None):
+                self._closed = True
+                self._close_waiting_on = 'driver thread'
+                drain = self._close_future = Future()
+                # The worker keeps ownership if the caller times out or is interrupted.
+                threading.Thread(target=self._drain_on_close, args=(drain,),
+                                 name='twinkle-streaming-close', daemon=True).start()
+        try:
+            drain.result(timeout=max(0.0, deadline - time.monotonic()))
+        except TimeoutError:
+            if drain.done():
+                drain.result()
+            else:
+                raise TimeoutError(f'StreamingDriver.close timed out waiting for {self._close_waiting_on}') from None
+
+    def _drain_on_close(self, drain: Future) -> None:
+        try:
+            self._close_rollouts()
+        except BaseException as error:
+            drain.set_exception(error)
+        else:
+            drain.set_result(None)
+
+    def _close_rollouts(self) -> None:
         with self._lock:
-            self._closed = True
-            episodes = [episode for group in self._groups.values()
-                        for episode in group.members + group.baselines if not episode.finished]
             self._lock.notify_all()
-        for episode in episodes:
-            if not episode.done:
-                try:
-                    self.rollout.stop(episode.traj or {}, episode_id=episode.episode_id)
-                except Exception as exc:  # noqa: BLE001 -- best effort on the way out
-                    logger.warning(f'StreamingDriver.close: stopping {episode.episode_id} failed: {exc}')
         if self._thread is not None:
-            self._thread.join(timeout=10)
+            self._thread.join()
+
+        self._drain_episode_calls()
+        with self._lock:
+            self._groups.clear()
+            self._ready.clear()
+            self._stale_groups.clear()
+            self._ready_rows = self._live = self._inflight = 0
+        while not self._events.empty():
+            self._events.get_nowait()
+
+    def _drain_episode_calls(self) -> None:
+        episodes = self._closing_episodes
+        episodes.update((episode.episode_id, episode) for group in self._groups.values()
+                        for episode in group.members + group.baselines if not episode.done)
+        # A dropped group can still have a pending call that owns its session.
+        episodes.update((episode.episode_id, episode) for kind, episode in self._pending.values()
+                        if kind in ('step', 'stop'))
+        pending_by_episode = Counter(episode.episode_id for _, episode in self._pending.values())
+        requests: queue.SimpleQueue[_Episode | None] = queue.SimpleQueue()
+        completions: queue.SimpleQueue = queue.SimpleQueue()
+
+        def stop_episodes() -> None:
+            for episode in iter(requests.get, None):
+                try:
+                    future = self.rollout.stop(episode.traj or episode.submit_traj or {},
+                                               episode_id=episode.episode_id)
+                    if future is not None:
+                        future.result()
+                except BaseException as error:
+                    completions.put(('stop', episode, error))
+                else:
+                    completions.put(('stop', episode, None))
+
+        workers = 0
+        for _ in range(min(len(episodes), self.CLOSE_STOP_WORKERS)):
+            try:
+                threading.Thread(target=stop_episodes, name='twinkle-streaming-stop', daemon=True).start()
+            except RuntimeError:
+                if not workers:
+                    raise
+                break
+            workers += 1
+
+        stopping = set()
+        errors = []
+
+        def enqueue_stop(episode_id: str) -> None:
+            episode = episodes.get(episode_id)
+            if episode is None or pending_by_episode[episode_id]:
+                return
+            if episode.done:
+                del episodes[episode_id]
+            else:
+                stopping.add(episode_id)
+                requests.put(episode)
+
+        try:
+            for future in self._pending:
+                future.add_done_callback(lambda finished: completions.put(('call', finished, None)))
+            for episode_id in tuple(episodes):
+                enqueue_stop(episode_id)
+            while self._pending or stopping:
+                if self._pending:
+                    kind, episode = next(iter(self._pending.values()))
+                    self._close_waiting_on = f'{kind} for episode {episode.episode_id}'
+                else:
+                    self._close_waiting_on = f'stop for episode {next(iter(stopping))}'
+                action, item, error = completions.get()
+                if action == 'stop':
+                    episode_id = item.episode_id
+                    stopping.remove(episode_id)
+                    if error is None:
+                        item.done = True
+                        del episodes[episode_id]
+                    else:
+                        error.add_note(f'Stopping rollout episode {episode_id}')
+                        errors.append(error)
+                    continue
+                kind, episode = self._pending.pop(item)
+                try:
+                    result = item.result()
+                except Exception:
+                    # Retry stop after a failed call has settled.
+                    pass
+                else:
+                    if kind == 'stop':
+                        episode.done = True
+                    elif kind == 'step':
+                        rows, sample = result
+                        episode.done = sample.done
+                        if rows:
+                            episode.traj = rows[0]
+                pending_by_episode[episode.episode_id] -= 1
+                enqueue_stop(episode.episode_id)
+        finally:
+            for _ in range(workers):
+                requests.put(None)
+
+        # Failed stops remain owned for the next close attempt.
+        if errors:
+            raise BaseExceptionGroup('could not close rollout episodes', errors)
 
     # ------------------------------------------------------------------ background loop
 
     def _start(self) -> None:
         with self._lock:
-            if self._thread is not None:
+            if self._closed or self._thread is not None:
                 return
             self._version = self._read_version()
             # the bound counts versions from here: a manager synced before the run starts above 0
@@ -575,12 +733,13 @@ class StreamingDriver:
             # _next_batch also advances self._version, so version changes are tracked here on their own
             adjusted = self._version
             while True:
+                version = self._read_version()
                 with self._lock:
                     if self._closed:
                         return
-                version = self._read_version()
-                with self._lock:
                     self._version = max(self._version, version)
+                    while self._stale_groups:
+                        self._settle(self._stale_groups.popleft())
                     self._admit()
                     self._retry_no_slot_due()
                     self._lock.notify_all()
@@ -657,7 +816,9 @@ class StreamingDriver:
     # ------------------------------------------------------------------ admission
 
     def _capacity(self) -> int:
-        return (self._version - self._base_version + self.max_staleness + 1) * self.sync_interval * self.batch_size
+        synced_batches = (self._version - self._base_version) * self.sync_interval
+        ahead_batches = (self.max_staleness + 1) * self.sync_interval
+        return (max(synced_batches, self._consumed_batches) + ahead_batches) * self.batch_size
 
     def _admit(self) -> None:
         """Open groups within the version window and remaining-batch budget (under the lock)."""
@@ -667,11 +828,13 @@ class StreamingDriver:
         elif self.max_steps is not None:
             # Each successful episode delivers at least one row, including when segments are collected.
             remaining_groups = (self.max_steps - self._handed) * (self.batch_size // self.num_generations)
-        while not self._exhausted and self._live + self.num_generations <= self._capacity():
+        while not self._closed and not self._exhausted and self._live + self.num_generations <= self._capacity():
             # A group with missing members keeps its reservation until the group itself is dropped.
             if remaining_groups is not None and len(self._ready) + len(self._groups) >= remaining_groups:
                 return
             row = self._next_row()
+            if self._closed:
+                return
             if row is None:
                 self._exhausted = True
                 return
@@ -737,11 +900,24 @@ class StreamingDriver:
         future = self.rollout.step(traj, episode_id=episode.episode_id, session_wait=0)
         _record_driver_probe('step_submitted', episode.episode_id)
 
-        def _done(f, episode=episode):
-            _record_driver_probe('step_future_done', episode.episode_id)
-            self._events.put(('step', episode, None, f))
+        self._track(future, 'step', episode)
 
-        future.add_done_callback(_done)
+    def _track(self, future, kind, episode, index=None):
+        self._pending[future] = (kind, episode)
+
+        def done(result):
+            if self._closed:
+                return
+            if kind == 'step':
+                _record_driver_probe('step_future_done', episode.episode_id)
+            self._events.put((kind, episode, index, result))
+
+        future.add_done_callback(done)
+
+    def _stop(self, episode, trajectory):
+        future = self.rollout.stop(trajectory, episode_id=episode.episode_id)
+        if future is not None:
+            self._track(future, 'stop', episode)
 
     # ------------------------------------------------------------------ completions
 
@@ -751,10 +927,15 @@ class StreamingDriver:
         with self._lock:
             if self._closed:
                 return
+            if kind == 'stop' and exc is not None:
+                raise exc
+            self._pending.pop(future, None)
+            if kind == 'stop':
+                return
             if episode.lost:
                 if kind == 'step' and exc is None and not future.result()[1].done:
                     # dropped while this step ran: release its rollout state now
-                    self.rollout.stop(future.result()[0][0], episode_id=episode.episode_id)
+                    self._stop(episode, future.result()[0][0])
                 return
             if exc is not None and not (kind == 'step' and _is_episode_error(exc)):
                 raise exc
@@ -812,8 +993,8 @@ class StreamingDriver:
             episode.prm[scorer].append(_PENDING)
             episode.prm_pending += 1
             future = prm([episode.traj])
-            future.add_done_callback(
-                lambda f, episode=episode, key=(segment, scorer): self._events.put(('prm', episode, key, f)))
+            self._track(future, 'prm', episode, (segment, scorer))
+        _record_driver_probe('score_submitted', episode.episode_id, kind='prm', segment=segment)
         return segment
 
     def _release(self, episode: _Episode, segment: int) -> None:
@@ -823,7 +1004,7 @@ class StreamingDriver:
             self._step(episode, episode.traj)
             return
         self._counters['stopped'] += 1
-        self.rollout.stop(episode.traj, episode_id=episode.episode_id)
+        self._stop(episode, episode.traj)
         self._lose(episode)
 
     def _score_orm(self, episode: _Episode) -> None:
@@ -831,8 +1012,8 @@ class StreamingDriver:
         episode.orm_pending = len(self.orms)
         for index, orm in enumerate(self.orms):
             future = orm([episode.traj])
-            future.add_done_callback(
-                lambda f, episode=episode, index=index: self._events.put(('orm', episode, index, f)))
+            self._track(future, 'orm', episode, index)
+        _record_driver_probe('score_submitted', episode.episode_id, kind='orm')
         self._maybe_finish(episode)
 
     def _fail(self, episode: _Episode, exc: BaseException) -> None:
@@ -989,6 +1170,8 @@ class StreamingDriver:
         del self._groups[group.key]
         self._ready.append(list(group.members))
         self._ready_rows += sum(len(episode.deliver) for episode in group.members)
+        _record_driver_probe('group_ready', group.members[0].episode_id if group.members else '',
+                             group=group.key, ready_rows=self._ready_rows)
 
     def _drop_group(self, group: _Group) -> None:
         """Give the group up: its counted rows leave the bound, its unfinished episodes stop (under the lock)."""
@@ -1006,7 +1189,7 @@ class StreamingDriver:
                 episode.counted_inflight = False
                 if episode.held is not None:
                     # waiting for its PRM scores, no step in flight; a stepping one is stopped when it returns
-                    self.rollout.stop(episode.traj, episode_id=episode.episode_id)
+                    self._stop(episode, episode.traj)
 
 
 #: Placeholder for a score whose Future has not completed yet.

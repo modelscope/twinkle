@@ -10,6 +10,17 @@ from twinkle.processor import InputProcessor
 
 twinkle.initialize(mode='local')
 
+
+@pytest.fixture(autouse=True)
+def _pin_cpu_local_device(monkeypatch):
+    # CPU-tier contract (same pin as test_batch_context_loss): the processor moves tensors to
+    # Platform.get_local_device(), which on a GPU host resolves to cuda even under
+    # CUDA_VISIBLE_DEVICES=''. Lazy-dataset batching semantics are device-agnostic.
+    import torch
+    from twinkle.utils.platforms import Platform
+    monkeypatch.setattr(Platform, 'get_local_device', lambda *args, **kwargs: torch.device('cpu'))
+
+
 TEST_DATA_DIR = Path(__file__).parent.parent / 'dataset' / 'test_data'
 SKIP_MODEL_DOWNLOAD = os.getenv('SKIP_MODEL_DOWNLOAD', 'false').lower() == 'true'
 

@@ -8,6 +8,7 @@ from typing import List
 from twinkle import Platform, get_logger, remote_function
 from twinkle.checkpoint_engine.base import CheckpointEngine
 from twinkle.perf import timed
+from twinkle.utils.framework import Torch
 
 logger = get_logger()
 
@@ -204,11 +205,10 @@ class CheckpointEngineMixin:
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def direct_weight_sync_device(self):
         """Physical identity used to pair a colocated sender with a vLLM receiver."""
-        import torch
-
-        if not torch.cuda.is_available():
+        platform = Platform.get_platform()
+        if platform.device_prefix() not in ('cuda', 'npu') or platform.device_module() is None:
             return None
-        return Platform.get_vllm_device_uuid(torch.cuda.current_device())
+        return Platform.get_vllm_device_uuid(Torch.get_current_device())
 
     @remote_function(dispatch='all', lazy_collect=True)
     @timed
@@ -238,7 +238,7 @@ class CheckpointEngineMixin:
         if senders is None:
             senders = self._direct_vllm_senders = {}
         sender = senders.setdefault(channel, VLLMWeightSender())
-        transfer_device = torch.device('cuda', torch.cuda.current_device())
+        transfer_device = torch.device(Platform.device_prefix(), Torch.get_current_device())
 
         # A Ray actor already has an asyncio loop. Keep the streaming exporter
         # and its bucket handshakes on a dedicated thread, as send_weights does.
@@ -246,6 +246,8 @@ class CheckpointEngineMixin:
 
         def send():
             try:
+                # Accelerator device selection is thread-local, including on Ascend.
+                Torch.set_device(transfer_device)
                 asyncio.run(sender.update_weights(
                     weights, peft_config=peft_config, base_sync_done=base_sync_done,
                     zmq_handle=target['endpoint'], auth_key=auth_key, device=transfer_device,
@@ -353,22 +355,32 @@ class CheckpointEngineMixin:
         (not the full model).  Each received (name, tensor) is matched to the
         local state dict by name; a mismatch raises KeyError immediately.
 
-        The local state comes from ``_get_local_state_dict``, whose values are the
-        live parameters (``param.data``); ``param.data`` also tolerates plain
-        tensors, so hosts storing raw tensors keep working.
+        The local state comes from the live ``model.state_dict()`` (shared-storage views of the
+        actual parameters). A DTensor target is blended into its LIVE local shard: the received
+        bucket is a full tensor, wrapped Replicate on the target's mesh and redistributed to the
+        target's own placements so the slice geometry comes from the parameter itself. Blending
+        into ``_get_local_state_dict`` instead would mutate gathered throwaway copies
+        (``Torch.to_local_tensor`` calls ``full_tensor()``), leaving a sharded reference untouched.
         """
         engine = self._get_or_create_checkpoint_engine()
-        local_state = self._get_local_state_dict()
+        from torch.distributed.tensor import DTensor, Replicate
+        model = self.strategy.unwrap_model(self.model)
+        local_state = model.state_dict()
 
         async def _receive_and_ema():
             async for name, tensor in engine.receive_weights():
-                param = local_state[name]
-                # A received bucket rides the transport the pair negotiated --
-                # device-to-device on a shared NCCL channel, the ray object
-                # store (CPU tensors) across disjoint device groups. The EMA
-                # math runs on the parameter's device either way; ``.to`` is a
-                # no-op when the tensor already sits there.
-                param.data.mul_(alpha).add_(tensor.to(param.device), alpha=1.0 - alpha)
+                target = local_state[name]
+                # A received bucket rides the transport the pair negotiated -- device-to-device on a
+                # shared NCCL channel, the ray object store (CPU tensors) across disjoint device
+                # groups. Stage it onto the target's device before the EMA math.
+                if isinstance(target, DTensor):
+                    recv = tensor.to(target.to_local().device)
+                    recv_dt = DTensor.from_local(recv, target.device_mesh,
+                                                 [Replicate()] * len(target.placements), run_check=False)
+                    recv_local = recv_dt.redistribute(target.device_mesh, target.placements).to_local()
+                    target.to_local().mul_(alpha).add_(recv_local, alpha=1.0 - alpha)
+                else:
+                    target.mul_(alpha).add_(tensor.to(target.device), alpha=1.0 - alpha)
 
         result_container = {'error': None}
 

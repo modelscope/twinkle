@@ -6,7 +6,7 @@ from .completion_and_reward import CompletionRewardMetric
 from .dpo import DPOMetric
 from .embedding import EmbeddingMetric
 from .generation import ExactMatch, RougeBleu, TextMetric
-from .grpo import CISPOMetric, GRPOMetric, GSPOMetric, PPOMetric
+from .grpo import CISPOMetric, DISMetric, GRPOMetric, GSPOMetric, PPOMetric
 from .loss import LossMetric
 from .ppo import PPOValueMetric
 from .reporting import MetricsReporter, create_metrics_reporter

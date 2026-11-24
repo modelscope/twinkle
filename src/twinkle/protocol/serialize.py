@@ -5,6 +5,7 @@ Heavy domain types are resolved lazily so importing :mod:`twinkle.protocol` does
 not load PEFT or the dataset implementation.
 """
 import json
+import sys
 from dataclasses import fields
 from functools import lru_cache
 from numbers import Number
@@ -20,6 +21,12 @@ basic_types = (*primitive_types, *container_types)
 def _dataset_meta_cls():
     from twinkle.dataset import DatasetMeta
     return DatasetMeta
+
+
+def is_dataset_meta(obj: Any) -> bool:
+    # An existing DatasetMeta already has its defining module loaded. Avoid importing the
+    # dataset/template stack just to serialize a LoRA config or a different dataclass.
+    return isinstance(obj, getattr(sys.modules.get('twinkle.dataset.base'), 'DatasetMeta', ()))
 
 
 @lru_cache(maxsize=1)
@@ -62,7 +69,7 @@ def _deserialize_data_slice(data_slice):
 def serialize_object(obj) -> Any:
     if isinstance(obj, (bytes, bytearray, memoryview)):
         raise TypeError(f'Unsupported binary object: {type(obj).__name__}')
-    if isinstance(obj, _dataset_meta_cls()):
+    if is_dataset_meta(obj):
         data = {name: getattr(obj, name) for name in _dataset_meta_fields()}
         data['data_slice'] = _serialize_data_slice(data.get('data_slice'))
         data['_TWINKLE_TYPE_'] = 'DatasetMeta'

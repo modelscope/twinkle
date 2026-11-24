@@ -296,6 +296,44 @@ class TurnLedger:
         # concatenated, which no consumer asks for yet.
         self._sampling_masks = getattr(seq, "sampling_masks", None)
 
+    def record_continuation(self, seq: SampledSequence) -> None:
+        """Bank a continuation of the OPEN assistant turn (chat-protocol continue-on-length).
+
+        The agent re-sent the conversation ending with our truncated reply and asked for more
+        of it: the generation extends that same assistant message instead of opening a new
+        turn. Token accounting is :meth:`record`'s (the sampler's ``new_input_feature`` is the
+        prompt plus everything sampled, labelled); the turn count does not advance, and the
+        decoded continuation is concatenated onto the last assistant content.
+        """
+        if seq.new_input_feature is None or "input_ids" not in seq.new_input_feature:
+            raise RuntimeError(
+                f"sampler returned a SampledSequence without "
+                f"new_input_feature.input_ids for {self.label}; "
+                f"cannot continue multi-turn."
+            )
+        messages = self.messages
+        if not messages or messages[-1].get("role") != "assistant":
+            raise RuntimeError(f"continuation without an open assistant turn at {self.label}")
+        sampled_feature = _to_plain(dict(seq.new_input_feature))
+        new_state = getattr(seq, "new_state", None)
+        if new_state is not None:
+            self._state = new_state
+        elif self._state is not None:
+            completion = self.template.append_completion(self._state, list(seq.tokens or []))
+            if list(completion.state.feature.get("input_ids") or []) != list(sampled_feature.get("input_ids") or []):
+                raise RuntimeError("sampler new_input_feature disagrees with RolloutState token accounting.")
+            self._state = completion.state
+        self._pif = sampled_feature
+        merged = list(messages)
+        last = dict(merged[-1])
+        last["content"] = (last.get("content") or "") + (seq.decoded or "")
+        merged[-1] = last
+        self._pif["messages"] = merged
+        if self._state is not None:
+            self._state = replace(self._state, messages=tuple(merged))
+        self._extend_logprobs(seq)
+        self._sampling_masks = getattr(seq, "sampling_masks", None)
+
     def _extend_logprobs(self, seq: SampledSequence) -> None:
         """Append one generation's logprobs -- one per sampled token, or raise.
 
@@ -604,6 +642,19 @@ class MessageLedger:
         else:
             self._feature["messages"].append({"role": "assistant", "content": seq.decoded or ""})
         self._turns += 1
+
+    def record_continuation(self, seq: SampledSequence) -> None:
+        """Extend the open assistant turn with a continuation (no new turn banked)."""
+        feature = seq.new_input_feature
+        if isinstance(feature, dict) and feature.get("messages"):
+            self._feature["messages"] = list(feature["messages"])
+            if "tools" in feature:
+                self._feature["tools"] = list(feature["tools"])
+        else:
+            msgs = self._feature["messages"]
+            if not msgs or msgs[-1].get("role") != "assistant":
+                raise RuntimeError(f"continuation without an open assistant turn at {self.label}")
+            msgs[-1] = {**msgs[-1], "content": (msgs[-1].get("content") or "") + (seq.decoded or "")}
 
     def observe(self, messages: Sequence[dict[str, Any]]) -> bool:
         """Append messages the model did not write. Always fits: no token budget."""
