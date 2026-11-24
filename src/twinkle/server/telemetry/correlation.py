@@ -24,16 +24,6 @@ TASK_ID = f'{PREFIX}task_id'
 SAMPLING_SESSION_ID = f'{PREFIX}sampling_session_id'
 BASE_MODEL = f'{PREFIX}base_model'
 
-CORRELATION_KEYS: tuple[str, ...] = (
-    SESSION_ID,
-    MODEL_ID,
-    REPLICA_ID,
-    TENANT_FINGERPRINT,
-    SAMPLING_SESSION_ID,
-    BASE_MODEL,
-)
-
-
 def telemetry_node() -> str:
     return os.getenv('NODE_NAME') or socket.gethostname()
 

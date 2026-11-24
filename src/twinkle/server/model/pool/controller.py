@@ -32,7 +32,7 @@ from twinkle.server.state.training_records import (
     TrainingRoute,
 )
 from twinkle.server.state.training_store import TrainingStore
-from twinkle.server.telemetry.metrics import TrainingInstanceMetrics, TrainingInstanceSnapshot, get_training_metrics
+from twinkle.server.telemetry.metrics import MetricsRegistry, TrainingInstanceMetrics, TrainingInstanceSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ class TrainingController:
         self._failed_instances: dict[str, FutureFailureRecord] = {}
         self._lock = asyncio.Lock()
         self._ready = False
-        self._metrics = get_training_metrics()
+        self._metrics = MetricsRegistry.get()
         self._instance_metrics = TrainingInstanceMetrics(self._metrics)
 
     def _instance_metric_tags(self, instance: InstanceRecord) -> dict[str, str]:
@@ -269,7 +269,9 @@ class TrainingController:
             await self.fail_instance(instance.instance_id, failure_for(exc))
             raise
         finally:
-            self._metrics.startup_seconds.observe(time.monotonic() - started, tags={**tags, "status": status})
+            self._metrics.training_startup_seconds.record(
+                time.monotonic() - started, attributes={**tags, "status": status}
+            )
 
     def _select(self, spec: TrainingModelConfig) -> InstanceRecord | None:
         candidates = [
@@ -649,18 +651,21 @@ class TrainingController:
                 self._report_instance_metrics()
                 tags = self._instance_metric_tags(instance)
                 if entered_quarantine:
-                    self._metrics.quarantined_total.inc(
-                        tags={
+                    self._metrics.training_quarantined_total.add(
+                        1,
+                        attributes={
                             "backend": tags["backend"],
                             "mode": tags["mode"],
                             "reason": TrainingInstanceMetrics.quarantine_reason(exc),
                         }
                     )
-            self._metrics.shutdown_seconds.observe(time.monotonic() - started, tags={**timing_tags, "status": "error"})
+            self._metrics.training_shutdown_seconds.record(
+                time.monotonic() - started, attributes={**timing_tags, "status": "error"}
+            )
 
         async def stopped():
-            self._metrics.shutdown_seconds.observe(
-                time.monotonic() - started, tags={**timing_tags, "status": "success"}
+            self._metrics.training_shutdown_seconds.record(
+                time.monotonic() - started, attributes={**timing_tags, "status": "success"}
             )
             await self._retire_instance(instance)
 

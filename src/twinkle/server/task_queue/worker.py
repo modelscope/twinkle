@@ -35,7 +35,7 @@ from .types import QueuedTask
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
-    from twinkle.server.telemetry.metrics import TaskMetrics
+    from twinkle.server.telemetry.metrics import MetricsRegistry
 
 logger = get_logger()
 
@@ -99,7 +99,7 @@ class ComputeWorker:
         self,
         state: ServerState,
         config: TaskQueueConfig,
-        task_metrics: TaskMetrics | None,
+        task_metrics: MetricsRegistry | None,
         deployment_name: str,
         on_backend_timeout: Callable[[], Any] | None = None,
     ) -> None:
@@ -248,27 +248,27 @@ class ComputeWorker:
     def record_admission(self, task: QueuedTask) -> None:
         if self._task_metrics and task.tenant_fingerprint and task.task_type in METERED_TASK_TYPES:
             tags = self._task_tags(task)
-            self._task_metrics.usage_requests.inc(tags=tags)
-            self._task_metrics.usage_input_tokens.inc(task.input_tokens, tags=tags)
+            self._task_metrics.usage_requests.add(1, attributes=tags)
+            self._task_metrics.usage_input_tokens.add(task.input_tokens, attributes=tags)
 
     def _record_tasks_total(self, task: QueuedTask, status: str) -> None:
         if self._task_metrics:
-            self._task_metrics.tasks_total.inc(tags={**self._task_tags(task), 'status': status})
+            self._task_metrics.tasks_total.add(1, attributes={**self._task_tags(task), 'status': status})
 
     def _record_execution_time(self, task: QueuedTask, exec_time: float) -> None:
         if self._task_metrics:
             tags = self._task_tags(task)
-            self._task_metrics.execution_seconds.observe(exec_time, tags=tags)
+            self._task_metrics.task_execution_seconds.record(exec_time, attributes=tags)
 
     def _record_queue_depth(self) -> None:
         """Single writer of the queue-depth gauge."""
         if self._task_metrics:
             total_depth = sum(qq.qsize() for qq in self.task_queues.values())
-            self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
+            self._task_metrics.queue_depth.set(total_depth, attributes={'deployment': self._deployment_name})
 
     def _record_queue_metrics(self, task: QueuedTask, queue_wait: float) -> None:
         if self._task_metrics:
-            self._task_metrics.queue_wait_seconds.observe(queue_wait, tags=self._task_tags(task))
+            self._task_metrics.task_wait_seconds.record(queue_wait, attributes=self._task_tags(task))
 
     # ------------------------------------------------------------------
 

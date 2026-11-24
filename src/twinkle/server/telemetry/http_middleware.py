@@ -1,12 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""FastAPI HTTP request-metrics middleware.
-
-Split out of the former ``middleware.py``: the metric adapters and
-containers live in ``metrics.py`` next to the ``MetricsRegistry``; this file holds only
-the HTTP middleware factory, so a file named for HTTP middleware contains HTTP middleware
-and the queue code no longer imports a module called ``middleware`` just to reach
-``get_task_metrics``.
-"""
+"""HTTP request counts and latency at the FastAPI ingress."""
 from __future__ import annotations
 import asyncio
 import time
@@ -56,13 +49,13 @@ def create_metrics_middleware(deployment: str) -> Callable:
                     tags['tenant_fingerprint'] = fingerprint
                 if base_model := getattr(request.state, 'base_model', None):
                     tags['base_model'] = base_model
-                m = MetricsRegistry.get().request_metrics(deployment)
+                m = MetricsRegistry.get()
                 request_tags = {**tags, 'status': str(status)}
                 if status == 429:
                     request_tags['response_origin'] = (
                         'forwarded' if getattr(request.state, 'forwarded_429', False) else 'local'
                     )
-                m.requests_total.inc(tags=request_tags)
-                m.request_duration_seconds.observe(elapsed, tags=tags)
+                m.requests_total.add(1, attributes=request_tags)
+                m.request_duration_seconds.record(elapsed, attributes=tags)
 
     return metrics_middleware

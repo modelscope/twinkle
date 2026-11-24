@@ -75,3 +75,10 @@ def _reset_canonical_state_actor():
         except Exception:
             pass
     yield
+
+
+@pytest.fixture
+def isolated_metrics_registry(monkeypatch):
+    from twinkle.server.telemetry.metrics import MetricsRegistry
+
+    monkeypatch.setattr(MetricsRegistry, '_instance', None)

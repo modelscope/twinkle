@@ -127,7 +127,7 @@ class RateLimiter:
                                      f'Active tokens remaining: {len(self._token_requests)}')
 
                     if self._active_tokens_gauge is not None:
-                        self._active_tokens_gauge.set(len(self._token_requests), tags=self._metric_tags)
+                        self._active_tokens_gauge.set(len(self._token_requests), attributes=self._metric_tags)
 
             except asyncio.CancelledError:
                 logger.debug('[RateLimiter] Cleanup task cancelled')
@@ -179,5 +179,5 @@ class RateLimiter:
 
             self._token_requests[token].append((current_time, input_tokens))
             if self._active_tokens_gauge is not None:
-                self._active_tokens_gauge.set(len(self._token_requests), tags=self._metric_tags)
+                self._active_tokens_gauge.set(len(self._token_requests), attributes=self._metric_tags)
             return True, None

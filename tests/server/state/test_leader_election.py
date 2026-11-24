@@ -42,7 +42,7 @@ async def test_only_one_of_many_instances_becomes_leader() -> None:
 async def test_leader_publishes_resource_counts() -> None:
     from twinkle.server.telemetry import MetricsRegistry
 
-    MetricsRegistry.reset()
+    MetricsRegistry._instance = None
     backend = RayActorBackend()
     state = ServerState(
         backend=backend,
@@ -59,7 +59,7 @@ async def test_leader_publishes_resource_counts() -> None:
         assert registry.get_resource_count('active_sessions') == 1
     finally:
         await state.stop_cleanup_task()
-        MetricsRegistry.reset()
+        MetricsRegistry._instance = None
 
 
 @pytest.mark.asyncio
@@ -237,7 +237,7 @@ async def test_lazy_cleanup_retries_after_failed_start():
 async def test_four_instances_no_4x_gauge_inflation() -> None:
     """Four ServerState instances sharing one backend: only the leader publishes
     gauge counts, so the cache reads 5 (not 20)."""
-    MetricsRegistry.reset()
+    MetricsRegistry._instance = None
     backend = RayActorBackend()
     instances = [ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.5) for _ in range(4)]
     try:
@@ -253,13 +253,13 @@ async def test_four_instances_no_4x_gauge_inflation() -> None:
     finally:
         for s in instances:
             await s.stop_cleanup_task()
-        MetricsRegistry.reset()
+        MetricsRegistry._instance = None
 
 
 @pytest.mark.asyncio
 async def test_gauge_cache_zeroed_on_leadership_handover() -> None:
     """When a leader loses leadership its gauge cache is zeroed."""
-    MetricsRegistry.reset()
+    MetricsRegistry._instance = None
     backend = RayActorBackend()
     a = ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.3)
     b = ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.3)
@@ -282,4 +282,4 @@ async def test_gauge_cache_zeroed_on_leadership_handover() -> None:
     finally:
         await a.stop_cleanup_task()
         await b.stop_cleanup_task()
-        MetricsRegistry.reset()
+        MetricsRegistry._instance = None

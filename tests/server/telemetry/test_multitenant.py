@@ -44,7 +44,7 @@ def test_checkpoint_fingerprint_keeps_the_previous_directory(monkeypatch, salt):
 
 
 @pytest.mark.asyncio
-async def test_usage_is_recorded_once_at_admission(monkeypatch, in_memory_span_exporter, caplog):
+async def test_usage_is_recorded_once_at_admission(monkeypatch, in_memory_span_exporter, caplog, isolated_metrics_registry):
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
@@ -52,7 +52,7 @@ async def test_usage_is_recorded_once_at_admission(monkeypatch, in_memory_span_e
     provider = MeterProvider(metric_readers=[reader])
     monkeypatch.setenv(USER_ID_KEY_ENV, 'ops-only-key')
     monkeypatch.setattr(metrics, 'get_meter', provider.get_meter)
-    metrics.MetricsRegistry.reset()
+
     in_memory_span_exporter.clear()
 
     queue = TaskQueueMixin()
@@ -183,7 +183,7 @@ async def test_usage_is_recorded_once_at_admission(monkeypatch, in_memory_span_e
     finally:
         logger.removeHandler(caplog.handler)
         await queue.shutdown_task_queue()
-        metrics.MetricsRegistry.reset()
+
         provider.shutdown()
 
 
@@ -338,9 +338,9 @@ async def test_proxy_client_span_connects_two_server_spans(in_memory_span_export
     from twinkle.server.lifecycle.proxy import ServiceProxy
 
     in_memory_span_exporter.clear()
-    requests_total = SimpleNamespace(inc=Mock())
+    requests_total = SimpleNamespace(add=Mock())
     request_metrics = SimpleNamespace(requests_total=requests_total, request_duration_seconds=Mock())
-    monkeypatch.setattr(metrics.MetricsRegistry, 'request_metrics', lambda *_: request_metrics)
+    monkeypatch.setattr(metrics.MetricsRegistry, 'get', lambda: request_metrics)
     upstream = FastAPI()
     upstream.middleware('http')(create_tracing_middleware('Model'))
     upstream.middleware('http')(create_metrics_middleware('Model'))
@@ -366,8 +366,8 @@ async def test_proxy_client_span_connects_two_server_spans(in_memory_span_export
     finally:
         await proxy.close()
 
-    assert [(call.kwargs['tags']['deployment'], call.kwargs['tags']['response_origin'])
-            for call in requests_total.inc.call_args_list] == [('Model', 'local'), ('Gateway', 'forwarded')]
+    assert [(call.kwargs['attributes']['deployment'], call.kwargs['attributes']['response_origin'])
+            for call in requests_total.add.call_args_list] == [('Model', 'local'), ('Gateway', 'forwarded')]
     target, outbound, entry = in_memory_span_exporter.get_finished_spans()
     assert target.parent.span_id == outbound.context.span_id
     assert outbound.parent.span_id == entry.context.span_id

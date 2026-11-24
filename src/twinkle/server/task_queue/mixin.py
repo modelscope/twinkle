@@ -20,7 +20,7 @@ from twinkle.server.exceptions import BatchSizeError, ConfigError, InputTokensEx
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window
 from twinkle.server.state.models import FutureFailureRecord
-from twinkle.server.telemetry.metrics import get_task_metrics
+from twinkle.server.telemetry.metrics import MetricsRegistry
 from twinkle.utils.logger import get_logger
 from .backend_gate import BackendGate
 from .rate_limiter import RateLimiter
@@ -107,7 +107,7 @@ class TaskQueueMixin:
                          f'({_window}s); lower it or raise TWINKLE_LONG_POLL_TIMEOUT.'))
         self._deployment_name = deployment_name
         self._telemetry_base_model = telemetry_base_model
-        self._task_metrics = get_task_metrics(deployment_name) if deployment_name else None
+        self._task_metrics = MetricsRegistry.get() if deployment_name else None
         self._future_absolute_ttl = self._task_queue_config.absolute_future_ttl(collect_width)
 
         self._rate_limiter = RateLimiter(
@@ -209,7 +209,7 @@ class TaskQueueMixin:
         allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
         if not allowed:
             if self._task_metrics:
-                self._task_metrics.rate_limit_rejections.inc(tags={'deployment': self._deployment_name})
+                self._task_metrics.rate_limit_rejections.add(1, attributes={'deployment': self._deployment_name})
             raise RateLimitExceededError(f'Rate limit exceeded: {reason}')
 
     async def _schedule_task(

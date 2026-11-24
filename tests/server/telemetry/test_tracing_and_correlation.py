@@ -17,28 +17,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from twinkle.server.telemetry import correlation
-from twinkle.server.telemetry.correlation import CORRELATION_KEYS, PREFIX, set_correlation_attrs
+from twinkle.server.telemetry.correlation import set_correlation_attrs
 from twinkle.server.telemetry.tracing import _NoopSpan, traced_operation
-
-# ---------- correlation-key prefix invariant ----------------------------- #
-
-
-@pytest.mark.parametrize('key', CORRELATION_KEYS)
-def test_prefix_invariant(key: str) -> None:
-    assert key.startswith(PREFIX), key
-
-
-def test_helper_constants_complete() -> None:
-    expected = {
-        'twinkle.session_id',
-        'twinkle.model_id',
-        'twinkle.replica_id',
-        'twinkle.tenant_fingerprint',
-        'twinkle.sampling_session_id',
-        'twinkle.base_model',
-    }
-    assert set(CORRELATION_KEYS) == expected
-
 
 # ---------- attachment of present-only values ------------------------------ #
 
@@ -233,7 +213,7 @@ def test_pipeline_exports_once_and_keeps_early_gauge_callbacks(monkeypatch) -> N
         assert provider.init_telemetry(config)
         assert MetricsRegistry.get() is early
         early.set_resource_count('active_sessions', 7)
-        early.request_metrics('Audit').request_duration_seconds.observe(0.08)
+        early.request_duration_seconds.record(0.08)
         data = {m.name: m.data.data_points for r in reader.get_metrics_data().resource_metrics
                 for scope in r.scope_metrics for m in scope.metrics}
         assert [p.value for p in data['twinkle.sessions.active']] == [7]
