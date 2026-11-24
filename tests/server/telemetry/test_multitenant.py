@@ -44,7 +44,9 @@ def test_checkpoint_fingerprint_keeps_the_previous_directory(monkeypatch, salt):
 
 
 @pytest.mark.asyncio
-async def test_usage_is_recorded_once_at_admission(monkeypatch, in_memory_span_exporter, caplog, isolated_metrics_registry):
+async def test_usage_is_recorded_once_at_admission(
+    monkeypatch, in_memory_span_exporter, caplog, isolated_metrics_registry,
+):
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 

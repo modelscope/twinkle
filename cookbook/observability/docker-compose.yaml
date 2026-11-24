@@ -20,6 +20,8 @@ services:
     build: .
     image: twinkle-lgtm:0.28.0
     container_name: twinkle-lgtm
+    environment:
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
     ports:
       - "127.0.0.1:3000:3000"   # Grafana UI
       - "127.0.0.1:4317:4317"   # OTLP gRPC — point telemetry.otlp_endpoint here

@@ -57,7 +57,9 @@ def test_training_and_redis_instruments_are_registered(monkeypatch):
 
     registry.training_instances_active.set(2, attributes={'backend': 'transformers', 'mode': 'lora', 'state': 'READY',
                                            'resident': 'false'})
-    registry.training_startup_seconds.record(1.5, attributes={'backend': 'transformers', 'mode': 'lora', 'status': 'success'})
+    registry.training_startup_seconds.record(
+        1.5, attributes={'backend': 'transformers', 'mode': 'lora', 'status': 'success'},
+    )
     registry.training_quarantined_total.add(1, attributes={'backend': 'megatron', 'mode': 'full', 'reason': 'timeout'})
     registry.redis_health.set(1)
     registry.redis_update_atomic_conflicts.add(1)
