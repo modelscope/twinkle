@@ -7,9 +7,8 @@ FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:
 ENV LD_LIBRARY_PATH="/usr/local/cuda-13.0/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/cuda/compat:/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 
 # Only twinkle-specific deps; everything else (torch, vllm, TE, flash-attn, megatron-core, mcore-bridge, transformers, peft, accelerate) ships in the base.
-RUN pip config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simple && \
-    pip config set install.trusted-host mirrors.cloud.aliyuncs.com && \
-    pip install --no-cache-dir \
+ARG PIP_INDEX_URL=https://mirrors.cloud.aliyuncs.com/pypi/simple
+RUN pip install --no-cache-dir \
         "ray[serve]>=2.55" && \
     pip install --no-cache-dir --no-deps \
         flash-linear-attention \
@@ -23,6 +22,11 @@ RUN pip config set global.index-url https://mirrors.cloud.aliyuncs.com/pypi/simp
 WORKDIR /twinkle
 COPY pyproject.toml setup.cfg README.md LICENSE ./
 COPY src/ ./src/
+
+# The base release predates swift.dev.template_contract. Use the same
+# revision as the Twinkle client setup, with the base runtime dependencies.
+RUN pip install --no-cache-dir --no-deps --no-build-isolation \
+    "ms-swift @ https://codeload.github.com/modelscope/ms-swift/tar.gz/e1ac89d24f47cb8fd73a7245dd79df0959aec284"
 
 # Install twinkle itself (with server extras: redis + otel + telemetry)
 RUN pip install -e ".[server]" --no-build-isolation
