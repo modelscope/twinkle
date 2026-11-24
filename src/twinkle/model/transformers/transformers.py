@@ -1008,6 +1008,32 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return inputs
         return {k: v for k, v in inputs.items() if k != 'position_ids'}
 
+    def _compute_precision_autocast(self):
+        """Run a full-parameter fp32 actor's forward in the mixed-precision compute dtype.
+
+        RL's trainable actors pin float32 parameter storage (master weights) while compute follows
+        ``mixed_precision``. A LoRA policy (``PeftModel``) already gets bf16 compute from the strategy's
+        autocast / FSDP cast, so it must be left untouched (adding autocast would upcast its softmax /
+        layernorm to fp32 and drift the curve). PPO's FULL-PARAMETER critic, however, reaches the
+        eval/forward_only path (``model.eval()`` + ``no_grad``) without that cast and runs fp32 into
+        flash_attention_2 (fp16/bf16 only), which raises. Gate on full-parameter fp32 storage so only that
+        broken case gets the autocast; LoRA policies and already-bf16 models are untouched.
+        """
+        amp_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(self.mixed_precision)
+        if amp_dtype is None:
+            return contextlib.nullcontext()
+        param = next(self.model.parameters(), None)
+        if param is None or param.dtype != torch.float32:
+            return contextlib.nullcontext()
+        base = self.strategy.unwrap_model(self.model)
+        if isinstance(base, PeftModel):
+            return contextlib.nullcontext()
+        if not getattr(self, '_precision_autocast_logged', False):
+            self._precision_autocast_logged = True
+            logger.info('compute_precision_autocast: full-param fp32 storage -> %s compute (strategy=%s, mixed_precision=%s)',
+                        amp_dtype, type(self.strategy).__name__, self.mixed_precision)
+        return torch.autocast(device_type=param.device.type, dtype=amp_dtype)
+
     def _forward_with_task_readout(self, unwrapped_model, task, inputs, adapter_name=None):
         """Model call for tasks whose registry row carries a readout kind (``TaskSpec.readout``).
 
@@ -1159,7 +1185,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # processes every forward with the wrong template.
         with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), \
                 _resolve_mm_graph_context(unwrapped_model, optimizer_config.template), \
-                self._mm_forward_context(optimizer_config):
+                self._mm_forward_context(optimizer_config), self._compute_precision_autocast():
             with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                 # Without gradient checkpointing use_cache stays True, and Transformers skips
                 # detecting padding-free packed sequences whenever a KV cache exists.
@@ -1384,7 +1410,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # See ``forward``: the per-group multimodal hook needs to know which group this call
             # selected, and the forward-only path resolves it from ``adapter_name`` just the same.
             with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), \
-                    lora_ctx, self._mm_forward_context(optimizer_config):
+                    lora_ctx, self._mm_forward_context(optimizer_config), self._compute_precision_autocast():
                 with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                     # In eval mode use_cache defaults to True, and Transformers skips detecting
                     # padding-free packed sequences whenever a KV cache exists.
