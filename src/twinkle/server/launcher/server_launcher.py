@@ -110,7 +110,7 @@ class ServerLauncher:
         if not telemetry.enabled:
             return
         from twinkle.server.telemetry import init_telemetry
-        from twinkle.server.telemetry.identity import USER_ID_KEY_ENV, user_id_key
+        from twinkle.server.identity import USER_ID_KEY_ENV, user_id_key
         if USER_ID_KEY_ENV in os.environ and user_id_key() is None:
             raise ValueError(f'{USER_ID_KEY_ENV} must be nonempty and distinct from TWINKLE_TOKEN_SALT')
         if USER_ID_KEY_ENV not in os.environ:

@@ -5,7 +5,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, H_CLIENT_ID, H_REQUEST_ID, H_SESSION_ID
-from twinkle.server.telemetry.identity import current_tenant_fingerprint, tenant_fingerprint
+from twinkle.server.identity import current_tenant_fingerprint, tenant_fingerprint
 
 _OPENAI_COMPAT_SUFFIXES = ('/chat/completions', '/models')
 

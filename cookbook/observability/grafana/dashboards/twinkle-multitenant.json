@@ -417,7 +417,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (tenant_fingerprint) (increase(twinkle_task_execution_seconds_sum{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\",task_type=~\"forward|forward_only|forward_backward|step|clip_grad_and_step|optim_step|sample\"}[$__range]))",
+          "expr": "sum by (tenant_fingerprint) (increase(twinkle_task_execution_seconds_sum{tenant_fingerprint!=\"\",tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\",task_type=~\"forward|forward_only|forward_backward|step|clip_grad_and_step|optim_step|sample\"}[$__range]))",
           "legendFormat": "{{tenant_fingerprint}}",
           "instant": true,
           "range": false

@@ -8,23 +8,22 @@ inheritance relationship with the deployment class. All endpoints are prefixed
 FastAPI Depends to obtain the ProcessorManagement instance at request time.
 """
 from __future__ import annotations
-
 import asyncio
 import importlib
 import uuid
 from collections.abc import Callable
-from fastapi import Depends, FastAPI, HTTPException, Request
 from typing import TYPE_CHECKING
+
+from fastapi import Depends, FastAPI, HTTPException, Request
 
 if TYPE_CHECKING:
     from .app import ProcessorManagement
 
 import twinkle.protocol.types as types
 from twinkle.protocol.serialize import deserialize_object
-from twinkle.server.middleware.auth import get_session_id_from_request, get_token_from_request
 from twinkle.server.exceptions import RequestRejectedError
+from twinkle.server.middleware.auth import get_session_id_from_request, get_token_from_request
 from twinkle.server.telemetry.correlation import SESSION_ID, TENANT_FINGERPRINT
-from twinkle.server.telemetry.identity import current_tenant_fingerprint
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 
@@ -101,7 +100,7 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
             with traced_operation(
                     f'processor.create.{processor_type_name}.{class_type}',
                     attrs={
-                        TENANT_FINGERPRINT: current_tenant_fingerprint.get(),
+                        TENANT_FINGERPRINT: getattr(request.state, 'tenant_fingerprint', None),
                         SESSION_ID: session_id,
                     }):
                 processor = await asyncio.get_running_loop().run_in_executor(None, _do_create)
@@ -158,7 +157,10 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
                 return True, None
 
         # Span the primary processor.call op so each invocation is observable.
-        with traced_operation(f'processor.call.{function_name}', attrs={TENANT_FINGERPRINT: current_tenant_fingerprint.get()}):
+        with traced_operation(
+            f'processor.call.{function_name}',
+            attrs={TENANT_FINGERPRINT: getattr(request.state, 'tenant_fingerprint', None)},
+        ):
             is_exhausted, result = await asyncio.get_running_loop().run_in_executor(None, _do_call)
 
         if function_name == '__next__':

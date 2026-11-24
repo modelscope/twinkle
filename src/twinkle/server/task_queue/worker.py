@@ -7,27 +7,38 @@ GPU compute tasks serially across all per-adapter/per-token queues using
 a round-robin policy.
 """
 from __future__ import annotations
-
 import asyncio
 import time
 import traceback
 from collections import deque
 from dataclasses import replace
-from ray.exceptions import RayTaskError
 from typing import TYPE_CHECKING, Any, Callable, Deque
+
+from ray.exceptions import RayTaskError
 
 from twinkle.protocol.types.errors import ErrorCategory, QueueState
 from twinkle.protocol.types.lifecycle import TaskStatus
 from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.exceptions import (BackendBusyError, BatchSizeError, EndpointUnavailableError, FullModeBusyError,
-                                       InputTokensExceededError, RateLimitExceededError, RequestRejectedError,
-                                       ResourceExhaustedError, ResourceNotFoundError, ResourceQuotaExceededError,
-                                       StateBackendError, TrainModeMismatchError, TwinkleServerError)
+from twinkle.server.exceptions import (
+    BackendBusyError,
+    BatchSizeError,
+    EndpointUnavailableError,
+    FullModeBusyError,
+    InputTokensExceededError,
+    RateLimitExceededError,
+    RequestRejectedError,
+    ResourceExhaustedError,
+    ResourceNotFoundError,
+    ResourceQuotaExceededError,
+    StateBackendError,
+    TrainModeMismatchError,
+    TwinkleServerError,
+)
+from twinkle.server.identity import current_tenant_fingerprint
 from twinkle.server.state.backend.base import ConcurrencyError
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.task_queue.backend_gate import BACKEND_TIMEOUT_EXCEPTIONS
 from twinkle.server.telemetry.correlation import BASE_MODEL, TASK_ID, TENANT_FINGERPRINT, TRAINING_ID
-from twinkle.server.telemetry.identity import current_tenant_fingerprint
 from twinkle.server.telemetry.metrics import METERED_TASK_TYPES
 from twinkle.server.telemetry.tracing import get_trace_id, set_span_error, traced_operation
 from twinkle.utils.logger import get_logger

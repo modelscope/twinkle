@@ -6,8 +6,8 @@ import math
 import time
 from datetime import UTC, datetime
 
+from twinkle.server.identity import tenant_fingerprint
 from twinkle.server.telemetry import MetricsRegistry
-from twinkle.server.telemetry.identity import tenant_fingerprint
 from twinkle.utils.logger import get_logger
 from .backend.base import StateBackend
 from .future_manager import FutureManager

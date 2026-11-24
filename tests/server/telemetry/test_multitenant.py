@@ -22,7 +22,7 @@ from twinkle.server.state.server_state import ServerState
 from twinkle.server.task_queue.mixin import TaskQueueMixin
 from twinkle.server.telemetry import metrics, resource_metrics
 from twinkle.server.telemetry.http_middleware import create_metrics_middleware
-from twinkle.server.telemetry.identity import USER_ID_KEY_ENV, current_tenant_fingerprint, tenant_fingerprint
+from twinkle.server.identity import USER_ID_KEY_ENV, current_tenant_fingerprint, tenant_fingerprint
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.utils.logger import get_logger
 

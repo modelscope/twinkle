@@ -6,7 +6,6 @@ used for I/O and for engines such as vLLM that own their compute concurrency
 and continuous batching internally.
 """
 from __future__ import annotations
-
 import asyncio
 import time
 import uuid
@@ -17,15 +16,15 @@ from twinkle.protocol.types.errors import QueueState
 from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope, TaskStatus
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.exceptions import BatchSizeError, ConfigError, InputTokensExceededError, RateLimitExceededError
+from twinkle.server.identity import current_tenant_fingerprint
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.telemetry.metrics import MetricsRegistry
+from twinkle.server.telemetry.tracing import get_trace_context
 from twinkle.utils.logger import get_logger
 from .backend_gate import BackendGate
 from .rate_limiter import RateLimiter
-from twinkle.server.telemetry.identity import current_tenant_fingerprint
-from twinkle.server.telemetry.tracing import get_trace_context
 from .types import ExecutionScope, QueuedTask
 from .worker import ComputeWorker
 

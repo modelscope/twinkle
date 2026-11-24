@@ -10,6 +10,7 @@ from typing import Any
 
 from twinkle.server.config.persistence import PersistenceConfig
 from twinkle.server.exceptions import ResourceNotFoundError, ResourceQuotaExceededError
+from twinkle.server.identity import current_tenant_fingerprint, tenant_fingerprint, user_id_key
 from twinkle.server.telemetry.correlation import (
     BASE_MODEL,
     MODEL_ID,
@@ -18,7 +19,6 @@ from twinkle.server.telemetry.correlation import (
     SESSION_ID,
     TENANT_FINGERPRINT,
 )
-from twinkle.server.telemetry.identity import current_tenant_fingerprint, tenant_fingerprint, user_id_key
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 from .backend import StateBackend
