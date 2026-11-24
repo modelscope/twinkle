@@ -861,8 +861,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         after the forward to gather recorded indices (RECORD) and clear global state.
         """
         from .moe.router_replay import RouterReplay
-        if not getattr(self, '_router_replay_enabled', False) or action is None:
+        if action is None:
             return RouterReplay(action=None)
+        if not getattr(self, '_router_replay_enabled', False):
+            raise ValueError('Routing replay was requested, but the model was built with enable_router_replay=False. '
+                             'Set enable_router_replay=True when constructing the model '
+                             '(in the model application args for a remote deployment).')
         self._maybe_apply_router_replay()
         return RouterReplay(
             action=action,
@@ -1671,8 +1675,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         router_replay_mode = kwargs.pop('router_replay_mode', None)
         rr = None
-        if router_replay_mode is not None:
+        if router_replay_mode not in (None, 'disabled'):
             from .moe.router_replay import RouterReplay, RouterReplayAction
+            RouterReplay.resolve_router_replay_mode(router_replay_mode)
             rr = self._router_replay(RouterReplayAction.REPLAY_BACKWARD)
 
         with no_sync_ctx:

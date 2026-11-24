@@ -24,7 +24,7 @@ from .processor import (ProcessorCallRequest, ProcessorCallResponse, ProcessorCr
 from .sampler import (EncodeRequest, SampledSequenceModel, SamplerAddAdapterRequest, SamplerAddAdapterResponse,
                       SamplerApplyPatchRequest, SamplerCreateResponse, SampleRequest, SampleResponseModel,
                       SampleResponseModelList,
-                      SamplerSetTemplateRequest, SamplerSetTemplateResponse)
+                      SamplerSetTemplateRequest, SamplerSetTemplateResponse, SamplingMaskModel)
 from .server import (CapacityInfoResponse, CheckpointPathResponse, ClientFeatures, DeleteCheckpointResponse,
                      GetServerCapabilitiesResponse, HealthResponse, ProtocolLimits, SupportedModel, WeightsInfoRequest)
 from .session import CreateSessionRequest, CreateSessionResponse, SessionHeartbeatRequest, SessionHeartbeatResponse
@@ -134,6 +134,7 @@ __all__ = [
     'SampleResponseModelList',
     'SamplerSetTemplateRequest',
     'SamplerSetTemplateResponse',
+    'SamplingMaskModel',
     'CapacityInfoResponse',
     'CheckpointPathResponse',
     'ClientFeatures',

@@ -17,11 +17,11 @@ matching :mod:`twinkle.protocol.types.processor`.
 """
 from __future__ import annotations
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, StrictInt, model_validator
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from .base import ResponseModel, StrictRequest, passthrough
-from .data import WireInputBatch
+from .data import Ints3, WireInputBatch
 
 StopReason = Literal['length', 'stop', 'abort', 'error']
 
@@ -44,6 +44,21 @@ class SampleRequest(StrictRequest):
         False, description='Return sampled tokens/logprobs only; encoded inputs are engine ids, media alongside')
 
 
+class SamplingMaskModel(ResponseModel):
+    """CSR sampling support sets, mirroring the two fields of SamplingMask."""
+
+    token_ids: list[StrictInt]
+    offsets: list[StrictInt] = Field(min_length=1)
+
+    @model_validator(mode='after')
+    def validate_offsets(self) -> SamplingMaskModel:
+        if self.offsets[0] != 0 or self.offsets[-1] != len(self.token_ids):
+            raise ValueError('sampling_masks offsets must start at zero and end at len(token_ids)')
+        if any(left > right for left, right in zip(self.offsets, self.offsets[1:])):
+            raise ValueError('sampling_masks offsets must be nondecreasing')
+        return self
+
+
 class SampledSequenceModel(ResponseModel):
     """A single sampled sequence, mirroring twinkle.data_format.SampledSequence."""
     stop_reason: StopReason = Field(..., description="Stop reason: 'length' or 'stop'")
@@ -53,6 +68,8 @@ class SampledSequenceModel(ResponseModel):
     text: str | None = Field(None, description='Assistant content parsed by the serving template')
     new_input_feature: dict[str, Any] | None = Field(
         None, description='Updated InputFeature after sampling (input_ids, labels, etc.)')
+    routed_experts: Ints3 | None = Field(None, description='Expert routing exported by token-only sampling')
+    sampling_masks: SamplingMaskModel | None = Field(None, description='Support sets for sampled tokens')
 
 
 class SampleResponseModel(ResponseModel):

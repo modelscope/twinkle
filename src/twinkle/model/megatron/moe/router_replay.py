@@ -49,9 +49,14 @@ class RouterReplay:
         self.recorded: List[Optional[torch.Tensor]] = []
         self.action = None
         self._cp_size = int(cp_size or 1)
-        if enabled and mode is not None:
-            self.action = RouterReplay.resolve_router_replay_mode(mode, allow_record=forward_only)
-            apply_patch()
+        if mode is None or mode == 'disabled':
+            return
+        if not enabled:
+            raise ValueError('Routing replay was requested, but the model was built with enable_router_replay=False. '
+                             'Set enable_router_replay=True when constructing the model '
+                             '(in the model application args for a remote deployment).')
+        self.action = RouterReplay.resolve_router_replay_mode(mode, allow_record=forward_only)
+        apply_patch()
 
     @property
     def active(self) -> bool:
@@ -136,11 +141,12 @@ corrupt an MoE policy's importance ratio."""
         """
         if mode is None or mode == 'disabled':
             return None
-        if mode == 'R3':
-            return RouterReplayAction.REPLAY_FORWARD
-        if mode == 'R2':
-            return RouterReplayAction.RECORD if allow_record else RouterReplayAction.REPLAY_FORWARD
-        raise ValueError(f'Unknown router_replay_mode {mode!r}; expected one of disabled/R2/R3.')
+        if mode not in ('R2', 'R3'):
+            raise ValueError(f'Unknown router_replay_mode {mode!r}; expected one of disabled/R2/R3.')
+        RouterReplay._require_available()
+        if mode == 'R2' and allow_record:
+            return RouterReplayAction.RECORD
+        return RouterReplayAction.REPLAY_FORWARD
 
     @staticmethod
     def iter_model_routers(model: Any):
