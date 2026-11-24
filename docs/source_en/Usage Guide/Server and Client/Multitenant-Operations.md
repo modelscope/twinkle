@@ -84,7 +84,9 @@ empty row list and a count of zero. Requests without a token appear as
 - **Business admission rejections / second** groups rate limits, quota and
   unavailable capacity. A rejected training creation can arrive as a
   failed future over HTTP 200. Replaying that receipt or reading it again
-  adds no rejection. The legacy HTTP 429 metric remains available in Explore.
+  adds no rejection. **Recorded business rejections** shows the latest
+  cumulative counts from live processes, including the first observed rejection.
+  The legacy HTTP 429 metric remains available in Explore.
 - The two deployment references are requests per second and input tokens
   per second. Grafana compares five-minute rates against the same references
   for every tenant and highlights the corresponding panels.

@@ -594,7 +594,7 @@
       "title": "Runtime HTTP latency p95",
       "description": "",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
-      "gridPos": {"x": 0, "y": 74, "w": 24, "h": 8},
+      "gridPos": {"x": 0, "y": 74, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
       "options": {},
       "targets": [
@@ -602,6 +602,42 @@
           "refId": "A",
           "expr": "histogram_quantile(0.95, sum by (le, deployment, base_model) (rate(twinkle_http_request_duration_seconds_bucket{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m])))",
           "legendFormat": "{{deployment}} {{base_model}}"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "stat",
+      "title": "Recorded business rejections",
+      "description": "Latest cumulative count reported by running processes at the end of the selected time range. Visible from the first scrape. Counts reset when a process restarts.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 12, "y": 74, "w": 12, "h": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "No rejection series received"
+        },
+        "overrides": []
+      },
+      "options": {"graphMode": "none", "colorMode": "none", "textMode": "value_and_name"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason,base_model,tenant_fingerprint) (twinkle_admission_rejections_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"})",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{reason}} · {{base_model}} · {{tenant_fingerprint}}"
         }
       ]
     },
