@@ -731,7 +731,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 from .vision_keepalive import VisionKeepAlive
 
                 base_model = self.model.get_base_model() if isinstance(self.model, PeftModel) else self.model
-                self._vision_keepalive = VisionKeepAlive(base_model, self.model, self.model_arch['aligner'])
+                # Text-only checkpoints (e.g. JEV-9B qwen3_5_text) can carry a multimodal model_arch
+                # declaration yet have no visual tower; only keep alive aligners that actually exist
+                # so the wrap does not raise on get_submodule('visual').
+                aligners = []
+                for path in self.model_arch['aligner']:
+                    try:
+                        base_model.get_submodule(path)
+                    except AttributeError:
+                        continue
+                    aligners.append(path)
+                if aligners:
+                    self._vision_keepalive = VisionKeepAlive(base_model, self.model, aligners)
 
             if optimizer_groups:
                 result = self.strategy.wrap_model(self.model, *(group.optimizer for group in optimizer_groups))
