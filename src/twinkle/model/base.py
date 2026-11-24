@@ -431,6 +431,22 @@ class TrainableModel(ABC):
         ...
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def remove_metric(self, metric_type: type, *, adapter_name: Optional[str] = None) -> None:
+        """Strip metrics that are instances of ``metric_type`` from a group's train/eval statuses.
+
+        Worker-side handle for the decision readout's metric swap: the default optimizer group
+        seeds a token ``Accuracy`` that a scoring head replaces with its own metric. Under Ray the
+        driver proxy has no ``optimizer_group`` (it is built worker-side, like the parameters
+        :meth:`freeze_parameters` reads), so the strip must run on the workers as :meth:`add_metric`
+        does -- ``dispatch='all'`` cleans every rank's group and blocking ensures the next metric
+        read sees the cleaned statuses.
+        """
+        name = adapter_name if adapter_name is not None else self._get_default_group()
+        optimizer_config = self.optimizer_group[name]
+        for status in (optimizer_config.train_status, optimizer_config.eval_status):
+            status.metrics = [m for m in status.metrics if not isinstance(m, metric_type)]
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def perf_on(self, *, profiler_spec=None):
         """Enable profiling on this model's unwrapped modules."""
         from twinkle.perf import Perf
