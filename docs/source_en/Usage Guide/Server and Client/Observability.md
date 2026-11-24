@@ -95,7 +95,7 @@ In Grafana, switch the datasource to Tempo to search traces by service name or s
 
 ## Production Deployment
 
-The [multitenant operations guide](Multitenant-Operations.md) covers the dedicated monitoring host. It runs Collector, Mimir, Tempo, Loki, and Grafana as separate services with persistent storage. Set `telemetry.otlp_endpoint` in the Runtime deployment config to the Collector's private address. The Megatron entrypoint accepts that config through `--server-config`.
+The [multitenant operations guide](Multitenant-Operations.md) describes a Compose example with Collector, Mimir, Tempo, Loki, and Grafana on persistent storage. Set `telemetry.otlp_endpoint` to the Collector endpoint reachable from Runtime. The Megatron entrypoint accepts the Runtime configuration through `--server-config`.
 
 ## Troubleshooting
 

@@ -2,4 +2,5 @@
 telemetry:
   enabled: true
   service_name: twinkle-server
-  otlp_endpoint: http://twinkle-monitor.internal:4317
+  # Replace this example hostname with the Collector endpoint reachable from Runtime.
+  otlp_endpoint: http://collector.example:4317

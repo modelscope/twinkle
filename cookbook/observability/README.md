@@ -96,21 +96,19 @@ the gauge value directly.
 docker compose down -v   # -v also removes the named volume
 ```
 
-## Dedicated monitoring host
+## Standalone monitoring stack
 
 `docker-compose.production.yaml` runs Collector, Tempo, Loki, Mimir, and Grafana
-as separate services on one internal CPU host. Place Docker's named volumes on
-supported persistent block storage with capacity for 30 days of telemetry. Use
-the platform's approved object storage configuration if the storage available
-for telemetry is NFS. Keep Mimir's TSDB and component working directories on
-supported local block storage.
+as separate services with persistent volumes. The example retains 30 days of
+telemetry. Choose storage supported by each backend and size it for your
+ingestion and retention settings.
 
-1. Provision a private OTLP listener and a Grafana listener on the administrator
-   network. Allow TCP 4317 from Runtime and TCP 3000 from the managed network only.
-   Keep the business Redis and the three backends on internal networks.
-2. Have the Redis administrator provision a dedicated account for GET on the
-   three snapshot keys in the operations guide. Use the same Redis database and
-   key prefix as Runtime.
+1. Configure the Collector listener so Runtime can reach it. The example uses
+   OTLP gRPC on TCP 4317 and Grafana on TCP 3000. Restrict access to the Collector
+   and Redis, and require Grafana authentication.
+2. Create a dedicated Redis account that can only GET the three snapshot keys
+   listed in the operations guide. Use the same Redis database and key prefix
+   as Runtime.
 3. Copy `production/usage-limits.example.json` to deployment configuration.
    Set default rates and optional overrides keyed by the complete fingerprint.
    Render the dashboard with the existing Runtime Redis key prefix:
@@ -132,7 +130,7 @@ supported local block storage.
    ```
 
 5. Merge `production/server_config.yaml` into the existing Runtime config,
-   select the internal Collector address, and inject the same
+   set the Collector endpoint, and inject the same
    `TWINKLE_TELEMETRY_USER_ID_KEY` into every Runtime worker using a deployment
    secret. With the Megatron container entrypoint, pass
    `--server-config /path/to/deployment.yaml` to load the resulting config.
@@ -140,7 +138,7 @@ supported local block storage.
    Confirm all three signals arrive.
 
 See the [multitenant operations guide](../../docs/source_en/Usage%20Guide/Server%20and%20Client/Multitenant-Operations.md)
-for Redis ACLs, credential handling, dashboard queries, and release checks.
+for Redis ACLs, credential handling, dashboard queries, and deployment checks.
 
 ## Troubleshooting
 

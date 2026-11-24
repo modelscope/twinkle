@@ -1,31 +1,21 @@
 # Multitenant operations
 
-## Deploy the monitoring host
+## Configure observability
 
-1. Request a long-running CPU host for Collector, Tempo, Loki, Mimir, and Grafana.
-   Size CPU and memory for ingestion and concurrent queries. Use measured daily
-   disk growth for each signal to size durable storage for 30 days plus room
-   for WALs and compaction. Confirm the storage backend with the platform.
-   The supplied single-host configuration uses volumes on persistent local
-   block storage. For NFS-backed capacity, confirm an internal object store
-   and keep Mimir's local TSDB and working directories on supported block storage.
-2. Request private Runtime-to-Collector TCP 4317 access and private monitoring
-   host-to-business-Redis access. Bind Grafana only to the managed administrator
-   network and enforce that restriction at the platform ingress. Enable login
-   and store the Grafana and Redis credentials in deployment secrets.
-3. Use the deployment files and Runtime OTLP configuration under
-   [cookbook/observability](https://github.com/modelscope/twinkle/tree/main/cookbook/observability).
-   Inject the same `TWINKLE_TELEMETRY_USER_ID_KEY` in every Runtime process.
-   Use a randomly generated secret separate from `TWINKLE_TOKEN_SALT`. When
-   the key is absent, tenant attribution and Redis snapshots are disabled.
-   Rotating the key changes the fingerprint. Existing telemetry and previously
-   attributed sessions keep their original fingerprints until they expire or
-   the sessions are recreated. Checkpoint directories keep their existing format.
+The [Compose example](https://github.com/modelscope/twinkle/tree/main/cookbook/observability)
+runs Collector, Tempo, Loki, Mimir, and Grafana with persistent storage.
+Set `telemetry.otlp_endpoint` to a Collector reachable from Runtime. Choose a
+retention period and storage backend for your deployment. The example retains
+30 days of data. Keep Mimir's TSDB and working directories on supported block
+storage. Restrict access to the Collector and Redis, and require authentication
+for Grafana.
 
-The existing GPU serving ingress stays in use. Runtime sends metrics, traces,
-and logs over outbound OTLP. Ray Dashboard and Prometheus scraping are outside
-this rollout and can be evaluated if the platform later allows inbound scraping.
-Multinode Ray cluster networking has its own acceptance criteria.
+Set the same `TWINKLE_TELEMETRY_USER_ID_KEY` in every Runtime process. Use a
+randomly generated secret separate from `TWINKLE_TOKEN_SALT`. When the key is
+absent, tenant attribution and Redis snapshots are disabled. Rotating the key
+changes the fingerprint. Existing telemetry and previously attributed sessions
+keep their original fingerprints until they expire or the sessions are recreated.
+Checkpoint directories keep their existing format.
 
 ## Redis access
 
@@ -37,7 +27,7 @@ the ACL. This example assumes an empty prefix and Redis database 0.
 ACL SETUSER twinkle-grafana reset on >DEPLOYMENT_SECRET ~admin:index:sessions ~admin:index:trainings ~admin:index:sampling +get
 ```
 
-Use the platform's secret injection to supply the password. Verify the production
+Supply the password through your secret manager. Verify the
 Grafana data source can read all three keys with GET. Also verify that the same
 account cannot read any business key, write, or enumerate keys with SCAN or KEYS.
 The Runtime cleanup leader refreshes the snapshots at `metrics_update_interval`
@@ -111,11 +101,10 @@ three refresh intervals, rounded up to seconds. An empty snapshot reports
   node. If it goes missing, check Runtime and Collector connectivity. The heartbeat
   covers the metrics pipeline. Check Loki and Tempo independently when testing ingestion.
 
-## Release checks
+## Verify the deployment
 
-Confirm real OTLP ingestion for metrics, logs, and traces from Runtime. Check
-the configured 30-day retention and query stored samples again after restarting
-the backends. Validate Grafana login and network restrictions, the Redis ACL,
-and observed node and GPU identities. Use the deployed Twinkle and Tinker SDKs
-to exercise session creation, heartbeat, sampling, and asynchronous retrieval
-through the existing Mesh chain before releasing on the current deployment.
+Confirm that Runtime metrics, logs, and traces arrive. Check the configured
+retention and query stored samples after restarting the backends. Verify Grafana
+authentication, Redis permissions, and device identity labels. Use the Twinkle
+and Tinker clients to exercise session creation, heartbeat, sampling, and result
+retrieval through your deployment's API endpoint.

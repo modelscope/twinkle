@@ -1,11 +1,11 @@
-# Run on the internal monitoring host. Only Grafana and the OTLP receiver bind host ports.
+# Only Grafana and the OTLP receiver bind host ports.
 services:
   collector:
     image: otel/opentelemetry-collector-contrib:0.132.0
     command: ["--config=/etc/collector.yaml"]
     restart: unless-stopped
     ports:
-      - "${OBS_OTLP_BIND_IP:?Set the private OTLP IP}:4317:4317"
+      - "${OBS_OTLP_BIND_IP:?Set the OTLP bind IP}:4317:4317"
     volumes:
       - ./production/collector.yaml:/etc/collector.yaml:ro
 
@@ -37,7 +37,7 @@ services:
     image: grafana/grafana:12.1.1
     restart: unless-stopped
     ports:
-      - "${OBS_GRAFANA_BIND_IP:?Set the managed Grafana IP}:3000:3000"
+      - "${OBS_GRAFANA_BIND_IP:?Set the Grafana bind IP}:3000:3000"
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "false"
       GF_USERS_ALLOW_SIGN_UP: "false"
@@ -48,7 +48,7 @@ services:
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
       GF_PLUGINS_PREINSTALL_SYNC: "redis-datasource@2.2.0"
-      OBS_REDIS_URL: "${OBS_REDIS_URL:?Set the internal Redis address}"
+      OBS_REDIS_URL: "${OBS_REDIS_URL:?Set the Redis address}"
       OBS_REDIS_USER: "${OBS_REDIS_USER:?Set the dedicated Redis username}"
       OBS_REDIS_PASSWORD: "${OBS_REDIS_PASSWORD:?Set the dedicated Redis password}"
     volumes:
