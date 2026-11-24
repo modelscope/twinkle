@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """End-to-end tests for the checkpoint helpers in ``twinkle.model.base``.
 
-``rotate_checkpoints`` / ``copy_checkpoint_args`` run on the master rank inside the
+``rotate_checkpoints`` / ``stage_checkpoint_args`` run on the master rank inside the
 transformers and megatron ``save`` path, but had no test at all. They are pure
 filesystem logic, so these cases drive them against real temporary directories on CPU
 (with ``Platform.is_master()`` true in a single-process run) and pin the retention
@@ -14,7 +14,13 @@ import os
 
 import pytest
 
-from twinkle.model.base import (TrainableModel, copy_checkpoint_args, rotate_checkpoints)
+from twinkle.model.base import (TrainableModel, rotate_checkpoints, stage_checkpoint_args)
+from twinkle.utils.storage import Storage
+
+
+def _local_lease(path):
+    """The lease a local save writes through (path == target for local destinations)."""
+    return Storage.from_url(str(path)).write_lease(str(path))
 
 
 def _mkdirs(root, names):
@@ -93,18 +99,18 @@ class TestRotateCheckpoints:
 
 
 # ---------------------------------------------------------------------------
-# copy_checkpoint_args
+# stage_checkpoint_args
 # ---------------------------------------------------------------------------
 
-class TestCopyCheckpointArgs:
+class TestStageCheckpointArgs:
 
-    def test_copies_args_json_into_checkpoint(self, tmp_path):
+    def test_stages_args_json_into_the_checkpoint_lease(self, tmp_path):
         output_dir = tmp_path / 'output'
         checkpoint_dir = tmp_path / 'output' / 'checkpoint-1'
         output_dir.mkdir()
         checkpoint_dir.mkdir()
         (output_dir / 'args.json').write_text('{"model": "qwen"}')
-        copy_checkpoint_args(str(output_dir), str(checkpoint_dir))
+        stage_checkpoint_args(str(output_dir), _local_lease(checkpoint_dir))
         assert (checkpoint_dir / 'args.json').read_text() == '{"model": "qwen"}'
 
     def test_missing_source_is_noop(self, tmp_path):
@@ -112,7 +118,7 @@ class TestCopyCheckpointArgs:
         checkpoint_dir = tmp_path / 'output' / 'checkpoint-1'
         output_dir.mkdir()
         checkpoint_dir.mkdir()
-        copy_checkpoint_args(str(output_dir), str(checkpoint_dir))
+        stage_checkpoint_args(str(output_dir), _local_lease(checkpoint_dir))
         assert not (checkpoint_dir / 'args.json').exists()
 
     def test_same_directory_skips_self_copy(self, tmp_path):
@@ -121,7 +127,7 @@ class TestCopyCheckpointArgs:
         (output_dir / 'args.json').write_text('{"a": 1}')
         # source and target resolve to the same file -> the realpath guard skips the copy
         # (shutil.copy2 onto itself would otherwise raise SameFileError).
-        copy_checkpoint_args(str(output_dir), str(output_dir))
+        stage_checkpoint_args(str(output_dir), _local_lease(output_dir))
         assert (output_dir / 'args.json').read_text() == '{"a": 1}'
 
 

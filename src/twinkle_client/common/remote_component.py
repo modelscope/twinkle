@@ -1,11 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Shared transport binding for processor-backed remote component wrappers."""
 from __future__ import annotations
-
 from typing import Any
 
-from twinkle_client.common.component_rpc import call_remote_component, create_remote_component
+from twinkle.protocol.types.processor import (
+    ProcessorCallRequest,
+    ProcessorCallResponse,
+    ProcessorCreateRequest,
+    ProcessorCreateResponse,
+)
+from twinkle_client._request_builder import build_request
 from twinkle_client.http import ClientTransport
+from twinkle_client.http.client import DEFAULT_TIMEOUT
 from twinkle_client.http.context import capture_transport
 
 
@@ -28,18 +34,11 @@ class RemoteComponent:
         **kwargs: Any,
     ) -> None:
         self._transport = capture_transport(transport)
-        self.processor_id = create_remote_component(
-            processor_type,
-            class_type,
-            transport=self._transport,
-            **kwargs,
-        )
+        body = build_request(ProcessorCreateRequest, processor_type=processor_type, class_type=class_type, **kwargs)
+        response = self._transport.post_model(self._transport.url('processor/twinkle/create'), body)
+        self.processor_id = ProcessorCreateResponse(**response.json()).processor_id
 
-    def _call(self, function: str, *args: Any, **kwargs: Any) -> Any:
-        return call_remote_component(
-            self.processor_id,
-            function,
-            *args,
-            transport=self._transport,
-            **kwargs,
-        )
+    def _call(self, function: str, http_timeout: Any = DEFAULT_TIMEOUT, /, **kwargs: Any) -> Any:
+        body = build_request(ProcessorCallRequest, processor_id=self.processor_id, function=function, **kwargs)
+        response = self._transport.post_model(self._transport.url('processor/twinkle/call'), body, timeout=http_timeout)
+        return ProcessorCallResponse(**response.json()).result

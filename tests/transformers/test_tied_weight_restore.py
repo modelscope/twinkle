@@ -29,6 +29,7 @@ def test_full_restore_expands_tied_aliases_and_rejects_missing_independent_weigh
         strategy = object.__new__(AccelerateStrategy)
         strategy.accelerator = SimpleNamespace(
             unwrap_model=lambda value, **kwargs: value,
+            mixed_precision='no',
             state=SimpleNamespace(fsdp_plugin=SimpleNamespace(fsdp_version=2)))
 
     def strict_cpu_load(target, state, *, options):

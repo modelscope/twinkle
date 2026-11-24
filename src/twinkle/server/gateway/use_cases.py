@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
+from twinkle.server.exceptions import ResourceNotFoundError
 from twinkle.server.lifecycle.poll_config import long_poll_window, retrieve_poll_interval
 
 # Deliberately local: this layer works on canonical records and must not import the
@@ -29,15 +30,22 @@ class FuturePollResult:
     timed_out: bool
 
 
-async def poll_future(state: Any, request_id: str) -> FuturePollResult:
+async def poll_future(
+    state: Any, request_id: str, *, after_progress: int | None = None, owner_token: str | None = None,
+) -> FuturePollResult:
     """Long-poll one canonical future record without constructing wire responses."""
     deadline = asyncio.get_running_loop().time() + long_poll_window()
     interval = retrieve_poll_interval()
     record = None
     while True:
         record = await state.get_future(request_id)
-        if record is not None and record.get('status') in _TERMINAL_STATUSES:
-            return FuturePollResult(record=record, timed_out=False)
+        if record is not None:
+            if owner_token is not None and record.get('owner_token') not in (None, owner_token):
+                raise ResourceNotFoundError('Unknown future')
+            if record.get('status') in _TERMINAL_STATUSES:
+                return FuturePollResult(record=record, timed_out=False)
+            if after_progress is not None and (record.get('progress') or {}).get('sequence', 0) > after_progress:
+                return FuturePollResult(record=record, timed_out=False)
         if asyncio.get_running_loop().time() >= deadline:
             return FuturePollResult(record=record, timed_out=True)
         await asyncio.sleep(interval)

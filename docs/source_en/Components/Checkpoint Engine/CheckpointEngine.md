@@ -6,10 +6,12 @@ CheckpointEngine is a component used to synchronize model weights between traine
 
 - `auto`: local objects use `naive`; Ray actor handlers use `standalone`.
 - `naive`: stream the model's weight generator directly into a local sampler without creating a checkpoint engine.
-- `colocate`: synchronize Ray actors sharing GPUs through CUDA IPC.
+- `colocate`: synchronize Ray actors sharing physical devices through device IPC, with shared-memory buckets when NPU device IPC is unavailable.
 - `standalone`: synchronize disaggregated Ray actors through NCCL on GPU or HCCL on NPU.
 
 `auto` never infers `colocate`, because actor placement cannot be determined reliably from the driver.
+
+With vLLM on CUDA or Ascend NPU, colocated synchronization pairs each vLLM TP worker with its training worker by physical device UUID and transfers weights directly between them. The sampler actor handles control calls only. Sorting an NPU actor's visible-device list does not change this pairing. `TWINKLE_DISABLE_DIRECT_VLLM_SYNC=1` retains the checkpoint-engine path; other sampler backends also use that path.
 
 ## Basic Interface
 

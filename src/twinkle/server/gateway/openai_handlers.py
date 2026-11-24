@@ -7,19 +7,26 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 /twinkle/sample (non-streaming) or /twinkle/sample_stream (streaming) routes.
 """
 from __future__ import annotations
-
 import asyncio
-import json
 import os
 import secrets
 import time
 import uuid
 from collections.abc import Callable
-from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
 from typing import TYPE_CHECKING, Any
 
-from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, build_routing_headers
+import json
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from twinkle.protocol.headers import (
+    H_AUTH,
+    H_AUTH_TWINKLE,
+    H_CLIENT_ID,
+    H_REQUEST_ID,
+    H_SESSION_ID,
+    build_request_headers,
+)
 from twinkle.server.lifecycle.envelope import envelope_from_record
 
 if TYPE_CHECKING:
@@ -28,14 +35,21 @@ if TYPE_CHECKING:
 import httpx
 
 import twinkle.protocol.types as types
-
 from twinkle.server.utils import get_template_for_model
 from twinkle.utils.logger import get_logger
-from .openai_bridge import (make_error, translate_chat_request, translate_completion_request,
-                            translate_completion_response, translate_completion_stream_chunk,
-                            translate_embedding_request, translate_embedding_response,
-                            translate_infer_request, translate_infer_response, translate_response,
-                            translate_stream_chunk)
+from .openai_bridge import (
+    make_error,
+    translate_chat_request,
+    translate_completion_request,
+    translate_completion_response,
+    translate_completion_stream_chunk,
+    translate_embedding_request,
+    translate_embedding_response,
+    translate_infer_request,
+    translate_infer_response,
+    translate_response,
+    translate_stream_chunk,
+)
 from .use_cases import poll_future
 
 logger = get_logger()
@@ -89,7 +103,7 @@ async def _resolve_sampler_envelope(gateway: GatewayServer, sampler_data: dict[s
         return await asyncio.wait_for(wait_for_terminal(envelope), timeout=timeout)
     except SamplerWaitTimeoutError:
         raise
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise SamplerWaitTimeoutError(
             f'Sampling task {envelope.request_id} did not finish within {timeout:g}s.') from None
 
@@ -104,8 +118,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
     ):
         """OpenAI-compatible chat completions endpoint.
 
-        Translates OpenAI request to SampleRequest, injects sticky routing
-        headers using the model field, and proxies to the sampler.
+        Translates OpenAI request to SampleRequest and proxies to the sampler.
         """
         body = await request.json()
 
@@ -130,8 +143,8 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         base_model = await _resolve_base_model(self, model)
         if base_model is None:
             return _model_not_found(model)
-        sticky_headers = _build_sticky_headers(_sticky_key(request, model), request)
-        await _ensure_template(self, base_model, sticky_headers, request)
+        sampler_headers = _sampler_headers(request)
+        await _ensure_template(self, base_model, sampler_headers, request)
         request_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
         first_chunk = {'is_first': True}
 
@@ -146,7 +159,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 is_first=is_first,
             )
 
-        return _streaming_response(self, request, sample_request, base_model, sticky_headers, _chat_chunk)
+        return _streaming_response(self, request, sample_request, base_model, sampler_headers, _chat_chunk)
 
     @app.post('/completions')
     async def completions(
@@ -169,11 +182,11 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             base_model = await _resolve_base_model(self, model)
             if base_model is None:
                 return _model_not_found(model)
-            sticky_headers = _build_sticky_headers(_sticky_key(request, model), request)
-            await _ensure_template(self, base_model, sticky_headers, request)
+            sampler_headers = _sampler_headers(request)
+            await _ensure_template(self, base_model, sampler_headers, request)
             request_id = f'cmpl-{uuid.uuid4().hex[:24]}'
             return _streaming_response(
-                self, request, sample_request, base_model, sticky_headers,
+                self, request, sample_request, base_model, sampler_headers,
                 lambda delta, finish: translate_completion_stream_chunk(
                     delta_text=delta, model=model, finish_reason=finish, request_id=request_id),
             )
@@ -299,18 +312,14 @@ async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
     return None
 
 
-def _build_sticky_headers(sticky_key: str, request: Request) -> dict[str, str]:
-    """Build the headers needed for sticky session routing."""
-    auth = (request.headers.get(H_AUTH_TWINKLE) or request.headers.get(H_AUTH) or '')
-    return build_routing_headers(sticky_key, auth)
-
-
-def _sticky_key(request: Request, model: str) -> str:
-    """Per-caller routing key: session/token so each client gets its own adapter slot, model as fallback.
-
-    Using the model name alone would share slots across every caller of the same model.
-    """
-    return getattr(request.state, 'session_id', '') or getattr(request.state, 'token', '') or model
+def _sampler_headers(request: Request) -> dict[str, str]:
+    """Carry the caller's identity and assign a request ID when absent."""
+    request_id = request.headers.get(H_REQUEST_ID) or uuid.uuid4().hex
+    auth = request.headers.get(H_AUTH_TWINKLE) or request.headers.get(H_AUTH) or ''
+    headers = build_request_headers(request_id, auth, client_id=request.headers.get(H_CLIENT_ID, ''))
+    if session_id := request.headers.get(H_SESSION_ID):
+        headers[H_SESSION_ID] = session_id
+    return headers
 
 
 def _bad_request(exc: ValueError) -> JSONResponse:
@@ -370,7 +379,7 @@ async def _proxy_sample(
 
     The shared body of every non-streaming OpenAI endpoint (chat/completions/infer/embeddings): they
     differ only in ``endpoint`` and in how the sampler's dict is turned back into an OpenAI shape, which
-    the caller passes as ``translate(data, model)``. Keeping the resolve → sticky → template → proxy →
+    the caller passes as ``translate(data, model)``. Keeping the resolve → template → proxy →
     wait → error sequence in one place means a fix to routing applies to all of them at once.
 
     The sampler replies with a TaskEnvelope, and the payload of a completed task rides in
@@ -383,9 +392,9 @@ async def _proxy_sample(
     if base_model is None:
         return _model_not_found(model)
 
-    sticky_headers = _build_sticky_headers(_sticky_key(request, model), request)
+    sampler_headers = _sampler_headers(request)
     body_bytes = json.dumps(sample_request).encode()
-    await _ensure_template(gateway, base_model, sticky_headers, request)
+    await _ensure_template(gateway, base_model, sampler_headers, request)
 
     response = await gateway.proxy.proxy_request(
         request,
@@ -393,7 +402,7 @@ async def _proxy_sample(
         base_model=base_model,
         service_type='sampler',
         body_override=body_bytes,
-        extra_headers=sticky_headers,
+        extra_headers=sampler_headers,
     )
     if response.status_code != 200:
         return JSONResponse(
@@ -441,7 +450,7 @@ def _streaming_response(
     request: Request,
     sample_request: dict[str, Any],
     base_model: str,
-    sticky_headers: dict[str, str],
+    sampler_headers: dict[str, str],
     chunk_translator: Callable[[str, str | None], dict[str, Any]],
 ) -> StreamingResponse:
     """Proxy to the sampler's streaming endpoint and translate its NDJSON lines to OpenAI SSE.
@@ -460,7 +469,7 @@ def _streaming_response(
                     base_model=base_model,
                     service_type='sampler',
                     body_override=json.dumps(sample_request).encode(),
-                    extra_headers=sticky_headers,
+                    extra_headers=sampler_headers,
             ):
                 chunk_data = json.loads(line)
                 if isinstance(chunk_data.get('error'), str):
@@ -525,7 +534,7 @@ def _register_api_key_gate(app: FastAPI, self_fn: Callable[[], GatewayServer]) -
 async def _ensure_template(
     gateway: GatewayServer,
     base_model: str,
-    sticky_headers: dict[str, str],
+    sampler_headers: dict[str, str],
     request: Request,
 ) -> None:
     """Ensure the sampler has a chat template set for encoding Trajectory inputs.
@@ -549,7 +558,7 @@ async def _ensure_template(
             base_model=base_model,
             service_type='sampler',
             body_override=set_template_body,
-            extra_headers=sticky_headers,
+            extra_headers=sampler_headers,
         )
         if resp.status_code == 200:
             gateway._template_initialized.add(base_model)

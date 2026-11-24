@@ -433,7 +433,9 @@ class TrainingController:
             return True
         return self.clock() - training.last_activity_at >= spec.config.idle_timeout_s
 
-    async def _authorized(self, training_id: str, token: str, session_id: str | None) -> TrainingRecord:
+    async def _authorized(
+        self, training_id: str, token: str, session_id: str | None, *, for_release: bool = False
+    ) -> TrainingRecord:
         await self._assert_epoch()
         training = self.trainings.get(training_id)
         if (
@@ -442,6 +444,9 @@ class TrainingController:
             or (session_id is not None and session_id != training.session_id)
         ):
             raise ResourceNotFoundError("Unknown training handle")
+        if for_release and training.terminal_reason == "released" and training.state in ("CLOSING", "RELEASED"):
+            # A retried release may arrive while the original task drains or after it succeeded.
+            return training
         if training.state == "EXPIRED":
             raise TrainingExpiredError("Training handle expired; create a new handle and explicitly load a checkpoint.")
         if training.state != "ACTIVE" or training.instance_id in self._failed_instances:
@@ -502,24 +507,29 @@ class TrainingController:
         if cleanup:
             self.lifecycle.spawn(self._cleanup_user(training))
 
-    async def route(self, training_id: str, token: str, session_id: str | None = None) -> TrainingRoute:
+    async def route(
+        self, training_id: str, token: str, session_id: str | None = None, *, for_release: bool = False
+    ) -> TrainingRoute:
         async with self._lock:
-            training = await self._authorized(training_id, token, session_id)
+            training = await self._authorized(training_id, token, session_id, for_release=for_release)
             return {"instance_id": training.instance_id, "base_model": training.base_model, "epoch": self.epoch}
 
     async def release(self, training_id: str, token: str, session_id: str | None = None) -> None:
         async with self._lock:
-            training = await self._authorized(training_id, token, session_id)
-            training.state = "CLOSING"
-            training.terminal_reason = "released"
-            await self.store.save_training(training)
-            cleanup = not training.pending_operation_ids
+            training = await self._authorized(training_id, token, session_id, for_release=True)
+            if training.state == "ACTIVE":
+                closing = training.model_copy(update={"state": "CLOSING", "terminal_reason": "released"})
+                await self.store.save_training(closing)
+                training.state = closing.state
+                training.terminal_reason = closing.terminal_reason
+            instance = self.instances.get(training.instance_id)
+            cleanup = training.state == "CLOSING" and not training.pending_operation_ids
         if cleanup:
             await self._cleanup_user(training)
         config = self.config.get(training.base_model, training.mode).config.queue_config
         deadline = asyncio.get_running_loop().time() + config.absolute_future_ttl(1) + self.config.shutdown_timeout_s
-        while training.state == "CLOSING" or self.instances[training.instance_id].state in ("DRAINING", "QUARANTINED"):
-            if self.instances[training.instance_id].state == "QUARANTINED":
+        while training.state == "CLOSING" or (instance is not None and instance.state in ("DRAINING", "QUARANTINED")):
+            if instance is not None and instance.state == "QUARANTINED":
                 raise RuntimeError("Runtime cleanup is quarantined; device release is not confirmed")
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError("Training cleanup is still pending; its slot remains reserved")

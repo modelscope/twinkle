@@ -1,12 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """NCCL checkpoint engines across real GPUs: full sync (reused and rebuilt groups) and delta sync."""
 from __future__ import annotations
-
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from twinkle.checkpoint_engine.zmq_auth import send_auth_pyobj
 from ._hccl_loopback import build_rounds, make_state
 from ._nccl_harness import make_full_state, run
 
@@ -159,9 +159,25 @@ def test_delta_receiver_skips_stale_wire_probes():
     from twinkle.checkpoint_engine.delta.transport.nccl_engine import DeltaShardedCheckpointEngine
     engine = DeltaShardedCheckpointEngine(bucket_size=16)
     engine.rank = 1
+    engine.auth_key = 'k'
+    wire = SimpleNamespace(sent=[], send=lambda msg: wire.sent.append(msg))
+    send_auth_pyobj(wire, {'wire_probe': True}, engine.auth_key)
     topics = [engine.topic + '__wire_probe__', engine.topic + '__wire_probe__', engine.topic]
     dropped = []
-    engine.socket = SimpleNamespace(recv_string=lambda: topics.pop(0), recv=lambda: dropped.append(1) or b'\x00',
+    engine.socket = SimpleNamespace(recv_string=lambda: topics.pop(0),
+                                    recv=lambda copy=True: dropped.append(1) or wire.sent[0],
                                     recv_pyobj=lambda: {'terminal_empty': True})
     assert list(engine.receive_weights()) == []
     assert not topics and len(dropped) == 2
+
+
+def test_delta_receiver_rejects_unsigned_wire_probe():
+    from twinkle.checkpoint_engine.delta.transport.nccl_engine import DeltaShardedCheckpointEngine
+    engine = DeltaShardedCheckpointEngine(bucket_size=16)
+    engine.rank = 1
+    engine.auth_key = 'k'
+    engine.socket = SimpleNamespace(recv_string=lambda: engine.topic + '__wire_probe__',
+                                    recv=lambda copy=True: b'\x00' * 40,
+                                    recv_pyobj=lambda: {'terminal_empty': True})
+    with pytest.raises(RuntimeError, match='HMAC verification failed'):
+        list(engine.receive_weights())

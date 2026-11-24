@@ -2,6 +2,9 @@
 """Guards for the wire-contract migration to :mod:`twinkle.protocol`."""
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 _MIGRATED_NAMES = frozenset(
     """
 AdapterRequest AddAdapterRequest AddMetricRequest AddMetricResponse ApplyPatchRequest ApplyPatchResponse
@@ -16,7 +19,8 @@ GetTrainConfigsResponse HealthResponse LoadRequest LoadResponse LoraConfig LrSte
 OkResponse ParsedCheckpointTwinklePath ProcessorCallRequest ProcessorCallResponse ProcessorCreateRequest
 ProcessorCreateResponse ProcessorHeartbeatRequest ProcessorHeartbeatResponse ProtocolLimits ResolvedLoadPath
 ResponseModel ResumeFromCheckpointRequest RetrieveFutureRequest SampleRequest SampleResponseModel
-SampleResponseModelList SampledSequenceModel SamplerAddAdapterRequest SamplerAddAdapterResponse SamplerCreateResponse
+SampleResponseModelList SampledSequenceModel SamplerAddAdapterRequest SamplerAddAdapterResponse SamplerApplyPatchRequest
+SamplerCreateResponse
 SamplerSetTemplateRequest SamplerSetTemplateResponse SaveRequest SaveResponse SessionHeartbeatRequest
 SessionHeartbeatResponse SetLossRequest SetLossResponse SetLrSchedulerRequest SetLrSchedulerResponse SetOptimizerRequest
 SetOptimizerResponse SetProcessorRequest SetProcessorResponse SetTemplateRequest SetTemplateResponse StepRequest
@@ -31,5 +35,20 @@ def test_protocol_exports_match_committed_snapshot() -> None:
     import twinkle.protocol.types as types
 
     assert set(types.__all__) == _MIGRATED_NAMES
-    assert len(types.__all__) == 121
+    assert len(types.__all__) == 122
     assert 'ErrorResponse' not in types.__all__
+
+
+
+def test_sampler_patch_request_has_no_training_handle() -> None:
+    from twinkle.protocol.types import ApplyPatchRequest, SamplerApplyPatchRequest
+    from twinkle.server.lifecycle.submit import backend_kwargs
+    from twinkle_client._request_builder import build_request
+
+    request = build_request(SamplerApplyPatchRequest, patch_cls='ExamplePatch', enabled=True)
+    assert request.model_dump() == {'patch_cls': 'ExamplePatch', 'init_kwargs': {'enabled': True}}
+    assert backend_kwargs(request) == {'enabled': True}
+    with pytest.raises(ValidationError, match='training_id'):
+        SamplerApplyPatchRequest.model_validate({'patch_cls': 'ExamplePatch', 'training_id': 'training-1'})
+    with pytest.raises(ValidationError, match='training_id'):
+        ApplyPatchRequest(patch_cls='ExamplePatch', adapter_name='train-adapter')

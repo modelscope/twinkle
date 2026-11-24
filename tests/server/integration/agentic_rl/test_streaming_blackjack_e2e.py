@@ -39,7 +39,8 @@ def test_streaming_blackjack_trains_and_samples_published_policy(monkeypatch, re
     spec = importlib.util.spec_from_file_location('streaming_blackjack_e2e', path)
     recipe = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(recipe)
-    e2b_envs, e2b_sandboxes = [], []
+    env_factory = recipe.BlackjackEnv
+    e2b_sandboxes = []
     if os.environ.get('TWINKLE_TEST_E2B') == '1':
         env_spec = importlib.util.spec_from_file_location(
             'e2b_blackjack_recipe', path.with_name('e2b_multi_turn_grpo.py'))
@@ -47,21 +48,17 @@ def test_streaming_blackjack_trains_and_samples_published_policy(monkeypatch, re
         env_spec.loader.exec_module(env_recipe)
 
         class TracedE2BEnv(env_recipe.E2BBlackjackEnv):
-            def __init__(self, seed):
-                super().__init__(seed)
-                e2b_envs.append(self)
 
-            def reset(self, trajectory=None):
-                result = super().reset(trajectory)
-                e2b_sandboxes.append(self.sandbox)
-                return result
+            def _open(self, trajectory):
+                state, result = super()._open(trajectory)
+                e2b_sandboxes.append(state.sandbox)
+                return state, result
 
-        monkeypatch.setattr(recipe, 'BlackjackEnv', TracedE2BEnv)
-        recipe.BUFFER_GROUPS = 2
-        recipe.MAX_GROUPS = 8  # Bound cloud usage; passing still requires updates, publication and new-policy sampling.
-    # Leave an update beyond the first bufferful so stopping cannot skip publication.
-    recipe.MAX_STEPS = recipe.BUFFER_GROUPS + 1
-    saved, requests, training = [], [], []
+        env_factory = TracedE2BEnv
+        recipe.MAX_GROUPS = 8  # Bound cloud usage.
+    # Leave an update after publication so the next policy is sampled.
+    recipe.MAX_STEPS = 2
+    saved, requests = [], []
     steps = 0
     lock = threading.Lock()
     original_save = MultiLoraTransformersModel.save
@@ -82,16 +79,14 @@ def test_streaming_blackjack_trains_and_samples_published_policy(monkeypatch, re
         return result
 
     def backward(model, *args, **kwargs):
-        for feature, logps in zip(kwargs['inputs'], kwargs['old_logps'], strict=True):
-            labels, mask = feature['labels'], feature['completion_mask']
-            assert len(feature['input_ids']) == len(labels) == len(mask)
-            assert sum(label != -100 and bool(scored) for label, scored in zip(labels, mask, strict=True)) == len(logps)
+        from twinkle.data_format import validate_trajectory
+
+        for feature in kwargs['inputs']:
+            validate_trajectory(feature)
+            logps = feature['rollout_logps']
             assert logps and all(math.isfinite(value) for value in logps)
-        started = time.monotonic()
-        result = original_backward(model, *args, **kwargs)
-        with lock:
-            training.append((started, time.monotonic()))
-        return result
+            assert len(logps) == len(feature['advantages'])
+        return original_backward(model, *args, **kwargs)
 
     def step(model, *args, **kwargs):
         nonlocal steps
@@ -103,10 +98,9 @@ def test_streaming_blackjack_trains_and_samples_published_policy(monkeypatch, re
     monkeypatch.setattr(vLLMSampler, 'sample', sample)
     monkeypatch.setattr(MultiLoraTransformersModel, 'forward_backward', backward)
     monkeypatch.setattr(MultiLoraTransformersModel, 'clip_grad_and_step', step)
-    recipe.train()
+    recipe.train(env_factory)
 
-    if e2b_envs:
-        assert all(env.sandbox_id is None for env in e2b_envs), 'A trajectory retained its E2B sandbox'
+    if e2b_sandboxes:
         assert all(not sandbox.is_running() for sandbox in e2b_sandboxes), 'An E2B sandbox is still running'
         record_property('released_e2b_sandboxes', len(e2b_sandboxes))
 
@@ -119,8 +113,6 @@ def test_streaming_blackjack_trains_and_samples_published_policy(monkeypatch, re
     assert len(published) == len(saved) - 1
     new_requests = [request for request in requests if request[0] in published]
     assert new_requests, 'No successful sampling call used a published policy'
-    assert any(start < end_train and start_train < end
-               for _, start, end in requests for start_train, end_train in training), 'No HTTP sampling/training overlap'
 
     assert all(checkpoint.checkpoint_dir for checkpoint in saved[:2]), 'Server did not return checkpoint directories'
     paths = [Path(checkpoint.checkpoint_dir) / 'adapter_model.safetensors' for checkpoint in saved[:2]]

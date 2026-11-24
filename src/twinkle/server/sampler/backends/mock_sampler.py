@@ -20,7 +20,6 @@ import numpy as np
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
-from twinkle.template.utils import construct_template
 from twinkle.utils.logger import get_logger
 from twinkle.utils.seed import stable_seed
 
@@ -188,11 +187,8 @@ class MockSampler:
 
     @remote_function()
     def set_template(self, template_cls: Any, **kwargs: Any) -> None:
-        # Mirror the base sampler's rule: pin to this sampler's own model when the caller
-        # (the construct-time template pin) did not carry a model_id.
-        if 'model_id' not in kwargs and hasattr(self, 'model_id'):
-            kwargs['model_id'] = self.model_id
-        self.template = construct_template(template_cls, **kwargs)
+        """Acknowledge template setup; mock generation only operates on token IDs."""
+        return None
 
     @remote_function()
     def reset_prefix_cache(self) -> None:
@@ -260,17 +256,8 @@ class MockSampler:
     def _build_new_input_feature(pif: Any, tokens: list[int]) -> dict[str, Any]:
         """Deterministically append the freshly sampled ``tokens`` to ``pif``.
 
-        Produces a plain-dict ``InputFeature`` that carries the running context
-        for the next multi-turn round: ``input_ids`` is the prior prompt plus
-        this round's sampled tokens, ``labels`` marks the sampled tokens as
-        trainable (their own ids) while prior/context positions stay ``-100``,
-        and ``completion_mask`` marks them as the policy's own output.
-        This mirrors the shape a real sampler's ``append_completion`` yields,
-        which the multi-turn rollout relies on (it reads
-        ``new_input_feature.input_ids`` and counts trainable ``labels``).
-
-        The mock does not depend on a template, so the append is a simple,
-        deterministic list concatenation performed entirely on the CPU.
+        The labels and completion mask mark the positions that predict sampled
+        tokens, as in the real sampler. No tokenizer or template is needed.
         """
         feat: dict[str, Any] = dict(pif) if isinstance(pif, dict) else {}
         prev_ids = list(feat.get("input_ids") or [])
@@ -288,7 +275,14 @@ class MockSampler:
             completion_mask = [0 if label == -100 else 1 for label in labels]
 
         feat["input_ids"] = prev_ids + list(tokens)
-        feat["labels"] = labels + list(tokens)
-        feat["completion_mask"] = completion_mask + [1] * len(tokens)
+        # The wire feature is in prediction order. The first new token is
+        # predicted at the last prompt position, and the tail remains masked.
+        scored_tokens = tokens if prev_ids else tokens[1:]
+        feat["labels"] = labels[:-1] + scored_tokens + [-100]
+        feat["completion_mask"] = completion_mask[:-1] + [1] * len(scored_tokens) + [0]
         feat["length"] = len(feat["input_ids"])
+        if "attention_mask" in feat:
+            feat["attention_mask"] = list(feat["attention_mask"]) + [1] * len(tokens)
+        if "position_ids" in feat:
+            feat["position_ids"] = list(range(feat["length"]))
         return feat

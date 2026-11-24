@@ -51,9 +51,8 @@ def to_wire_value(value: Any) -> Any:
 
     from peft import LoraConfig
 
-    from twinkle.dataset import DatasetMeta
-    if isinstance(value, (DatasetMeta, LoraConfig)):
-        from twinkle.protocol.serialize import serialize_object
+    from twinkle.protocol.serialize import is_dataset_meta, serialize_object
+    if isinstance(value, LoraConfig) or is_dataset_meta(value):
         return serialize_object(value)
     if is_dataclass(value) and not isinstance(value, type):
         return to_wire_value(asdict(value))

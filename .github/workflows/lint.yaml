@@ -15,8 +15,23 @@ jobs:
         uses: actions/setup-python@v2
         with:
           python-version: '3.11'
-      - name: Install pre-commit hook
-        run: |
-          pip install pre-commit
+      - name: Install ruff
+        run: pip install ruff==0.13.0
       - name: Linting
-        run: pre-commit run --all-files
+        run: |
+          ruff check .
+          ruff format --check .
+
+  # The GPU CI installs with --no-deps (the image owns the stack), so the pyproject ranges
+  # would otherwise never be exercised. Resolve them here -- metadata only, nothing installed --
+  # so an unsatisfiable or contradictory declaration fails loudly on every push.
+  dependency-resolution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Resolve declared dependency ranges
+        run: pip install --dry-run --ignore-installed .

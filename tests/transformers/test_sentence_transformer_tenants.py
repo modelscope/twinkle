@@ -11,8 +11,7 @@ pytest.importorskip('swift.dev.model.multi_lora_sentence_transformer_model')
 
 
 def test_st_pipeline_tenants_checkpoint_and_reuse(tmp_path, monkeypatch):
-    from sentence_transformers.base.modules import Transformer, Dense, Normalize
-    from sentence_transformers.sentence_transformer.modules import Pooling
+    from sentence_transformers.sentence_transformer.modules import Transformer, Dense, Normalize, Pooling
     from tokenizers import Tokenizer
     from tokenizers.models import WordPiece
     from transformers import BertConfig, BertModel, PreTrainedTokenizerFast

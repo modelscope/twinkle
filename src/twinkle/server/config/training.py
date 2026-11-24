@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, ValidationInf
 
 from twinkle.hub.model_alias import extract_model_alias
 from twinkle.server.exceptions import RequestRejectedError
-from .resources import ResourceOptions
+from .resource_options import ResourceOptions
 from .task_queue import TaskQueueConfig
 
 if TYPE_CHECKING:
@@ -54,6 +54,7 @@ class TrainingArguments(BaseModel):
     strategy: Literal["accelerate", "native_fsdp"] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     max_length: int | None = Field(default=None, gt=0, strict=True)
+    template: dict[str, Any] | None = None
     model_cls: str | None = None
     model_loader: str | None = None
     gradient_checkpointing: bool | None = Field(default=None, strict=True)
@@ -63,6 +64,15 @@ class TrainingArguments(BaseModel):
     task_type: Literal["causal_lm", "embedding", "seq_cls", "reranker", "value", "decision"] | None = None
     num_labels: int | None = Field(default=None, gt=0, strict=True)
     language_model_only: bool | None = Field(default=None, strict=True)
+
+    @field_validator("template")
+    @classmethod
+    def _validate_template(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is not None:
+            template_cls = value.get("template_cls")
+            if not isinstance(template_cls, str) or not template_cls.strip():
+                raise ValueError("template requires a nonempty template_cls")
+        return value
 
     @model_validator(mode="after")
     def _validate_head(self):

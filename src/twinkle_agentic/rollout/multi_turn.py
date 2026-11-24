@@ -28,10 +28,28 @@ from twinkle_agentic.envs.base import NoSlot
 from twinkle_agentic.envs.env_tool import EnvTool
 from twinkle_agentic.protocol.api_sampler import APIGenerationError
 from twinkle_agentic.tools.tool_manager import ToolManager
+from twinkle_agentic.verifier.result_check import CheckContext, checks_from_dicts, run_checks
 from .endpoint import ENDPOINTS, EndpointRequest, PolicyEndpoint, assistant_message
 from .ledger import MessageLedger, TurnLedger
 
 logger = get_logger()
+
+
+def _final_answer(traj: Trajectory) -> str:
+    """The last assistant turn's text -- what the ``answer_*`` checks read; '' when there is none.
+
+    Multimodal content is a part list; the text parts concatenate in order.
+    """
+    content = None
+    for message in reversed(traj.get('messages') or []):
+        if message.get('role') == 'assistant':
+            content = message.get('content')
+            break
+    if content is None:
+        return ''
+    if isinstance(content, list):
+        return ''.join(str(part.get('text') or '') for part in content if isinstance(part, dict))
+    return str(content or '')
 
 
 def _dump_rollout_rows(episode_id: str, rows: list) -> None:
@@ -398,6 +416,12 @@ class _Episode:
         #: The last served reply, for resubmitted requests (an agent HTTP client that timed out
         #: and retried sends the same payload verbatim: it is answered verbatim, not re-served).
         self.last_reply: Optional[dict] = None
+        #: Continue-on-length (defect110): while an assistant turn is being continued, its reply
+        #: reaches the agent as several wire messages the agent merges into ONE. ``merged_content``
+        #: accumulates their content (None = no open split); ``split_start`` is where the split
+        #: pieces begin in ``sent``, so the agent's merged view can be reconstructed for detection.
+        self.merged_content: str | None = None
+        self.split_start = 0
         #: Under segment_policy='collect': the rows of segments a compaction boundary already
         #: froze, oldest first; the final segment's row joins them when the episode ends.
         self.closed_rows: list = []
@@ -780,20 +804,58 @@ class MultiTurnRollout:
         episode_end = None
         if self.on_episode_end is not None:
             episode_end = self.on_episode_end(traj, self.env, ep.episode_id)
-        env_reward = 0.0
+        # Terminal checks run inside the episode's env session, BEFORE ``close`` ends it: they
+        # must see exactly the state the agent left behind (the session -- and for LocalEnv its
+        # workspace -- dies with close). The score lands as the rollout's own ``rewards.check``
+        # key beside ``rewards.env``; a row that declares no checks carries no key. Checks that
+        # need to run something (shell / python) ride ``ctx.env``, so episodes run and score in
+        # the same sandbox; ``env=None`` (a tools-only local episode) falls back to a LocalEnv
+        # over the row's own ``workspace`` column.
+        check_score: Optional[float] = None
+        if traj.get('checks') is not None:
+            if self.env is not None and not ep.env_open:
+                raise EpisodeError(
+                    f'episode {ep.episode_id!r}: its env session is already closed, so its terminal '
+                    'checks cannot see the state the agent left behind.')
+            try:
+                checks = checks_from_dicts(traj.get('checks'))
+            except Exception as exc:
+                raise EpisodeError(
+                    f'episode {ep.episode_id!r}: malformed checks column: {exc}') from exc
+            workspace = (self.env.workspace(ep.episode_id) if self.env is not None
+                         else str(traj.get('workspace') or ''))
+            report = run_checks(
+                checks,
+                CheckContext(workspace=workspace, final_answer=_final_answer(traj),
+                             env=self.env, episode_id=ep.episode_id))
+            check_score = float(report.score)
+        env_reward: Optional[float] = None
         if self.env is not None and ep.env_open:
-            env_reward = float(self.env.close(ep.episode_id) or 0.0)
+            env_reward = self.env.close(ep.episode_id)
             ep.env_open = False
         self._discard(ep.episode_id)
-        # ``rewards.env`` is the one reward key the rollout itself owns; the scorer
-        # columns (orm / baseline) are the driver's to name when it hands the batch out.
-        traj['rewards'] = dict(traj.get('rewards') or {}, env=env_reward)
+        # ``rewards.env`` / ``rewards.check`` are the reward keys the rollout itself owns; the
+        # scorer columns (orm / baseline) are the driver's to name when it hands the batch out.
+        # ``rewards.env`` lands only when the env session actually scored (``close`` returns None
+        # for a sandbox used only for its tools: its constant zero is "no reward", not a score),
+        # so an absent env key never fabricates one.
+        rewards = dict(traj.get('rewards') or {})
+        if env_reward is not None:
+            rewards['env'] = float(env_reward)
+        if check_score is not None:
+            rewards['check'] = check_score
+        traj['rewards'] = rewards
         if episode_end is not None:
             traj['episode_end'] = episode_end
         for row in ep.closed_rows:
-            # The frozen rows carry the episode's env reward too: the reward key belongs to
-            # the episode, and every row of it carries the same one.
-            row['rewards'] = dict(row.get('rewards') or {}, env=env_reward)
+            # The frozen rows carry the episode's env reward too: the reward keys belong to
+            # the episode, and every row of it carries the same ones.
+            row_rewards = dict(row.get('rewards') or {})
+            if env_reward is not None:
+                row_rewards['env'] = float(env_reward)
+            if check_score is not None:
+                row_rewards['check'] = check_score
+            row['rewards'] = row_rewards
         rows = list(ep.closed_rows) + [traj]
         _dump_rollout_rows(ep.episode_id, rows)
         extra = {
@@ -829,7 +891,7 @@ class MultiTurnRollout:
             truncated=bool(ep.truncated),
             token_lengths=(prompt_tokens, response_tokens) if coded else None,
             routing_exported=traj.get('routed_experts') is not None,
-            env_reward=env_reward,
+            env_reward=float(env_reward) if env_reward is not None else 0.0,
             extra=extra,
         )
         return rows, sample
@@ -1162,7 +1224,11 @@ class MultiTurnRollout:
 
         def run() -> None:
             try:
-                ep.exit = self.env.run_script(ep.episode_id, command, interpreter='shell', timeout=self.harness.timeout)
+                # The agent program is a full third-party runtime, not a model-written tool
+                # script: the tool-script address-space cap would strangle it before its first
+                # request (defect108). Its containment is the harness timeout passed here.
+                ep.exit = self.env.run_script(ep.episode_id, command, interpreter='shell',
+                                              timeout=self.harness.timeout, cap_memory=False)
             except BaseException as error:  # noqa # reported by the step that reads the exit
                 ep.exit = (None, f'{type(error).__name__}: {error}')
             finally:
@@ -1235,10 +1301,39 @@ class MultiTurnRollout:
             # otherwise read as a rewrite and needlessly swap the ledger).
             request.reply.set_result(dict(ep.last_reply))
             return self._continue(ep)
+        if (ledger is not None and ep.last_reply is not None
+                and ep.last_reply.get('finish_reason') == 'length'
+                and tools_key == ep.tools_key and canonical and canonical == ep.sent):
+            # Continue-on-length (chat protocol): the agent echoed the conversation ending with
+            # our truncated reply and asks for more of THAT turn. Detection is against the WIRE
+            # view (ep.sent), not ledger.messages: the ledger banks the decoded text with the
+            # template's end-of-turn marker, the agent echoes the marker-stripped wire content.
+            # Generating from the ledger's current state extends the open assistant message;
+            # opening a segment instead would re-encode an assistant-ending prompt and crash
+            # (defect110).
+            return self._continue_generation(ep, request, canonical, tools_key)
+        merged_extends = False
+        if ep.merged_content is not None and ledger is not None and tools_key == ep.tools_key and canonical:
+            # A continued turn reaches the agent as several wire messages it merges into ONE
+            # assistant message; reconstruct that merged view to recognise what comes back.
+            merged_view = ep.sent[:ep.split_start] + [
+                ('assistant', ep.merged_content.strip(), ep.sent[-1][2], '')]
+            if (ep.last_reply is not None and ep.last_reply.get('finish_reason') == 'length'
+                    and canonical == merged_view):
+                # Still truncated after the merge: continue the same turn again.
+                return self._continue_generation(ep, request, canonical, tools_key)
+            if len(canonical) > len(merged_view) and canonical[:len(merged_view)] == merged_view:
+                # The merged turn plus what the environment added (tool results, a new
+                # question): an append onto the SAME ledger, so the banked assistant turn
+                # keeps its sampled tokens instead of being dropped with a fresh segment.
+                if not ledger.observe(request.messages[len(merged_view):]):
+                    return self._end_agent_truncated(ep, request)
+                ep.merged_content = None
+                merged_extends = True
         noise = None
-        if self.harness is not None:
+        if self.harness is not None and not merged_extends:
             noise = self.harness.noise_reply(request.messages, request.tools, request.params)
-        extends = (
+        extends = merged_extends or (
             ledger is not None and tools_key == ep.tools_key and len(canonical) > len(ep.sent)
             and canonical[:len(ep.sent)] == ep.sent)
         if noise is not None:
@@ -1265,8 +1360,9 @@ class MultiTurnRollout:
             return self._continue(ep)
         if extends:
             # Token-in: what the agent added since our last reply (tool results, its own
-            # notes) is the environment's, appended masked.
-            if not ledger.observe(request.messages[len(ep.sent):]):
+            # notes) is the environment's, appended masked. A merged continuation already
+            # observed its suffix above.
+            if not merged_extends and not ledger.observe(request.messages[len(ep.sent):]):
                 return self._end_agent_truncated(ep, request)
         else:
             # The first request, or a history the agent rewrote (compacted, dropped a
@@ -1301,6 +1397,63 @@ class MultiTurnRollout:
         text = ledger.decode_tokens(seq)
         parsed = ledger.parse_tool_call(text)
         message = assistant_message(text, parsed, self.template.clean_tool_call(text) if parsed else text)
+        ep.sent = canonical + [_canonical(message)]
+        ep.tools_key = tools_key
+        ep.last_reply = {
+            'message': message,
+            'finish_reason': 'tool_calls' if parsed else ('length' if seq.stop_reason == 'length' else 'stop'),
+            'usage': {
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': len(seq.tokens or []),
+            },
+        }
+        request.reply.set_result(dict(ep.last_reply))
+        if ledger.full():
+            ep.truncated = True
+            return self._finish(ep, segments=ep.segments)
+        return self._continue(ep)
+
+    def _continue_generation(self, ep: _Episode, request: EndpointRequest, canonical: list,
+                             tools_key: str) -> tuple[list, RolloutStatus]:
+        """Extend the open assistant turn: the agent asked for more of a length-truncated reply.
+
+        The ledger already holds the conversation including the truncated reply, so the sampler
+        generates straight from its current state -- no re-encode (an assistant-ending prompt
+        refuses ``add_generation_prompt=True``), no new segment, no new turn. The reply carries
+        ONLY the continuation: chat-protocol agents concatenate it onto their partial message.
+        Tool calls are parsed on the MERGED wire text, since a call may complete across the
+        boundary; the merged content is tracked on the episode so the agent's folded view of
+        the split replies stays recognisable (defect110).
+        """
+        ledger = ep.ledger
+        params = self._request_params(ep, request.params)
+        if ledger.unfit(params):
+            # The turn is already banked: no room ends the episode truncated, as in _serve.
+            return self._end_agent_truncated(ep, request)
+        prompt_tokens = len(ledger.input_feature.get('input_ids') or [])
+        prev_wire = ep.last_reply['message']
+        # Parse on the ledger's RAW contiguous text: the model generated it as one token
+        # stream, and a call completing across the boundary must read as it was sampled.
+        prev_raw = ledger.messages[-1].get('content') or ''
+        try:
+            seq = self._generate(ep, ledger, params)
+        except APIGenerationError as error:
+            raise EpisodeError(f'episode {ep.episode_id!r}: generation failed: {error}') from error
+        ledger.record_continuation(seq)
+        ep.stop_reason = seq.stop_reason
+        text = ledger.decode_tokens(seq)
+        parsed = ledger.parse_tool_call(prev_raw + text)
+        message = assistant_message(text, parsed, self.template.clean_tool_call(text) if parsed else text)
+        if ep.merged_content is None:
+            ep.split_start = len(ep.sent) - 1
+            ep.merged_content = (prev_wire.get('content') or '').strip()
+        # The agent's merged view is NOT the raw concatenation: ms-agent strips each stored
+        # message at send time (its _format_input_message mutates content.strip()), so the
+        # boundary whitespace of earlier pieces is gone before the next piece appends.
+        # Track its exact recurrence echo_k = strip(echo_{k-1} + piece_k), or the second
+        # continuation's merged echo reads as a rewrite and re-encodes assistant-ending
+        # (the attempt4 crash, defect110 follow-up).
+        ep.merged_content = (ep.merged_content + (message.get('content') or '')).strip()
         ep.sent = canonical + [_canonical(message)]
         ep.tools_key = tools_key
         ep.last_reply = {

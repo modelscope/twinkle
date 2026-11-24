@@ -62,7 +62,10 @@ async def test_replica_lifecycle_updates_shared_capacity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_constructor_registers_replica_before_ready() -> None:
+async def test_deferred_startup_registers_replica_before_ready() -> None:
+    # The constructor is synchronous (Ray Serve cannot await __init__); the startup body runs
+    # once on the FIRST awaited instance method (check_health), and must register the replica's
+    # capacity before Serve marks the replica ready. A second probe must not re-register.
     state = SimpleNamespace(register_replica=AsyncMock(), touch_replica_last_seen=AsyncMock())
     manager = ModelManagement.__new__(ModelManagement)
     manager._task_queue_config = SimpleNamespace(effective_execution_timeout=1800.0)
@@ -75,7 +78,7 @@ async def test_async_constructor_registers_replica_before_ready() -> None:
          patch.object(ModelManagement, '_init_task_queue'), \
          patch.object(ModelManagement, 'initialize_training_runtime', new_callable=AsyncMock), \
          patch.object(ModelManagement, 'wait_for_training_workers', new_callable=AsyncMock):
-        await ModelManagement.__init__(
+        ModelManagement.__init__(
             manager,
             model_id='model',
             nproc_per_node=1,
@@ -88,6 +91,10 @@ async def test_async_constructor_registers_replica_before_ready() -> None:
             placement_group=None,
             allocation_devices=[],
         )
+        assert manager._startup_async_done is False
+        state.register_replica.assert_not_awaited()
+        await manager.check_health()
+        await manager.check_health()
 
     state.register_replica.assert_awaited_once_with('replica-1', 3)
     state.touch_replica_last_seen.assert_awaited_once_with('replica-1')

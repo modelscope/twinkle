@@ -13,9 +13,83 @@ from on_demand_sdk import unload_tinker_model
 from ray import serve
 
 from twinkle.server.config import ServerConfig
-from twinkle.server.launcher.server_launcher import ServerLauncher
+from twinkle.server.launcher.server_launcher import ServerLauncher, build_ray_runtime_env
+from twinkle.server.processor import build_processor_app
 from twinkle_client import init_tinker_client, init_twinkle_client
+from twinkle_client.dataloader import DataLoader
+from twinkle_client.dataset import Dataset
+from twinkle_client.exceptions import TwinkleHTTPError
 from twinkle_client.model.multi_lora_transformers import MultiLoraTransformersModel
+
+
+def verify_remote_processors(base):
+    from twinkle.dataset import DatasetMeta
+
+    app = build_processor_app(
+        ncpu_proc_per_node=1,
+        device_group={'name': 'processor', 'ranks': 1, 'device_type': 'cpu'},
+        device_mesh={'device_type': 'cpu', 'dp_size': 1},
+        deploy_options={'ray_actor_options': {'num_cpus': 0.1}},
+        processor_config={'processor_timeout': 5, 'per_token_processor_limit': 2},
+    )
+    serve.run(app, name='processor', route_prefix='/api/v1/processor')
+    token = 'probe-processor'
+    rows = [{'value': 1}, {'value': 2}, {'value': 3}, {'value': 4}]
+
+    def read_dataset_and_loader(client):
+        dataset = Dataset(dataset_meta=DatasetMeta(data=rows), transport=client.transport)
+        loader = DataLoader(dataset=dataset, batch_size=2, shuffle=False, num_workers=0)
+        assert len(dataset) == 4 and dataset[1] == rows[1]
+        assert list(loader) == [rows[:2], rows[2:]]
+        return dataset.processor_id, loader.processor_id
+
+    def worker_names():
+        return {actor['name'] for actor in ray.util.list_named_actors(all_namespaces=True)}
+
+    try:
+        no_session = requests.post(
+            base + '/api/v1/processor/twinkle/create',
+            json={'processor_type': 'dataset', 'class_type': 'Dataset'},
+            headers={'Authorization': f'Bearer {token}', 'x-request-id': uuid.uuid4().hex},
+            timeout=5,
+        )
+        assert no_session.status_code == 400 and 'session_id' in no_session.text, no_session.text
+        with init_twinkle_client(base_url=base, api_key=token, session_heartbeat_interval=1) as owner:
+            processor_ids = read_dataset_and_loader(owner)
+            workers = {name for name in worker_names()
+                       if any(pid.removeprefix('pid:') in name for pid in processor_ids)}
+            assert len(workers) == len(processor_ids), workers
+            try:
+                Dataset(dataset_meta=DatasetMeta(data=rows), transport=owner.transport)
+            except TwinkleHTTPError as exc:
+                assert exc.status_code == 429, str(exc)
+            else:
+                raise AssertionError('Processor quota was not enforced')
+            session = owner.transport.context.session_id
+
+        # Closing the SDK stops heartbeats. Both handles should expire before the
+        # 30-second quota lease would naturally lapse.
+        deadline = time.monotonic() + 25
+        while remaining := workers & worker_names():
+            assert time.monotonic() < deadline, f'Expired Processor workers are still running: {remaining}'
+            time.sleep(0.25)
+        for processor_id in processor_ids:
+            request_id = uuid.uuid4().hex
+            response = requests.post(
+                base + '/api/v1/processor/twinkle/call',
+                json={'processor_id': processor_id, 'function': '__len__'},
+                headers={
+                    'Authorization': f'Bearer {token}',
+                    'X-Twinkle-Session-Id': session,
+                    'x-request-id': request_id,
+                },
+                timeout=5,
+            )
+            assert response.status_code == 404 and response.json()['request_id'] == request_id, response.text
+        with init_twinkle_client(base_url=base, api_key=token, session_heartbeat_interval=1) as replacement:
+            assert set(read_dataset_and_loader(replacement)).isdisjoint(processor_ids)
+    finally:
+        serve.delete('processor')
 
 
 def main():
@@ -38,6 +112,7 @@ def main():
         address='local',
         namespace=namespace,
         num_cpus=8,
+        runtime_env=build_ray_runtime_env(),
         _temp_dir='/tmp/twh-' + namespace[-8:],
         include_dashboard=False,
         log_to_driver=False)
@@ -126,6 +201,8 @@ def main():
         for spec in config.applications:
             if spec.import_path != 'model':
                 launcher._deploy_application(spec)
+        verify_remote_processors(base)
+        phase('remote_processors_verified')
         launcher._deploy_training()
         controller = launcher._training_controller
         assert ray.get(controller.diagnostics.remote())['instances'] == []

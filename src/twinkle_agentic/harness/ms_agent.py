@@ -9,10 +9,13 @@ from .base import CliAgent
 class MsAgent(CliAgent):
     """Run ``ms-agent run`` against the training policy.
 
-    Endpoint and key go in as ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY``, which
-    ms-agent folds over its config as overrides -- so they win over whatever the
-    yaml says, and a config that hardcodes a different endpoint cannot quietly
-    send the episode to another model.
+    Endpoint and key go in as ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY``. ms-agent's
+    ``Config._update_config`` replaces config LEAVES from same-named env vars
+    (case-insensitive), so the config must declare ``llm.openai_base_url`` /
+    ``llm.openai_api_key`` leaves (unset is fine) for the injection to land -- they
+    then win over whatever the yaml hardcodes, and the episode cannot quietly go
+    to another model. A config WITHOUT those leaves falls back to the service
+    default endpoint (api.openai.com): the env vars alone do not create keys.
 
     Args:
         config: ``--config``: a config directory or a repo id. The place to set
