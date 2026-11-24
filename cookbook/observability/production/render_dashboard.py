@@ -2,7 +2,6 @@
 """Render the provisioned multitenant dashboard with deployment reference limits."""
 import argparse
 import math
-import re
 from pathlib import Path
 
 import json
@@ -19,24 +18,16 @@ def reference(value: float) -> str:
 
 def render(config: dict, key_prefix: str) -> dict:
     dashboard = json.loads(TEMPLATE.read_text())
-    overrides = config.get('overrides', {})
-    if any(not re.fullmatch('[0-9a-f]{64}', user_id) for user_id in overrides):
-        raise ValueError('Usage overrides must use complete Token fingerprints')
+    if set(config) != set(LIMITS):
+        raise ValueError(f'Expected reference limits for {", ".join(LIMITS)}')
+    limits = {name: reference(value) for name, value in config.items()}
     for panel in dashboard['panels']:
-        for target in panel['targets']:
+        for target in panel.get('targets', ()):
             if 'keyName' in target:
                 target['keyName'] = key_prefix + target['keyName']
             limit = target.pop('referenceLimit', None)
-            if limit is None:
-                continue
-            usage_rate = target['expr']
-            default = reference(config['defaults'][limit])
-            specific = ' or '.join(
-                f'label_replace(vector({reference(values[limit])}), "user_id", "{user_id}", "__name__", ".*")'
-                for user_id, values in overrides.items() if limit in values
-            )
-            fallback = f'({usage_rate}) / {default}'
-            target['expr'] = f'(({usage_rate}) / on (user_id) ({specific})) or ({fallback})' if specific else fallback
+            if limit is not None:
+                target['expr'] = f"({target['expr']}) / {limits[limit]}"
     return dashboard
 
 
@@ -47,10 +38,11 @@ def main() -> None:
     parser.add_argument('--redis-key-prefix', default='', help='Existing Runtime persistence.key_prefix')
     args = parser.parse_args()
     config = json.loads(args.limits.read_text())
-    if config['defaults'].keys() != set(LIMITS) or any(
-            values.keys() - set(LIMITS) for values in config.get('overrides', {}).values()):
-        parser.error(f'Expected reference limits for {", ".join(LIMITS)}')
-    args.output.write_text(json.dumps(render(config, args.redis_key_prefix), indent=2) + '\n')
+    try:
+        dashboard = render(config, args.redis_key_prefix)
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.output.write_text(json.dumps(dashboard, indent=2) + '\n')
 
 
 if __name__ == '__main__':

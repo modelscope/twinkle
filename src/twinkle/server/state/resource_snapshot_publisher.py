@@ -1,13 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Current, read-only operator views published by the cleanup leader."""
+"""Resource counts and current Redis views published by the cleanup leader."""
 
+import asyncio
 import math
 import time
 from datetime import UTC, datetime
 
+from twinkle.server.telemetry import MetricsRegistry
 from twinkle.server.telemetry.identity import tenant_fingerprint
 from twinkle.utils.logger import get_logger
 from .backend.base import StateBackend
+from .future_manager import FutureManager
 from .model_manager import ModelManager
 from .sampling_manager import SamplingSessionManager
 from .session_manager import SessionManager
@@ -16,14 +19,16 @@ from .training_records import TERMINAL_TRAINING
 logger = get_logger()
 
 
-class AdminIndex:
+class ResourceSnapshotPublisher:
     def __init__(
         self,
         backend: StateBackend,
         sessions: SessionManager,
         models: ModelManager,
         sampling: SamplingSessionManager,
+        futures: FutureManager,
         *,
+        publish_details: bool,
         expiration_timeout: float,
         interval: float,
     ) -> None:
@@ -32,35 +37,60 @@ class AdminIndex:
         self._models = models
         self._sampling = sampling
         self._expiration_timeout = expiration_timeout
+        self._futures = futures
+        self._interval = interval
+        self._publish_details = publish_details
         self._ttl = max(1, math.ceil(interval * 3))
+        self._task: asyncio.Task | None = None
 
-    async def publish(self) -> None:
+    async def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._publish_loop())
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        MetricsRegistry.get().clear_resource_counts()
+
+    async def _publish_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._interval)
+            await self._publish_once()
+
+    async def _publish_once(self) -> None:
+        registry = MetricsRegistry.get()
         now = time.time()
         updated_at = datetime.fromtimestamp(now, UTC).isoformat()
         cutoff = now - self._expiration_timeout
-        for name, collect in (
-            ("sessions", self._session_rows),
-            ("trainings", self._training_rows),
-            ("sampling", self._sampling_rows),
+        for gauge, manager, name, collect in (
+            ("active_sessions", self._sessions, "sessions", self._session_rows),
+            ("active_models", self._models, "trainings", self._training_rows),
+            ("active_sampling_sessions", self._sampling, "sampling", self._sampling_rows),
+            ("active_futures", self._futures, None, None),
         ):
             try:
-                rows = await collect(cutoff)
-                for row in rows:
-                    row["updated_at"] = updated_at
+                if not self._publish_details or collect is None:
+                    registry.set_resource_count(gauge, await manager.count())
+                    continue
+                ids = await manager.keys()
+                registry.set_resource_count(gauge, len(ids))
+                rows = await collect(ids, cutoff)
                 await self._backend.set(
                     f"admin:index:{name}",
-                    {
-                        "updated_at": updated_at,
-                        "rows": rows or [{"updated_at": updated_at, "state": "EMPTY"}],
-                    },
+                    {"updated_at": updated_at, "row_count": len(rows), "rows": rows},
                     ttl=self._ttl,
                 )
             except Exception as exc:
-                # The existing snapshot expires if this source stays unavailable.
-                logger.warning("Unable to publish admin snapshot %s (%s)", name, type(exc).__name__)
+                # A failed update leaves the prior view available until its TTL expires.
+                logger.warning("Unable to refresh resource view %s (%s)", gauge, type(exc).__name__)
 
-    async def _session_rows(self, cutoff: float) -> list[dict]:
-        sessions = await self._sessions.get_all()
+    async def _session_rows(self, ids: list[str], cutoff: float) -> list[dict]:
+        sessions = await self._sessions.get_all(resource_ids=ids)
         return [
             {
                 "session_id": session_id,
@@ -72,8 +102,8 @@ class AdminIndex:
             if record.last_heartbeat >= cutoff
         ]
 
-    async def _training_rows(self, _cutoff: float) -> list[dict]:
-        records = await self._models.get_training_records()
+    async def _training_rows(self, ids: list[str], _cutoff: float) -> list[dict]:
+        records = await self._models.get_training_records(model_ids=ids)
         return [
             {
                 "training_id": record.training_id,
@@ -87,8 +117,8 @@ class AdminIndex:
             if record.state not in TERMINAL_TRAINING
         ]
 
-    async def _sampling_rows(self, cutoff: float) -> list[dict]:
-        sampling = await self._sampling.get_all()
+    async def _sampling_rows(self, ids: list[str], cutoff: float) -> list[dict]:
+        sampling = await self._sampling.get_all(resource_ids=ids)
         owners = list({record.session_id for record in sampling.values() if record.session_id})
         heartbeats = await self._sessions.get_last_heartbeats(owners)
         expired_owners = {owner for owner, heartbeat in heartbeats.items() if heartbeat is None or heartbeat < cutoff}

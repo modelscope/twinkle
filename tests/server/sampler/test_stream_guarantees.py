@@ -35,7 +35,8 @@ class _BlockingQueue:
 async def test_sampler_request_refreshes_replica_liveness():
     service = SamplerManagement.__new__(SamplerManagement)
     service.replica_id = 'sampler-replica'
-    service.model_id = 'sampling-model'
+    service.model_id = '/weights/local-model'
+    service._telemetry_base_model = 'sampling-model'
     service.state = SimpleNamespace(touch_replica_last_seen=AsyncMock())
     service._ensure_state_cleanup_started = AsyncMock()
     request = SimpleNamespace(

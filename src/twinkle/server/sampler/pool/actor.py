@@ -18,9 +18,10 @@ def create_controller_actor():
 
     @ray.remote(num_cpus=0.1, max_restarts=-1, max_task_retries=0)
     class SamplerControllerActor(SamplerController):
-        def __init__(self, values, namespace, pool_id, options, budgets):
+        def __init__(self, values, namespace, pool_id, options, budgets, base_model):
             args = SamplerArgs.model_validate(values)
-            super().__init__(args, SamplerDriver(args, namespace, pool_id, options, budgets), budgets)
+            driver = SamplerDriver(args, namespace, pool_id, options, budgets, base_model=base_model)
+            super().__init__(args, driver, budgets)
 
         async def initialize(self):
             await super().initialize()
@@ -34,7 +35,7 @@ def create_controller_actor():
     return SamplerControllerActor
 
 
-def create_sampler_controller(spec, namespace, budgets, env):
+def create_sampler_controller(spec, namespace, budgets, env, *, base_model):
     """Driver-only composition. Each compute instance owns its external allocation."""
     from .controller import sampler_controller_name, sampling_pool_id
 
@@ -55,7 +56,7 @@ def create_sampler_controller(spec, namespace, budgets, env):
     controller = (
         create_controller_actor()
         .options(name=name, namespace=namespace, lifetime="detached", runtime_env=runtime_env)
-        .remote(spec.args.model_dump(), namespace, pool_id, options, budgets)
+        .remote(spec.args.model_dump(), namespace, pool_id, options, budgets, base_model)
     )
     return controller, options, pool_id
 

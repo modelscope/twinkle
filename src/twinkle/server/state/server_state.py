@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 import functools
 import math
 import re
@@ -11,20 +10,25 @@ from typing import Any
 
 from twinkle.server.config.persistence import PersistenceConfig
 from twinkle.server.exceptions import ResourceNotFoundError, ResourceQuotaExceededError
-from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
-                                                  TENANT_FINGERPRINT)
+from twinkle.server.telemetry.correlation import (
+    BASE_MODEL,
+    MODEL_ID,
+    REPLICA_ID,
+    SAMPLING_SESSION_ID,
+    SESSION_ID,
+    TENANT_FINGERPRINT,
+)
 from twinkle.server.telemetry.identity import current_tenant_fingerprint, tenant_fingerprint, user_id_key
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
-from .admin_index import AdminIndex
 from .backend import StateBackend
 from .backend.factory import create_backend
 from .backend.redis_backend import RedisBackend
 from .cleanup_coordinator import ResourceCleanupCoordinator
-from .count_publisher import ResourceCountPublisher
 from .future_manager import FutureManager
 from .model_manager import ModelManager
 from .models import FutureFailureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
+from .resource_snapshot_publisher import ResourceSnapshotPublisher
 from .sampling_manager import SamplingSessionManager
 from .session_manager import SessionManager
 from .training_store import TrainingSequences, TrainingStore
@@ -115,7 +119,7 @@ class ServerState:
     spelled out in ``build_deployment_app``'s lifespan comment). Cleanup
     orchestration and cleanup-leader election live in
     :class:`ResourceCleanupCoordinator`; resource-count publishing lives in
-    :class:`ResourceCountPublisher`. ``start_cleanup_task`` is idempotent, which is
+    :class:`ResourceSnapshotPublisher`. ``start_cleanup_task`` is idempotent, which is
     what makes per-request invocation safe.
     """
 
@@ -152,18 +156,11 @@ class ServerState:
             'sampling_sessions': self._sampling_mgr,
             'futures': self._future_mgr,
         }
-        self._count_publisher = ResourceCountPublisher(
-            [
-                ('active_sessions', self._session_mgr),
-                ('active_models', self._model_mgr),
-                ('active_sampling_sessions', self._sampling_mgr),
-                ('active_futures', self._future_mgr),
-            ],
-            interval=float(metrics_update_interval),
-            admin_index=AdminIndex(
-                self._backend, self._session_mgr, self._model_mgr, self._sampling_mgr,
-                expiration_timeout=expiration_timeout, interval=metrics_update_interval,
-            ) if isinstance(self._backend, RedisBackend) and user_id_key() else None,
+        self._snapshot_publisher = ResourceSnapshotPublisher(
+            self._backend, self._session_mgr, self._model_mgr, self._sampling_mgr, self._future_mgr,
+            interval=metrics_update_interval,
+            expiration_timeout=expiration_timeout,
+            publish_details=isinstance(self._backend, RedisBackend) and user_id_key() is not None,
         )
         self._cleanup = ResourceCleanupCoordinator(
             self._backend,
@@ -171,13 +168,9 @@ class ServerState:
             cleanup_interval=cleanup_interval,
             expiration_timeout=expiration_timeout,
             sweep_processor_quotas=self.sweep_processor_quotas,
-            on_become_leader=self._count_publisher.start,
-            on_lose_leader=self._on_lose_leader,
+            on_become_leader=self._snapshot_publisher.start,
+            on_lose_leader=self._snapshot_publisher.stop,
         )
-
-    async def _on_lose_leader(self) -> None:
-        await self._count_publisher.stop()
-        self._count_publisher.clear()
 
     async def get_capacity_info(self) -> dict[str, int]:
         return await self._model_mgr.get_capacity_info()

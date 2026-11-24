@@ -193,13 +193,15 @@ class ServerLauncher:
 
         from twinkle.server.sampler.pool.actor import create_sampler_controller
         from twinkle.server.sampler.pool.router import build_sampler_router
-        controller, options, pool_id = create_sampler_controller(app, self.ray_namespace,
-                                                                 self.config.resources.model_dump(),
-                                                                 build_worker_env_vars())
+        base_model = extract_model_alias(app.route_prefix, 'sampler') or app.name
+        controller, options, pool_id = create_sampler_controller(
+            app, self.ray_namespace, self.config.resources.model_dump(), build_worker_env_vars(),
+            base_model=base_model,
+        )
         self._sampler_controllers.append(controller)
         ray.get(controller.initialize.remote())
         serve.run(
-            build_sampler_router(self.ray_namespace, pool_id, options, model_id=app.args.model_id),
+            build_sampler_router(self.ray_namespace, pool_id, options, model_id=base_model),
             name=app.name,
             route_prefix=app.route_prefix,
         )

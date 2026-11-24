@@ -1,7 +1,4 @@
 {
-  "defaults": {
-    "requests_per_second": 20,
-    "input_tokens_per_second": 20000
-  },
-  "overrides": {}
+  "requests_per_second": 20,
+  "input_tokens_per_second": 20000
 }

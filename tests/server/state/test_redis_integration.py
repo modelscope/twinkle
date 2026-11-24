@@ -146,7 +146,7 @@ async def test_cleanup_leader_refreshes_admin_snapshots(shared_backend, monkeypa
         assert 'private' not in json.dumps([sessions, trainings, sampling])
 
         await state.unload_model(active.training_id)
-        await wait_for_snapshot('trainings', lambda value: value and value['rows'][0]['state'] == 'EMPTY')
+        await wait_for_snapshot('trainings', lambda value: value and value['rows'] == [] and value['row_count'] == 0)
 
         set_value = shared_backend.set
 
