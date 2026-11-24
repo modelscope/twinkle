@@ -134,6 +134,10 @@ def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
                 text=sequence.new_state.messages[-1].get('content') if sequence.new_state is not None else None,
                 new_input_feature=(_serialize_input_feature(sequence.new_input_feature)
                                    if sequence.new_input_feature is not None else None),
+                routed_experts=json_safe(sequence.routed_experts),
+                sampling_masks=({'token_ids': json_safe(sequence.sampling_masks.token_ids),
+                                 'offsets': json_safe(sequence.sampling_masks.offsets)}
+                                if sequence.sampling_masks is not None else None),
             ) for sequence in response.sequences
         ]
         sample_models.append(
@@ -300,8 +304,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             if body.sampling_params:
                 params = SamplingParams.from_dict(body.sampling_params)
 
-            # Sample. token_only goes to the backend only when asked: a multi-turn client that
-            # re-uploads its media every turn builds the extended feature itself.
+            # token_only leaves feature assembly to the client for both text and media prompts.
             extra = {'token_only': True} if body.token_only else {}
 
             async def generate(adapter_path):

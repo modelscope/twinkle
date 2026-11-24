@@ -373,6 +373,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
                     stop_reason=seq.stop_reason,
                     tokens=[] if logprobs_only else seq.tokens,
                     logprobs=None if logprobs_only else seq.logprobs,
+                    routed_experts=_convert_ndarray_to_list(seq.routed_experts),
                     sampling_masks=seq.sampling_masks,
                 )
             elif logprobs_only:

@@ -3,20 +3,20 @@
 from __future__ import annotations
 import base64
 import threading
+from dataclasses import replace
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
-from twinkle.data_format.sampling import SampledSequence, SampleResponse
+from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingMask
+from twinkle.template.contract import RolloutState, feature_has_media
 
 
 class HTTPSampler:
     """A served sampler behind the ``sample`` call :class:`MultiTurnRollout` makes.
 
-    The server keeps no episode state. A text prompt is sent as its encoded feature and the server
-    returns the extended one. A prompt with media is sent as the ids the engine runs on plus the
-    media itself, uploaded again on every turn; the server returns the sampled tokens only and the
-    extended feature is built here with the episode's ``template``, the way an in-process sampler
-    builds it.
+    The server keeps no episode state. Text and multimodal prompts send the engine's token IDs,
+    with media uploaded alongside. The client appends the returned tokens using the episode's
+    template and preserves sampling metadata without retokenizing the reply.
 
     ``adapter_path`` is the policy samples come from (None: the server's base weights);
     :class:`ClientCheckpointManager` moves it to each newly saved adapter.
@@ -47,29 +47,49 @@ class HTTPSampler:
         return [self._sample_one(item, sampling_params, adapter_uri) for item in items]
 
     def _sample_one(self, item: Any, sampling_params: Any, adapter_uri: Optional[str]) -> SampleResponse:
-        media = getattr(item, 'media', None)
-        if media:
-            entry = {'input_ids': list(item.engine_input_ids), **_wire_media(media)}
-        else:
-            entry = dict(getattr(item, 'feature', item))
+        state = item if isinstance(item, RolloutState) else None
+        prompt_feature = state.feature if state is not None else item
+        media = state.media if state is not None else None
+        if feature_has_media(prompt_feature) and not media:
+            raise ValueError('Multimodal token-only sampling requires a RolloutState with its original media.')
+        prefix_ids = list(prompt_feature['input_ids'])
+        engine_ids = list(state.engine_input_ids) if state is not None else prefix_ids
+        if not media and engine_ids != prefix_ids:
+            raise ValueError('A text RolloutState must have identical feature.input_ids and engine_input_ids.')
+        entry = {'input_ids': engine_ids, **_wire_media(media)}
         responses = self.sampler.sample(
-            [entry], sampling_params, adapter_name=self.adapter_name, adapter_uri=adapter_uri, token_only=bool(media))
+            [entry], sampling_params, adapter_name=self.adapter_name, adapter_uri=adapter_uri, token_only=True)
         if len(responses) != 1:
             raise RuntimeError(f'the server returned {len(responses)} responses for one prompt.')
         response = responses[0]
+        # Engines may expand visual placeholders, so collapsed media IDs cannot be compared directly.
+        if not media and response.prompt_token_ids != engine_ids:
+            raise RuntimeError('Token-only sampling returned different or missing prompt_token_ids; '
+                               'the training prefix must match the sampled text prompt exactly.')
         sequences = []
         for seq in response.sequences:
             tokens = list(seq.tokens)
-            if media:
-                completion = self.template.append_completion(item, tokens)
-                sequences.append(SampledSequence(
-                    stop_reason=seq.stop_reason, tokens=tokens, logprobs=seq.logprobs,
-                    decoded=self.template.decode(tokens), new_input_feature=dict(completion.state.feature),
-                    new_state=completion.state))
-            else:
-                sequences.append(SampledSequence(
-                    stop_reason=seq.stop_reason, tokens=tokens, logprobs=seq.logprobs, decoded=seq.decoded,
-                    new_input_feature=seq.new_input_feature))
+            if seq.logprobs is not None and len(seq.logprobs) != len(tokens):
+                raise RuntimeError('Token-only sampling must return one logprob entry per sampled token.')
+            completion = self.template.append_completion(item, tokens)
+            feature = dict(completion.state.feature)
+            if list(feature['input_ids']) != prefix_ids + tokens:
+                raise RuntimeError('Appending sampled tokens changed or truncated input_ids; '
+                                   'increase max_length or use a template that preserves the sampled sequence.')
+            # Routing belongs to this generation; a missing export must not reuse the prefix's old routing.
+            feature.pop('routed_experts', None)
+            if seq.routed_experts is not None:
+                feature['routed_experts'] = seq.routed_experts
+            if seq.sampling_masks is not None and len(seq.sampling_masks.offsets) != len(tokens) + 1:
+                raise RuntimeError('Token-only sampling masks must contain one CSR segment per sampled token.')
+            sampling_masks = (SamplingMask(token_ids=list(seq.sampling_masks.token_ids),
+                                           offsets=list(seq.sampling_masks.offsets))
+                              if seq.sampling_masks is not None else None)
+            sequences.append(SampledSequence(
+                stop_reason=seq.stop_reason, tokens=tokens, logprobs=seq.logprobs,
+                decoded=self.template.decode(tokens), new_input_feature=feature,
+                new_state=replace(completion.state, feature=feature),
+                routed_experts=seq.routed_experts, sampling_masks=sampling_masks))
         return SampleResponse(sequences=sequences, prompt_token_ids=response.prompt_token_ids,
                               prompt_logprobs=response.prompt_logprobs,
                               topk_prompt_logprobs=response.topk_prompt_logprobs)
