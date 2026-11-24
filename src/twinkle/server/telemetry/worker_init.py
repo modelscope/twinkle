@@ -1,69 +1,41 @@
-"""Telemetry initialization for Ray worker processes.
-
-Ray Serve deployments run in separate worker processes that do not inherit
-the driver process's OTEL global state. This module provides a function
-to re-initialize telemetry in each worker process using environment variables
-set by the launcher.
-"""
+"""Start telemetry in Ray workers, which do not inherit the driver's providers."""
 from __future__ import annotations
-import os
+from typing import TYPE_CHECKING
 
-import json
-
+from twinkle.server.config.telemetry import TelemetryConfig
 from twinkle.utils import get_logger
+from .provider import init_telemetry, shutdown_telemetry
+
+if TYPE_CHECKING:
+    from .resource_metrics import ResourceMetricsCollector
 
 logger = get_logger()
-
-_worker_initialized = False
+_node_metrics: ResourceMetricsCollector | None = None
 
 
 def ensure_telemetry_initialized() -> None:
-    """Initialize telemetry in the current worker process if not already done.
-
-    Reads configuration from environment variables set by the launcher process.
-    Safe to call multiple times - only initializes once per process.
-    """
-    global _worker_initialized
-    if _worker_initialized:
+    """Start the process pipeline and its node and process gauges once."""
+    global _node_metrics
+    if _node_metrics is not None:
         return
-
-    if os.environ.get('TWINKLE_TELEMETRY_ENABLED') != '1':
-        return
-
     try:
-        from twinkle.server.config.telemetry import TelemetryConfig
-        from twinkle.server.telemetry.provider import init_telemetry
-        from twinkle.server.telemetry.resource_metrics import get_collector
-
-        config = TelemetryConfig(
-            enabled=True,
-            debug=os.environ.get('TWINKLE_TELEMETRY_DEBUG', '0') == '1',
-            service_name=os.environ.get('TWINKLE_TELEMETRY_SERVICE', 'twinkle-server'),
-            otlp_endpoint=os.environ.get('TWINKLE_TELEMETRY_ENDPOINT', 'http://localhost:4317'),
-            export_interval_ms=int(os.environ.get('TWINKLE_TELEMETRY_INTERVAL', '30000')),
-            resource_attributes=json.loads(os.environ.get('TWINKLE_TELEMETRY_RESOURCE_ATTRIBUTES', '{}')),
-        )
+        config = TelemetryConfig.from_env()
         if init_telemetry(config):
-            get_collector().maybe_start()
-            _worker_initialized = True
+            from .resource_metrics import ResourceMetricsCollector
+
+            _node_metrics = ResourceMetricsCollector(config)
+            _node_metrics.maybe_start()
     except Exception as exc:
         logger.warning('Failed to initialize worker telemetry (%s)', type(exc).__name__)
 
 
-def flush_telemetry_safely() -> None:
-    """Flush + shut down telemetry, swallowing any error.
-
-    Called from the launcher driver after ``serve.shutdown()`` and from each
-    worker deployment's FastAPI lifespan shutdown so buffered OTLP batches
-    (traces / metrics / logs) flush on graceful termination. A
-    telemetry-shutdown failure MUST NOT mask the user-facing shutdown path,
-    so every error here is swallowed.
-    """
+def shutdown_telemetry_safely() -> None:
+    """Flush buffered signals, close providers, and release this worker's node metrics lease."""
+    global _node_metrics
     try:
-        from twinkle.server.telemetry.provider import shutdown_telemetry
         shutdown_telemetry()
-        if _worker_initialized:
-            from twinkle.server.telemetry.resource_metrics import get_collector
-            get_collector().close()
-    except Exception as e:  # pragma: no cover - defensive
-        logger.warning('Telemetry shutdown failed (%s)', type(e).__name__)
+        if _node_metrics is not None:
+            _node_metrics.close()
+            _node_metrics = None
+    except Exception as exc:  # pragma: no cover - telemetry must not interrupt worker teardown
+        logger.warning('Telemetry shutdown failed (%s)', type(exc).__name__)

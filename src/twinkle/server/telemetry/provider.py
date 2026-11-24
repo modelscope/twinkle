@@ -106,7 +106,7 @@ _tracer_provider: Any | None = None
 _meter_provider: Any | None = None
 _logger_provider: Any | None = None
 _logging_handler: Any | None = None
-_initialized: bool = False
+_shutdown = False
 
 
 class _LoggingWriter:
@@ -138,7 +138,7 @@ def init_telemetry(config: TelemetryConfig) -> bool:
     Return whether the process has a telemetry pipeline.
     """
     global _tracer_provider, _meter_provider, _logger_provider
-    global _logging_handler, _initialized
+    global _logging_handler
 
     if not config.enabled:
         return False
@@ -150,7 +150,11 @@ def init_telemetry(config: TelemetryConfig) -> bool:
         )
         return False
 
-    if _initialized:
+    if _shutdown:
+        logger.warning("Telemetry has shut down in this process; start a new process to enable it again")
+        return False
+
+    if _logging_handler is not None:
         return True
 
     # ---- Resource -------------------------------------------------------
@@ -233,7 +237,6 @@ def init_telemetry(config: TelemetryConfig) -> bool:
         twinkle_logger.addHandler(handler)
     _logging_handler = handler
 
-    _initialized = True
     logger.info(
         'Telemetry initialized (service=%s, debug=%s, otlp_endpoint=%s)',
         config.service_name,
@@ -244,40 +247,23 @@ def init_telemetry(config: TelemetryConfig) -> bool:
 
 
 def shutdown_telemetry() -> None:
-    """Shutdown all OTEL providers and detach the logging handler."""
+    """Close this process's pipeline. OTel global providers can only be set once."""
     global _tracer_provider, _meter_provider, _logger_provider
-    global _logging_handler, _initialized
+    global _logging_handler, _shutdown
 
-    if _logging_handler is not None:
-        for logger_name in ('', 'twinkle'):
-            try:
-                logging.getLogger(logger_name).removeHandler(_logging_handler)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning('Failed to detach logging handler from %r: %s', logger_name, exc)
-        _logging_handler = None
+    if _logging_handler is None:
+        return
 
-    if _tracer_provider is not None:
+    _shutdown = True
+    for logger_name in ('', 'twinkle'):
+        logging.getLogger(logger_name).removeHandler(_logging_handler)
+    _logging_handler = None
+    for provider in (_tracer_provider, _meter_provider, _logger_provider):
         try:
-            _tracer_provider.shutdown()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning('TracerProvider shutdown failed: %s', exc)
-        _tracer_provider = None
-
-    if _meter_provider is not None:
-        try:
-            _meter_provider.shutdown()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning('MeterProvider shutdown failed: %s', exc)
-        _meter_provider = None
-
-    if _logger_provider is not None:
-        try:
-            _logger_provider.shutdown()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning('LoggerProvider shutdown failed: %s', exc)
-        _logger_provider = None
-
-    _initialized = False
+            provider.shutdown()
+        except Exception as exc:  # pragma: no cover - exporter failures must not interrupt shutdown
+            logger.warning('Telemetry provider shutdown failed (%s)', type(exc).__name__)
+    _tracer_provider = _meter_provider = _logger_provider = None
 
 
 class _NoopInstrument:

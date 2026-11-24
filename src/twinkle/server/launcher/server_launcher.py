@@ -106,7 +106,7 @@ class ServerLauncher:
 
     def _configure_telemetry(self) -> None:
         telemetry = self.config.telemetry
-        os.environ['TWINKLE_TELEMETRY_ENABLED'] = str(int(telemetry.enabled))
+        os.environ.update(telemetry.to_env_vars())
         if not telemetry.enabled:
             return
         from twinkle.server.identity import USER_ID_KEY_ENV, user_id_key
@@ -116,13 +116,6 @@ class ServerLauncher:
         if USER_ID_KEY_ENV not in os.environ:
             logger.warning('Tenant usage and snapshots require %s', USER_ID_KEY_ENV)
         init_telemetry(telemetry)
-        os.environ.update({
-            'TWINKLE_TELEMETRY_DEBUG': str(int(telemetry.debug)),
-            'TWINKLE_TELEMETRY_SERVICE': telemetry.service_name,
-            'TWINKLE_TELEMETRY_ENDPOINT': telemetry.otlp_endpoint,
-            'TWINKLE_TELEMETRY_INTERVAL': str(telemetry.export_interval_ms),
-            'TWINKLE_TELEMETRY_RESOURCE_ATTRIBUTES': json.dumps(telemetry.resource_attributes),
-        })
 
     def _init_ray(self) -> None:
         """Initialize Ray with the resolved namespace (attach-or-local via :func:`ensure_ray_cluster`)."""
@@ -294,13 +287,13 @@ class ServerLauncher:
 
         from ray import serve
 
-        from twinkle.server.telemetry import flush_telemetry_safely
+        from twinkle.server.telemetry import shutdown_telemetry_safely
         actions = [('training controller shutdown', self._stop_training_controller)]
         actions.extend(('sampler controller shutdown', partial(self._stop_sampler_controller, controller))
                        for controller in tuple(self._sampler_controllers))
         if self._serve_started:
             actions.append(('Ray Serve shutdown', serve.shutdown))
-        actions.append(('telemetry flush', flush_telemetry_safely))
+        actions.append(('telemetry shutdown', shutdown_telemetry_safely))
         self._run_cleanup(actions, raise_errors=raise_errors)
         self._serve_started = False
 

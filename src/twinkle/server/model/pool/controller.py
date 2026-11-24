@@ -19,6 +19,7 @@ from twinkle.server.exceptions import (
     ResourceQuotaExceededError,
     TrainingExpiredError,
 )
+from twinkle.server.identity import tenant_fingerprint
 from twinkle.server.resources.allocation import CapacityUnavailableError
 from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.state.models import FutureFailureRecord
@@ -32,7 +33,7 @@ from twinkle.server.state.training_records import (
     TrainingRoute,
 )
 from twinkle.server.state.training_store import TrainingStore
-from twinkle.server.telemetry.admission import record_training_rejection
+from twinkle.server.telemetry.admission import record_admission_rejection
 from twinkle.server.telemetry.metrics import MetricsRegistry, TrainingInstanceMetrics, TrainingInstanceSnapshot
 
 logger = logging.getLogger(__name__)
@@ -370,7 +371,14 @@ class TrainingController:
         self, request_id: str, training_id: str, failure: FutureFailureRecord, token: str, base_model: str
     ) -> None:
         if await self.store.future(request_id, "failed", training_id, failure=failure):
-            record_training_rejection(failure, token=token, base_model=base_model)
+            reason = {"resource_quota_exceeded": "quota", "capacity_unavailable": "capacity"}.get(failure.reason_code)
+            if reason is not None:
+                record_admission_rejection(
+                    reason,
+                    deployment="TrainingController",
+                    fingerprint=tenant_fingerprint(token),
+                    base_model=base_model,
+                )
 
     async def _create_user(self, training: TrainingRecord, request: CreateTraining) -> None:
         instance = self.instances[training.instance_id]

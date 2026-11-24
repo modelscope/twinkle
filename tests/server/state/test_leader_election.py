@@ -19,7 +19,30 @@ from tests.server.state.fake_backend import FakeBackend
 from twinkle.server.state import ServerState
 from twinkle.server.state.backend.memory_backend import RayActorBackend
 from twinkle.server.state.cleanup_coordinator import LEADER_KEY, LEASE_RENEW, ResourceCleanupCoordinator
-from twinkle.server.telemetry import MetricsRegistry
+from twinkle.server.telemetry import metrics
+
+
+@pytest.fixture
+def active_session_counts(monkeypatch, isolated_metrics_registry):
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    monkeypatch.setattr(metrics, 'get_meter', provider.get_meter)
+
+    def read():
+        return [
+            point.value
+            for resource in reader.get_metrics_data().resource_metrics
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+            if metric.name == 'twinkle.sessions.active'
+            for point in metric.data.data_points
+        ]
+
+    yield read
+    provider.shutdown()
 
 
 @pytest.mark.asyncio
@@ -39,10 +62,7 @@ async def test_only_one_of_many_instances_becomes_leader() -> None:
 
 
 @pytest.mark.asyncio
-async def test_leader_publishes_resource_counts() -> None:
-    from twinkle.server.telemetry import MetricsRegistry
-
-    MetricsRegistry._instance = None
+async def test_leader_publishes_resource_counts(active_session_counts) -> None:
     backend = RayActorBackend()
     state = ServerState(
         backend=backend,
@@ -55,11 +75,9 @@ async def test_leader_publishes_resource_counts() -> None:
         await state.create_session({})
         await asyncio.sleep(1.5)
         assert state._is_leader
-        registry = MetricsRegistry.get()
-        assert registry.get_resource_count('active_sessions') == 1
+        assert active_session_counts() == [1]
     finally:
         await state.stop_cleanup_task()
-        MetricsRegistry._instance = None
 
 
 @pytest.mark.asyncio
@@ -234,10 +252,9 @@ async def test_lazy_cleanup_retries_after_failed_start():
 
 
 @pytest.mark.asyncio
-async def test_four_instances_no_4x_gauge_inflation() -> None:
+async def test_four_instances_no_4x_gauge_inflation(active_session_counts) -> None:
     """Four ServerState instances sharing one backend: only the leader publishes
     gauge counts, so the cache reads 5 (not 20)."""
-    MetricsRegistry._instance = None
     backend = RayActorBackend()
     instances = [ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.5) for _ in range(4)]
     try:
@@ -248,18 +265,15 @@ async def test_four_instances_no_4x_gauge_inflation() -> None:
         await asyncio.sleep(1.5)
         leaders = [s for s in instances if s._is_leader]
         assert len(leaders) == 1
-        registry = MetricsRegistry.get()
-        assert registry.get_resource_count('active_sessions') == 5
+        assert active_session_counts() == [5]
     finally:
         for s in instances:
             await s.stop_cleanup_task()
-        MetricsRegistry._instance = None
 
 
 @pytest.mark.asyncio
-async def test_gauge_cache_zeroed_on_leadership_handover() -> None:
+async def test_gauge_cache_zeroed_on_leadership_handover(active_session_counts) -> None:
     """When a leader loses leadership its gauge cache is zeroed."""
-    MetricsRegistry._instance = None
     backend = RayActorBackend()
     a = ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.3)
     b = ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.3)
@@ -271,15 +285,13 @@ async def test_gauge_cache_zeroed_on_leadership_handover() -> None:
         await asyncio.sleep(1.0)
 
         leader = a if a._is_leader else b
-        registry = MetricsRegistry.get()
-        assert registry.get_resource_count('active_sessions') == 3
+        assert active_session_counts() == [3]
 
         # Force handover
         await backend.set(LEADER_KEY, 'someone-else')
         await leader._try_acquire_or_renew()
         assert leader._is_leader is False
-        assert registry.get_resource_count('active_sessions') == 0
+        assert active_session_counts() == [0]
     finally:
         await a.stop_cleanup_task()
         await b.stop_cleanup_task()
-        MetricsRegistry._instance = None

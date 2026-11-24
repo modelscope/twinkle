@@ -21,6 +21,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from twinkle.server.config.telemetry import TelemetryConfig
 from .correlation import telemetry_node
 from .provider import get_meter
 
@@ -56,21 +57,14 @@ def _nvml_handle_count() -> int:
 class ResourceMetricsCollector:
     """Owns the observable-gauge callbacks for CPU/Mem/GPU."""
 
-    def __init__(self) -> None:
+    def __init__(self, config: TelemetryConfig) -> None:
         self._started = False
         self._node = telemetry_node()
         self._node_attrs = {'node': self._node}
         self._process_attrs = {**self._node_attrs, 'pid': os.getpid()}
-        scope = (
-            self._node,
-            os.environ.get('TWINKLE_TELEMETRY_SERVICE', 'twinkle-server'),
-            os.environ.get('TWINKLE_TELEMETRY_ENDPOINT', 'http://localhost:4317'),
-        )
+        scope = (self._node, config.service_name, config.otlp_endpoint)
         self._lock_scope = sha256(repr(scope).encode()).hexdigest()[:16]
         self._node_leases = {}
-        # Track which gauges were registered so callers (and tests) can
-        # introspect what's exported in this process.
-        self.registered_gauges: list[str] = []
 
     def maybe_start(self) -> None:
         """Register the available gauges; idempotent and never raises."""
@@ -90,19 +84,16 @@ class ResourceMetricsCollector:
                     description='System CPU utilization (0..1)',
                     callbacks=[self._cpu_utilization_callback],
                 )
-                self.registered_gauges.append('twinkle.system.cpu.utilization')
                 meter.create_observable_gauge(
                     'twinkle.system.memory.usage_bytes',
                     description='System memory used in bytes',
                     callbacks=[self._memory_usage_callback],
                 )
-                self.registered_gauges.append('twinkle.system.memory.usage_bytes')
                 meter.create_observable_gauge(
                     'twinkle.process.memory.usage_bytes',
                     description='Resident-set memory of this process in bytes',
                     callbacks=[self._process_memory_callback],
                 )
-                self.registered_gauges.append('twinkle.process.memory.usage_bytes')
             except Exception:
                 pass
 
@@ -115,13 +106,11 @@ class ResourceMetricsCollector:
                     description='Per-GPU utilization (0..1)',
                     callbacks=[self._gpu_utilization_callback],
                 )
-                self.registered_gauges.append('twinkle.gpu.utilization')
                 meter.create_observable_gauge(
                     'twinkle.gpu.memory.usage_bytes',
                     description='Per-GPU memory used in bytes',
                     callbacks=[self._gpu_memory_callback],
                 )
-                self.registered_gauges.append('twinkle.gpu.memory.usage_bytes')
             except Exception:
                 pass
 
@@ -212,21 +201,3 @@ class ResourceMetricsCollector:
                     yield Observation(int(pynvml.nvmlDeviceGetMemoryInfo(handle).used), attrs)
                 except Exception:
                     continue
-
-
-_GLOBAL_COLLECTOR: ResourceMetricsCollector | None = None
-
-
-def get_collector() -> ResourceMetricsCollector:
-    global _GLOBAL_COLLECTOR
-    if _GLOBAL_COLLECTOR is None:
-        _GLOBAL_COLLECTOR = ResourceMetricsCollector()
-    return _GLOBAL_COLLECTOR
-
-
-def reset_collector_for_tests() -> None:
-    """Clear the module-global collector. Test-only helper."""
-    global _GLOBAL_COLLECTOR
-    if _GLOBAL_COLLECTOR is not None:
-        _GLOBAL_COLLECTOR.close()
-    _GLOBAL_COLLECTOR = None

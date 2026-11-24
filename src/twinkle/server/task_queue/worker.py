@@ -38,7 +38,6 @@ from twinkle.server.identity import current_tenant_fingerprint
 from twinkle.server.state.backend.base import ConcurrencyError
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.task_queue.backend_gate import BACKEND_TIMEOUT_EXCEPTIONS
-from twinkle.server.telemetry.correlation import BASE_MODEL, TASK_ID, TENANT_FINGERPRINT, TRAINING_ID
 from twinkle.server.telemetry.metrics import METERED_TASK_TYPES
 from twinkle.server.telemetry.tracing import get_trace_id, set_span_error, traced_operation
 from twinkle.utils.logger import get_logger
@@ -475,12 +474,8 @@ class ComputeWorker:
         executed = False
         finished_at = None
         queue_attrs = {
-            TENANT_FINGERPRINT: task.tenant_fingerprint,
-            TRAINING_ID: task.training_id,
-            BASE_MODEL: task.base_model,
-            'twinkle.task_type': task_type,
+            **task.correlation_attrs(),
             'twinkle.deployment': self._deployment_name or 'unknown',
-            TASK_ID: task.request_id,
             'twinkle.wait_seconds': queue_wait,
         }
         with traced_operation('task_queue.execute', attrs=queue_attrs, parent_context=task.trace_context) as span:

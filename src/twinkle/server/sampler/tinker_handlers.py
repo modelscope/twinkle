@@ -73,10 +73,10 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
         if not model_path and body.sampling_session_id:
             session = await self.state.get_sampling_session(body.sampling_session_id)
             model_path = session.get('model_path') if session else None
-        checkpoint_training_id = None
+        training_id = None
         if model_path:
             checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
-            checkpoint_training_id = await asyncio.to_thread(checkpoint_manager.sampling_training_id, model_path)
+            training_id = await asyncio.to_thread(checkpoint_manager.sampling_training_id, model_path)
 
         async def _do_sample():
             prompt_inputs = {'input_ids': body.prompt.to_ints()}
@@ -155,7 +155,7 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
             input_tokens=input_tokens,
             task_type='sample',
             execution_scope=request_execution_scope(request),
-            checkpoint_training_id=checkpoint_training_id,
+            training_id=training_id,
             request_id=submission.request_id if submission else None,
             submission_fingerprint=submission.fingerprint if submission else None,
         )

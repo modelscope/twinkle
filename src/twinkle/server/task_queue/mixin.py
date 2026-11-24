@@ -247,7 +247,8 @@ class TaskQueueMixin:
             tenant_fingerprint=current_tenant_fingerprint.get(),
             base_model=self._telemetry_base_model,
             trace_context=get_trace_context(),
-            created_at=time.monotonic())
+            created_at=time.monotonic(),
+            training_id=model_id)
         await self._prepare_queued_task(task)
 
         if self._event_loop is None:
@@ -367,7 +368,7 @@ class TaskQueueMixin:
         request_id: str | None = None,
         execution_scope: ExecutionScope | None = None,
         submission_fingerprint: str | None = None,
-        checkpoint_training_id: str | None = None,
+        training_id: str | None = None,
     ) -> dict[str, Any]:
         """Schedule a compute task that runs now instead of in serial order.
 
@@ -396,7 +397,7 @@ class TaskQueueMixin:
             trace_context=get_trace_context(),
             created_at=time.monotonic(),
             execution_scope=execution_scope,
-            checkpoint_training_id=checkpoint_training_id)
+            training_id=training_id or model_id)
         started = await self._compute_worker.submit_detached(
             task,
             replica_id=getattr(self, 'replica_id', None),

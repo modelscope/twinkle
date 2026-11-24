@@ -35,7 +35,7 @@ datasources:
           - key: service.name
             value: service_name
         customQuery: true
-        query: '{$${__tags}} |= "Task $${__span.tags["twinkle.task_id"]} "'
+        query: '{$${__tags}} | twinkle_task_id = "$${__span.tags["twinkle.task_id"]}"'
       tracesToMetrics:
         datasourceUid: twinkle-mimir
         spanStartTimeShift: '-2m'

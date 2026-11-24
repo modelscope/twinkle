@@ -41,7 +41,7 @@ ingestion and retention settings.
    The entrypoint supervises Runtime independently of the monitoring stack.
    Confirm all three signals arrive.
 
-To show **Serve ingress wait p95**, enable the optional Ray metrics scrape.
+To show **Serve ingress wait p95** and **Serve ingress waits over 1 s**, enable the optional Ray metrics scrape.
 Set `OBS_RAY_METRICS_TARGET` to the private `host:port` of the Ray metrics
 endpoint on the HTTP proxy node, then start the stack with both Compose files:
 
@@ -59,7 +59,7 @@ for Redis ACLs, credential handling, dashboard queries, and deployment checks.
 
 ## Start LGTM for development
 
-For local development, build the standalone Twinkle LGTM image on top of the
+For local development and signal smoke tests, build the standalone Twinkle LGTM image on top of the
 [`grafana/otel-lgtm`](https://github.com/grafana/docker-otel-lgtm) image.
 It bundles OTel Collector, Prometheus, Tempo, Loki, Grafana, and the Twinkle
 Server Overview dashboard.

@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 import json
+from starlette.datastructures import Headers
 
 if TYPE_CHECKING:
     from twinkle.server.lifecycle.proxy import ForwardedReply, ForwardedRequest
@@ -23,6 +24,7 @@ from twinkle.server.exceptions import RequestRejectedError, ResourceExhaustedErr
 from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.sampler.concurrency import SamplerConcurrency
 from twinkle.server.sampler.submission import SampleSubmission
+from twinkle.server.telemetry.tracing import extract_context, traced_operation
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -283,7 +285,10 @@ class SamplerController:
                     return
                 if full_path is not None and full_path != self._base_path:
                     await self._mutate(full_path=full_path)
-                instance, ticket = await self._select()
+                # This background operation survives cancellation of the forwarding RPC.
+                parent = extract_context(Headers(raw=payload["headers"]))
+                with traced_operation("sampler.wait_for_replica", parent_context=parent):
+                    instance, ticket = await self._select()
                 response = await self.driver.invoke(instance, ticket, payload, stream_queue)
                 if not reply_ready.done():
                     reply_ready.set_result(response)

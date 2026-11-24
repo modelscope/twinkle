@@ -16,6 +16,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from twinkle.server.config.telemetry import TelemetryConfig
 from twinkle.server.telemetry import correlation
 from twinkle.server.telemetry.correlation import set_correlation_attrs
 from twinkle.server.telemetry.tracing import _NoopSpan, traced_operation
@@ -125,61 +126,76 @@ def test_exception_recorded_and_reraised(in_memory_span_exporter) -> None:
 # ---------- ResourceMetricsCollector wiring ------------------------------ #
 
 
-def test_resource_metrics_collector_does_not_raise_without_pynvml() -> None:
-    """Collector starts cleanly even when pynvml/GPU is absent."""
+@pytest.fixture
+def resource_meter(monkeypatch):
+    from twinkle.server.telemetry import resource_metrics
+
+    meter = mock.Mock()
+    monkeypatch.setattr(resource_metrics, 'get_meter', lambda _: meter)
+    return meter
+
+
+def test_resource_metrics_collector_does_not_raise_without_pynvml(resource_meter) -> None:
     from twinkle.server.telemetry import resource_metrics
 
     with mock.patch.object(resource_metrics, '_PYNVML_AVAILABLE', False):
-        collector = resource_metrics.ResourceMetricsCollector()
-        collector.maybe_start()  # must not raise
-        # No GPU gauges registered when pynvml is absent.
-        assert all(not g.startswith('twinkle.gpu.') for g in collector.registered_gauges)
+        collector = resource_metrics.ResourceMetricsCollector(TelemetryConfig())
+        collector.maybe_start()
+        names = [call.args[0] for call in resource_meter.create_observable_gauge.call_args_list]
+        assert all(not name.startswith('twinkle.gpu.') for name in names)
 
 
-def test_resource_metrics_collector_registers_named_gauges_when_psutil_present() -> None:
+def test_resource_metrics_collector_registers_named_gauges_when_psutil_present(resource_meter) -> None:
     from twinkle.server.telemetry import resource_metrics
 
     if not resource_metrics._PSUTIL_AVAILABLE:
         pytest.skip('psutil not installed in test env')
-    collector = resource_metrics.ResourceMetricsCollector()
+    collector = resource_metrics.ResourceMetricsCollector(TelemetryConfig())
     collector.maybe_start()
-    # System CPU + system memory + process memory always present when psutil is.
     expected = {
         'twinkle.system.cpu.utilization',
         'twinkle.system.memory.usage_bytes',
         'twinkle.process.memory.usage_bytes',
     }
-    assert expected.issubset(set(collector.registered_gauges))
+    assert expected <= {c.args[0] for c in resource_meter.create_observable_gauge.call_args_list}
 
 
-def test_resource_metrics_collector_idempotent() -> None:
+def test_resource_metrics_collector_idempotent(resource_meter) -> None:
     from twinkle.server.telemetry import resource_metrics
 
-    collector = resource_metrics.ResourceMetricsCollector()
+    collector = resource_metrics.ResourceMetricsCollector(TelemetryConfig())
     collector.maybe_start()
-    pre = list(collector.registered_gauges)
+    resource_meter.reset_mock()
     collector.maybe_start()
-    assert collector.registered_gauges == pre
+    resource_meter.create_observable_gauge.assert_not_called()
 
 
 def test_worker_init_registers_resources_only_with_telemetry(monkeypatch) -> None:
-    from twinkle.server.telemetry import provider, resource_metrics, worker_init
+    from twinkle.server.telemetry import resource_metrics, worker_init
 
-    monkeypatch.setattr(worker_init, '_worker_initialized', False)
+    monkeypatch.setattr(worker_init, '_node_metrics', None)
     monkeypatch.delenv('TWINKLE_TELEMETRY_ENABLED', raising=False)
-    with (mock.patch.object(resource_metrics, 'get_collector') as get_collector,
-          mock.patch.object(provider, 'init_telemetry', side_effect=(False, True)) as init):
+    with (mock.patch.object(resource_metrics, 'ResourceMetricsCollector') as collector,
+          mock.patch.object(worker_init, 'init_telemetry', side_effect=(False, False, True)) as init,
+          mock.patch.object(worker_init, 'shutdown_telemetry') as shutdown):
         worker_init.ensure_telemetry_initialized()
-        get_collector.assert_not_called()
+        collector.assert_not_called()
 
-        monkeypatch.setenv('TWINKLE_TELEMETRY_ENABLED', '1')
-        monkeypatch.setenv('TWINKLE_TELEMETRY_RESOURCE_ATTRIBUTES', '{"deployment.environment.name":"test"}')
+        config = TelemetryConfig(enabled=True, debug=True, service_name='test-worker',
+                                 otlp_endpoint='http://collector:4317', export_interval_ms=250,
+                                 resource_attributes={'deployment.environment.name': 'test'})
+        for key, value in config.to_env_vars().items():
+            monkeypatch.setenv(key, value)
         worker_init.ensure_telemetry_initialized()
-        get_collector.assert_not_called()
+        collector.assert_not_called()
         worker_init.ensure_telemetry_initialized()
         worker_init.ensure_telemetry_initialized()
-        get_collector.return_value.maybe_start.assert_called_once()
-        assert init.call_args.args[0].resource_attributes == {'deployment.environment.name': 'test'}
+        collector.assert_called_once_with(config)
+        collector.return_value.maybe_start.assert_called_once()
+        assert init.call_args.args[0] == config
+        worker_init.shutdown_telemetry_safely()
+        shutdown.assert_called_once()
+        collector.return_value.close.assert_called_once()
 
 
 def test_pipeline_exports_once_and_keeps_early_gauge_callbacks(monkeypatch) -> None:
@@ -191,7 +207,6 @@ def test_pipeline_exports_once_and_keeps_early_gauge_callbacks(monkeypatch) -> N
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
     from opentelemetry.util._once import Once
 
-    from twinkle.server.config.telemetry import TelemetryConfig
     from twinkle.server.telemetry import provider
     from twinkle.server.telemetry.metrics import MetricsRegistry
 
@@ -199,6 +214,7 @@ def test_pipeline_exports_once_and_keeps_early_gauge_callbacks(monkeypatch) -> N
         monkeypatch.setattr(module, f'_{name}_PROVIDER_SET_ONCE', Once())
         monkeypatch.setattr(module, f'_{name}_PROVIDER', None)
     monkeypatch.setattr(metrics._internal, '_PROXY_METER_PROVIDER', metrics._internal._ProxyMeterProvider())
+    monkeypatch.setattr(provider, '_shutdown', False)
     monkeypatch.setattr(MetricsRegistry, '_instance', None)
     early = MetricsRegistry.get()
 
@@ -245,12 +261,13 @@ def test_pipeline_exports_once_and_keeps_early_gauge_callbacks(monkeypatch) -> N
     finally:
         provider.shutdown_telemetry()
     assert all(handler not in logging.getLogger(name).handlers for name in ('', 'twinkle'))
+    assert not provider.init_telemetry(config)
+    assert provider._logging_handler is None
 
 
 def test_telemetry_export_interval_must_be_positive() -> None:
     from pydantic import ValidationError
 
-    from twinkle.server.config.telemetry import TelemetryConfig
 
     with pytest.raises(ValidationError, match='export_interval_ms'):
         TelemetryConfig(export_interval_ms=0)

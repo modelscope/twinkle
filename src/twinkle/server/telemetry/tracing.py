@@ -24,6 +24,11 @@ def inject_context(carrier: dict) -> None:
     inject(carrier)
 
 
+def extract_context(headers: Mapping[str, str]):
+    """Read propagated context at a process boundary."""
+    return extract(headers) if _OTEL_AVAILABLE else None
+
+
 def get_trace_context():
     return context.get_current() if _OTEL_AVAILABLE else None
 

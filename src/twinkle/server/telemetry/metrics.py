@@ -182,10 +182,6 @@ class MetricsRegistry:
         for name in self._resource_cache:
             self._resource_cache[name] = 0
 
-    def get_resource_count(self, name: str) -> int:
-        """Return the most recently pushed value for ``name`` (0 if never set)."""
-        return self._resource_cache.get(name, 0)
-
     @classmethod
     def get(cls) -> MetricsRegistry:
         """Retrieve global MetricsRegistry singleton. Created on first call."""

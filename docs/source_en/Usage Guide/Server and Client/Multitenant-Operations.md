@@ -68,10 +68,12 @@ empty row list and a count of zero. Requests without a token appear as
   **Training ID** narrows the training and diagnostic panels. **Resource
   node** narrows the node metrics. Queue depth is global across tenants
   and models. **Serve ingress wait p95** measures waiting for an HTTP
-  replica (optional Ray scrape). **Compute queue wait p95** starts at
-  task admission. For a cold sampler, compare the start of
-  `sampler.forward` with `task_queue.execute`. If the connection drops,
-  the forwarding span can end while the sampler is still warming up.
+  replica (optional Ray scrape). **Serve ingress waits over 1 s** shows the
+  estimated tail count in each five-minute window. **Compute queue wait p95**
+  starts at task admission. Open the task trace and select
+  `sampler.wait_for_replica` to see how long the sampling pool took to select
+  a replica, including a cold start. This span keeps measuring after the
+  original client connection closes.
 - Usage includes admitted training compute and ordinary sampling requests.
   Retries that replay an accepted request contribute once. For a manual retry
   of Twinkle `sample` or `asample` after a timeout, reuse the original
@@ -98,6 +100,30 @@ empty row list and a count of zero. Requests without a token appear as
   Tempo local-blocks processor. **Drilldown → Logs** shows service and label
   activity. Use **Last Runtime metric received** to check exporter freshness
   and confirm trace and log ingestion separately.
+
+## Maintainer guide
+
+| Field | Origin and use |
+| --- | --- |
+| `base_model` | Public model name from deployment configuration. Use it to filter usage and training. |
+| `training_id` | Training handle. Training requests supply it at enqueue. Normal rollout sampling gets it from a published checkpoint owned by the caller. |
+| `task_id` | ID of the accepted task, returned as `request_id` in the future receipt. Use it to join span and log details. |
+| `tenant_fingerprint` | An opaque fingerprint of the caller's token. With a telemetry key configured, requests without a token use `unassigned`. |
+
+For a missing signal, check **Last Runtime metric received**, then check the
+Runtime endpoint and Collector logs. Follow the signal to Mimir for metrics,
+Loki for logs, or Tempo for traces, before checking the Grafana filters. Redis
+serves the current resource tables. Historical logs and traces can be queried
+during a Redis outage.
+
+For a code change, start at `server/telemetry/worker_init.py` for per-process
+startup, `server/task_queue/types.py` for the task's correlation fields, and
+`server/task_queue/worker.py` for admission metrics and execution spans.
+HTTP metrics count each hop. A business rejection is counted at the HTTP error
+boundary or the first failed training receipt. Task outcomes are recorded
+after admission. `ResourceMetricsCollector` observes node CPU/GPU and process
+memory. `ResourceSnapshotPublisher` publishes current business state from the
+cleanup leader.
 
 ## Verify the deployment
 

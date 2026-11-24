@@ -102,28 +102,55 @@ async def settle_jobs(pool):
 
 
 @pytest.mark.asyncio
-async def test_cold_sample_retry_joins_disconnected_submission():
+async def test_cold_sample_retry_joins_disconnected_submission(monkeypatch):
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from twinkle.server.telemetry import tracing
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(tracing.trace, 'get_tracer', provider.get_tracer)
+
+    def forwarded_request():
+        payload = request()
+        carrier = {}
+        tracing.inject_context(carrier)
+        payload['headers'].extend((key.encode(), value.encode()) for key, value in carrier.items())
+        return payload
+
     pool, driver, _ = setup(minimum=0, maximum=1)
     driver.start_gate.clear()
     submission = SampleSubmission('req_same', 'original')
-    original = asyncio.create_task(pool.request(request(), submission=submission))
     try:
-        while not driver.started:
-            await asyncio.sleep(0)
-        original.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await original
+        with tracing.traced_operation('sampler.forward') as forwarding:
+            original = asyncio.create_task(pool.request(forwarded_request(), submission=submission))
+            while not driver.started:
+                await asyncio.sleep(0)
+            original.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await original
         with pytest.raises(RequestRejectedError, match='different submission'):
             await pool.request(request(), submission=SampleSubmission('req_same', 'changed'))
-        retry = asyncio.create_task(pool.request(request(), submission=submission))
-        await asyncio.sleep(0)
-        driver.start_gate.set()
-        assert (await retry)['status'] == 200
+        with tracing.traced_operation('sampler.forward.retry'):
+            retry = asyncio.create_task(pool.request(forwarded_request(), submission=submission))
+            await asyncio.sleep(0)
+            driver.start_gate.set()
+            assert (await retry)['status'] == 200
         assert len(driver.calls) == len(driver.started) == 1
+        wait, = [span for span in exporter.get_finished_spans() if span.name == 'sampler.wait_for_replica']
+        assert wait.parent.trace_id == forwarding.get_span_context().trace_id
+        assert wait.parent.span_id == forwarding.get_span_context().span_id
+        assert wait.parent.is_remote
+        original_span, = [span for span in exporter.get_finished_spans() if span.name == 'sampler.forward']
+        assert wait.start_time < original_span.end_time < wait.end_time
     finally:
         driver.start_gate.set()
         driver.finish.set()
         await pool.shutdown()
+        provider.shutdown()
 
 
 @pytest.mark.asyncio

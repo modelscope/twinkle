@@ -243,10 +243,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         if submission and await existing_sample(self.state, submission, token) is not None:
             return await self._peek_terminal(submission.request_id, fallback_status='pending')
 
-        checkpoint_training_id = None
+        training_id = None
         if body.adapter_uri:
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
-            checkpoint_training_id = await asyncio.to_thread(checkpoint_manager.sampling_training_id, body.adapter_uri)
+            training_id = await asyncio.to_thread(checkpoint_manager.sampling_training_id, body.adapter_uri)
 
         async def _task():
             # Resolve adapter
@@ -295,7 +295,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             input_tokens=input_tokens,
             task_type='sample',
             execution_scope=request_execution_scope(request),
-            checkpoint_training_id=checkpoint_training_id,
+            training_id=training_id,
             request_id=submission.request_id if submission else None,
             submission_fingerprint=submission.fingerprint if submission else None)
 

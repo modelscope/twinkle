@@ -21,6 +21,7 @@ from twinkle.server.middleware.auth import get_token_from_request, verify_reques
 from twinkle.server.processor.twinkle_handlers import _register_processor_routes
 from twinkle.server.state.server_state import ServerState
 from twinkle.server.task_queue.mixin import TaskQueueMixin
+from twinkle.server.config.telemetry import TelemetryConfig
 from twinkle.server.telemetry import metrics, resource_metrics
 from twinkle.server.telemetry.http_middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
@@ -267,7 +268,7 @@ def test_same_card_index_on_two_nodes_has_distinct_observations(monkeypatch):
     ), raising=False)
     for node in ('node-a', 'node-b'):
         monkeypatch.setenv('NODE_NAME', node)
-        collector = resource_metrics.ResourceMetricsCollector()
+        collector = resource_metrics.ResourceMetricsCollector(TelemetryConfig())
         gpu, = collector._gpu_memory_callback(None)
         assert gpu.attributes == {'node': node, 'gpu_index': 0, 'gpu_uuid': 'GPU-test'}
         if resource_metrics._PSUTIL_AVAILABLE:
@@ -275,7 +276,7 @@ def test_same_card_index_on_two_nodes_has_distinct_observations(monkeypatch):
             assert cpu.attributes == {'node': node}
             rss, = collector._process_memory_callback(None)
             assert rss.attributes == {'node': node, 'pid': os.getpid()}
-        competitor = resource_metrics.ResourceMetricsCollector()
+        competitor = resource_metrics.ResourceMetricsCollector(TelemetryConfig())
         assert list(competitor._gpu_memory_callback(None)) == []
         collector.close()
         assert list(competitor._gpu_memory_callback(None)) == [gpu]

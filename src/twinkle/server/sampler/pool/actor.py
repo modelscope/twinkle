@@ -5,6 +5,7 @@ import asyncio
 from copy import deepcopy
 
 from twinkle.server.config.application_spec import SamplerArgs
+from twinkle.server.telemetry.worker_init import ensure_telemetry_initialized, shutdown_telemetry_safely
 from twinkle.utils.logger import get_logger
 from .controller import SamplerController
 
@@ -19,6 +20,7 @@ def create_controller_actor():
     @ray.remote(num_cpus=0.1, max_restarts=-1, max_task_retries=0)
     class SamplerControllerActor(SamplerController):
         def __init__(self, values, namespace, pool_id, options, budgets, base_model):
+            ensure_telemetry_initialized()
             args = SamplerArgs.model_validate(values)
             driver = SamplerDriver(args, namespace, pool_id, options, budgets, base_model=base_model)
             super().__init__(args, driver, budgets)
@@ -29,8 +31,11 @@ def create_controller_actor():
                 self._monitor_task = asyncio.create_task(self._monitor())
 
         async def shutdown(self):
-            await super().shutdown()
-            await self.driver.runtime.wait_for_cleanup()
+            try:
+                await super().shutdown()
+                await self.driver.runtime.wait_for_cleanup()
+            finally:
+                await asyncio.to_thread(shutdown_telemetry_safely)
 
     return SamplerControllerActor
 

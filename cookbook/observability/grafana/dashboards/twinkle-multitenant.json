@@ -426,99 +426,56 @@
     },
     {
       "id": 3,
-      "type": "bargauge",
-      "title": "Request rate / reference",
-      "description": "Five-minute rate per tenant across replicas for the selected base model.",
+      "type": "timeseries",
+      "title": "Accepted requests / second",
+      "description": "Five-minute rate per tenant across replicas. The line marks the deployment reference.",
+      "referenceLimit": "requests_per_second",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 0, "y": 43, "w": 12, "h": 8},
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {"color": "green", "value": null},
-              {"color": "orange", "value": 0.8},
-              {"color": "red", "value": 1}
-            ]
-          },
-          "min": 0
+          "unit": "reqps",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+          "custom": {"thresholdsStyle": {"mode": "line"}}
         },
         "overrides": []
       },
-      "options": {
-        "displayMode": "gradient",
-        "orientation": "horizontal",
-        "reduceOptions": {"calcs": ["lastNotNull"], "values": false}
-      },
+      "options": {},
       "transformations": [{"id": "renameByRegex", "options": {"regex": "^([0-9a-f]{12})[0-9a-f]{52}$", "renamePattern": "$1"}}],
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (tenant_fingerprint) (rate(twinkle_usage_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))",
-          "legendFormat": "{{tenant_fingerprint}}",
-          "instant": true,
-          "range": false,
-          "referenceLimit": "requests_per_second"
-        }
-      ]
+      "targets": [{"refId": "A", "expr": "sum by (tenant_fingerprint) (rate(twinkle_usage_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))", "legendFormat": "{{tenant_fingerprint}}"}]
     },
     {
       "id": 4,
-      "type": "bargauge",
-      "title": "Input token rate / reference",
-      "description": "Five-minute rate per tenant across replicas for the selected base model.",
+      "type": "timeseries",
+      "title": "Input tokens / second",
+      "description": "Five-minute rate per tenant across replicas. The line marks the deployment reference.",
+      "referenceLimit": "input_tokens_per_second",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 12, "y": 43, "w": 12, "h": 8},
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {"color": "green", "value": null},
-              {"color": "orange", "value": 0.8},
-              {"color": "red", "value": 1}
-            ]
-          },
-          "min": 0
+          "unit": "suffix:tok/s",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+          "custom": {"thresholdsStyle": {"mode": "line"}}
         },
         "overrides": []
       },
-      "options": {
-        "displayMode": "gradient",
-        "orientation": "horizontal",
-        "reduceOptions": {"calcs": ["lastNotNull"], "values": false}
-      },
-      "transformations": [{"id": "renameByRegex", "options": {"regex": "^([0-9a-f]{12})[0-9a-f]{52}$", "renamePattern": "$1"}}],
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (tenant_fingerprint) (rate(twinkle_usage_input_tokens_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))",
-          "legendFormat": "{{tenant_fingerprint}}",
-          "instant": true,
-          "range": false,
-          "referenceLimit": "input_tokens_per_second"
-        }
-      ]
-    },
-    {
-      "id": 1,
-      "type": "timeseries",
-      "title": "Accepted requests / second",
-      "description": "",
-      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
-      "gridPos": {"x": 0, "y": 50, "w": 12, "h": 8},
-      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
       "options": {},
       "transformations": [{"id": "renameByRegex", "options": {"regex": "^([0-9a-f]{12})[0-9a-f]{52}$", "renamePattern": "$1"}}],
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (tenant_fingerprint) (rate(twinkle_usage_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))",
-          "legendFormat": "{{tenant_fingerprint}}"
-        }
-      ]
+      "targets": [{"refId": "A", "expr": "sum by (tenant_fingerprint) (rate(twinkle_usage_input_tokens_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))", "legendFormat": "{{tenant_fingerprint}}"}]
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Serve ingress waits over 1 s",
+      "description": "Estimated number of requests waiting over one second for a replica in each five-minute window. Global across tenants. Uses the optional Ray metrics scrape.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 51, "w": 12, "h": 7},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {},
+      "targets": [{"refId": "A", "expr": "clamp_min(sum by (application, deployment) (increase(ray_serve_request_router_fulfillment_time_ms_count{handle_source=\"PROXY\"}[5m])) - sum by (application, deployment) (increase(ray_serve_request_router_fulfillment_time_ms_bucket{handle_source=\"PROXY\",le=\"1000\"}[5m])), 0)", "legendFormat": "{{application}} / {{deployment}}"}]
     },
     {
       "id": 27,
@@ -526,7 +483,7 @@
       "title": "Business admission rejections / second",
       "description": "Rate limits, resource quota and unavailable capacity at the admission decision. Includes rejected training futures even when HTTP returned 200. Forwarded replies and repeated future polls do not add a rejection.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
-      "gridPos": {"x": 12, "y": 50, "w": 12, "h": 8},
+      "gridPos": {"x": 12, "y": 51, "w": 12, "h": 7},
       "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
       "options": {},
       "targets": [
@@ -575,7 +532,7 @@
       "id": 35,
       "type": "timeseries",
       "title": "Serve ingress wait p95",
-      "description": "Time for the Ray Serve HTTP proxy to assign a request to a replica, by application and deployment across all tenants. Requires the optional Ray metrics scrape. This histogram ends at replica assignment. For a sampler request, compare forwarding and task execution timestamps on the trace.",
+      "description": "Time for the Ray Serve HTTP proxy to assign a request to a replica, by application and deployment across all tenants. Requires the optional Ray metrics scrape. This histogram ends at replica assignment. For a sampler request, open sampler.wait_for_replica in the trace to inspect cold-start waiting.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 0, "y": 66, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},

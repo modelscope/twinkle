@@ -10,10 +10,10 @@ TEMPLATE = Path(__file__).resolve().parents[1] / 'grafana/dashboards/twinkle-mul
 LIMITS = ('requests_per_second', 'input_tokens_per_second')
 
 
-def reference(value: float) -> str:
+def reference(value: float) -> float:
     if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
         raise ValueError('Usage reference limits must be positive finite numbers')
-    return str(value)
+    return value
 
 
 def render(config: dict, key_prefix: str) -> dict:
@@ -22,12 +22,12 @@ def render(config: dict, key_prefix: str) -> dict:
         raise ValueError(f'Expected reference limits for {", ".join(LIMITS)}')
     limits = {name: reference(value) for name, value in config.items()}
     for panel in dashboard['panels']:
+        limit = panel.pop('referenceLimit', None)
+        if limit is not None:
+            panel['fieldConfig']['defaults']['thresholds']['steps'][-1]['value'] = limits[limit]
         for target in panel.get('targets', ()):
             if 'keyName' in target:
                 target['keyName'] = key_prefix + target['keyName']
-            limit = target.pop('referenceLimit', None)
-            if limit is not None:
-                target['expr'] = f"({target['expr']}) / {limits[limit]}"
     return dashboard
 
 
