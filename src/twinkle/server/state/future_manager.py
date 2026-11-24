@@ -166,7 +166,7 @@ class FutureManager(BaseManager[FutureRecord]):
         replica_id: str | None = None,
         absolute_deadline: float | None = None,
         owner_token: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Create or update a future record with the latest status.
 
         Uses :meth:`StateBackend.update_atomic` so that a slow retry writing
@@ -188,7 +188,7 @@ class FutureManager(BaseManager[FutureRecord]):
         failure_data = failure.model_dump() if failure is not None else None
 
         now = _now_iso()
-        await self._backend.update_atomic(
+        return await self._backend.update_atomic(
             self._make_key(request_id),
             functools.partial(
                 FutureTransitions.update,
@@ -205,6 +205,7 @@ class FutureManager(BaseManager[FutureRecord]):
                 owner_token=owner_token,
                 now=now,
             ),
+            return_changed=True,
         )
 
     async def try_start(self, request_id: str) -> bool:

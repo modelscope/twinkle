@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from .app import SamplerManagement
 
 from twinkle.data_format import SamplingParams
+from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.sampler.submission import existing_sample, sample_submission
@@ -62,7 +63,9 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
             UntypedAPIFuture wrapping SampleResponse with generated sequences
         """
         token = await self._on_request_start(request)
-        submission = sample_submission(request, 'tinker/asample', self._telemetry_base_model, await request.json())
+        submission = None
+        if H_SAMPLE_IDEMPOTENCY_KEY in request.headers or (body.sampling_session_id and body.seq_id is not None):
+            submission = sample_submission(request, 'tinker/asample', self._telemetry_base_model, await request.json())
         if submission and await existing_sample(self.state, submission, token) is not None:
             return {'request_id': submission.request_id, 'model_id': None}
 

@@ -27,9 +27,9 @@ def sample_submission(request, endpoint, base_model, body) -> SampleSubmission |
     if not key or len(key) > 256:
         raise RequestRejectedError('Invalid sample idempotency key')
     token = get_token_from_request(request)
-    scope = ['token', token] if token else ['session', get_session_id_from_request(request)]
-    identity = json.dumps([scope, base_model, endpoint, key]).encode()
-    request_id = 'req_' + hashlib.sha256(identity).hexdigest()
+    identity = json.dumps([base_model, endpoint, key]).encode()
+    owner = f'token:{token}' if token else f'session:{get_session_id_from_request(request)}'
+    request_id = 'req_' + hmac.digest(owner.encode(), identity, 'sha256').hex()
     canonical = json.dumps(body, sort_keys=True, separators=(',', ':')).encode()
     return SampleSubmission(request_id, hashlib.sha256(canonical).hexdigest())
 

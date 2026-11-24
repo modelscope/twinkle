@@ -95,8 +95,8 @@ class TrainingStore:
         failure: FutureFailureRecord | None = None,
         deadline: float | None = None,
         owner_token: str | None = None,
-    ) -> None:
-        await self.futures.store_status(
+    ) -> bool:
+        return await self.futures.store_status(
             request_id,
             status,
             model_id,

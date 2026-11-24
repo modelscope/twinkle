@@ -23,7 +23,7 @@ import numpy as np
 
 import twinkle.protocol.types as types
 from twinkle.data_format import PoolingParams, SamplingParams
-from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_SUPPORTED
+from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTENCY_SUPPORTED
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
@@ -237,7 +237,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         Supports Trajectory or InputFeature inputs, with optional LoRA adapter.
         """
         token = await self._on_request_start(request)
-        submission = sample_submission(request, 'twinkle/sample', self._telemetry_base_model, await request.json())
+        submission = None
+        if H_SAMPLE_IDEMPOTENCY_KEY in request.headers:
+            submission = sample_submission(request, 'twinkle/sample', self._telemetry_base_model, await request.json())
         if submission and await existing_sample(self.state, submission, token) is not None:
             return await self._peek_terminal(submission.request_id, fallback_status='pending')
 
