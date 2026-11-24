@@ -72,8 +72,10 @@ empty row list and a count of zero. Requests without a token appear as
   task admission. For a cold sampler, inspect the `sampler.forward` span
   for the post-assignment wait.
 - Usage includes admitted training compute and ordinary sampling requests.
-  Retries that replay an accepted request contribute once. Input token counts
-  use token IDs known at admission. Execution seconds sum task duration
+  Retries that replay an accepted request contribute once. For a manual retry
+  of Twinkle `sample` or `asample` after a timeout, reuse the original
+  `idempotency_key` and input while the receipt is retained. Input token
+  counts use token IDs known at admission. Execution seconds sum task duration
   across replicas. The time-range totals use Prometheus `increase()`
   estimates. Each time series needs two samples in the selected range.
   Activity already included in the first sample of a new series can be missed,

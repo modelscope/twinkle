@@ -432,6 +432,7 @@ def test_sample_submission_retries_a_timeout_only_when_server_can_replay(monkeyp
     from types import SimpleNamespace
 
     from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTENCY_SUPPORTED
+    from twinkle_client.exceptions import TwinkleClientValidationError
     from twinkle_client.http import ClientContext, ClientTransport
     from twinkle_client.sampler import vllm_sampler as module
 
@@ -455,7 +456,13 @@ def test_sample_submission_retries_a_timeout_only_when_server_can_replay(monkeyp
         assert sampler.sample([{'input_ids': [1, 2]}]) == [reply]
         assert len(posts) == 2 and posts[0] == posts[1]
         assert posts[0][2][H_SAMPLE_IDEMPOTENCY_KEY]
+        assert sampler.sample([{'input_ids': [1, 2]}], idempotency_key='caller-key') == [reply]
+        assert asyncio.run(sampler.asample([{'input_ids': [1, 2]}], idempotency_key='caller-key')) == [reply]
+        assert posts[2] == posts[3] and posts[3][2][H_SAMPLE_IDEMPOTENCY_KEY] == 'caller-key'
     else:
         with pytest.raises(ReadTimeout):
             sampler.sample([{'input_ids': [1, 2]}])
         assert len(posts) == 1 and posts[0][2] is None
+        with pytest.raises(TwinkleClientValidationError, match='does not support'):
+            sampler.sample([{'input_ids': [1, 2]}], idempotency_key='caller-key')
+        assert len(posts) == 1

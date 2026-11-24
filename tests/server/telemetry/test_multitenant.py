@@ -337,19 +337,25 @@ async def test_http_failure_status_and_anonymous_attribution(monkeypatch, in_mem
 
 @pytest.mark.asyncio
 async def test_proxy_client_span_connects_two_server_spans(in_memory_span_exporter, monkeypatch):
+    from twinkle.server.deployment import twinkle_server_error_handler
+    from twinkle.server.exceptions import RateLimitExceededError, TwinkleServerError
     from twinkle.server.lifecycle.proxy import ServiceProxy
 
     in_memory_span_exporter.clear()
     requests_total = SimpleNamespace(add=Mock())
-    request_metrics = SimpleNamespace(requests_total=requests_total, request_duration_seconds=Mock())
+    admission_rejections = SimpleNamespace(add=Mock())
+    request_metrics = SimpleNamespace(requests_total=requests_total, request_duration_seconds=Mock(),
+                                      admission_rejections=admission_rejections)
     monkeypatch.setattr(metrics.MetricsRegistry, 'get', lambda: request_metrics)
     upstream = FastAPI()
+    upstream.add_exception_handler(TwinkleServerError, twinkle_server_error_handler)
     upstream.middleware('http')(create_tracing_middleware('Model'))
     upstream.middleware('http')(create_metrics_middleware('Model'))
 
-    @upstream.post('/api/v1/model/base-model/twinkle/step', status_code=429)
-    async def step():
-        return {}
+    @upstream.post('/api/v1/model/base-model/twinkle/step')
+    async def step(request: Request):
+        request.state.base_model = 'base-model'
+        raise RateLimitExceededError('Test limit')
 
     proxy = ServiceProxy()
     await proxy.client.aclose()
@@ -370,6 +376,8 @@ async def test_proxy_client_span_connects_two_server_spans(in_memory_span_export
 
     assert [(call.kwargs['attributes']['deployment'], call.kwargs['attributes']['response_origin'])
             for call in requests_total.add.call_args_list] == [('Model', 'local'), ('Gateway', 'forwarded')]
+    admission_rejections.add.assert_called_once_with(
+        1, attributes={'reason': 'rate_limit', 'deployment': 'Model', 'base_model': 'base-model'})
     target, outbound, entry = in_memory_span_exporter.get_finished_spans()
     assert target.parent.span_id == outbound.context.span_id
     assert outbound.parent.span_id == entry.context.span_id
