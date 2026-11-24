@@ -3194,10 +3194,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         base_model = model
         while isinstance(base_model, PeftModel):
             base_model = base_model.get_base_model()
+        amp_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(self.mixed_precision)
         for prefix in prefixes:
             tower = deep_getattr(base_model, prefix)
             if isinstance(tower, torch.nn.Module) and not any(p.requires_grad for p in tower.parameters()):
-                patch_frozen_module(tower)
+                patch_frozen_module(tower, amp_dtype=amp_dtype)
 
     def _expand_multimodal_lora_target(self, config, model, *, freeze_llm: bool, freeze_vit: bool,
                                        freeze_aligner: bool) -> None:
