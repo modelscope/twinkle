@@ -89,7 +89,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         self.controller = ray.get_actor(controller_name(namespace), namespace=namespace)
         self.proxy = ServiceProxy(http_options)
         self.replica_id = "training-router_" + uuid.uuid4().hex
-        self._init_task_queue(None, deployment_name="TrainingRouter", telemetry_model_id=model.name)
+        self._init_task_queue(None, deployment_name="TrainingRouter", telemetry_base_model=model.name)
         self._startup_async_done = False
 
     async def _complete_startup(self) -> None:
@@ -132,12 +132,10 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             raise RequestValidationError(exc.errors()) from exc
         token = get_token_from_request(request)
         if endpoint == "create":
-            request.state.model_id = self.model.name
             if not body.training_handles:
                 raise ProtocolMismatchError("Upgrade Twinkle SDK: training_handles handshake is required")
             return native.CreateResponse(training_handles=True)
         if endpoint == "add_adapter_to_model":
-            request.state.model_id = self.model.name
             if not body.client_create_id:
                 raise ProtocolMismatchError("Upgrade Twinkle SDK: client_create_id is required")
             if not body.adapter_name or not validate_user_path(token, body.adapter_name):
@@ -197,7 +195,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         route = await self.controller.route.remote(body.training_id, token, session)
         if route["base_model"] != self.model.name:
             raise ResourceNotFoundError("Training handle belongs to another model endpoint")
-        request.state.model_id = body.training_id
+        request.state.training_id = body.training_id
         return await self.proxy.proxy_request(request, f"twinkle/{endpoint}", route["instance_id"], "training-runtime")
 
     async def tinker_request(self, request, endpoint):
@@ -211,7 +209,6 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
             raise RequestValidationError(exc.errors()) from exc
         token = get_token_from_request(request)
         if endpoint == "create_model":
-            request.state.model_id = self.model.name
             if body.base_model != self.model.name:
                 raise RequestRejectedError("Model does not match the catalog endpoint")
             mode = "lora" if body.lora_config is not None else "full"
@@ -235,7 +232,7 @@ class TrainingRouter(TaskQueueMixin, LazyCleanupMixin):
         route = await self.controller.route.remote(body.model_id, token)
         if route["base_model"] != self.model.name:
             raise ResourceNotFoundError("Training handle belongs to another model endpoint")
-        request.state.model_id = body.model_id
+        request.state.training_id = body.model_id
         return await self.proxy.proxy_request(request, f"tinker/{endpoint}", route["instance_id"], "training-runtime")
 
     async def _release(self, training_id, token, session, client_type):

@@ -26,8 +26,8 @@ from twinkle.server.exceptions import (BackendBusyError, BatchSizeError, Endpoin
 from twinkle.server.state.backend.base import ConcurrencyError
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.task_queue.backend_gate import BACKEND_TIMEOUT_EXCEPTIONS
-from twinkle.server.telemetry.correlation import BASE_MODEL, MODEL_ID, USER_ID
-from twinkle.server.telemetry.identity import current_user_id
+from twinkle.server.telemetry.correlation import BASE_MODEL, TASK_ID, TENANT_FINGERPRINT, TRAINING_ID
+from twinkle.server.telemetry.identity import current_tenant_fingerprint
 from twinkle.server.telemetry.metrics import METERED_TASK_TYPES
 from twinkle.server.telemetry.tracing import get_trace_id, set_span_error, traced_operation
 from twinkle.utils.logger import get_logger
@@ -239,14 +239,14 @@ class ComputeWorker:
 
     def _task_tags(self, task: QueuedTask) -> dict[str, str]:
         tags = {'deployment': self._deployment_name, 'task_type': task.task_type or 'unknown'}
-        if task.user_id:
-            tags['user_id'] = task.user_id
+        if task.tenant_fingerprint:
+            tags['tenant_fingerprint'] = task.tenant_fingerprint
         if task.base_model:
-            tags['model_id'] = task.base_model
+            tags['base_model'] = task.base_model
         return tags
 
     def record_admission(self, task: QueuedTask) -> None:
-        if self._task_metrics and task.user_id and task.task_type in METERED_TASK_TYPES:
+        if self._task_metrics and task.tenant_fingerprint and task.task_type in METERED_TASK_TYPES:
             tags = self._task_tags(task)
             self._task_metrics.usage_requests.inc(tags=tags)
             self._task_metrics.usage_input_tokens.inc(task.input_tokens, tags=tags)
@@ -259,8 +259,6 @@ class ComputeWorker:
         if self._task_metrics:
             tags = self._task_tags(task)
             self._task_metrics.execution_seconds.observe(exec_time, tags=tags)
-            if task.user_id and task.task_type in METERED_TASK_TYPES:
-                self._task_metrics.usage_run_seconds.inc(exec_time, tags=tags)
 
     def _record_queue_depth(self) -> None:
         """Single writer of the queue-depth gauge."""
@@ -466,13 +464,12 @@ class ComputeWorker:
         executed = False
         finished_at = None
         queue_attrs = {
-            USER_ID: task.user_id,
-            MODEL_ID: task.telemetry_model_id,
+            TENANT_FINGERPRINT: task.tenant_fingerprint,
+            TRAINING_ID: task.model_id,
             BASE_MODEL: task.base_model,
             'twinkle.task_type': task_type,
             'twinkle.deployment': self._deployment_name or 'unknown',
-            'twinkle.queue_key': task.model_id or task.user_id,
-            'twinkle.request_id': task.request_id,
+            TASK_ID: task.request_id,
             'twinkle.wait_seconds': queue_wait,
         }
         with traced_operation('task_queue.execute', attrs=queue_attrs, parent_context=task.trace_context) as span:
@@ -483,7 +480,7 @@ class ComputeWorker:
                     logger.info(f'[ComputeWorker] Task {task.request_id} was not acquired; skipping.',
                                 extra=task.log_fields(task_status))
                     return
-                binding = current_user_id.set(task.user_id)
+                binding = current_tenant_fingerprint.set(task.tenant_fingerprint)
                 exec_start = time.monotonic()
                 try:
                     executed = True
@@ -492,7 +489,7 @@ class ComputeWorker:
                     finished_at = time.time()
                 finally:
                     exec_time = time.monotonic() - exec_start
-                    current_user_id.reset(binding)
+                    current_tenant_fingerprint.reset(binding)
                     span.set_attribute('twinkle.execution_seconds', exec_time)
                 await self._state.store_future_status(
                     task.request_id,

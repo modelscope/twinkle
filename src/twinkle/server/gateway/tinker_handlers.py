@@ -90,8 +90,7 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
         request_id = body.request_id
         outcome = await poll_future(self.state, request_id, owner_token=get_token_from_request(request))
         record = outcome.record
-        if record is not None:
-            request.state.model_id = record.get('model_id')
+        request.state.task_id = request_id
         if outcome.timed_out:
             response_data: dict[str, Any] = {'type': 'try_again'}
             if record is not None:

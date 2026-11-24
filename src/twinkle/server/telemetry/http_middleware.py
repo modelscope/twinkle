@@ -52,12 +52,17 @@ def create_metrics_middleware(deployment: str) -> Callable:
                 route_name = request.path_params.get('endpoint') or getattr(request.scope.get('route'), 'name', None)
                 operation = route_name if route_name in _OPERATIONS else 'request'
                 tags = {'deployment': deployment, 'method': request.method, 'operation': operation}
-                if user_id := getattr(request.state, 'user_id', None):
-                    tags['user_id'] = user_id
+                if fingerprint := getattr(request.state, 'tenant_fingerprint', None):
+                    tags['tenant_fingerprint'] = fingerprint
                 if base_model := getattr(request.state, 'base_model', None):
-                    tags['model_id'] = base_model
+                    tags['base_model'] = base_model
                 m = MetricsRegistry.get().request_metrics(deployment)
-                m.requests_total.inc(tags={**tags, 'status': str(status)})
+                request_tags = {**tags, 'status': str(status)}
+                if status == 429:
+                    request_tags['response_origin'] = (
+                        'forwarded' if getattr(request.state, 'forwarded_429', False) else 'local'
+                    )
+                m.requests_total.inc(tags=request_tags)
                 m.request_duration_seconds.observe(elapsed, tags=tags)
 
     return metrics_middleware

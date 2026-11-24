@@ -44,21 +44,17 @@ class QueuedTask:
     created_at: float
     on_finished: Callable[[bool, bool], Coroutine] | None = None
     execution_scope: ExecutionScope | None = None
-    user_id: str | None = None
+    tenant_fingerprint: str | None = None
     trace_context: Any = None
     base_model: str | None = None
 
-    @property
-    def telemetry_model_id(self) -> str | None:
-        return self.model_id or self.base_model
-
     def log_fields(self, outcome: str, trace_id: str | None = None) -> dict[str, str]:
         fields = {
-            'twinkle_model_id': self.telemetry_model_id,
-            'twinkle_request_id': self.request_id,
+            'twinkle_training_id': self.model_id,
+            'twinkle_task_id': self.request_id,
             'twinkle_task_type': self.task_type or 'unknown',
             'twinkle_task_outcome': outcome,
-            'twinkle_user_id': self.user_id,
+            'twinkle_tenant_fingerprint': self.tenant_fingerprint,
             'twinkle_base_model': self.base_model,
             'twinkle_trace_id': trace_id or get_trace_id(self.trace_context),
         }

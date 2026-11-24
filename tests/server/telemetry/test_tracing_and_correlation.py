@@ -33,7 +33,7 @@ def test_helper_constants_complete() -> None:
         'twinkle.session_id',
         'twinkle.model_id',
         'twinkle.replica_id',
-        'twinkle.user_id',
+        'twinkle.tenant_fingerprint',
         'twinkle.sampling_session_id',
         'twinkle.base_model',
     }
@@ -60,7 +60,7 @@ class _RecordingSpan:
             correlation.SESSION_ID: st.one_of(st.none(), st.text(min_size=1, max_size=8)),
             correlation.MODEL_ID: st.one_of(st.none(), st.text(min_size=1, max_size=8)),
             correlation.REPLICA_ID: st.one_of(st.none(), st.text(min_size=1, max_size=8)),
-            correlation.USER_ID: st.one_of(st.none(), st.text(min_size=1, max_size=8)),
+            correlation.TENANT_FINGERPRINT: st.one_of(st.none(), st.text(min_size=1, max_size=8)),
         },
     ))
 def test_set_correlation_attrs_skips_none(payload: dict) -> None:

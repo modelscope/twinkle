@@ -24,7 +24,7 @@ from twinkle.server.telemetry.metrics import get_task_metrics
 from twinkle.utils.logger import get_logger
 from .backend_gate import BackendGate
 from .rate_limiter import RateLimiter
-from twinkle.server.telemetry.identity import current_user_id
+from twinkle.server.telemetry.identity import current_tenant_fingerprint
 from twinkle.server.telemetry.tracing import get_trace_context
 from .types import ExecutionScope, QueuedTask
 from .worker import ComputeWorker
@@ -61,7 +61,7 @@ class TaskQueueMixin:
 
     state: ServerState
     replica_id: str
-    _telemetry_model_id: str | None = None
+    _telemetry_base_model: str | None = None
 
     def _init_task_queue(
         self,
@@ -71,7 +71,7 @@ class TaskQueueMixin:
         enable_admission_gate: bool = False,
         on_backend_timeout: Callable[[], Coroutine[Any, Any, None]] | None = None,
         collect_width: int = 1,
-        telemetry_model_id: str | None = None,
+        telemetry_base_model: str | None = None,
     ) -> None:
         """Initialise the task queue, rate limiter, and compute worker.
 
@@ -106,7 +106,7 @@ class TaskQueueMixin:
                 message=(f'inline_fast_path_timeout ({_inline}s) must be < Long_Poll_Window '
                          f'({_window}s); lower it or raise TWINKLE_LONG_POLL_TIMEOUT.'))
         self._deployment_name = deployment_name
-        self._telemetry_model_id = telemetry_model_id
+        self._telemetry_base_model = telemetry_base_model
         self._task_metrics = get_task_metrics(deployment_name) if deployment_name else None
         self._future_absolute_ttl = self._task_queue_config.absolute_future_ttl(collect_width)
 
@@ -245,8 +245,8 @@ class TaskQueueMixin:
             token=token,
             input_tokens=input_tokens,
             task_type=task_type,
-            user_id=current_user_id.get(),
-            base_model=self._telemetry_model_id,
+            tenant_fingerprint=current_tenant_fingerprint.get(),
+            base_model=self._telemetry_base_model,
             trace_context=get_trace_context(),
             created_at=time.monotonic())
         await self._prepare_queued_task(task)
@@ -303,7 +303,7 @@ class TaskQueueMixin:
         try:
             self._compute_worker.record_admission(task)
             logger.info(f'[TaskQueue] Task {request_id} queued, type={task.task_type or "unknown"}, '
-                        f'model_id={model_id}, user_id={task.user_id}, '
+                        f'model_id={model_id}, tenant_fingerprint={task.tenant_fingerprint}, '
                         f'queue_depth={q.qsize()}, input_tokens={task.input_tokens}', extra=task.log_fields('queued'))
             await self.state.store_future_status(
                 request_id,
@@ -391,8 +391,8 @@ class TaskQueueMixin:
             token=token,
             input_tokens=input_tokens,
             task_type=task_type,
-            user_id=current_user_id.get(),
-            base_model=self._telemetry_model_id,
+            tenant_fingerprint=current_tenant_fingerprint.get(),
+            base_model=self._telemetry_base_model,
             trace_context=get_trace_context(),
             created_at=time.monotonic(),
             execution_scope=execution_scope)

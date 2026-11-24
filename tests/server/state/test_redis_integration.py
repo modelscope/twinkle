@@ -26,7 +26,7 @@ from twinkle.server.state import ServerState
 from twinkle.server.state.backend.factory import create_backend
 from twinkle.server.state.backend.redis_backend import RedisBackend
 from twinkle.server.state.training_records import TrainingRecord
-from twinkle.server.telemetry.identity import USER_ID_KEY_ENV, current_user_id, user_fingerprint
+from twinkle.server.telemetry.identity import USER_ID_KEY_ENV, current_tenant_fingerprint, tenant_fingerprint
 
 REDIS_URL = os.environ.get('TWINKLE_TEST_REDIS_URL', 'redis://localhost:6379/0')
 
@@ -112,13 +112,13 @@ async def test_cleanup_leader_refreshes_admin_snapshots(shared_backend, monkeypa
     monkeypatch.setenv(USER_ID_KEY_ENV, 'redis-integration-key')
     state = ServerState(backend=shared_backend, cleanup_interval=1, metrics_update_interval=0.05)
     token = 'synthetic-redis-owner'
-    user_id = user_fingerprint(token)
-    binding = current_user_id.set(user_id)
+    user_id = tenant_fingerprint(token)
+    binding = current_tenant_fingerprint.set(user_id)
     try:
         session = await state.create_session({'user_metadata': {'private': 'not-in-snapshot'}})
         await state.create_sampling_session({'session_id': session, 'model_path': '/private/checkpoint'})
     finally:
-        current_user_id.reset(binding)
+        current_tenant_fingerprint.reset(binding)
     legacy_session = await state.create_session({})
     active = TrainingRecord(training_id='train-1', token=token, session_id=session, base_model='tiny',
                             controller_epoch='epoch', instance_id='instance', mode='lora', state='ACTIVE',
@@ -136,12 +136,12 @@ async def test_cleanup_leader_refreshes_admin_snapshots(shared_backend, monkeypa
     await state.start_cleanup_task()
     try:
         sessions = await wait_for_snapshot('sessions', lambda value: value is not None)
-        assert {row['session_id']: row['user_id'] for row in sessions['rows']} == {
-            session: user_id, legacy_session: None}
+        assert {row['session_id']: row['tenant_fingerprint'] for row in sessions['rows']} == {
+            session: user_id, legacy_session: 'unassigned'}
         trainings = await wait_for_snapshot('trainings', lambda value: value is not None)
-        assert trainings['rows'][0]['user_id'] == user_id
+        assert trainings['rows'][0]['tenant_fingerprint'] == user_id
         sampling = await wait_for_snapshot('sampling', lambda value: value is not None)
-        assert sampling['rows'][0]['user_id'] == user_id
+        assert sampling['rows'][0]['tenant_fingerprint'] == user_id
         assert token not in json.dumps([sessions, trainings, sampling])
         assert 'private' not in json.dumps([sessions, trainings, sampling])
 

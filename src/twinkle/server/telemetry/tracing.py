@@ -14,7 +14,7 @@ try:
 except Exception:
     _OTEL_AVAILABLE = False
 
-from .correlation import BASE_MODEL, MODEL_ID, USER_ID, set_correlation_attrs
+from .correlation import BASE_MODEL, TASK_ID, TENANT_FINGERPRINT, TRAINING_ID, set_correlation_attrs
 
 
 def get_tracer(name: str = 'twinkle-server'):
@@ -202,8 +202,9 @@ def create_tracing_middleware(service_component: str):
                     span.update_name(f'{method} {route}')
                     span.set_attribute('http.route', route)
                 set_correlation_attrs(span, {
-                    USER_ID: getattr(request.state, 'user_id', None),
-                    MODEL_ID: getattr(request.state, 'model_id', None),
+                    TENANT_FINGERPRINT: getattr(request.state, 'tenant_fingerprint', None),
+                    TRAINING_ID: getattr(request.state, 'training_id', None),
+                    TASK_ID: getattr(request.state, 'task_id', None),
                     BASE_MODEL: getattr(request.state, 'base_model', None),
                     'twinkle.http_request_id': getattr(request.state, 'request_id', None),
                 })

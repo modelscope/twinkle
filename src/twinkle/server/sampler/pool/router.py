@@ -31,7 +31,6 @@ class SamplerRouter:
         self.controller = ray.get_actor(sampler_controller_name(namespace, pool_id), namespace=namespace)
 
     async def forward(self, request, endpoint):
-        request.state.model_id = self.model_id
         request.state.base_model = self.model_id
         body = await request.body()
         payload: ForwardedRequest = {
@@ -86,6 +85,7 @@ class SamplerRouter:
             for key, value in reply["headers"]
             if key.lower() not in (b"content-length", b"transfer-encoding")
         }
+        request.state.forwarded_429 = reply["status"] == 429
         if not stream:
             return Response(reply["body"], status_code=reply["status"], headers=headers)
 

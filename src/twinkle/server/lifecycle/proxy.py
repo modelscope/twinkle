@@ -74,6 +74,8 @@ class ServiceProxy:
         body_override: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> Response:
+        if service_type in ("model", "sampler"):
+            request.state.base_model = base_model
         body_bytes = body_override if body_override is not None else await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
         headers = self._prepare_headers(request.headers, extra_headers)
@@ -88,6 +90,7 @@ class ServiceProxy:
                     params=request.query_params,
                 )
                 record_http_status(span, response.status_code, client=True)
+            request.state.forwarded_429 = response.status_code == 429
             return Response(
                 content=response.content,
                 status_code=response.status_code,
@@ -112,6 +115,8 @@ class ServiceProxy:
         body_override: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
     ):
+        if service_type in ("model", "sampler"):
+            request.state.base_model = base_model
         body_bytes = body_override if body_override is not None else await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
         headers = self._prepare_headers(request.headers, extra_headers)
@@ -136,11 +141,7 @@ class ServiceProxy:
                         yield line
 
     async def proxy_to_model(self, request: Request, endpoint: str, base_model: str) -> Response:
-        request.state.model_id = base_model
-        request.state.base_model = base_model
         return await self.proxy_request(request, f"tinker/{endpoint}", base_model, "model")
 
     async def proxy_to_sampler(self, request: Request, endpoint: str, base_model: str) -> Response:
-        request.state.model_id = base_model
-        request.state.base_model = base_model
         return await self.proxy_request(request, f"tinker/{endpoint}", base_model, "sampler")

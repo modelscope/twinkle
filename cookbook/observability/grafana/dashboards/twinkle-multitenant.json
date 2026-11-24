@@ -30,7 +30,7 @@
   "templating": {
     "list": [
       {
-        "name": "user_id",
+        "name": "tenant_fingerprint",
         "label": "User fingerprint prefix",
         "type": "textbox",
         "description": "Leave blank for all users, or paste a full fingerprint or its prefix.",
@@ -38,12 +38,12 @@
         "current": {"text":"","value":""}
       },
       {
-        "name": "model_id",
+        "name": "base_model",
         "label": "Base model",
         "type": "query",
         "datasource": {"type":"prometheus","uid":"twinkle-mimir"},
-        "definition": "label_values({__name__=~\"twinkle_http_requests_total|twinkle_usage_requests_total\"}, model_id)",
-        "query": "label_values({__name__=~\"twinkle_http_requests_total|twinkle_usage_requests_total\"}, model_id)",
+        "definition": "label_values({__name__=~\"twinkle_http_requests_total|twinkle_usage_requests_total\"}, base_model)",
+        "query": "label_values({__name__=~\"twinkle_http_requests_total|twinkle_usage_requests_total\"}, base_model)",
         "refresh": 2,
         "includeAll": true,
         "allValue": ".*",
@@ -156,7 +156,7 @@
                   {
                     "title": "Open training activity",
                     "targetBlank": true,
-                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"Training ID\"]}&${user_id:queryparam}"
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"Training ID\"]}&${tenant_fingerprint:queryparam}"
                   }
                 ]
               }
@@ -225,7 +225,7 @@
                   {
                     "title": "Open training activity",
                     "targetBlank": true,
-                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"Training ID\"]}&${user_id:queryparam}"
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"Training ID\"]}&${tenant_fingerprint:queryparam}"
                   }
                 ]
               }
@@ -309,11 +309,11 @@
             "match": "any",
             "filters": [
               {
-                "fieldName": "user_id",
+                "fieldName": "tenant_fingerprint",
                 "config": {
                   "id": "regex",
                   "options": {
-                    "value": "^(${user_id:raw}).*$"
+                    "value": "^(${tenant_fingerprint:regex}).*$"
                   }
                 }
               },
@@ -334,16 +334,16 @@
           "options": {
             "indexByName": {
               "state": 0,
-              "model_id": 1,
-              "user_id": 2,
+              "base_model": 1,
+              "tenant_fingerprint": 2,
               "created_at": 3,
               "training_id": 4,
               "session_id": 5
             },
             "renameByName": {
               "state": "State",
-              "model_id": "Base model",
-              "user_id": "Token fingerprint",
+              "base_model": "Base model",
+              "tenant_fingerprint": "Token fingerprint",
               "created_at": "Started",
               "training_id": "Training ID",
               "session_id": "Session ID"
@@ -481,7 +481,7 @@
             {
               "title": "Open matching task logs",
               "targetBlank": true,
-              "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?viewPanel=21&from=${__from}&to=${__to}&${user_id:queryparam}&${model_id:queryparam}&${training_id:queryparam}&${node:queryparam}&var-task_outcome=failed%7Ctimeout%7Crefused"
+              "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?viewPanel=21&from=${__from}&to=${__to}&${tenant_fingerprint:queryparam}&${base_model:queryparam}&${training_id:queryparam}&${node:queryparam}&var-task_outcome=failed%7Ctimeout%7Crefused"
             }
           ]
         },
@@ -495,7 +495,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(count_over_time({service_name=~\".+\"} | twinkle_model_id=~\"(${training_id:regex}).*\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome =~ \"failed|timeout|refused\" [$__range])) or (sum(count_over_time({service_name=~\".+\"} | twinkle_model_id=~\"(${training_id:regex}).*\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome != \"\" [$__range])) * 0)",
+          "expr": "sum(count_over_time({service_name=~\".+\"} | twinkle_training_id=~\"(${training_id:regex}).*\" | twinkle_training_id != \"\" | twinkle_tenant_fingerprint =~ \"(${tenant_fingerprint:regex}).*\" | twinkle_task_outcome =~ \"failed|timeout|refused\" [$__range])) or (sum(count_over_time({service_name=~\".+\"} | twinkle_training_id=~\"(${training_id:regex}).*\" | twinkle_training_id != \"\" | twinkle_tenant_fingerprint =~ \"(${tenant_fingerprint:regex}).*\" | twinkle_task_outcome != \"\" [$__range])) * 0)",
           "queryType": "instant"
         }
       ]
@@ -544,7 +544,7 @@
                   {
                     "title": "Open training activity",
                     "targetBlank": true,
-                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"training_id\"]}&${user_id:queryparam}"
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"training_id\"]}&${tenant_fingerprint:queryparam}"
                   }
                 ]
               }
@@ -566,7 +566,7 @@
                   {
                     "title": "Open training activity",
                     "targetBlank": true,
-                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"training_id\"]}&${user_id:queryparam}"
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__data.fields[\"training_id\"]}&${tenant_fingerprint:queryparam}"
                   }
                 ]
               }
@@ -665,7 +665,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(30, topk by (training_id) (1, max_over_time({service_name=~\".+\"} |= \"[TaskQueue]\" | regexp `model_id=(?P<legacy_training>training_[0-9a-f]+)(, user_id=(?P<legacy_owner>[0-9a-f]{64}))?` | label_format training_id=`{{ .twinkle_model_id | default .legacy_training }}`, owner=`{{ .twinkle_user_id | default .legacy_owner }}` | training_id=~\"training_.+\" | training_id=~\"(${training_id:regex}).*\" | owner=~\"(${user_id:raw}).*\" | label_format training_ref=`{{ .training_id | trimPrefix \"training_\" | trunc 12 }}`, last_task=`{{ __timestamp__ | unixEpochMillis }}` | unwrap last_task | __error__=\"\" [$__range]) by (training_id, training_ref, twinkle_base_model, owner)))",
+          "expr": "topk(30, topk by (training_id) (1, max_over_time({service_name=~\".+\"} |= \"[TaskQueue]\" | regexp `base_model=(?P<legacy_training>training_[0-9a-f]+)(, tenant_fingerprint=(?P<legacy_owner>[0-9a-f]{64}))?` | label_format training_id=`{{ .twinkle_training_id | default .legacy_training }}`, owner=`{{ .twinkle_tenant_fingerprint | default .legacy_owner }}` | training_id=~\"training_.+\" | training_id=~\"(${training_id:regex}).*\" | owner=~\"(${tenant_fingerprint:regex}).*\" | label_format training_ref=`{{ .training_id | trimPrefix \"training_\" | trunc 12 }}`, last_task=`{{ __timestamp__ | unixEpochMillis }}` | unwrap last_task | __error__=\"\" [$__range]) by (training_id, training_ref, twinkle_base_model, owner)))",
           "queryType": "instant"
         }
       ]
@@ -673,38 +673,38 @@
     {
       "id": 20,
       "type": "stat",
-      "title": "Accepted requests over selected range",
+      "title": "Estimated accepted requests",
       "description": "Accepted requests summed over Runtime instances. Chart labels show the first 12 characters of the Token fingerprint.",
       "datasource": {"type":"prometheus","uid":"twinkle-mimir"},
       "gridPos": {"x":0,"y":14,"w":8,"h":6},
       "fieldConfig": {"defaults":{"unit":"short","decimals":0,"min":0,"thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}},"overrides":[]},
       "options": {"graphMode":"none","colorMode":"value","textMode":"value_and_name"},
       "transformations": [{"id":"renameByRegex","options":{"regex":"^([0-9a-f]{12})[0-9a-f]{52}$","renamePattern":"$1"}}],
-      "targets": [{"refId":"A","expr":"sum by (user_id) (last_over_time(twinkle_usage_requests_total{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"}[$__range]) - (twinkle_usage_requests_total{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"} offset $__range or 0 * last_over_time(twinkle_usage_requests_total{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"}[$__range])))","legendFormat":"{{user_id}}","instant":true,"range":false}]
+      "targets": [{"refId":"A","expr":"sum by (tenant_fingerprint) (increase(twinkle_usage_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[$__range]))","legendFormat":"{{tenant_fingerprint}}","instant":true,"range":false}]
     },
     {
       "id": 2,
       "type": "stat",
-      "title": "Input tokens over selected range",
+      "title": "Estimated input tokens",
       "description": "",
       "datasource": {"type":"prometheus","uid":"twinkle-mimir"},
       "gridPos": {"x":8,"y":14,"w":8,"h":6},
       "fieldConfig": {"defaults":{"unit":"short","min":0,"thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}},"overrides":[]},
       "options": {"graphMode":"none","colorMode":"value","textMode":"value_and_name"},
       "transformations": [{"id":"renameByRegex","options":{"regex":"^([0-9a-f]{12})[0-9a-f]{52}$","renamePattern":"$1"}}],
-      "targets": [{"refId":"A","expr":"sum by (user_id) (last_over_time(twinkle_usage_input_tokens_total{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"}[$__range]) - (twinkle_usage_input_tokens_total{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"} offset $__range or 0 * last_over_time(twinkle_usage_input_tokens_total{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"}[$__range])))","legendFormat":"{{user_id}}","instant":true,"range":false}]
+      "targets": [{"refId":"A","expr":"sum by (tenant_fingerprint) (increase(twinkle_usage_input_tokens_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[$__range]))","legendFormat":"{{tenant_fingerprint}}","instant":true,"range":false}]
     },
     {
       "id": 5,
       "type": "stat",
-      "title": "Run seconds over selected range",
+      "title": "Estimated execution seconds",
       "description": "Sum of task execution time, without weighting by device count.",
       "datasource": {"type":"prometheus","uid":"twinkle-mimir"},
       "gridPos": {"x":16,"y":14,"w":8,"h":6},
       "fieldConfig": {"defaults":{"unit":"s","min":0,"thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}},"overrides":[]},
       "options": {"graphMode":"none","colorMode":"value","textMode":"value_and_name"},
       "transformations": [{"id":"renameByRegex","options":{"regex":"^([0-9a-f]{12})[0-9a-f]{52}$","renamePattern":"$1"}}],
-      "targets": [{"refId":"A","expr":"sum by (user_id) (last_over_time(twinkle_usage_run_seconds_total{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"}[$__range]) - (twinkle_usage_run_seconds_total{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"} offset $__range or 0 * last_over_time(twinkle_usage_run_seconds_total{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"}[$__range])))","legendFormat":"{{user_id}}","instant":true,"range":false}]
+      "targets": [{"refId":"A","expr":"sum by (tenant_fingerprint) (increase(twinkle_task_execution_seconds_sum{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\",task_type=~\"forward|forward_only|forward_backward|step|clip_grad_and_step|optim_step|sample\"}[$__range]))","legendFormat":"{{tenant_fingerprint}}","instant":true,"range":false}]
     },
     {
       "id": 8,
@@ -715,7 +715,7 @@
       "gridPos": {"x":0,"y":20,"w":12,"h":8},
       "fieldConfig": {"defaults":{"unit":"s"},"overrides":[]},
       "options": {},
-      "targets": [{"refId":"A","expr":"histogram_quantile(0.95, sum by (le, deployment, model_id) (rate(twinkle_task_wait_seconds_bucket{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"}[5m])))","legendFormat":"{{deployment}} {{model_id}}"}]
+      "targets": [{"refId":"A","expr":"histogram_quantile(0.95, sum by (le, deployment, base_model) (rate(twinkle_task_wait_seconds_bucket{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m])))","legendFormat":"{{deployment}} {{base_model}}"}]
     },
     {
       "id": 9,
@@ -726,7 +726,7 @@
       "gridPos": {"x":12,"y":20,"w":12,"h":8},
       "fieldConfig": {"defaults":{"unit":"s"},"overrides":[]},
       "options": {},
-      "targets": [{"refId":"A","expr":"histogram_quantile(0.95, sum by (le, deployment, model_id) (rate(twinkle_task_execution_seconds_bucket{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"}[5m])))","legendFormat":"{{deployment}} {{model_id}}"}]
+      "targets": [{"refId":"A","expr":"histogram_quantile(0.95, sum by (le, deployment, base_model) (rate(twinkle_task_execution_seconds_bucket{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m])))","legendFormat":"{{deployment}} {{base_model}}"}]
     },
     {
       "id": 22,
@@ -785,7 +785,7 @@
                   {
                     "title": "Open matching task logs",
                     "targetBlank": true,
-                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?viewPanel=21&from=${__from}&to=${__to}&${user_id:queryparam}&${model_id:queryparam}&${training_id:queryparam}&${node:queryparam}&var-task_outcome=${__value.raw}"
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?viewPanel=21&from=${__from}&to=${__to}&${tenant_fingerprint:queryparam}&${base_model:queryparam}&${training_id:queryparam}&${node:queryparam}&var-task_outcome=${__value.raw}"
                   }
                 ]
               }
@@ -804,7 +804,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (twinkle_task_outcome) (count_over_time({service_name=~\".+\"} | twinkle_model_id=~\"(${training_id:regex}).*\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome != \"\" [$__range]))",
+          "expr": "sum by (twinkle_task_outcome) (count_over_time({service_name=~\".+\"} | twinkle_training_id=~\"(${training_id:regex}).*\" | twinkle_training_id != \"\" | twinkle_tenant_fingerprint =~ \"(${tenant_fingerprint:regex}).*\" | twinkle_task_outcome != \"\" [$__range]))",
           "queryType": "instant",
           "legendFormat": "{{twinkle_task_outcome}}"
         }
@@ -850,7 +850,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{service_name=~\".+\"} | twinkle_model_id=~\"(${training_id:regex}).*\" | twinkle_model_id != \"\" | twinkle_user_id =~ \"(${user_id:raw}).*\" | twinkle_task_outcome =~ \"${task_outcome:raw}\"",
+          "expr": "{service_name=~\".+\"} | twinkle_training_id=~\"(${training_id:regex}).*\" | twinkle_training_id != \"\" | twinkle_tenant_fingerprint =~ \"(${tenant_fingerprint:regex}).*\" | twinkle_task_outcome =~ \"${task_outcome:raw}\"",
           "queryType": "range",
           "maxLines": 200
         }
@@ -864,7 +864,7 @@
       "datasource": {"type":"tempo","uid":"twinkle-tempo"},
       "gridPos": {"x":0,"y":40,"w":24,"h":9},
       "fieldConfig": {"defaults":{},"overrides":[]},
-      "targets": [{"refId":"A","queryType":"traceql","query":"{ name = \"task_queue.execute\" && span.twinkle.user_id =~ \"^(${user_id:raw}).*$\" && span.twinkle.model_id =~ \"^(${training_id:regex}).*$\" }","limit":25}]
+      "targets": [{"refId":"A","queryType":"traceql","query":"{ name = \"task_queue.execute\" && span.twinkle.tenant_fingerprint =~ \"^(${tenant_fingerprint:regex}).*$\" && span.twinkle.training_id =~ \"^(${training_id:regex}).*$\" }","limit":25}]
     },
     {
       "id": 1,
@@ -876,7 +876,7 @@
       "fieldConfig": {"defaults":{"unit":"reqps"},"overrides":[]},
       "options": {},
       "transformations": [{"id":"renameByRegex","options":{"regex":"^([0-9a-f]{12})[0-9a-f]{52}$","renamePattern":"$1"}}],
-      "targets": [{"refId":"A","expr":"sum by (user_id) (rate(twinkle_usage_requests_total{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"}[5m]))","legendFormat":"{{user_id}}"}]
+      "targets": [{"refId":"A","expr":"sum by (tenant_fingerprint) (rate(twinkle_usage_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))","legendFormat":"{{tenant_fingerprint}}"}]
     },
     {
       "id": 6,
@@ -887,7 +887,7 @@
       "gridPos": {"x":12,"y":49,"w":12,"h":8},
       "fieldConfig": {"defaults":{"unit":"reqps"},"overrides":[]},
       "options": {},
-      "targets": [{"refId":"A","expr":"sum by (operation) (rate(twinkle_http_requests_total{user_id=~\"(${user_id:raw}).*\",operation=~\"session_heartbeat|retrieve_future\",status!=\"429\"}[5m])) or sum by (status) (rate(twinkle_http_requests_total{user_id=~\"(${user_id:raw}).*\",status=\"429\"}[5m]))","legendFormat":"{{operation}}{{status}}"}]
+      "targets": [{"refId":"A","expr":"sum by (operation) (rate(twinkle_http_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",operation=~\"session_heartbeat|retrieve_future\",status!=\"429\"}[5m])) or sum by (status) (rate(twinkle_http_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",status=\"429\",response_origin=\"local\"}[5m]))","legendFormat":"{{operation}}{{status}}"}]
     },
     {
       "id": 3,
@@ -899,7 +899,7 @@
       "fieldConfig": {"defaults":{"unit":"percentunit","thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":0.8},{"color":"red","value":1}]},"min":0},"overrides":[]},
       "options": {"displayMode":"gradient","orientation":"horizontal","reduceOptions":{"calcs":["lastNotNull"],"values":false}},
       "transformations": [{"id":"renameByRegex","options":{"regex":"^([0-9a-f]{12})[0-9a-f]{52}$","renamePattern":"$1"}}],
-      "targets": [{"refId":"A","expr":"sum by (user_id) (rate(twinkle_usage_requests_total{user_id=~\"(${user_id:raw}).*\"}[5m]))","legendFormat":"{{user_id}}","instant":true,"range":false,"referenceLimit":"requests_per_second"}]
+      "targets": [{"refId":"A","expr":"sum by (tenant_fingerprint) (rate(twinkle_usage_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\"}[5m]))","legendFormat":"{{tenant_fingerprint}}","instant":true,"range":false,"referenceLimit":"requests_per_second"}]
     },
     {
       "id": 4,
@@ -911,7 +911,7 @@
       "fieldConfig": {"defaults":{"unit":"percentunit","thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":0.8},{"color":"red","value":1}]},"min":0},"overrides":[]},
       "options": {"displayMode":"gradient","orientation":"horizontal","reduceOptions":{"calcs":["lastNotNull"],"values":false}},
       "transformations": [{"id":"renameByRegex","options":{"regex":"^([0-9a-f]{12})[0-9a-f]{52}$","renamePattern":"$1"}}],
-      "targets": [{"refId":"A","expr":"sum by (user_id) (rate(twinkle_usage_input_tokens_total{user_id=~\"(${user_id:raw}).*\"}[5m]))","legendFormat":"{{user_id}}","instant":true,"range":false,"referenceLimit":"input_tokens_per_second"}]
+      "targets": [{"refId":"A","expr":"sum by (tenant_fingerprint) (rate(twinkle_usage_input_tokens_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\"}[5m]))","legendFormat":"{{tenant_fingerprint}}","instant":true,"range":false,"referenceLimit":"input_tokens_per_second"}]
     },
     {
       "id": 7,
@@ -922,7 +922,7 @@
       "gridPos": {"x":0,"y":65,"w":12,"h":8},
       "fieldConfig": {"defaults":{"unit":"s"},"overrides":[]},
       "options": {},
-      "targets": [{"refId":"A","expr":"histogram_quantile(0.95, sum by (le, deployment, model_id) (rate(twinkle_http_request_duration_seconds_bucket{user_id=~\"(${user_id:raw}).*\",model_id=~\"${model_id:regex}\"}[5m])))","legendFormat":"{{deployment}} {{model_id}}"}]
+      "targets": [{"refId":"A","expr":"histogram_quantile(0.95, sum by (le, deployment, base_model) (rate(twinkle_http_request_duration_seconds_bucket{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m])))","legendFormat":"{{deployment}} {{base_model}}"}]
     },
     {
       "id": 10,
@@ -1027,7 +1027,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "user_id"
+              "options": "tenant_fingerprint"
             },
             "properties": [
               {
@@ -1093,11 +1093,11 @@
             "match": "all",
             "filters": [
               {
-                "fieldName": "user_id",
+                "fieldName": "tenant_fingerprint",
                 "config": {
                   "id": "regex",
                   "options": {
-                    "value": "^(${user_id:raw}).*$"
+                    "value": "^(${tenant_fingerprint:regex}).*$"
                   }
                 }
               }
@@ -1135,7 +1135,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "user_id"
+              "options": "tenant_fingerprint"
             },
             "properties": [
               {
@@ -1201,11 +1201,11 @@
             "match": "all",
             "filters": [
               {
-                "fieldName": "user_id",
+                "fieldName": "tenant_fingerprint",
                 "config": {
                   "id": "regex",
                   "options": {
-                    "value": "^(${user_id:raw}).*$"
+                    "value": "^(${tenant_fingerprint:regex}).*$"
                   }
                 }
               }

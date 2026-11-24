@@ -12,8 +12,8 @@ from typing import Any
 from twinkle.server.config.persistence import PersistenceConfig
 from twinkle.server.exceptions import ResourceNotFoundError, ResourceQuotaExceededError
 from twinkle.server.telemetry.correlation import (BASE_MODEL, MODEL_ID, REPLICA_ID, SAMPLING_SESSION_ID, SESSION_ID,
-                                                  USER_ID)
-from twinkle.server.telemetry.identity import current_user_id, user_fingerprint, user_id_key
+                                                  TENANT_FINGERPRINT)
+from twinkle.server.telemetry.identity import current_tenant_fingerprint, tenant_fingerprint, user_id_key
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.utils.logger import get_logger
 from .admin_index import AdminIndex
@@ -223,13 +223,13 @@ class ServerState:
         session_id = payload.get('session_id') or f'session_{uuid.uuid4().hex}'
         with traced_operation(
                 'server_state.create_session',
-                attrs={SESSION_ID: session_id, USER_ID: current_user_id.get()},
+                attrs={SESSION_ID: session_id, TENANT_FINGERPRINT: current_tenant_fingerprint.get()},
         ):
             record = SessionRecord(
                 tags=list(payload.get('tags') or []),
                 user_metadata=payload.get('user_metadata') or {},
                 sdk_version=payload.get('sdk_version'),
-                user_id=current_user_id.get(),
+                user_id=current_tenant_fingerprint.get(),
             )
             await self._session_mgr.add(session_id, record)
             return session_id
@@ -285,7 +285,7 @@ class ServerState:
                     MODEL_ID: _model_id,
                     BASE_MODEL: payload.get('base_model'),
                     REPLICA_ID: replica_id,
-                    USER_ID: user_fingerprint(token) if token else current_user_id.get(),
+                    TENANT_FINGERPRINT: tenant_fingerprint(token) if token else current_tenant_fingerprint.get(),
                     SESSION_ID: session_id or payload.get('session_id'),
                 },
         ):
@@ -446,7 +446,7 @@ class ServerState:
                     SAMPLING_SESSION_ID: _sampling_session_id,
                     SESSION_ID: payload.get('session_id'),
                     BASE_MODEL: payload.get('base_model'),
-                    USER_ID: current_user_id.get(),
+                    TENANT_FINGERPRINT: current_tenant_fingerprint.get(),
                 },
         ):
             record = SamplingSessionRecord(
@@ -454,7 +454,7 @@ class ServerState:
                 seq_id=payload.get('sampling_session_seq_id'),
                 base_model=payload.get('base_model'),
                 model_path=payload.get('model_path'),
-                user_id=current_user_id.get(),
+                user_id=current_tenant_fingerprint.get(),
             )
             await self._sampling_mgr.add(_sampling_session_id, record)
             return _sampling_session_id

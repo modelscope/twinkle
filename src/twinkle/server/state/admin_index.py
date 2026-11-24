@@ -5,7 +5,7 @@ import math
 import time
 from datetime import UTC, datetime
 
-from twinkle.server.telemetry.identity import user_fingerprint
+from twinkle.server.telemetry.identity import tenant_fingerprint
 from twinkle.utils.logger import get_logger
 from .backend.base import StateBackend
 from .model_manager import ModelManager
@@ -64,7 +64,7 @@ class AdminIndex:
         return [
             {
                 "session_id": session_id,
-                "user_id": record.user_id,
+                "tenant_fingerprint": record.user_id or "unassigned",
                 "created_at": record.created_at,
                 "last_heartbeat": datetime.fromtimestamp(record.last_heartbeat, UTC).isoformat(),
             }
@@ -78,8 +78,8 @@ class AdminIndex:
             {
                 "training_id": record.training_id,
                 "session_id": record.session_id,
-                "model_id": record.base_model,
-                "user_id": user_fingerprint(record.token),
+                "base_model": record.base_model,
+                "tenant_fingerprint": tenant_fingerprint(record.token),
                 "state": record.state,
                 "created_at": record.created_at,
             }
@@ -96,8 +96,8 @@ class AdminIndex:
             {
                 "sampling_session_id": sampling_id,
                 "session_id": record.session_id,
-                "model_id": record.base_model,
-                "user_id": record.user_id,
+                "base_model": record.base_model,
+                "tenant_fingerprint": record.user_id or "unassigned",
                 "state": "ACTIVE",
                 "created_at": record.created_at,
             }

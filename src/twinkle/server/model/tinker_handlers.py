@@ -46,7 +46,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
     @app.post('/tinker/get_info')
     async def get_info(request: Request, body: types.GetInfoRequest,
                        self: ModelManagement = Depends(self_fn)) -> types.GetInfoResponse:
-        request.state.model_id = body.model_id
+        request.state.training_id = body.model_id
         token = await self._on_request_start(request)
         training_run_manager = create_training_run_manager(token, client_type='tinker')
         metadata = training_run_manager.get(str(body.model_id))
@@ -75,7 +75,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
     @app.post('/tinker/forward')
     async def forward(request: Request, body: types.ForwardRequest,
                       self: ModelManagement = Depends(self_fn)) -> types.UntypedAPIFuture:
-        request.state.model_id = body.model_id
+        request.state.training_id = body.model_id
         token = await self._on_request_start(request)
 
         async def _do_forward():
@@ -114,7 +114,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             body: types.ForwardBackwardRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.UntypedAPIFuture:
-        request.state.model_id = body.model_id
+        request.state.training_id = body.model_id
         token = await self._on_request_start(request)
 
         async def _do_forward_backward():
@@ -172,7 +172,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             body: types.OptimStepRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.UntypedAPIFuture:
-        request.state.model_id = body.model_id
+        request.state.training_id = body.model_id
         token = await self._on_request_start(request)
 
         async def _do_optim():
@@ -203,7 +203,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             body: types.SaveWeightsRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.UntypedAPIFuture:
-        request.state.model_id = body.model_id
+        request.state.training_id = body.model_id
         token = await self._on_request_start(request)
 
         async def _do_save():
@@ -233,7 +233,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             body: types.SaveWeightsForSamplerRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.UntypedAPIFuture:
-        request.state.model_id = body.model_id
+        request.state.training_id = body.model_id
         assert_sampler_weights_supported(self)
         token = await self._on_request_start(request)
 
@@ -279,7 +279,7 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             body: types.LoadWeightsRequest,
             self: ModelManagement = Depends(self_fn),
     ) -> types.UntypedAPIFuture:
-        request.state.model_id = body.model_id
+        request.state.training_id = body.model_id
         token = await self._on_request_start(request)
 
         async def _do_load():

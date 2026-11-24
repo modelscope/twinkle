@@ -113,7 +113,6 @@ class TaskMetrics(BaseModel):
     rate_limiter_active_tokens: _Gauge
     usage_requests: _Counter
     usage_input_tokens: _Counter
-    usage_run_seconds: _Counter
 
 
 class TrainingMetrics(BaseModel):
@@ -213,8 +212,6 @@ class MetricsRegistry:
             'twinkle.usage.requests.total', description='Admitted training compute and sampling requests')
         self.usage_input_tokens = meter.create_counter(
             'twinkle.usage.input_tokens.total', description='Input tokens of admitted compute requests')
-        self.usage_run_seconds = meter.create_counter(
-            'twinkle.usage.run_seconds.total', description='Execution seconds of admitted compute requests')
 
         # === Managed training ===
         self.training_instances_active = meter.create_up_down_counter(
@@ -297,7 +294,6 @@ class MetricsRegistry:
                 rate_limiter_active_tokens=_Gauge(self.rate_limiter_active_tokens),
                 usage_requests=_Counter(self.usage_requests),
                 usage_input_tokens=_Counter(self.usage_input_tokens),
-                usage_run_seconds=_Counter(self.usage_run_seconds),
             )
         return cached
 
