@@ -755,20 +755,29 @@ class TwinkleWorkerExtension:
         A full-sync therefore leaves every hybrid layer convolving with its initial random weights
         while all other tensors match the trainer bit for bit. CUDA models expose no such hook, so
         the walk finds nothing there and costs one pass over ``modules()``.
+
+        Two passes, on purpose. The hook is backend-private and optional, so a backend that renames
+        or drops it would be repaired silently by the second pass, which keys off the packed
+        *parameter* (``refresh_derived_weights``, already used by the delta path) and validates the
+        layout instead of silently skipping modules it does not recognise. Neither pass hides a
+        failure: a sync that cannot repack must fail, because the alternative is a rollout that
+        looks healthy and emits garbage.
         """
+        from twinkle.sampler.vllm_sampler.delta.weight_update_utils import refresh_derived_weights
+
         repacked = 0
         for module in root.modules():
             pack = getattr(module, '_pack_conv_weights', None)
             if not callable(pack):
                 continue
-            try:
-                pack()
-                repacked += 1
-            except Exception as exc:  # a backend-private hook: never let it break the sync
-                logger.warning(f'Failed to repack derived weights of {type(module).__name__}: {exc}')
-        if repacked:
-            logger.info(f'Repacked derived weights for {repacked} modules')
-        return repacked
+            # Deliberately unguarded: a hook that raises leaves the kernel reading its build-time
+            # copy, and only this exception can tell the trainer the sync did not take effect.
+            pack()
+            repacked += 1
+        refreshed = refresh_derived_weights(root)
+        if repacked or refreshed:
+            logger.info(f'Repacked derived weights for {max(repacked, refreshed)} modules')
+        return max(repacked, refreshed)
 
     def _drafter_model(self):
         """The speculative-decoding draft model, or None when there is no weight-bearing drafter.

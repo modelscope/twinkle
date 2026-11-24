@@ -76,8 +76,8 @@ def test_repack_is_a_noop_for_backends_without_the_hook():
     assert TwinkleWorkerExtension._repack_derived_weights(model) == 0
 
 
-def test_repack_survives_a_failing_hook():
-    """A backend-private hook that raises must not abort the sync, nor block later modules."""
+def test_a_failing_hook_fails_the_repack():
+    """A hook that raises must fail the sync: a stale packed copy emits garbage tokens."""
     class Broken(nn.Module):
         def _pack_conv_weights(self):
             raise RuntimeError('kernel layout changed')
@@ -86,8 +86,37 @@ def test_repack_survives_a_failing_hook():
     layer = model[1]
     layer.conv1d.weight.data.fill_(1.0)
 
-    assert TwinkleWorkerExtension._repack_derived_weights(model) == 1
-    assert torch.equal(layer.conv1d.ascend_conv1d_weight, torch.ones(4, 3))
+    with pytest.raises(RuntimeError, match='kernel layout changed'):
+        TwinkleWorkerExtension._repack_derived_weights(model)
+
+
+class HooklessLayer(nn.Module):
+    """A layer with a packed copy but no private hook: the parameter itself is the contract."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv1d = PackedConv()
+
+
+def test_repack_uses_the_packed_parameter_when_the_backend_has_no_hook():
+    """A renamed or dropped ``_pack_conv_weights`` must be repaired, not skipped silently."""
+    model = nn.Sequential(HooklessLayer(), HooklessLayer())
+    for layer in model:
+        layer.conv1d.weight.data.fill_(2.0)
+
+    assert TwinkleWorkerExtension._repack_derived_weights(model) == 2
+    for layer in model:
+        assert torch.equal(layer.conv1d.ascend_conv1d_weight, torch.full((4, 3), 2.0))
+
+
+def test_repack_rejects_a_packed_layout_it_does_not_understand():
+    """An unrecognised packed shape must fail the sync rather than leave the kernel on stale data."""
+    layer = nn.Module()
+    layer.weight = nn.Parameter(torch.zeros(3, 1, 4))
+    layer.register_parameter('ascend_conv1d_weight', nn.Parameter(torch.zeros(7, 5)))
+
+    with pytest.raises(RuntimeError, match='unsupported packed conv layout'):
+        TwinkleWorkerExtension._repack_derived_weights(layer)
 
 
 def _worker(model, order):

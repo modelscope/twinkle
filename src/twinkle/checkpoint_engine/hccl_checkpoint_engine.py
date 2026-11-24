@@ -125,7 +125,7 @@ class HCCLCheckpointEngine(CheckpointEngine):
         )
 
     def _start_zmq_server(self):
-        from twinkle.utils.platforms import hccl_socket_env
+        from twinkle.utils.platforms import ensure_hccl_socket_env, hccl_socket_env
 
         self.ip = find_node_ip()
         self.zmq_port = find_free_port()
@@ -133,6 +133,10 @@ class HCCLCheckpointEngine(CheckpointEngine):
         self.auth_key = generate_auth_key()  # 256-bit shared secret
         # The default process group of this trainer may already have pinned the HCCL socket env
         # (derived from its MASTER_PORT); the rollout ranks must join with the same layout.
+        # Pin it here and publish what this process will actually use: a snapshot of a layout it
+        # might never apply (because another group built first pinned a different one) would send
+        # the receivers to ports the trainer never opens.
+        ensure_hccl_socket_env(self.dist_port)
         self.hccl_env = hccl_socket_env(self.dist_port)
 
         self._zmq_ctx = zmq.Context()

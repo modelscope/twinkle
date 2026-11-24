@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Registry and platform mapping of ``twinkle.comm`` (no process spawning)."""
+import os
 import subprocess
 import sys
 from datetime import timedelta
@@ -168,4 +169,39 @@ def test_import_needs_no_accelerator_stack():
             'twinkle.comm.backends.hccl\n'
             "leaked = [m for m in ('torch_npu', 'vllm', 'vllm_ascend') if m in sys.modules]\n"
             'assert not leaked, leaked\n')
-    subprocess.run([sys.executable, '-c', code], check=True, timeout=120)
+    # torch_npu registers a ``torch.backends`` entry point, so on an Ascend box a plain
+    # ``import torch`` pulls it in and this guard would fail for the platform, not for the package.
+    # Turn the autoload off to test what the guard is about: importing ``twinkle.comm`` must not
+    # select an accelerator itself.
+    subprocess.run([sys.executable, '-c', code], check=True, timeout=120,
+                   env=dict(os.environ, TORCH_DEVICE_BACKEND_AUTOLOAD='0'))
+
+
+class _FakeStore:
+    """Minimal ``dist.Store`` stand-in: the group-id helper only uses ``set``/``get``."""
+
+    def __init__(self):
+        self.values = {}
+
+    def set(self, key, value):
+        self.values[key] = value.encode()
+
+    def get(self, key):
+        return self.values[key]
+
+
+def test_hccl_group_id_agrees_across_ranks_and_is_unique_per_group():
+    """HCCL names its communicator after the group id: it must agree and must not collide."""
+    from twinkle.comm import Rendezvous
+    from twinkle.comm.backends.hccl import _group_id
+
+    store = _FakeStore()
+    master = _group_id(Rendezvous('127.0.0.1', 1234, group_name='twinkle_ckpt'), 0, store)
+    # The peers read the name rather than recomputing it from the address, which the API lets them
+    # spell differently ('0.0.0.0'/'localhost'/an IPv6 long form) without breaking the TCPStore.
+    peer = _group_id(Rendezvous('localhost', 1234, group_name='twinkle_ckpt'), 1, store)
+    assert peer == master
+    # Bounded, so a caller-supplied name cannot overflow HCCL's communicator-name limit.
+    assert master.startswith('twinkle_ckpt-') and len(master) < 64
+    # A second live group under the same name gets its own id (fresh store, fresh token).
+    assert _group_id(Rendezvous('127.0.0.1', 1234, group_name='twinkle_ckpt'), 0, _FakeStore()) != master

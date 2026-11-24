@@ -8,11 +8,13 @@ HCCL derives its internal listen/connect ports from a base port, so every rank o
 must agree on ``HCCL_IF_BASE_PORT`` and the host/NPU socket port ranges. Ranks that already
 pinned a different layout (a trainer whose default process group derived it from
 ``MASTER_PORT``) time out in the group's first collective, so a rank that knows the layout
-(usually rank 0) publishes it and every rank passes it as ``socket_env``; without it the
-layout is derived from the rendezvous port, which is identical on every rank.
+(usually rank 0) publishes it and every rank passes it as ``socket_env``. Without it a rank
+applies the layout derived from the rendezvous port *only if it has not pinned one already*,
+so a process that pinned a layout earlier would silently disagree with its peers: pass
+``socket_env`` whenever any rank may have pinned one.
 """
 from __future__ import annotations
-import os
+import uuid
 from datetime import timedelta
 
 import torch
@@ -20,9 +22,46 @@ import torch.distributed as dist
 
 from ..base import Communicator, ReduceOp, Rendezvous, Work, normalize_device
 
+#: TCPStore key rank 0 publishes this group's communicator name under.
+_GROUP_ID_KEY = '__twinkle_hccl_group_id__'
+
+
+def _group_id(rendezvous: Rendezvous, rank: int, store: dist.Store) -> str:
+    """A communicator name that agrees across the group's ranks and is unique per group.
+
+    HCCL names its communicator after ``Options.group_id``, and the default id is empty for
+    everyone: a second live group in one process therefore fails ``hcclCommInitRootInfoConfig``
+    with a parameter error. Deriving the name from the rendezvous address is not enough, because
+    the API only requires the ranks to agree on the *address*, not on how they spell it
+    (``0.0.0.0``/``localhost``/IPv6 long forms), and an unbounded ``group_name`` can exceed HCCL's
+    name limit. Rank 0 mints the token and the peers read it from the store, so the name is
+    identical by construction and bounded.
+    """
+    if rank == 0:
+        store.set(_GROUP_ID_KEY, uuid.uuid4().hex)
+    token = store.get(_GROUP_ID_KEY).decode()
+    return f'{rendezvous.group_name}-{token[:16]}'
+
+
+def _bind_layout(pg: dist.ProcessGroup, device: torch.device) -> None:
+    """Run one tiny collective so the HCCL communicator is really built.
+
+    HCCL builds its communicator -- and reads the socket layout environment -- on the group's
+    first collective, not in the constructor. Waiting for one collective here is what lets
+    :func:`hccl_socket_env_scope` restore the process environment as soon as ``_create`` returns.
+    """
+    from twinkle.utils.framework import Torch
+
+    probe = torch.zeros(1, device=device)
+    options = dist.AllreduceOptions()
+    options.reduceOp = dist.ReduceOp.SUM
+    pg.allreduce([probe], options).wait()
+    Torch.synchronize(device)
+
 
 class HCCLCommunicator(Communicator):
-    """Device collectives through HCCL. The HCCL communicator is built lazily on the first op."""
+    """Device collectives through HCCL. The HCCL communicator is built by the first collective,
+    which ``_create`` runs itself so the socket layout can be scoped to it."""
 
     backend_name = 'hccl'
     #: ``socket_env``: HCCL socket env every rank of this group must share (see module docstring).
@@ -52,13 +91,7 @@ class HCCLCommunicator(Communicator):
         # 'npu' without an index could not be resolved before torch_npu was imported.
         device = normalize_device(device)
 
-        from twinkle.utils.platforms import ensure_hccl_socket_env
-        if socket_env:
-            # The publisher's layout wins over this process's own values; agreement is what
-            # matters and only the publisher knows whether its group already pinned them.
-            os.environ.update(socket_env)
-        else:
-            ensure_hccl_socket_env(rendezvous.port)
+        from twinkle.utils.platforms import hccl_socket_env_scope
 
         store = dist.TCPStore(
             host_name=rendezvous.host,
@@ -71,11 +104,12 @@ class HCCLCommunicator(Communicator):
         options = ProcessGroupHCCL.Options()
         options._timeout = timeout
         options.is_high_priority_stream = False
-        # HCCL names its communicator after the group id, and a second live group with the same
-        # (default empty) id in one process fails hcclCommInitRootInfoConfig with a parameter
-        # error. The rendezvous address is identical on every rank and unique per live group.
-        options.group_id = f'{rendezvous.group_name}@{rendezvous.host}:{rendezvous.port}'
-        pg = ProcessGroupHCCL(dist.PrefixStore(rendezvous.group_name, store), rank, world_size, options)
+        options.group_id = _group_id(rendezvous, rank, store)
+        # The layout is applied only for as long as it takes to bind it: leaving it in place would
+        # hand this group's ports to the next group built in this process.
+        with hccl_socket_env_scope(socket_env, master_port=rendezvous.port):
+            pg = ProcessGroupHCCL(dist.PrefixStore(rendezvous.group_name, store), rank, world_size, options)
+            _bind_layout(pg, device)
         return cls(rank, world_size, device, store, pg)
 
     @staticmethod

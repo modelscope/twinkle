@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+
 import torch
 
 import pytest
@@ -88,7 +90,9 @@ def test_prepare_publishes_the_rendezvous_and_the_hccl_socket_env(comms, monkeyp
     zmq_port, dist_port = comms.ports[:2]
     assert (md.zmq_ip, md.zmq_port, md.dist_ip, md.dist_port) == ('127.0.0.1', zmq_port, '127.0.0.1', dist_port)
     assert md.hccl_env == dict(_derive_hccl_socket_env_defaults(dist_port), HCCL_IF_BASE_PORT='12345')
-    assert 'HCCL_HOST_SOCKET_PORT_RANGE' not in __import__('os').environ  # read-only
+    # Pin-then-publish: the layout is applied here, so what the rollout ranks are told is exactly
+    # what this process will use. A bare snapshot could be a layout nothing ever applies.
+    assert {key: os.environ[key] for key in md.hccl_env} == md.hccl_env
     assert len(md.auth_key) >= 32
     assert engine.prepare() == md  # idempotent
     assert engine.send_buf.device.type == 'cpu' and engine.send_buf.numel() == 4096

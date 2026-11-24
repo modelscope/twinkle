@@ -190,19 +190,27 @@ def _run_worker(backend, device_type, rank, world_size, ports, out_dir):
 
         # A second live group (full sync next to delta sync) must not interfere with the first.
         other = build(ports[1], 'other')
+        # ...and a third that deliberately REUSES the first one's name: the backends must tell
+        # groups apart by more than the name (HCCL names its communicator after the group id, and
+        # the checkpoint mixin really does keep several groups called 'twinkle_ckpt' alive).
+        twin = build(ports[2], 'main')
         for round_ in range(3):
             a = _payload(rank, torch.float32, device)
             b = _payload(rank + 100, torch.float32, device)
+            c = _payload(rank + 200, torch.float32, device)
             comm.broadcast(a, src=0)
             other.broadcast(b, src=world_size - 1)
+            twin.broadcast(c, src=0)
             comm.synchronize()
             _assert_payload(a, 0, ('main group', round_))
             _assert_payload(b, world_size - 1 + 100, ('other group', round_))
+            _assert_payload(c, 200, ('same-name group', round_))
         other.destroy()
+        twin.destroy()
         _check_destroyed(comm, device)
 
         # rebuild_group=True: a destroyed group must not block building a fresh one.
-        comm = build(ports[2], 'rebuilt')
+        comm = build(ports[3], 'rebuilt')
         t = _payload(rank, torch.float32, device)
         comm.broadcast(t, src=0)
         comm.synchronize()
@@ -216,7 +224,7 @@ def _run_worker(backend, device_type, rank, world_size, ports, out_dir):
 
 def _spawn(backend, device_type, world_size, out_dir):
     ctx = mp.get_context('spawn')
-    ports = tuple(find_free_port() for _ in range(3))
+    ports = tuple(find_free_port() for _ in range(4))
     procs = [
         ctx.Process(target=_run_worker, args=(backend, device_type, rank, world_size, ports, str(out_dir)),
                     daemon=True) for rank in range(world_size)
