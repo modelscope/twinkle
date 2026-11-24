@@ -8,9 +8,11 @@ import pytest
 from starlette.requests import Request
 
 from twinkle.server.config.application_spec import SamplerArgs
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.lifecycle.submit import resolve_twinkle_adapter_name
 from twinkle.server.middleware.auth import verify_request_token
 from twinkle.server.sampler.pool.controller import SamplerController
+from twinkle.server.sampler.submission import SampleSubmission
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -97,6 +99,31 @@ async def settle_starts(pool):
 
 async def settle_jobs(pool):
     await asyncio.gather(*tuple(pool.lifecycle.jobs), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cold_sample_retry_joins_disconnected_submission():
+    pool, driver, _ = setup(minimum=0, maximum=1)
+    driver.start_gate.clear()
+    submission = SampleSubmission('req_same', 'original')
+    original = asyncio.create_task(pool.request(request(), submission=submission))
+    try:
+        while not driver.started:
+            await asyncio.sleep(0)
+        original.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await original
+        with pytest.raises(RequestRejectedError, match='different submission'):
+            await pool.request(request(), submission=SampleSubmission('req_same', 'changed'))
+        retry = asyncio.create_task(pool.request(request(), submission=submission))
+        await asyncio.sleep(0)
+        driver.start_gate.set()
+        assert (await retry)['status'] == 200
+        assert len(driver.calls) == len(driver.started) == 1
+    finally:
+        driver.start_gate.set()
+        driver.finish.set()
+        await pool.shutdown()
 
 
 @pytest.mark.asyncio

@@ -47,7 +47,9 @@ empty row list and a count of zero. Requests without a token appear as
    source error indicates a failed Redis read. Historical logs and traces
    remain independently searchable.
 2. Click the **Training ID** to open **Training task logs** with that training
-   and time range. Use **Log outcome** to narrow to failures, refusals, or
+   and time range. GRPO rollouts using that training’s published checkpoint
+   appear as `sample`. Base-weight sampling has no checkpoint training ID.
+   Use **Log outcome** to narrow to failures, refusals, or
    timeouts. To search a longer log history, open the logs panel in **Explore**.
 3. Expand a log and choose **View trace**, or open **Runtime task traces**.
    The execution span shows queue wait, execution time, outcome and error type.
@@ -65,7 +67,10 @@ empty row list and a count of zero. Requests without a token appear as
   **Base model** and the fingerprint filter apply to training and usage.
   **Training ID** narrows the training and diagnostic panels. **Resource
   node** narrows the node metrics. Queue depth is global across tenants
-  and models.
+  and models. **Serve ingress wait p95** measures waiting for an HTTP
+  replica (optional Ray scrape). **Compute queue wait p95** starts at
+  task admission. For a cold sampler, inspect the `sampler.forward` span
+  for the post-assignment wait.
 - Usage includes admitted training compute and ordinary sampling requests.
   Retries that replay an accepted request contribute once. Input token counts
   use token IDs known at admission. Execution seconds sum task duration
@@ -73,7 +78,11 @@ empty row list and a count of zero. Requests without a token appear as
   estimates. Each time series needs two samples in the selected range.
   Activity already included in the first sample of a new series can be missed,
   especially for a tenant making only a few requests.
-  Heartbeats, polling and origin HTTP 429 responses appear separately.
+  Heartbeats and polling appear separately.
+- **Business admission rejections / second** groups rate limits, quota and
+  unavailable capacity. A rejected training creation can arrive as a
+  failed future over HTTP 200. Replaying that receipt or reading it again
+  adds no rejection. The legacy HTTP 429 metric remains available in Explore.
 - The two deployment references are requests per second and input tokens
   per second. Grafana compares five-minute rates against the same references
   for every tenant and highlights the corresponding panels.

@@ -41,6 +41,19 @@ ingestion and retention settings.
    The entrypoint supervises Runtime independently of the monitoring stack.
    Confirm all three signals arrive.
 
+To show **Serve ingress wait p95**, enable the optional Ray metrics scrape.
+Set `OBS_RAY_METRICS_TARGET` to the private `host:port` of the Ray metrics
+endpoint on the HTTP proxy node, then start the stack with both Compose files:
+
+```sh
+docker compose -f docker-compose.production.yaml -f docker-compose.ray-metrics.yaml up -d
+```
+
+For a deployment with HTTP proxies on multiple nodes, list each proxy node
+in the Collector scrape configuration so the chart covers them all. This
+reuses Ray's replica-assignment histogram. The compute queue panels work
+with the regular OTLP pipeline alone.
+
 See the [multitenant operations guide](../../docs/source_en/Usage%20Guide/Server%20and%20Client/Multitenant-Operations.md)
 for Redis ACLs, credential handling, dashboard queries, and deployment checks.
 
@@ -127,6 +140,7 @@ counters where missing:
 | `twinkle.queue.depth` | UpDownCounter | `twinkle_queue_depth` |
 | `twinkle.task.execution_seconds` | Histogram | `twinkle_task_execution_seconds_bucket` |
 | `twinkle.task.wait_seconds` | Histogram | `twinkle_task_wait_seconds_bucket` |
+| `twinkle.admission.rejections.total` | Counter | `twinkle_admission_rejections_total` |
 | `twinkle.rate_limit.rejections.total` | Counter | `twinkle_rate_limit_rejections_total` |
 | `twinkle.tasks.total` | Counter | `twinkle_tasks_total` |
 | `twinkle.rate_limiter.active_tokens` | UpDownCounter | `twinkle_rate_limiter_active_tokens` |
