@@ -2,8 +2,9 @@
 
 ## Configure observability
 
-The [Compose example](https://github.com/modelscope/twinkle/tree/main/cookbook/observability)
-runs Collector, Tempo, Loki, Mimir, and Grafana with persistent storage.
+Follow [Start the training operations dashboard](https://github.com/modelscope/twinkle/tree/main/cookbook/observability#start-the-training-operations-dashboard)
+for both local and self-hosted use. The Compose example runs Collector, Tempo,
+Loki, Mimir, and Grafana with persistent storage.
 Set `telemetry.otlp_endpoint` to a Collector reachable from Runtime. Choose a
 retention period and storage backend for your deployment. The example retains
 30 days of data. Keep Mimir's TSDB and working directories on supported block
@@ -32,74 +33,55 @@ Grafana data source can read all three keys with GET. Also verify that the same
 account cannot read any business key, write, or enumerate keys with SCAN or KEYS.
 The Runtime cleanup leader refreshes the snapshots at `metrics_update_interval`
 (15 seconds by default). Each snapshot has a generation time and a TTL of
-three refresh intervals, rounded up to seconds. An empty snapshot reports
-`EMPTY`. Missing fingerprints appear as `未归属` in the dashboard.
+three refresh intervals, rounded up to seconds. Empty snapshots contain an
+empty row list and a count of zero. Requests without a token appear as
+**Unattributed** and can be selected with `unassigned`.
 
-## Investigate usage and latency
+## Find a training and investigate an error
 
-- **Current trainings** shows the live state, base model, and user fingerprint.
-  Click a base model or training ID in the table to filter task logs and traces by that training. **Training snapshot updated** shows the live snapshot's
-  update time or `Unavailable` if it expired. When an update time is present,
-  `No trainings` means there are no current trainings and `No data` means
-  the fingerprint filter matched no rows. Find finished trainings
-  in **Recent training activity** by base model, last enqueue time, and the
-  short training ID. Older logs may only show the time and training ID.
-- **Training task logs** shows lifecycle events such as enqueue, completion,
-  failure, and timeout. Select **Task errors in range** for failures, timeouts,
-  and refusals, or select an outcome in **Task events by outcome** to open
-  matching logs. Expand a log with a trace and choose **View trace**. Counts
-  represent log events in the selected range. A task can emit multiple events. For older Runtime logs,
-  use **Logs for this span** on the matching task trace.
-- **User fingerprint prefix** accepts the 12-character prefix shown in charts
-  or the complete `twinkle.user_id` from a trace. Leave it blank to see all
-  users. The filter applies to usage, traces, and Redis details. **Base model**
-  filters usage and latency metrics. **Training ID** filters task logs and traces.
-  Requests without a token use a stable client ID when available and share an
-  anonymous fingerprint otherwise.
-- Count one request per successful admission for `forward`, `forward_only`,
-  `forward_backward`, `step`, `clip_grad_and_step`, `optim_step`, and ordinary `sample` / `asample`.
-  Input token counts use the submission size already available at admission.
-  Unencoded inputs without token IDs contribute zero to that counter.
-  Run seconds sum task execution time across replicas. The range totals subtract
-  the last counter sample before the window from the final sample inside it,
-  using zero for a series that starts inside the window. View heartbeats,
-  result polling, and Runtime HTTP 429 separately.
-- Reference limits come from deployment configuration. Grafana sums five-minute
-  rates across replicas and models, applies a per-fingerprint override when
-  present, and highlights relative usage. Existing per-replica rate limits
-  continue to govern admission.
-- Use **Runtime task traces** to find traces for the selected training.
-  In **Explore → Tempo**, search by trace ID or use the TraceQL editor with
-  `{ span.twinkle.request_id = "req_..." }`. For a reused SDK HTTP request ID,
-  search `span.twinkle.http_request_id` and narrow by time and operation.
-  Open `task_queue.execute` to see the user's `twinkle.user_id`, queue wait
-  (`twinkle.wait_seconds`), execution time (`twinkle.execution_seconds`), and final task outcome.
-  Telemetry records the error type when an operation fails.
-  HTTP latency measures the Runtime response, including a separate result
-  poll when the operation is asynchronous.
-- On `task_queue.execute`, use **Logs for this span** to find Runtime logs
-  matching the task ID. **Find training logs** opens the selected training's
-  logs. To browse a whole service, select the time range in **Explore → Loki**.
-  If you know the service and task ID, use
-  `{service_name="runtime-service"} |= "req_..."`. The task ID also finds
-  completion logs emitted outside the trace context.
-- **Drilldown → Traces** shows span rate, errors, and latency grouped by
-  attributes such as service name. Select **All spans** to include child spans
-  such as `task_queue.execute`. Tempo builds these aggregates from traces
-  received after its local-blocks processor is enabled. Earlier traces remain
-  searchable in **Explore**. Use **Drilldown → Logs** to browse services and
-  labels and find changes in log volume or errors.
-- Queue depth comes from `sum by (deployment) (twinkle_queue_depth)`.
-  GPU charts show physical cards by node and UUID. In the execution span, open
-  **Links** and choose **Node GPU utilization** or **Node CPU utilization** for
-  the node and time around that span. New traces also show `twinkle.node` as a
-  resource attribute. Workers on a node share a node-local temporary directory
-  to elect a CPU and GPU metrics publisher. Process RSS stays per worker.
-  Establish exclusive model-to-device ownership before attributing device usage
-  to a model.
-- **Last Runtime metric received** shows the age of the latest heartbeat per reporting
-  node. If it goes missing, check Runtime and Collector connectivity. The heartbeat
-  covers the metrics pipeline. Check Loki and Tempo independently when testing ingestion.
+1. Select the time range and open **Current trainings** or **Recent training
+   activity**. **Training snapshot** shows the last refresh and total live
+   trainings before filters. A fresh snapshot with zero trainings is empty.
+   A fresh snapshot with a positive count and an empty filtered table has no
+   matches. **Unavailable** indicates a missing or expired snapshot. A data
+   source error indicates a failed Redis read. Historical logs and traces
+   remain independently searchable.
+2. Click the **Training ID** to open **Training task logs** with that training
+   and time range. Use **Log outcome** to narrow to failures, refusals, or
+   timeouts. To search a longer log history, open the logs panel in **Explore**.
+3. Expand a log and choose **View trace**, or open **Runtime task traces**.
+   The execution span shows queue wait, execution time, outcome and error type.
+   For a known task ID, search Tempo with
+   `{ span.twinkle.task_id = "req_..." }`, or filter Loki with
+   `{service_name="runtime-service"} | twinkle_task_id = "req_..."`.
+   **Logs for this span** searches by the task ID. From the span's **Links**,
+   open **Node GPU utilization** or **Node CPU utilization** to inspect the
+   device's node around that execution.
+
+## Check tenant usage and resources
+
+- **User fingerprint prefix** accepts a fingerprint or its prefix. The
+  full value appears as `twinkle.tenant_fingerprint` in a task trace.
+  **Base model** and the fingerprint filter apply to training and usage.
+  **Training ID** narrows the training and diagnostic panels. **Resource
+  node** narrows the node metrics. Queue depth is global across tenants
+  and models.
+- Usage includes admitted training compute and ordinary sampling requests.
+  Retries that replay an accepted request contribute once. Input token counts
+  use token IDs known at admission. Execution seconds sum task duration
+  across replicas. The time-range totals use Prometheus `increase()`
+  estimates. Each time series needs two samples in the selected range.
+  Heartbeats, polling and origin HTTP 429 responses appear separately.
+- The two deployment references are requests per second and input tokens
+  per second. Grafana compares five-minute rates against the same references
+  for every tenant and highlights the corresponding panels.
+- CPU and GPU metrics are emitted once per node and backend destination.
+  RSS is per process. Interpret GPU charts as physical device usage by node
+  and UUID. Attribute a device to a model only when its allocation is exclusive.
+- **Drilldown → Traces** shows span rates, errors and latency using the
+  Tempo local-blocks processor. **Drilldown → Logs** shows service and label
+  activity. Use **Last Runtime metric received** to check exporter freshness
+  and confirm trace and log ingestion separately.
 
 ## Verify the deployment
 

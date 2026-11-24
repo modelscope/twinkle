@@ -21,9 +21,9 @@ services:
     image: twinkle-lgtm:0.28.0
     container_name: twinkle-lgtm
     ports:
-      - "3000:3000"   # Grafana UI
-      - "4317:4317"   # OTLP gRPC — point telemetry.otlp_endpoint here
-      - "4318:4318"   # OTLP HTTP (alternative)
+      - "127.0.0.1:3000:3000"   # Grafana UI
+      - "127.0.0.1:4317:4317"   # OTLP gRPC — point telemetry.otlp_endpoint here
+      - "127.0.0.1:4318:4318"   # OTLP HTTP (alternative)
     volumes:
       # Persist dashboards/data across container restarts (optional)
       - lgtm-data:/data
