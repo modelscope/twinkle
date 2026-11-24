@@ -3201,71 +3201,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
     def _expand_multimodal_lora_target(self, config, model, *, freeze_llm: bool, freeze_vit: bool,
                                        freeze_aligner: bool) -> None:
-        """Rewrite a multimodal ``'all-linear'`` LoRA target into the freeze_*-aware regex, in place.
-
-        PEFT expands ``'all-linear'`` to every linear in the model, which on a multimodal model would
-        also adapt the vision tower and the aligner -- but legacy swift targets only the *unfrozen*
-        towers (by default the language model alone), and that partition is what ``freeze_*`` express.
-        The expansion needs the real modules, so it runs here on the worker, not on the driver's PROXY.
-
-        Left untouched (so PEFT's own behaviour stands) when the target is not ``'all-linear'`` -- an
-        explicit user regex or name list is respected verbatim -- or when ``model_arch`` declares no
-        vision tower / aligner, i.e. a plain LLM where ``'all-linear'`` already means the right thing.
-        """
-        target = getattr(config, 'target_modules', None)
-        is_all_linear = target == 'all-linear' or (isinstance(target, (list, tuple, set)) and 'all-linear' in target)
-        if not is_all_linear:
-            return
-        if not (self.model_arch.get('vision_tower') or self.model_arch.get('aligner')):
-            return
-        from twinkle.model.transformers.target_modules import get_multimodal_target_regex
-        # Walk the base model: target prefixes in model_arch are base-relative, and when an adapter is
-        # added to an already-peft model the towers live under the wrapped base, not the PeftModel.
-        base_model = model
-        while isinstance(base_model, PeftModel):
-            base_model = base_model.get_base_model()
-        include_embedding = isinstance(target, (list, tuple, set)) and 'all-embedding' in target
-        config.target_modules = get_multimodal_target_regex(
-            base_model,
+        from twinkle.model.transformers.target_modules import expand_multimodal_lora_target
+        expand_multimodal_lora_target(
+            model,
+            config,
             self.model_arch,
             freeze_llm=freeze_llm,
             freeze_vit=freeze_vit,
-            freeze_aligner=freeze_aligner,
-            include_embedding=include_embedding)
+            freeze_aligner=freeze_aligner)
 
     def _expand_modules_to_save(self, config, model) -> None:
-        """Expand the ``'all-norm'`` / ``'all-embedding'`` shorthands in ``modules_to_save``, in place.
-
-        PEFT keeps ``modules_to_save`` entries as full-precision trainable copies and matches each by
-        ``name.endswith(entry)`` -- a shorthand like ``'all-norm'`` matches no module and is silently
-        ignored (``_set_trainable``, ``strict_module_check=False``), so it has to be resolved to concrete
-        module names here first. The expansion needs the real modules, so it runs on the worker, not the
-        driver's PROXY -- the same reason the ``'all-linear'`` target expansion lives here. Unlike that
-        target expansion, ``modules_to_save`` is NOT tower / freeze filtered: every norm / embedding the
-        shorthand names is saved, regardless of which towers are LoRA-adapted (legacy does the same).
-        """
-        modules_to_save = getattr(config, 'modules_to_save', None)
-        if not modules_to_save:
-            return
-        shorthands = ('all-norm', 'all-embedding')
-        if not any(name in shorthands for name in modules_to_save):
-            return
-        from twinkle.model.transformers.target_modules import find_embedding, find_norm
-        # Walk to the base model: when an adapter is added to an already-peft model the real modules
-        # live under the wrapped base, not the PeftModel.
-        base_model = model
-        while isinstance(base_model, PeftModel):
-            base_model = base_model.get_base_model()
-        expanded = [name for name in modules_to_save if name not in shorthands]
-        for shorthand, finder in (('all-embedding', find_embedding), ('all-norm', find_norm)):
-            if shorthand not in modules_to_save:
-                continue
-            found = finder(base_model)
-            if not found:
-                logger.warning(f'modules_to_save {shorthand!r} matched no module on this model; ignored.')
-            expanded += found
-        # de-dup while preserving order (a shorthand may overlap an explicitly-named module).
-        config.modules_to_save = list(dict.fromkeys(expanded))
+        from twinkle.model.transformers.target_modules import expand_modules_to_save
+        expand_modules_to_save(model, config)
 
     @remote_function()
     @timed
