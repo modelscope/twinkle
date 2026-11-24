@@ -476,7 +476,7 @@ class ComputeWorker:
         finished_at = None
         queue_attrs = {
             TENANT_FINGERPRINT: task.tenant_fingerprint,
-            TRAINING_ID: task.model_id,
+            TRAINING_ID: task.training_id,
             BASE_MODEL: task.base_model,
             'twinkle.task_type': task_type,
             'twinkle.deployment': self._deployment_name or 'unknown',

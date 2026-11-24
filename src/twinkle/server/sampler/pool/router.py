@@ -6,12 +6,14 @@ import asyncio
 
 import json
 from fastapi import Depends, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.deployment import bind_deployment, build_deployment_app
+from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.proxy import ForwardedRequest
 from twinkle.server.middleware.auth import get_token_from_request
+from twinkle.server.sampler.submission import existing_sample, sample_submission
 from twinkle.server.sampler.weights import is_full_checkpoint
 from twinkle.server.state import get_server_state
 from twinkle.server.telemetry.tracing import inject_context, record_http_status, traced_operation
@@ -41,6 +43,7 @@ class SamplerRouter:
             "query_string": request.scope.get("query_string", b""),
         }
         full_path = None
+        submission = None
         if endpoint in ("twinkle/sample", "twinkle/sample_stream", "twinkle/sample_to_data_plane", "tinker/asample"):
             try:
                 data = json.loads(body)
@@ -48,6 +51,15 @@ class SamplerRouter:
                 data = {}
             if not isinstance(data, dict):
                 data = {}
+            if endpoint in ("twinkle/sample", "tinker/asample"):
+                submission = sample_submission(request, endpoint, self.model_id, data)
+                if submission is not None:
+                    record = await existing_sample(self.state, submission, get_token_from_request(request))
+                    if record is not None:
+                        request.state.task_id = submission.request_id
+                        if endpoint == "twinkle/sample":
+                            return JSONResponse(envelope_from_record(submission.request_id, record).model_dump(mode="json"))
+                        return JSONResponse({"request_id": submission.request_id, "model_id": None})
             # The existing handler remains responsible for its validation/wire errors.
             path = data.get("adapter_uri") or data.get("model_path")
             if not path and endpoint == "tinker/asample" and data.get("sampling_session_id"):
@@ -74,7 +86,8 @@ class SamplerRouter:
                 payload["headers"] = [
                     (key, value) for key, value in payload["headers"] if key.lower() not in trace_headers
                 ] + list(trace_headers.items())
-                reply = await self.controller.request.remote(payload, queue, full_path)
+                options = {"submission": submission} if submission is not None else {}
+                reply = await self.controller.request.remote(payload, queue, full_path, **options)
                 record_http_status(span, reply["status"], client=True)
         except BaseException:
             if queue is not None:

@@ -8,6 +8,7 @@ schedule_concurrent_task() returning UntypedAPIFuture.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
 from twinkle.data_format import SamplingParams
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.exceptions import RequestRejectedError
+from twinkle.server.sampler.submission import existing_sample, sample_submission
 from twinkle.server.sampler.weights import sample_with_weights
 from .runtime import request_execution_scope
 
@@ -60,23 +62,26 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
             UntypedAPIFuture wrapping SampleResponse with generated sequences
         """
         token = await self._on_request_start(request)
+        submission = sample_submission(request, 'tinker/asample', self._telemetry_base_model, await request.json())
+        if submission and await existing_sample(self.state, submission, token) is not None:
+            return {'request_id': submission.request_id, 'model_id': None}
+
+        model_path = body.model_path
+        if not model_path and body.sampling_session_id:
+            session = await self.state.get_sampling_session(body.sampling_session_id)
+            model_path = session.get('model_path') if session else None
+        checkpoint_training_id = None
+        if model_path:
+            checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
+            checkpoint_training_id = await asyncio.to_thread(checkpoint_manager.sampling_training_id, model_path)
 
         async def _do_sample():
-            # Extract prompt token IDs from ModelInput
             prompt_inputs = {'input_ids': body.prompt.to_ints()}
-
-            # Get model_path from body or sampling session
-            model_path = body.model_path
-            if not model_path and body.sampling_session_id:
-                session = await self.state.get_sampling_session(body.sampling_session_id)
-                if session:
-                    model_path = session.get('model_path')
 
             # Parse and resolve adapter URI from model_path
             adapter_uri = None
             if model_path:
-                checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')
-                adapter_name, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
+                _, adapter_uri = checkpoint_manager.parse_adapter_uri(model_path)
 
             # Base-model sampling is valid when no model_path was provided.
             if adapter_uri and not os.path.exists(adapter_uri):
@@ -147,4 +152,7 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
             input_tokens=input_tokens,
             task_type='sample',
             execution_scope=request_execution_scope(request),
+            checkpoint_training_id=checkpoint_training_id,
+            request_id=submission.request_id if submission else None,
+            submission_fingerprint=submission.fingerprint if submission else None,
         )

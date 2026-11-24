@@ -1,8 +1,11 @@
 import asyncio
+import uuid
+from requests.exceptions import Timeout
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
+from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTENCY_SUPPORTED
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
 from twinkle.protocol.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
@@ -57,7 +60,8 @@ class vLLMSampler:
             model_id = model_id.split('://')[1]
         self.model_id = model_id
         self.server_url = f'{self._transport.context.base_url}/sampler/{model_id}/twinkle'
-        self._transport.post(f'{self.server_url}/create', json_data=kwargs)
+        response = self._transport.post(f'{self.server_url}/create', json_data=kwargs)
+        self._sample_idempotency = getattr(response, 'headers', {}).get(H_SAMPLE_IDEMPOTENCY_SUPPORTED) == '1'
 
     def _await_task(self, response, model_cls):
         """Resolve a Submit_Endpoint response through the Client_Future_Layer."""
@@ -111,15 +115,22 @@ class vLLMSampler:
         """
         if adapter_uri is None:
             adapter_uri = adapter_path if adapter_path is not None else getattr(self, 'adapter_uri', None)
-        response = self._transport.post_model(
-            f'{self.server_url}/sample',
-            build_request(
-                SampleRequest,
-                inputs=_json_safe(inputs),
-                sampling_params=self._sampling_params(sampling_params, num_samples),
-                adapter_name=adapter_name,
-                adapter_uri=adapter_uri,
-                token_only=token_only))
+        url = f'{self.server_url}/sample'
+        body = build_request(
+            SampleRequest,
+            inputs=_json_safe(inputs),
+            sampling_params=self._sampling_params(sampling_params, num_samples),
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            token_only=token_only)
+        if getattr(self, '_sample_idempotency', False):
+            headers = {H_SAMPLE_IDEMPOTENCY_KEY: uuid.uuid4().hex}
+            try:
+                response = self._transport.post_model(url, body, headers=headers)
+            except Timeout:
+                response = self._transport.post_model(url, body, headers=headers)
+        else:
+            response = self._transport.post_model(url, body)
         return self._await_task(response, SampleResponseModelList).samples
 
     @staticmethod

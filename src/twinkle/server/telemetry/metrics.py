@@ -93,6 +93,10 @@ class MetricsRegistry:
             'twinkle.rate_limit.rejections.total',
             description='Total requests rejected by rate limiter',
         )
+        self.admission_rejections = meter.create_counter(
+            'twinkle.admission.rejections.total',
+            description='Business admission rejections counted where the decision was made',
+        )
         self.tasks_total = meter.create_counter(
             'twinkle.tasks.total',
             description='Total task completions, partitioned by status',

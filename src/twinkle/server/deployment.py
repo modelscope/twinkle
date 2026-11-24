@@ -40,6 +40,7 @@ from twinkle.protocol.types.errors import ErrorCategory
 from twinkle.server.exceptions import TwinkleServerError
 from twinkle.server.middleware.auth import verify_request_token
 from twinkle.server.task_errors import build_error_payload
+from twinkle.server.telemetry.admission import record_admission_rejection
 from twinkle.server.telemetry.http_middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
 from twinkle.utils.logger import get_logger
@@ -60,6 +61,12 @@ async def twinkle_server_error_handler(request: Request, exc: TwinkleServerError
     (``category=user``) carries no traceback.
     """
     request_id = getattr(request.state, 'request_id', None) or ''
+    record_admission_rejection(
+        exc,
+        deployment=getattr(request.state, 'metrics_deployment', 'unknown'),
+        fingerprint=getattr(request.state, 'tenant_fingerprint', None),
+        base_model=getattr(request.state, 'base_model', None),
+    )
     payload = build_error_payload(
         str(exc) or exc.__class__.__name__,
         category=exc.category,

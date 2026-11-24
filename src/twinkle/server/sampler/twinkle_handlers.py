@@ -12,7 +12,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Callable, Mapping
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -23,11 +23,14 @@ import numpy as np
 
 import twinkle.protocol.types as types
 from twinkle.data_format import PoolingParams, SamplingParams
+from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_SUPPORTED
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
+from twinkle.server.checkpoint import create_checkpoint_manager
+from twinkle.server.sampler.submission import existing_sample, sample_submission
 from twinkle.server.sampler.weights import resolve_sampler_weights, sample_with_weights
 from twinkle.server.task_errors import task_error_payload
 from twinkle.server.telemetry.correlation import MODEL_ID
@@ -221,8 +224,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
     @app.post('/twinkle/create', response_model=sampler_types.SamplerCreateResponse)
     async def create(
-        request: Request, self: SamplerManagement = Depends(self_fn)) -> sampler_types.SamplerCreateResponse:
+        response: Response, self: SamplerManagement = Depends(self_fn)) -> sampler_types.SamplerCreateResponse:
         """Health check / session creation endpoint."""
+        response.headers[H_SAMPLE_IDEMPOTENCY_SUPPORTED] = '1'
         return sampler_types.SamplerCreateResponse()
 
     @app.post('/twinkle/sample', response_model=types.TaskEnvelope)
@@ -233,6 +237,14 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         Supports Trajectory or InputFeature inputs, with optional LoRA adapter.
         """
         token = await self._on_request_start(request)
+        submission = sample_submission(request, 'twinkle/sample', self._telemetry_base_model, await request.json())
+        if submission and await existing_sample(self.state, submission, token) is not None:
+            return await self._peek_terminal(submission.request_id, fallback_status='pending')
+
+        checkpoint_training_id = None
+        if body.adapter_uri:
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+            checkpoint_training_id = await asyncio.to_thread(checkpoint_manager.sampling_training_id, body.adapter_uri)
 
         async def _task():
             # Resolve adapter
@@ -241,8 +253,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             full_adapter_name = resolve_twinkle_adapter_name(request, adapter_name) or ''
 
             if body.adapter_uri:
-                from twinkle.server.checkpoint import create_checkpoint_manager
-                checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
             else:
                 # No explicit uri: the OpenAI-gateway shape carries only the adapter's public
@@ -282,7 +292,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             token=token,
             input_tokens=input_tokens,
             task_type='sample',
-            execution_scope=request_execution_scope(request))
+            execution_scope=request_execution_scope(request),
+            checkpoint_training_id=checkpoint_training_id,
+            request_id=submission.request_id if submission else None,
+            submission_fingerprint=submission.fingerprint if submission else None)
 
     @app.post('/twinkle/sample_to_data_plane', response_model=types.TaskEnvelope)
     async def sample_to_data_plane(

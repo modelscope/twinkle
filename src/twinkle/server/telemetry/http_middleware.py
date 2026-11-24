@@ -30,6 +30,7 @@ def create_metrics_middleware(deployment: str) -> Callable:
     """
 
     async def metrics_middleware(request: Any, call_next: Callable) -> Any:
+        request.state.metrics_deployment = deployment
         start = time.monotonic()
         status = 500
         try:

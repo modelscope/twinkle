@@ -48,9 +48,15 @@ class QueuedTask:
     trace_context: Any = None
     base_model: str | None = None
 
+    checkpoint_training_id: str | None = None
+
+    @property
+    def training_id(self) -> str | None:
+        return self.checkpoint_training_id or self.model_id
+
     def log_fields(self, outcome: str, trace_id: str | None = None) -> dict[str, str]:
         fields = {
-            'twinkle_training_id': self.model_id,
+            'twinkle_training_id': self.training_id,
             'twinkle_task_id': self.request_id,
             'twinkle_task_type': self.task_type or 'unknown',
             'twinkle_task_outcome': outcome,

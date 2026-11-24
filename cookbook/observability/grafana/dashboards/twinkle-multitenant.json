@@ -298,7 +298,7 @@
       "id": 21,
       "type": "logs",
       "title": "Training task logs",
-      "description": "Task events for the selected training. Open the panel menu and choose Explore to search more logs.",
+      "description": "Task events for the selected training, including GRPO rollouts (sample) using its saved checkpoints. Open the panel menu and choose Explore to search more logs.",
       "datasource": {"type": "loki", "uid": "twinkle-loki"},
       "gridPos": {"x": 0, "y": 18, "w": 24, "h": 10},
       "options": {
@@ -321,7 +321,7 @@
       "id": 16,
       "type": "table",
       "title": "Runtime task traces",
-      "description": "Filter by Token fingerprint or training ID. Open a Trace ID to see the request path. On task_queue.execute, use Logs for this span to see the task's Runtime logs.",
+      "description": "Filter by Token fingerprint or training ID. Open a Trace ID to see training compute or the rollout sample path, including sampler forwarding and cold-start wait. On task_queue.execute, use Logs for this span to see the task’s Runtime logs.",
       "datasource": {"type": "tempo", "uid": "twinkle-tempo"},
       "gridPos": {"x": 0, "y": 28, "w": 24, "h": 9},
       "fieldConfig": {"defaults": {}, "overrides": []},
@@ -523,8 +523,8 @@
     {
       "id": 27,
       "type": "timeseries",
-      "title": "Runtime rejections (HTTP 429) / second",
-      "description": "Counts each 429 where it originated. Proxied copies are excluded.",
+      "title": "Business admission rejections / second",
+      "description": "Rate limits, resource quota and unavailable capacity at the admission decision. Includes rejected training futures even when HTTP returned 200. Forwarded replies and repeated future polls do not add a rejection.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 12, "y": 50, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
@@ -532,16 +532,16 @@
       "targets": [
         {
           "refId": "A",
-          "legendFormat": "{{tenant_fingerprint}}",
-          "expr": "sum by (tenant_fingerprint) (rate(twinkle_http_requests_total{status=\"429\",response_origin=\"local\",tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))"
+          "legendFormat": "{{reason}} · {{base_model}} · {{tenant_fingerprint}}",
+          "expr": "sum by (reason,base_model,tenant_fingerprint) (rate(twinkle_admission_rejections_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))"
         }
       ]
     },
     {
       "id": 8,
       "type": "timeseries",
-      "title": "Queue wait p95",
-      "description": "",
+      "title": "Compute queue wait p95",
+      "description": "Wait after task admission. Requests waiting at the Serve ingress or for a sampler to become ready are counted separately from compute queue wait.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 0, "y": 58, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
@@ -572,12 +572,29 @@
       ]
     },
     {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Serve ingress wait p95",
+      "description": "Time for the Ray Serve HTTP proxy to assign a request to a replica, by application and deployment across all tenants. Requires the optional Ray metrics scrape. Sampler cold-start after assignment appears in sampler.forward on the trace.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 66, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le,application,deployment) (rate(ray_serve_request_router_fulfillment_time_ms_bucket{handle_source=\"PROXY\"}[5m]))) / 1000",
+          "legendFormat": "{{application}} / {{deployment}}"
+        }
+      ]
+    },
+    {
       "id": 7,
       "type": "timeseries",
       "title": "Runtime HTTP latency p95",
       "description": "",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
-      "gridPos": {"x": 0, "y": 66, "w": 12, "h": 8},
+      "gridPos": {"x": 0, "y": 74, "w": 24, "h": 8},
       "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
       "options": {},
       "targets": [
@@ -591,8 +608,8 @@
     {
       "id": 10,
       "type": "timeseries",
-      "title": "Global queue depth by deployment",
-      "description": "Shared queue depth across all tenants and models.",
+      "title": "Global compute queue depth",
+      "description": "Admitted tasks waiting in Twinkle’s serial compute queues across all tenants and models.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "gridPos": {"x": 12, "y": 66, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
@@ -610,7 +627,7 @@
       "type": "row",
       "title": "Node resources",
       "collapsed": false,
-      "gridPos": {"x": 0, "y": 74, "w": 24, "h": 1},
+      "gridPos": {"x": 0, "y": 82, "w": 24, "h": 1},
       "panels": []
     },
     {
@@ -619,7 +636,7 @@
       "title": "CPU utilization",
       "description": "",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
-      "gridPos": {"x": 0, "y": 75, "w": 12, "h": 8},
+      "gridPos": {"x": 0, "y": 83, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
       "options": {},
       "targets": [
@@ -636,7 +653,7 @@
       "title": "System memory used",
       "description": "",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
-      "gridPos": {"x": 12, "y": 75, "w": 12, "h": 8},
+      "gridPos": {"x": 12, "y": 83, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
       "options": {},
       "targets": [
@@ -653,7 +670,7 @@
       "title": "GPU utilization",
       "description": "Physical devices. A device can be shared by multiple models.",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
-      "gridPos": {"x": 0, "y": 83, "w": 12, "h": 8},
+      "gridPos": {"x": 0, "y": 91, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
       "options": {},
       "targets": [
@@ -670,7 +687,7 @@
       "title": "GPU memory used",
       "description": "",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
-      "gridPos": {"x": 12, "y": 83, "w": 12, "h": 8},
+      "gridPos": {"x": 12, "y": 91, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
       "options": {},
       "targets": [
@@ -687,7 +704,7 @@
       "title": "Process memory (RSS)",
       "description": "",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
-      "gridPos": {"x": 0, "y": 92, "w": 12, "h": 8},
+      "gridPos": {"x": 0, "y": 100, "w": 12, "h": 8},
       "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
       "options": {},
       "targets": [
@@ -703,7 +720,7 @@
       "type": "stat",
       "title": "Last Runtime metric received",
       "description": "Age of the most recent exporter heartbeat at the selected time. A missing heartbeat can indicate a stopped Runtime or an unreachable telemetry backend.",
-      "gridPos": {"x": 12, "y": 92, "w": 12, "h": 8},
+      "gridPos": {"x": 12, "y": 100, "w": 12, "h": 8},
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
       "fieldConfig": {
         "defaults": {
@@ -727,7 +744,7 @@
       "type": "row",
       "title": "Sessions and service activity",
       "collapsed": false,
-      "gridPos": {"x": 0, "y": 100, "w": 24, "h": 1},
+      "gridPos": {"x": 0, "y": 108, "w": 24, "h": 1},
       "panels": []
     },
     {
@@ -736,7 +753,7 @@
       "title": "Current sessions",
       "description": "No data means the snapshot has expired, is unavailable, or has no rows matching the filter.",
       "datasource": {"type": "redis-datasource", "uid": "twinkle-redis"},
-      "gridPos": {"x": 0, "y": 101, "w": 24, "h": 8},
+      "gridPos": {"x": 0, "y": 109, "w": 24, "h": 8},
       "fieldConfig": {
         "defaults": {},
         "overrides": [
@@ -791,7 +808,7 @@
       "title": "Current sampling sessions",
       "description": "No data means the snapshot has expired, is unavailable, or has no rows matching the filter.",
       "datasource": {"type": "redis-datasource", "uid": "twinkle-redis"},
-      "gridPos": {"x": 0, "y": 109, "w": 24, "h": 8},
+      "gridPos": {"x": 0, "y": 117, "w": 24, "h": 8},
       "fieldConfig": {
         "defaults": {},
         "overrides": [
@@ -859,7 +876,7 @@
       "title": "Heartbeats and result polls / second",
       "description": "",
       "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
-      "gridPos": {"x": 0, "y": 117, "w": 24, "h": 8},
+      "gridPos": {"x": 0, "y": 125, "w": 24, "h": 8},
       "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
       "options": {},
       "targets": [
