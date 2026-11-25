@@ -454,10 +454,10 @@ class CheckpointEngineManager:
         receiver_devices = [t['device_uuid'] for t in targets]
         if len(set(receiver_devices)) != len(receiver_devices):
             return False
-        return all(devices.count(d) == 1 for d in receiver_devices)
+        return bool(receiver_devices) and all(devices.count(d) == 1 for d in receiver_devices)
 
     def _warm_colocated_ipc(self, sub: Any, channel: str) -> bool:
-        """Warm colocated new replicas via direct IPC; return False to fall through to NCCL.
+        """Warm colocated new replicas via direct IPC; return False to use checkpoint-engine sync.
 
         Lend grows sampler replicas onto the trainer's GPUs while the trainer is offloaded
         (defect118). The NCCL checkpoint PG would assign trainer rank 0 and the new replica
@@ -474,7 +474,11 @@ class CheckpointEngineManager:
             return False
         targets = [t for r in replicas for t in (r if isinstance(r, list) else [r])]
         self._ensure_model_keys()
-        steps = (False, True) if (not self._merge_and_sync and self.base_sync_done) else (False,)
+        if not self._merge_and_sync and self.base_sync_done:
+            steps = (False, True)
+        else:
+            # A merged publication after training must include the learned adapters.
+            steps = (self.base_sync_done and self._merge_and_sync,)
         for base_sync_done in steps:
             peft_config = self._adapter_config(base_sync_done, self._merge_and_sync)
             _together(
@@ -488,6 +492,22 @@ class CheckpointEngineManager:
         return True
 
     # ── New replicas ─────────────────────────────────────────────────────────
+
+    @remote_function(collect='first', lazy_collect=False)
+    def prepare_for_lending(self) -> None:
+        """Prepare merged publication while the trainer still owns its devices."""
+        with self._sync_lock:
+            prepare = getattr(self.model, 'prepare_for_lending', None)
+            if self._merge_and_sync and prepare is not None:
+                prepare()
+
+    @remote_function(collect='first', lazy_collect=False)
+    def restore_after_lending(self) -> None:
+        """Undo publication preparation after the trainer has reloaded its parameters."""
+        with self._sync_lock:
+            restore = getattr(self.model, 'restore_after_lending', None)
+            if restore is not None:
+                restore()
 
     @remote_function(collect='first', lazy_collect=False)
     def warm(self, sub) -> None:
@@ -512,8 +532,10 @@ class CheckpointEngineManager:
                 return
             try:
                 count = len(self._activate_checkpoint_channel(sub, channel))
+                # A merged publication must include learned adapters, not just the initial base.
+                base_sync_done = self.base_sync_done and self._merge_and_sync
+                self._transfer(sub, count, self._merge_and_sync, base_sync_done)
                 # LoRA-only syncs need the base first, then the current adapter on top of it.
-                self._transfer(sub, count, self._merge_and_sync, False)
                 if not self._merge_and_sync and self.base_sync_done:
                     self._transfer(sub, count, self._merge_and_sync, True)
             finally:

@@ -11,7 +11,7 @@ CheckpointEngine is a component used to synchronize model weights between traine
 
 `auto` never infers `colocate`, because actor placement cannot be determined reliably from the driver.
 
-With vLLM on CUDA or Ascend NPU, colocated synchronization pairs each vLLM TP worker with its training worker by physical device UUID and transfers weights directly between them. The sampler actor handles control calls only. Sorting an NPU actor's visible-device list does not change this pairing. `TWINKLE_DISABLE_DIRECT_VLLM_SYNC=1` retains the checkpoint-engine path; other sampler backends also use that path.
+With vLLM on CUDA or Ascend NPU, colocated synchronization pairs each vLLM TP worker with its training worker by physical device UUID and transfers weights directly between them. The sampler actor handles control calls only. Sorting an NPU actor's visible-device list does not change this pairing. `TWINKLE_DISABLE_DIRECT_VLLM_SYNC=1` selects the checkpoint-engine path for `sync_weights()`; it does not affect `warm()` for new replicas. Other sampler backends also use the checkpoint-engine path.
 
 ## Basic Interface
 

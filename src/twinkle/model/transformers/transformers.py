@@ -3391,6 +3391,27 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
     # The weight generator is shared by direct and checkpoint-engine sync.
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def prepare_for_lending(self) -> None:
+        """Merge FSDP adapters before their shards leave the accelerator for device lending."""
+        if not isinstance(self.strategy, NativeFSDPStrategy) or getattr(self, '_lent_merged_model', None) is not None:
+            return
+        self._lazy_wrap_model()
+        model = self.strategy.unwrap_model(self.model)
+        if isinstance(model, PeftModel):
+            # Record ownership before merging so a partially failed merge can be undone
+            # on every rank by the lending controller's rollback.
+            self._lent_merged_model = model
+            model.merge_adapter()
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def restore_after_lending(self) -> None:
+        """Unmerge only after the trainer's shards are back on their original device."""
+        model = getattr(self, '_lent_merged_model', None)
+        if model is not None:
+            model.unmerge_adapter()
+            self._lent_merged_model = None
+
     def _get_weight_generator(
         self,
         adapter_name: str = None,
@@ -3439,19 +3460,24 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 # merge and skip lora weigts(already merged)
                 # trim prefix(base_model.model.) and suffix(.base_layer)
                 def weight_generator():
-                    if isinstance(model, PeftModel):
-                        model.merge_adapter()
-                    names = []
-                    for name, tensor in model.state_dict().items():
-                        if is_lora_key(name) or name in _tied_duplicates:
-                            continue
-                        tensor = _checkpoint_tensor(tensor)
-                        name = normalize_param_name(name, keep_base_layer=False)
-                        names.append(name)
-                        yield name, tensor
-                    print_weight_example(names)
-                    if isinstance(model, PeftModel):
-                        model.unmerge_adapter()
+                    merge_here = isinstance(model, PeftModel) and getattr(self, '_lent_merged_model', None) is not model
+                    try:
+                        if merge_here:
+                            model.merge_adapter()
+                        names = []
+                        for name, tensor in model.state_dict().items():
+                            if is_lora_key(name) or name in _tied_duplicates:
+                                continue
+                            tensor = _checkpoint_tensor(tensor)
+                            name = normalize_param_name(name, keep_base_layer=False)
+                            names.append(name)
+                            yield name, tensor
+                        print_weight_example(names)
+                    finally:
+                        # A borrowed-device publication stays merged on CPU until reclaim.
+                        # Ordinary exports still own their temporary merge/unmerge pair.
+                        if merge_here:
+                            model.unmerge_adapter()
             else:
                 # LoRA-only mode: send only adapter weights.
                 # Use PEFT's get_peft_model_state_dict for clean LoRA extraction
