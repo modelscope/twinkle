@@ -12,7 +12,7 @@ from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.deployment import bind_deployment, build_deployment_app
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.proxy import ForwardedRequest
-from twinkle.server.middleware.auth import get_token_from_request
+from twinkle.server.middleware.auth import get_token_from_request, install_api_key_gate
 from twinkle.server.sampler.submission import existing_sample, sample_submission
 from twinkle.server.sampler.weights import is_full_checkpoint
 from twinkle.server.state import get_server_state
@@ -116,7 +116,7 @@ class SamplerRouter:
         return StreamingResponse(generate(), status_code=reply["status"], headers=headers)
 
 
-def build_sampler_router(namespace, pool_id, deploy_options, *, model_id):
+def build_sampler_router(namespace, pool_id, deploy_options, *, model_id, api_key=None):
     def routes(app, get_self):
         @app.get("/healthz")
         async def health(self=Depends(get_self)):
@@ -132,6 +132,12 @@ def build_sampler_router(namespace, pool_id, deploy_options, *, model_id):
             return await self.forward(request, f"tinker/{endpoint}")
 
     app = build_deployment_app("SamplerRouter", routes)
+    # The router is the sampler's PUBLIC ingress on the same proxy port as the gateway: without
+    # this gate a caller could skip the gateway's api_key check and generate anonymously by
+    # hitting {route_prefix}/sampler/{model}/twinkle/sample directly (the identity middleware's
+    # is_token_valid hook accepts every token). The gateway forwards the caller's Bearer key, so
+    # legitimate proxied traffic passes unchanged.
+    install_api_key_gate(app, api_key)
     return bind_deployment(
         app, SamplerRouter, deploy_options, deployment_name="SamplerRouter", bind_args=(namespace, pool_id, model_id)
     )

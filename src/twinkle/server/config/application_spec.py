@@ -72,6 +72,12 @@ class SamplerArgs(_ArgsBase):
     device_mesh: dict[str, Any]
     sampler_type: Literal['mock', 'vllm', 'vllm_async', 'sglang', 'sglang_async', 'torch']
     engine_args: dict[str, Any] | None = None
+    #:
+    #: Bearer credential required on the sampler's own public routes (the router mounted at
+    #: ``{route_prefix}/sampler/{name}``). ``None`` leaves them unauthenticated, matching a
+    #: gateway deployed without ``ServerArgs.api_key``; set it to the SAME key as the gateway
+    #: so direct sampler calls cannot bypass the gateway's auth boundary.
+    api_key: str | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     data_plane_url: str | None = None
     template: dict[str, Any] | None = None

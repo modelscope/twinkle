@@ -405,8 +405,16 @@ class ServerLauncher:
         if app.name not in self._existing_applications:
             self._owned_applications.add(app.name)
         ray.get(controller.initialize.remote())
+        # The sampler router shares the proxy port with the gateway, so it must enforce the same
+        # credential: an explicit SamplerArgs.api_key wins, else inherit the gateway's key so a
+        # deployment authenticated at the gateway cannot be bypassed by dialing the sampler route
+        # directly. (The gateway forwards the caller's Bearer key, so proxied traffic still passes.)
+        api_key = getattr(app.args, 'api_key', None)
+        if api_key is None:
+            api_key = next((getattr(other.args, 'api_key', None) for other in self.config.applications
+                            if other.import_path == 'server'), None)
         serve.run(
-            build_sampler_router(self.ray_namespace, pool_id, options, model_id=base_model),
+            build_sampler_router(self.ray_namespace, pool_id, options, model_id=base_model, api_key=api_key),
             name=app.name,
             route_prefix=app.route_prefix,
         )
