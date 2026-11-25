@@ -5,10 +5,13 @@ Coroutine factories, asyncio tasks, and callbacks belong here. Public task and
 queue state enums live in twinkle.protocol.types and are shared by SDK/server.
 """
 from __future__ import annotations
-
 import asyncio
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
+from typing import Any
+
+from twinkle.server.telemetry.correlation import BASE_MODEL, TASK_ID, TENANT_FINGERPRINT, TRAINING_ID
+from twinkle.server.telemetry.tracing import get_trace_id
 
 
 @dataclass
@@ -41,3 +44,25 @@ class QueuedTask:
     created_at: float
     on_finished: Callable[[bool, bool], Coroutine] | None = None
     execution_scope: ExecutionScope | None = None
+    tenant_fingerprint: str | None = None
+    trace_context: Any = None
+    base_model: str | None = None
+
+    training_id: str | None = None
+
+    def correlation_attrs(self) -> dict[str, str]:
+        fields = {
+            TRAINING_ID: self.training_id,
+            TASK_ID: self.request_id,
+            TENANT_FINGERPRINT: self.tenant_fingerprint,
+            BASE_MODEL: self.base_model,
+            'twinkle.task_type': self.task_type or 'unknown',
+        }
+        return {key: value for key, value in fields.items() if value is not None}
+
+    def log_fields(self, outcome: str, trace_id: str | None = None) -> dict[str, str]:
+        fields = {key.replace('.', '_'): value for key, value in self.correlation_attrs().items()}
+        fields['twinkle_task_outcome'] = outcome
+        if trace_id := trace_id or get_trace_id(self.trace_context):
+            fields['twinkle_trace_id'] = trace_id
+        return fields

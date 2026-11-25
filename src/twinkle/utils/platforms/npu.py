@@ -5,6 +5,7 @@ import platform
 import re
 import socket
 import subprocess
+from contextlib import contextmanager
 from typing import Optional
 
 from packaging import version
@@ -57,6 +58,43 @@ def hccl_socket_env(master_port: int, environ: Optional[dict] = None) -> dict:
     """
     env = os.environ if environ is None else environ
     return {key: env.get(key, value) for key, value in _derive_hccl_socket_env_defaults(master_port).items()}
+
+
+#: Every environment variable the HCCL socket layout is made of.
+HCCL_SOCKET_ENV_KEYS = (
+    _HCCL_IF_BASE_PORT_ENV,
+    _HCCL_HOST_SOCKET_PORT_RANGE_ENV,
+    _HCCL_NPU_SOCKET_PORT_RANGE_ENV,
+)
+
+
+@contextmanager
+def hccl_socket_env_scope(layout: dict | None = None, *, master_port: int = 0):
+    """Apply an HCCL socket layout for the duration of the block, then restore the process env.
+
+    HCCL reads these variables when it *builds* a communicator, which happens on the group's first
+    collective -- not when the process group object is constructed. So a caller that has to control
+    the layout must (a) keep it in place until one collective has run and (b) not leave it behind:
+    the next group in this process (delta sync next to full sync, a rebuilt group, the default
+    process group of another actor in the same process) may need a different layout, and
+    :func:`ensure_hccl_socket_env` would silently keep the stale one.
+
+    ``layout`` wins over the derived defaults, since agreement between ranks matters more than what
+    any one rank derived on its own. Pass ``master_port`` instead to apply the derived defaults.
+    """
+    previous = {key: os.environ.get(key) for key in HCCL_SOCKET_ENV_KEYS}
+    try:
+        if layout:
+            os.environ.update({key: str(value) for key, value in layout.items() if key in HCCL_SOCKET_ENV_KEYS})
+        else:
+            ensure_hccl_socket_env(master_port)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _resolve_ascend_physical_device_id(device_id: int) -> int:

@@ -25,12 +25,8 @@ def test_gpu_placement_group_cpus_can_be_configured(monkeypatch):
     assert _gpu_placement_group_cpus(node_cpu=192, nproc_per_node=2) == 16
 
 
-@pytest.mark.parametrize('device_type,expected_model,expected_sampler', [
-    ('NPU', [6, 13, 8, 9], [7, 10, 11, 12]),
-    ('GPU', [6, 13, 8, 9], [10, 11, 7, 12]),
-])
-def test_worker_device_order_preserves_group_allocation(
-        monkeypatch, device_type, expected_model, expected_sampler):
+@pytest.mark.parametrize('device_type', ['NPU', 'GPU'])
+def test_worker_device_order_preserves_group_allocation(monkeypatch, device_type):
     import ray
 
     # Ray's accelerator IDs need not arrive in ascending order. This allocation reproduces
@@ -64,16 +60,13 @@ def test_worker_device_order_preserves_group_allocation(
         ],
     )
 
-    assert [placement['gpu_rank'][0] for placement in manager.get_group('model')] == expected_model
-    assert manager.get_group('sampler')[0]['gpu_rank'] == expected_sampler
+    assert [placement['gpu_rank'][0] for placement in manager.get_group('model')] == [6, 13, 8, 9]
+    assert manager.get_group('sampler')[0]['gpu_rank'] == [10, 11, 7, 12]
     assert [manager.rank_placements[rank]['gpu_rank'] for rank in range(8)] == [6, 13, 8, 9, 10, 11, 7, 12]
 
 
-@pytest.mark.parametrize('device_type,expected', [
-    ('NPU', [['6', '8', '9', '13'], ['7', '10', '11', '12']]),
-    ('GPU', [['6', '13', '8', '9'], ['10', '11', '7', '12']]),
-])
-def test_external_device_allocation_is_ordered_numerically_for_npu(monkeypatch, device_type, expected):
+@pytest.mark.parametrize('device_type', ['NPU', 'GPU'])
+def test_external_device_allocation_preserves_order(monkeypatch, device_type):
     import ray
 
     monkeypatch.setattr(ray, 'get_runtime_context', lambda: SimpleNamespace(gcs_address='test-gcs'))
@@ -83,5 +76,53 @@ def test_external_device_allocation_is_ordered_numerically_for_npu(monkeypatch, 
         placement_group=object(), devices=devices,
     )
 
-    assert [placement['gpu_rank'] for placement in manager.get_group('sampler')] == expected
+    assert [placement['gpu_rank'] for placement in manager.get_group('sampler')] == [devices[:4], devices[4:]]
     assert devices == ['6', '13', '8', '9', '10', '11', '7', '12']
+
+
+@pytest.mark.parametrize('device_type,visible_env,expected', [
+    ('NPU', 'ASCEND_RT_VISIBLE_DEVICES', ['6,13', '7,12']),
+    ('GPU', 'CUDA_VISIBLE_DEVICES', ['13,6', '12,7']),
+])
+@pytest.mark.parametrize('placement_source', ['group', 'lend', 'lend_registry'])
+def test_worker_visibility_preserves_devices_and_orders_npu_ids(
+        monkeypatch, device_type, visible_env, expected, placement_source):
+    from unittest.mock import Mock
+
+    import ray.util.scheduling_strategies
+
+    from twinkle.infra._ray.ray_helper import RayHelper
+
+    pg = object()
+    devices = ['13', '6', '12', '7']
+    table = {rank: {'gpu_rank': device, 'placement_group': pg} for rank, device in enumerate(devices)}
+    manager = None if placement_source == 'lend_registry' else SimpleNamespace(rank_placements=table)
+    monkeypatch.setattr(RayHelper, 'resource_manager', manager)
+    monkeypatch.setattr(RayHelper, 'get_config', lambda key: table)
+    info = {'device_type': device_type}
+    monkeypatch.setattr(RayHelper, 'group_info', lambda group: info)
+    monkeypatch.setattr(RayHelper, 'get_master_id_port', lambda placement_group: ('127.0.0.1', 12345))
+    monkeypatch.setattr(RayHelper, '_created_actors', [])
+    monkeypatch.setattr(Platform, 'get_platform', lambda platform: SimpleNamespace(
+        visible_device_env=lambda: visible_env))
+    monkeypatch.setattr(ray.util.scheduling_strategies, 'PlacementGroupSchedulingStrategy',
+                        lambda **kwargs: SimpleNamespace(**kwargs))
+    remote = Mock()
+    remote.options.return_value = remote
+    monkeypatch.setattr(RayHelper, '_get_remote_component', lambda worker_cls: remote)
+
+    class Worker:
+        pass
+
+    placements = RayHelper.rank_placements([0, 1, 2, 3], width=2)
+    info['placements'] = placements
+    RayHelper.create_workers(
+        Worker, 'sampler', 'all', instance_id='visibility',
+        placements=None if placement_source == 'group' else placements)
+
+    environments = [call.kwargs['runtime_env']['env_vars'] for call in remote.options.call_args_list]
+    assert [env[visible_env] for env in environments] == expected
+    assert all(env[f'RAY_EXPERIMENTAL_NOSET_{visible_env}'] == '1' for env in environments)
+    assert [placement['ranks'] for placement in placements] == [[0, 1], [2, 3]]
+    assert [placement['gpu_rank'] for placement in placements] == [['13', '6'], ['12', '7']]
+    assert [table[rank]['gpu_rank'] for rank in range(4)] == devices

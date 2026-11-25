@@ -14,10 +14,9 @@ http_options:
   host: 0.0.0.0        # Listen on all network interfaces
   port: 9000            # Port number for the server
 
-# Telemetry: push traces/metrics/logs to LGTM's OTel Collector via OTLP
+# Set otlp_endpoint in deployment config to the Collector reachable from Runtime.
 telemetry:
-  enabled: true
-  otlp_endpoint: http://localhost:4317
+  enabled: false
 
 # Persistence configuration for ServerState (sessions, models, futures, ...).
 # Top-level placement makes the launcher propagate this to every Ray worker

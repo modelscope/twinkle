@@ -2,6 +2,7 @@
 """Shared HTTP forwarding between services; independent of gateway and training controller."""
 
 from __future__ import annotations
+import logging
 from typing import Any, TypedDict
 
 import httpx
@@ -11,10 +12,9 @@ from fastapi.responses import JSONResponse
 from twinkle.protocol.headers import H_REQUEST_ID
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.telemetry.tracing import inject_context
-from twinkle.utils.logger import get_logger
+from twinkle.server.telemetry.tracing import inject_context, record_http_status, trace_http_client
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 class ForwardedRequest(TypedDict):
@@ -74,14 +74,23 @@ class ServiceProxy:
         body_override: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> Response:
+        if service_type in ("model", "sampler"):
+            request.state.base_model = base_model
         body_bytes = body_override if body_override is not None else await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
         headers = self._prepare_headers(request.headers, extra_headers)
-        inject_context(headers)
         try:
-            response = await self.client.request(
-                method=request.method, url=target_url, content=body_bytes, headers=headers, params=request.query_params
-            )
+            with trace_http_client(request.method, service_type) as span:
+                inject_context(headers)
+                response = await self.client.request(
+                    method=request.method,
+                    url=target_url,
+                    content=body_bytes,
+                    headers=headers,
+                    params=request.query_params,
+                )
+                record_http_status(span, response.status_code, client=True)
+            request.state.forwarded_429 = response.status_code == 429
             return Response(
                 content=response.content,
                 status_code=response.status_code,
@@ -89,7 +98,7 @@ class ServiceProxy:
                 media_type=response.headers.get("content-type"),
             )
         except Exception as exc:
-            logger.error("Proxy error: %s", str(exc), exc_info=True)
+            logger.error("Proxy request failed (%s)", type(exc).__name__)
             request_id = headers.get(H_REQUEST_ID, "")
             payload = ErrorPayload(
                 error=f"Proxy Error: {exc}", category=ErrorCategory.Server, error_code=502, request_id=request_id
@@ -106,21 +115,30 @@ class ServiceProxy:
         body_override: bytes | None = None,
         extra_headers: dict[str, str] | None = None,
     ):
+        if service_type in ("model", "sampler"):
+            request.state.base_model = base_model
         body_bytes = body_override if body_override is not None else await request.body()
         target_url = self._build_target_url(service_type, base_model, endpoint)
         headers = self._prepare_headers(request.headers, extra_headers)
-        inject_context(headers)
-        async with self.client.stream(method="POST", url=target_url, content=body_bytes, headers=headers) as response:
-            if response.status_code >= 400:
-                body = await response.aread()
-                raise httpx.HTTPStatusError(
-                    f"Upstream returned {response.status_code}",
-                    request=response.request,
-                    response=httpx.Response(status_code=response.status_code, content=body),
-                )
-            async for line in response.aiter_lines():
-                if line:
-                    yield line
+        with trace_http_client("POST", service_type) as span:
+            inject_context(headers)
+            async with self.client.stream(
+                method="POST",
+                url=target_url,
+                content=body_bytes,
+                headers=headers,
+            ) as response:
+                record_http_status(span, response.status_code, client=True)
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise httpx.HTTPStatusError(
+                        f"Upstream returned {response.status_code}",
+                        request=response.request,
+                        response=httpx.Response(status_code=response.status_code, content=body),
+                    )
+                async for line in response.aiter_lines():
+                    if line:
+                        yield line
 
     async def proxy_to_model(self, request: Request, endpoint: str, base_model: str) -> Response:
         return await self.proxy_request(request, f"tinker/{endpoint}", base_model, "model")

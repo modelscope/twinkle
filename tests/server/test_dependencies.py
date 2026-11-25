@@ -12,7 +12,7 @@ _ROOT_COMPONENT = '__root__'
 # Dependencies must point from a later layer to an earlier layer. Components in
 # the same layer are independent and therefore may not import one another.
 _LAYERS = (
-    frozenset({'exceptions'}),
+    frozenset({'exceptions', 'identity'}),
     frozenset({'config', 'middleware', 'model.tinker_datum', 'runtime', 'task_errors', 'utils', 'validation'}),
     frozenset({'telemetry'}),
     frozenset({'state'}),

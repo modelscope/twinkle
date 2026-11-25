@@ -3,7 +3,8 @@
 # ============================================
 # Twinkle Megatron 服务启动脚本
 # ============================================
-# 功能：启动 Ray 集群（支持 GPU 节点）、LGTM 观测栈和 Twinkle 服务器。
+# 功能：启动 Redis、Ray 集群（支持 GPU 节点）和 Twinkle 服务器。
+# 遥测由服务器配置中的 telemetry.otlp_endpoint 发送到独立的 Collector。
 #
 # 用法：./run.sh [选项]
 #
@@ -63,16 +64,6 @@ REDIS_LOG_FILE="/twinkle/redis.log"
 DEFAULT_SAVE_DIR="${TWINKLE_SAVE_DIR:-$TWINKLE_RUNTIME_DIR/save}"
 DEFAULT_SERVER_CONFIG_FILE="/twinkle/cookbook/client/server/megatron/server_config.yaml"
 
-# --- LGTM 版本配置（与 grafana/otel-lgtm:0.28.0 保持一致） ---
-LGTM_VERSION="${LGTM_VERSION:-0.28.0}"
-GRAFANA_VERSION="${GRAFANA_VERSION:-v13.0.1}"
-PROMETHEUS_VERSION="${PROMETHEUS_VERSION:-v3.11.3}"
-TEMPO_VERSION="${TEMPO_VERSION:-v2.10.5}"
-LOKI_VERSION="${LOKI_VERSION:-v3.7.1}"
-PYROSCOPE_VERSION="${PYROSCOPE_VERSION:-v2.0.2}"
-OPENTELEMETRY_COLLECTOR_VERSION="${OPENTELEMETRY_COLLECTOR_VERSION:-v0.151.0}"
-OBI_VERSION="${OBI_VERSION:-v0.9.0}"
-
 # --- 单实例与重启请求配置 ---
 RUN_SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 TWINKLE_RUN_OWNER="${USER:-shared}"
@@ -106,6 +97,7 @@ print_usage() {
   --temp-dir DIR       Ray 临时目录
   --save-dir DIR       Twinkle 模型保存目录 (默认: $DEFAULT_SAVE_DIR)
   --server-config FILE Twinkle 服务器配置文件路径 (默认: $DEFAULT_SERVER_CONFIG_FILE)
+                       部署时在该配置中设置 telemetry.otlp_endpoint
   --help, -h           显示帮助信息
 
 环境变量:
@@ -421,23 +413,6 @@ wait_for_redis_stopped() {
     return 1
 }
 
-wait_for_lgtm_ready() {
-    local lgtm_pid="$1"
-    local timeout="${2:-90}"
-
-    for ((i=1; i<=timeout; i++)); do
-        if [ -f /tmp/ready ]; then
-            return 0
-        fi
-        if ! kill -0 "$lgtm_pid" 2>/dev/null; then
-            return 1
-        fi
-        sleep 1
-    done
-
-    return 1
-}
-
 start_log_tail() {
     tail -F "$LOG_FILE" &
     TAIL_PID=$!
@@ -503,15 +478,6 @@ cleanup_existing_runtime() {
             return 1
         fi
     fi
-
-    print_info "停止已有的 LGTM 观测栈..."
-    pkill -f "/otel-lgtm/run-all.sh" 2>/dev/null || true
-    pkill prometheus 2>/dev/null || true
-    pkill grafana 2>/dev/null || true
-    pkill otelcol 2>/dev/null || true
-    pkill loki 2>/dev/null || true
-    pkill tempo 2>/dev/null || true
-    pkill pyroscope 2>/dev/null || true
 }
 
 cleanup_script_exit() {
@@ -656,36 +622,6 @@ start_ray_cluster() {
     ray status 2>/dev/null || true
 }
 
-start_lgtm() {
-    print_header "启动 LGTM 观测栈（可选）"
-
-    if [ -d "/otel-lgtm" ]; then
-        if [ -f /otel-lgtm/prometheus.yaml.orig ]; then
-            cp /otel-lgtm/prometheus.yaml.orig /otel-lgtm/prometheus.yaml
-        fi
-
-        print_info "启动 LGTM 观测栈..."
-        rm -f /tmp/ready
-        export LGTM_VERSION GRAFANA_VERSION PROMETHEUS_VERSION TEMPO_VERSION LOKI_VERSION
-        export PYROSCOPE_VERSION OPENTELEMETRY_COLLECTOR_VERSION OBI_VERSION
-        (cd /otel-lgtm && exec nohup ./run-all.sh > /twinkle/lgtm.log 2>&1) &
-        LGTM_PID=$!
-
-        if wait_for_lgtm_ready "$LGTM_PID" 120; then
-            print_success "LGTM 观测栈已启动"
-            echo "  - Grafana:   http://localhost:3000 (admin/admin)"
-            echo "  - OTLP gRPC: localhost:4317"
-            echo "  - OTLP HTTP: localhost:4318"
-            echo "  - 日志文件:  /twinkle/lgtm.log"
-        else
-            print_warning "LGTM 观测栈未在 120 秒内就绪，Twinkle 将继续启动"
-            echo "  - 日志文件: /twinkle/lgtm.log"
-        fi
-    else
-        print_warning "未检测到 LGTM 观测栈 (/otel-lgtm)，跳过"
-    fi
-}
-
 start_twinkle_server() {
     print_header "启动 Twinkle 服务器"
 
@@ -728,7 +664,6 @@ run_service_once() {
     cleanup_existing_runtime
     start_redis
     start_ray_cluster
-    start_lgtm
     start_twinkle_server
     wait_runtime
 }

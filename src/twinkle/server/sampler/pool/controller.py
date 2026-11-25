@@ -4,6 +4,7 @@
 from __future__ import annotations
 import asyncio
 import hashlib
+import logging
 import math
 import time
 import uuid
@@ -12,19 +13,21 @@ from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 import json
+from starlette.datastructures import Headers
 
 if TYPE_CHECKING:
     from twinkle.server.lifecycle.proxy import ForwardedReply, ForwardedRequest
 
-from twinkle.protocol.headers import H_CLIENT_ID, H_REQUEST_ID, H_SESSION_ID
+from twinkle.protocol.headers import H_CLIENT_ID, H_REQUEST_ID, H_SAMPLE_IDEMPOTENCY_SUPPORTED, H_SESSION_ID
 from twinkle.server.config.application_spec import SamplerArgs
 from twinkle.server.config.resource_options import ResourceOptions
-from twinkle.server.exceptions import ResourceExhaustedError
+from twinkle.server.exceptions import RequestRejectedError, ResourceExhaustedError
 from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.sampler.concurrency import SamplerConcurrency
-from twinkle.utils.logger import get_logger
+from twinkle.server.sampler.submission import SampleSubmission
+from twinkle.server.telemetry.tracing import extract_context, traced_operation
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 _CONTROL_ENDPOINTS = frozenset(
     {"twinkle/set_template", "twinkle/add_adapter_to_sampler", "twinkle/apply_patch", "twinkle/unload_adapter_paths"}
 )
@@ -66,6 +69,7 @@ class SamplerController:
         self._stopping = False
         self._initialization = None
         self._monitor_task = None
+        self._sample_replies: dict[str, tuple[str, asyncio.Future]] = {}
 
     def _owned_count(self):
         return self.lifecycle.owned_count(self.instances.values())
@@ -243,13 +247,37 @@ class SamplerController:
                 await self._release(replica, ticket)
             await self._release(seed, seed_ticket)
 
-    async def request(self, payload: ForwardedRequest, stream_queue=None, full_path=None) -> ForwardedReply:
+    async def request(self, payload: ForwardedRequest, stream_queue=None, full_path=None,
+                      submission: SampleSubmission | None = None) -> ForwardedReply:
         await self.initialize()
         endpoint = payload["endpoint"]
         if endpoint == "twinkle/create":
-            return {"status": 200, "headers": [(b"content-type", b"application/json")], "body": b'{"status":"ok"}'}
+            return {
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (H_SAMPLE_IDEMPOTENCY_SUPPORTED.lower().encode(), b"1"),
+                ],
+                "body": b'{"status":"ok"}',
+            }
         control = endpoint in _CONTROL_ENDPOINTS
+        if submission is not None and submission.request_id in self._sample_replies:
+            fingerprint, reply_ready = self._sample_replies[submission.request_id]
+            if fingerprint != submission.fingerprint:
+                raise RequestRejectedError("Sample idempotency key was already used for a different submission")
+            return await asyncio.shield(reply_ready)
+
         reply_ready = asyncio.get_running_loop().create_future()
+        if submission is not None:
+            self._sample_replies[submission.request_id] = (submission.fingerprint, reply_ready)
+
+            def clear_submission(reply):
+                self._sample_replies.pop(submission.request_id, None)
+                # The disconnected original caller might never collect an exception.
+                if not reply.cancelled():
+                    reply.exception()
+
+            reply_ready.add_done_callback(clear_submission)
 
         async def operation():
             instance = None
@@ -260,7 +288,10 @@ class SamplerController:
                     return
                 if full_path is not None and full_path != self._base_path:
                     await self._mutate(full_path=full_path)
-                instance, ticket = await self._select()
+                # This background operation survives cancellation of the forwarding RPC.
+                parent = extract_context(Headers(raw=payload["headers"]))
+                with traced_operation("sampler.wait_for_replica", parent_context=parent):
+                    instance, ticket = await self._select()
                 response = await self.driver.invoke(instance, ticket, payload, stream_queue)
                 if not reply_ready.done():
                     reply_ready.set_result(response)

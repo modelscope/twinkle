@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """NCCL checkpoint engines across real GPUs: full sync (reused and rebuilt groups) and delta sync."""
 from __future__ import annotations
+
 from types import SimpleNamespace
 
 import pytest

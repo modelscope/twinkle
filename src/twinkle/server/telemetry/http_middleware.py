@@ -1,19 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""FastAPI HTTP request-metrics middleware.
-
-Split out of the former ``middleware.py``: the metric adapters and
-containers live in ``metrics.py`` next to the ``MetricsRegistry``; this file holds only
-the HTTP middleware factory, so a file named for HTTP middleware contains HTTP middleware
-and the queue code no longer imports a module called ``middleware`` just to reach
-``get_task_metrics``.
-"""
+"""HTTP request counts and latency at the FastAPI ingress."""
 from __future__ import annotations
-
+import asyncio
 import time
 from collections.abc import Callable
 from typing import Any
 
-from twinkle.server.telemetry.metrics import MetricsRegistry
+from twinkle.server.telemetry.metrics import METERED_TASK_TYPES, MetricsRegistry
+
+_OPERATIONS = METERED_TASK_TYPES | {'asample', 'session_heartbeat', 'retrieve_future'}
 
 
 def create_metrics_middleware(deployment: str) -> Callable:
@@ -35,24 +30,31 @@ def create_metrics_middleware(deployment: str) -> Callable:
     """
 
     async def metrics_middleware(request: Any, call_next: Callable) -> Any:
+        request.state.metrics_deployment = deployment
         start = time.monotonic()
-        response = await call_next(request)
-        elapsed = time.monotonic() - start
-        status = str(response.status_code)
-        # The HTTP verb is the ``method`` label (standard RED semantics); the route template would
-        # merge GET/POST and make the label useless for read/write split.
-        method = request.method
-        m = MetricsRegistry.get().request_metrics(deployment)
-        m.requests_total.inc(tags={
-            'deployment': deployment,
-            'method': method,
-            'status': status,
-        })
-        m.request_duration_seconds.observe(
-            elapsed, tags={
-                'deployment': deployment,
-                'method': method,
-            })
-        return response
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        except asyncio.CancelledError:
+            status = None
+            raise
+        finally:
+            if status is not None:
+                elapsed = time.monotonic() - start
+                route_name = request.path_params.get('endpoint') or getattr(request.scope.get('route'), 'name', None)
+                operation = route_name if route_name in _OPERATIONS else 'request'
+                tags = {'deployment': deployment, 'method': request.method, 'operation': operation}
+                if base_model := getattr(request.state, 'base_model', None):
+                    tags['base_model'] = base_model
+                m = MetricsRegistry.get()
+                request_tags = {**tags, 'status': str(status)}
+                if status == 429:
+                    request_tags['response_origin'] = (
+                        'forwarded' if getattr(request.state, 'forwarded_429', False) else 'local'
+                    )
+                m.requests_total.add(1, attributes=request_tags)
+                m.request_duration_seconds.record(elapsed, attributes=tags)
 
     return metrics_middleware

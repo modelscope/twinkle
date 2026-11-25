@@ -300,17 +300,16 @@ class ServerLauncher:
 
     def _configure_telemetry(self) -> None:
         telemetry = self.config.telemetry
-        os.environ['TWINKLE_TELEMETRY_ENABLED'] = str(int(telemetry.enabled))
+        os.environ.update(telemetry.to_env_vars())
         if not telemetry.enabled:
             return
+        from twinkle.server.identity import USER_ID_KEY_ENV, user_id_key
         from twinkle.server.telemetry import init_telemetry
+        if USER_ID_KEY_ENV in os.environ and user_id_key() is None:
+            raise ValueError(f'{USER_ID_KEY_ENV} must be nonempty and distinct from TWINKLE_TOKEN_SALT')
+        if USER_ID_KEY_ENV not in os.environ:
+            logger.warning('Tenant usage and snapshots require %s', USER_ID_KEY_ENV)
         init_telemetry(telemetry)
-        os.environ.update({
-            'TWINKLE_TELEMETRY_DEBUG': str(int(telemetry.debug)),
-            'TWINKLE_TELEMETRY_SERVICE': telemetry.service_name,
-            'TWINKLE_TELEMETRY_ENDPOINT': telemetry.otlp_endpoint,
-            'TWINKLE_TELEMETRY_INTERVAL': str(telemetry.export_interval_ms),
-        })
 
     def _init_ray(self) -> None:
         """Initialize Ray with the resolved namespace (attach-or-local via :func:`ensure_ray_cluster`)."""
@@ -379,15 +378,20 @@ class ServerLauncher:
 
         from twinkle.server.sampler.pool.actor import create_sampler_controller
         from twinkle.server.sampler.pool.router import build_sampler_router
-        controller, options, pool_id = create_sampler_controller(app, self.ray_namespace,
-                                                                 self.config.resources.model_dump(),
-                                                                 build_worker_env_vars())
+        base_model = extract_model_alias(app.route_prefix, 'sampler') or app.name
+        controller, options, pool_id = create_sampler_controller(
+            app, self.ray_namespace, self.config.resources.model_dump(), build_worker_env_vars(),
+            base_model=base_model,
+        )
         self._sampler_controllers.append(controller)
         if app.name not in self._existing_applications:
             self._owned_applications.add(app.name)
         ray.get(controller.initialize.remote())
         serve.run(
-            build_sampler_router(self.ray_namespace, pool_id, options), name=app.name, route_prefix=app.route_prefix)
+            build_sampler_router(self.ray_namespace, pool_id, options, model_id=base_model),
+            name=app.name,
+            route_prefix=app.route_prefix,
+        )
 
     def _deploy_application(self, app_spec: ApplicationSpec) -> None:
         """Model declarations go to the training controller; other apps deploy here."""
@@ -516,14 +520,14 @@ class ServerLauncher:
     def _shutdown(self, *, raise_errors: bool = True) -> None:
         from functools import partial
 
-        from twinkle.server.telemetry import flush_telemetry_safely
+        from twinkle.server.telemetry import shutdown_telemetry_safely
         actions = [('training controller shutdown', self._stop_training_controller)]
         actions.extend(('sampler controller shutdown', partial(self._stop_sampler_controller, controller))
                        for controller in tuple(self._sampler_controllers))
         if self._serve_started:
             actions.append(('gateway discovery cleanup', self._unpublish_models))
             actions.append(('owned application cleanup', self._delete_owned_applications))
-        actions.append(('telemetry flush', flush_telemetry_safely))
+        actions.append(('telemetry shutdown', shutdown_telemetry_safely))
         self._run_cleanup(actions, raise_errors=raise_errors)
         self._serve_started = bool(self._owned_applications or self._published_models)
 

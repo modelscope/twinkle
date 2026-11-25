@@ -12,9 +12,11 @@ from twinkle.server.state.models import FutureFailureRecord, RuntimeContext
 
 
 class SamplerDriver:
-    def __init__(self, args: SamplerArgs, namespace: str, pool_id: str, options: dict, budgets: dict):
+    def __init__(self, args: SamplerArgs, namespace: str, pool_id: str, options: dict, budgets: dict,
+                 *, base_model: str | None = None):
         self.args, self.namespace, self.pool_id = args, namespace, pool_id
         self.options = options
+        self.base_model = base_model
         self.budgets = ResourceOptions.model_validate(budgets)
         self.runtime = RayRuntime(
             namespace,
@@ -51,6 +53,7 @@ class SamplerDriver:
         app = build_sampler_app(
             **values,
             queue_config=self.args.queue_config,
+            telemetry_base_model=self.base_model,
             deploy_options=options,
             sampling_context=RuntimeContext(
                 namespace=self.namespace, registry_name=allocation.name + "-registry", instance_id=instance.identity

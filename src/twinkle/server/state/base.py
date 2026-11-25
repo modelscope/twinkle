@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 import time
 from abc import ABC
 from datetime import datetime, timezone
-from pydantic import BaseModel
 from typing import Generic, TypeVar
+
+from pydantic import BaseModel
 
 from twinkle.server.state.backend.base import StateBackend
 from twinkle.utils import get_logger
@@ -63,14 +63,15 @@ class BaseManager(ABC, Generic[T]):
         raw_keys = await self._backend.keys(f'{self._prefix}*')
         return [self._strip_prefix(k) for k in raw_keys]
 
-    async def get_all(self) -> dict[str, T]:
+    async def get_all(self, *, resource_ids: list[str] | None = None) -> dict[str, T]:
         """Load all records from backend. Uses batch mget for efficiency."""
-        all_keys = await self._backend.keys(f'{self._prefix}*')
+        all_keys = (await self._backend.keys(f'{self._prefix}*') if resource_ids is None
+                    else [self._make_key(resource_id) for resource_id in resource_ids])
         if not all_keys:
             return {}
         values = await self._backend.mget(all_keys)
         result = {}
-        for key, data in zip(all_keys, values):
+        for key, data in zip(all_keys, values, strict=True):
             if data is not None:
                 resource_id = self._strip_prefix(key)
                 result[resource_id] = self._record_type.model_validate(data)

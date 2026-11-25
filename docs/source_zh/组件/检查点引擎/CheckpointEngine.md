@@ -11,7 +11,7 @@ CheckpointEngine (检查点引擎) 是用于在训练器和推理进程之间同
 
 `auto` 不会推断 `colocate`，因为 driver 无法可靠判断 actor 的实际设备放置。
 
-在 CUDA 或昇腾 NPU 上使用 vLLM 时，同卡同步按物理设备 UUID 将每个 vLLM TP worker 与训练 worker 配对，两者直接传输权重，sampler actor 只负责控制调用。NPU actor 的可见设备列表排序不会改变这种配对。设置 `TWINKLE_DISABLE_DIRECT_VLLM_SYNC=1` 可保留检查点引擎路径；其他 sampler 后端也使用该路径。
+在 CUDA 或昇腾 NPU 上使用 vLLM 时，同卡同步按物理设备 UUID 将每个 vLLM TP worker 与训练 worker 配对，两者直接传输权重，sampler actor 只负责控制调用。NPU actor 的可见设备列表排序不会改变这种配对。设置 `TWINKLE_DISABLE_DIRECT_VLLM_SYNC=1` 可使 `sync_weights()` 使用检查点引擎路径；该开关不影响新增副本的 `warm()`。其他 sampler 后端也使用检查点引擎路径。
 
 ## 基本接口
 

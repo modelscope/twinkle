@@ -27,6 +27,7 @@ _PORT_RETRIES = 3
 #: backend name -> device type its ranks bind to.
 _BACKEND_DEVICE_TYPES = {
     'gloo': 'cpu',
+    'hccl': 'npu',
     'nccl': 'cuda',
 }
 
@@ -35,6 +36,21 @@ _BROADCAST_DTYPES = (torch.float32, torch.bfloat16, torch.int64, torch.uint8)
 
 def _device_for_rank(device_type: str, rank: int) -> torch.device:
     return torch.device('cpu') if device_type == 'cpu' else torch.device(device_type, rank)
+
+
+def _devices_available(device_type: str, count: int) -> bool:
+    """Whether this box has ``count`` devices of ``device_type``.
+
+    The ``accel`` mark only counts accelerators, whichever kind the box has, so a CUDA box still
+    collects the npu case (and the other way round); each case checks its own device type here.
+    """
+    if device_type == 'npu':
+        try:
+            import torch_npu  # noqa: F401  (registers torch.npu)
+        except ImportError:
+            return False
+    module = getattr(torch, device_type, None)
+    return bool(module is not None and module.is_available() and module.device_count() >= count)
 
 
 def _foreign_device(device: torch.device) -> torch.device:
@@ -174,19 +190,27 @@ def _run_worker(backend, device_type, rank, world_size, ports, out_dir):
 
         # A second live group (full sync next to delta sync) must not interfere with the first.
         other = build(ports[1], 'other')
+        # ...and a third that deliberately REUSES the first one's name: the backends must tell
+        # groups apart by more than the name (HCCL names its communicator after the group id, and
+        # the checkpoint mixin really does keep several groups called 'twinkle_ckpt' alive).
+        twin = build(ports[2], 'main')
         for round_ in range(3):
             a = _payload(rank, torch.float32, device)
             b = _payload(rank + 100, torch.float32, device)
+            c = _payload(rank + 200, torch.float32, device)
             comm.broadcast(a, src=0)
             other.broadcast(b, src=world_size - 1)
+            twin.broadcast(c, src=0)
             comm.synchronize()
             _assert_payload(a, 0, ('main group', round_))
             _assert_payload(b, world_size - 1 + 100, ('other group', round_))
+            _assert_payload(c, 200, ('same-name group', round_))
         other.destroy()
+        twin.destroy()
         _check_destroyed(comm, device)
 
         # rebuild_group=True: a destroyed group must not block building a fresh one.
-        comm = build(ports[2], 'rebuilt')
+        comm = build(ports[3], 'rebuilt')
         t = _payload(rank, torch.float32, device)
         comm.broadcast(t, src=0)
         comm.synchronize()
@@ -200,7 +224,7 @@ def _run_worker(backend, device_type, rank, world_size, ports, out_dir):
 
 def _spawn(backend, device_type, world_size, out_dir):
     ctx = mp.get_context('spawn')
-    ports = tuple(find_free_port() for _ in range(3))
+    ports = tuple(find_free_port() for _ in range(4))
     procs = [
         ctx.Process(target=_run_worker, args=(backend, device_type, rank, world_size, ports, str(out_dir)),
                     daemon=True) for rank in range(world_size)
@@ -232,6 +256,8 @@ def test_conformance(backend, device_type, world_size, tmp_path):
 
     if backend not in available_backends():
         pytest.skip(f'{backend} communicator is not implemented yet')
+    if device_type != 'cpu' and not _devices_available(device_type, world_size):
+        pytest.skip(f'needs {world_size} {device_type} device(s)')
     for attempt in range(_PORT_RETRIES):
         out_dir = tmp_path / f'attempt{attempt}'
         out_dir.mkdir()

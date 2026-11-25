@@ -13,6 +13,7 @@ import queue as queue_mod
 import time
 import traceback
 
+import pytest
 import torch
 
 from ._hccl_loopback import FakeTrainingEngine, apply_flush
@@ -167,6 +168,11 @@ def delta_receiver_main(cfg, rank, md_q, res_q, barrier):
 # --------------------------------------------------------------------------- driver (parent)
 def run(mode: str, cfg: dict, timeout: float = 120.0) -> dict:
     """Run trainer + receivers; returns every message keyed by kind. Children are always killed."""
+    # The ``accel(n)`` marker counts whatever accelerator the box has, so these NCCL cases are also
+    # collected on an NPU box -- where the children would die in ``torch.cuda.set_device``. Skip on
+    # the device type they actually need instead of failing there.
+    if not torch.cuda.is_available():
+        pytest.skip('the NCCL harness needs CUDA devices')
     trainer, receiver = {'full': (full_trainer_main, full_receiver_main),
                          'delta': (delta_trainer_main, delta_receiver_main)}[mode]
     ctx = mp.get_context('spawn')
