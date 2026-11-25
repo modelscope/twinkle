@@ -246,6 +246,13 @@ class ModelLoaderProtocol(Protocol):
         ...
 
 
+def _collect_temperatures(results, device_mesh):
+    values = [value for value in results if value is not None]
+    if not values or any(value != values[0] for value in values[1:]):
+        raise ValueError('Expected consistent task-head temperatures on all head ranks.')
+    return values[0]
+
+
 class TrainableModel(ABC):
     """The backend-agnostic training surface.
 
@@ -519,12 +526,12 @@ class TrainableModel(ABC):
         return spec_obj.build_head(self.hf_config, num_labels)
 
     def _attached_head(self, adapter_name):
-        """The adapter's head on the host: the task_heads dict when the host keeps one,
-        else the single task_head attribute (megatron single-model form)."""
+        """Resolve an adapter head, or either registered alias on a single-head host."""
         host = self._task_head_host()
         heads = getattr(host, 'task_heads', None)
         if heads is None:
-            return getattr(host, 'task_head', None)
+            head = getattr(host, 'task_head', None)
+            return head if head is not None else getattr(host, 'scoring_head', None)
         return heads.get(adapter_name)
 
     def _task_head_state(self, adapter_name: Optional[str]) -> Dict[str, Any]:
@@ -570,6 +577,71 @@ class TrainableModel(ABC):
                 raise ValueError(f'task-head shape mismatch for {key}: {value.shape} != {tensor.shape}')
         for key, value in state.items():
             torch_util.copy_tensor_(tensors[key[len('task_head.'):]], value)
+
+    @remote_function(dispatch='all', collect=_collect_temperatures, lazy_collect=False, sync=True)
+    def task_head_temperatures(self, *, adapter_name: str = 'default', update: Optional[dict] = None):
+        """Collectively read or replace head temperatures; every rank calls with the same update.
+
+        Local torchrun bypasses the Ray collector, so the model process group also collects
+        here. This gives head-less PP stages the same return dict as the head-owning stage
+        and checks every rank's validation before any buffer is changed.
+        """
+        import torch.distributed as dist
+
+        error, values, writes = None, None, []
+        try:
+            values, writes = self._prepare_task_head_temperatures(adapter_name, update)
+        except Exception as exc:
+            error = str(exc)
+        states = [(error, values)]
+        if dist.is_available() and dist.is_initialized():
+            states = [None] * dist.get_world_size()
+            dist.all_gather_object(states, (error, values))
+        errors = [message for message, _ in states if message is not None]
+        if errors:
+            raise ValueError(f'Task-head temperature validation failed: {errors[0]}')
+        result = _collect_temperatures([value for _, value in states], self.device_mesh)
+        if update is not None:
+            for buffer, value in writes:
+                torch_util.copy_tensor_(buffer, value)
+        return result
+
+    def _prepare_task_head_temperatures(self, adapter_name, update):
+        """Validate local buffers and prepare writes without mutating any rank's head."""
+        import torch
+
+        if not self._task_head_carries_on_this_rank():
+            return None, []
+        head = self._attached_head(adapter_name)
+        if head is None:
+            if update is not None:
+                raise ValueError('No task head is attached to this training handle.')
+            return {'temperatures': None}, []
+        buffers = dict(head.named_buffers(recurse=False))
+        kind = buffers.get('temperatures', buffers.get('temps'))
+        global_t = buffers.get('head_temperature')
+        if kind is None and global_t is None and update is None:
+            return {'temperatures': None}, []
+        if (kind is None or kind.ndim != 1 or not kind.numel() or not kind.is_floating_point()
+                or (global_t is not None and (global_t.ndim != 0 or not global_t.is_floating_point()))):
+            raise ValueError('Expected a task-head temperature vector and an optional scalar buffer.')
+        names = ('global_temperature', 'kind_temperatures')
+        if update is not None and (not isinstance(update, dict) or set(update) != set(names)):
+            raise ValueError(f'Temperature updates must contain exactly {names}.')
+        values, writes = {}, []
+        for name, buffer in zip(names, (global_t, kind)):
+            if update is not None and (buffer is None) != (update[name] is None):
+                raise ValueError(f'{name} must match the attached head buffer layout.')
+            if buffer is None:
+                values[name] = None
+                continue
+            value = (torch_util.to_local_tensor(buffer).detach().cpu() if update is None
+                     else torch.as_tensor(update[name], dtype=buffer.dtype, device='cpu'))
+            if value.shape != buffer.shape or not (value.isfinite() & (value > 0)).all():
+                raise ValueError(f'{name} must have shape {tuple(buffer.shape)} and finite positive values.')
+            values[name] = value.tolist()
+            writes.append((buffer, value))
+        return {'temperatures': values}, writes
 
     def _save_task_head_checkpoint(self, checkpoint_dir: str, adapter_name: Optional[str]) -> None:
         """Gather the attached head on participating ranks and write it on the master."""

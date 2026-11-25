@@ -461,6 +461,19 @@ class MultiLoraTransformersModel:
             is_training=is_training,
             **kwargs)
 
+    def task_head_temperatures(self, **kwargs) -> model_types.TaskHeadTemperaturesResponse:
+        """Read or replace the current training handle's task-head temperatures.
+
+        The same method face the in-process TrainableModel serves for local/ray runs;
+        here it crosses HTTP to the training handle's head buffers. ``update`` is the
+        write form (global_temperature / kind_temperatures); without it the call reads.
+        """
+        return self._submit(
+            'task_head_temperatures',
+            model_types.TaskHeadTemperaturesRequest,
+            model_types.TaskHeadTemperaturesResponse,
+            **kwargs)
+
     # ------------------------------------------------------------------ #
     # Checkpoint I/O
     # ------------------------------------------------------------------ #

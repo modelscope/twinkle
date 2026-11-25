@@ -18,6 +18,7 @@ from twinkle.processor.trajectory import response_positions
 from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.template import Template
+from twinkle.utils import torch_util
 
 
 def collect_forward_backward_results(results, device_mesh: DeviceMesh):
@@ -92,6 +93,23 @@ def to_cpu_safe_output(obj: Any) -> Any:
     return obj
 
 
+def decision_forward_output(output) -> dict:
+    """Preserve the option axes and serialize only the decision readout."""
+    keys = ('logits', 'option_mask', 'kinds', 'counts')
+    if any(not isinstance(output.get(key), torch.Tensor) for key in keys):
+        raise ValueError('Decision forward requires option logits, mask, kinds and record counts.')
+    logits, mask, kinds, counts = (torch_util.to_local_tensor(output[key]).detach().cpu() for key in keys)
+    if (logits.ndim != 2 or mask.shape != logits.shape or mask.dtype != torch.bool
+            or kinds.shape != logits.shape[:1] or kinds.dtype != torch.long or counts.ndim != 1
+            or counts.dtype != torch.long or (counts < 0).any() or counts.sum().item() != len(logits)
+            or not mask.any(dim=1).all()):
+        raise ValueError('Invalid decision forward shapes, option mask, kinds or record counts.')
+    if not logits[mask].isfinite().all():
+        raise ValueError('Decision forward returned non-finite logits for real options.')
+    return dict(logits=logits.masked_fill(~mask, 0).tolist(), option_mask=mask.tolist(),
+                kinds=kinds.tolist(), counts=counts.tolist())
+
+
 def clean_metrics(metrics: dict) -> dict:
 
     def _to_float(v):
@@ -129,7 +147,12 @@ def clean_metrics(metrics: dict) -> dict:
 
 
 class TwinkleCompatModelBase:
-    """Base class containing common logic for Twinkle compatibility wrappers."""
+    """Base class containing common logic for Twinkle compatibility wrappers.
+
+    The task-head temperature read/write (``task_head_temperatures``) lives on
+    :class:`~twinkle.model.base.TrainableModel` -- this mixin's backends inherit it,
+    which is what lets local, ray and the server endpoint share ONE implementation.
+    """
 
     @staticmethod
     def _normalize_ref_outputs(kwargs: dict) -> None:

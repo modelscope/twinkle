@@ -527,7 +527,15 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         if response_rows is not None:
             # Row identity for the response projection, captured before the feature split.
             kwargs['_response_rows'] = response_rows
-        return self.forward_backward(inputs=inputs, micro_batch_size=micro_batch_size, forward_only=True, **kwargs)
+        self._lazy_wrap_model()
+        modules = {module: module.training for chunk in self.model for module in chunk.modules()}
+        try:
+            for chunk in self.model:
+                chunk.eval()
+            return self.forward_backward(inputs=inputs, micro_batch_size=micro_batch_size, forward_only=True, **kwargs)
+        finally:
+            for module, training in modules.items():
+                module.training = training
 
     def _project_response_output(self, model_output, inputs, response_rows, optimizer_config):
         """Flatten the megatron micro-batch layout to rows, then run the shared projection.
@@ -620,7 +628,24 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
     @remote_function(collect='mean')
     @timed
     def calculate_loss(self, **kwargs):
-        return float('inf')
+        """Report the loss the fused forward already recorded on its status.
+
+        Megatron computes the loss inside forward_backward's schedule, so there is no
+        separate loss pass to re-run: read the value the last forward recorded -- the
+        same call-after-forward contract as TransformersModel.calculate_loss. The former
+        ``float('inf')`` placeholder was unread locally but cannot cross the wire
+        (pydantic serializes inf to null, breaking the client's float contract).
+        """
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        is_training = optimizer_config.last_forward_training
+        if is_training is None:
+            is_training = False
+        status = optimizer_config.train_status if is_training else optimizer_config.eval_status
+        loss = (status.outputs or {}).get('loss')
+        if loss is None:
+            raise ValueError('calculate_loss requires a forward that recorded a loss first.')
+        return float(loss)
 
     @remote_function()
     def backward(self, **kwargs):
@@ -1231,7 +1256,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         elif not logps:
             logps = None
         if logits:
-            if not self.variable_seq_lengths:
+            if forward_only and task == 'decision' and return_logits:
+                logits = pad_and_stack_tensors(logits, pad_value=0)
+            elif not self.variable_seq_lengths:
                 logits = torch.cat(logits, dim=0)
             elif not get_task_spec(task).token_level_labels:
                 # Pooled tasks (seq_cls / decision ...): variable lengths split the batch, but the
@@ -1272,6 +1299,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # TransformersModel.forward's return_outputs['routed_experts']).
         rr.finish(model_output, unwrapped_model.config, num_microbatches, vpp_size,
                   router_replay_manual_cleanup)
+        # Mirror TransformersModel._finalize_forward_outputs: record which status this
+        # forward populated, so a later calculate_loss reads the right one.
+        optimizer_config.last_forward_training = not forward_only
         if forward_only:
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = model_output

@@ -17,8 +17,8 @@ from .model import (AdapterRequest, AddAdapterRequest, AddMetricRequest, AddMetr
                     LrStepResponse, ModelResult, OkResponse, ResumeFromCheckpointRequest, SaveRequest, SaveResponse,
                     SetLossRequest, SetLossResponse, SetLrSchedulerRequest, SetLrSchedulerResponse, SetOptimizerRequest,
                     SetOptimizerResponse, SetProcessorRequest, SetProcessorResponse, SetTemplateRequest,
-                    SetTemplateResponse, StepRequest, StepResponse, TrainingProgressResponse, UploadToHubRequest,
-                    ZeroGradResponse)
+                    SetTemplateResponse, StepRequest, StepResponse, TaskHeadTemperaturesRequest,
+                    TaskHeadTemperaturesResponse, TrainingProgressResponse, UploadToHubRequest, ZeroGradResponse)
 from .processor import (ProcessorCallRequest, ProcessorCallResponse, ProcessorCreateRequest, ProcessorCreateResponse,
                         ProcessorHeartbeatRequest, ProcessorHeartbeatResponse)
 from .sampler import (EncodeRequest, SampledSequenceModel, SamplerAddAdapterRequest, SamplerAddAdapterResponse,
@@ -114,6 +114,8 @@ __all__ = [
     'SetTemplateResponse',
     'StepRequest',
     'StepResponse',
+    'TaskHeadTemperaturesRequest',
+    'TaskHeadTemperaturesResponse',
     'TrainingProgressResponse',
     'UploadToHubRequest',
     'ZeroGradResponse',

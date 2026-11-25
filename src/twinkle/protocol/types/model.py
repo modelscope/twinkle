@@ -20,7 +20,7 @@ user-supplied argument.
 from __future__ import annotations
 
 from pydantic import Field, JsonValue, StrictInt, field_validator, model_validator
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from .base import ResponseModel, StrictRequest, backend_kwarg, backend_only, passthrough
 from .component import DataRef
@@ -43,6 +43,24 @@ class TrainingRequest(StrictRequest):
 
     training_id: str = Field(min_length=1)
     adapter_name: str
+
+
+_Temperature = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
+
+
+class TaskHeadTemperatureUpdate(StrictRequest):
+    global_temperature: _Temperature | None = None
+    kind_temperatures: list[_Temperature] = Field(min_length=1)
+
+
+class TaskHeadTemperaturesRequest(TrainingRequest):
+    """Read the bound head's temperatures, or replace them if update is supplied."""
+
+    update: TaskHeadTemperatureUpdate | None = None
+
+
+class TaskHeadTemperaturesResponse(ResponseModel):
+    temperatures: TaskHeadTemperatureUpdate | None
 
 
 class AdapterRequest(TrainingRequest):
