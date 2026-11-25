@@ -286,6 +286,12 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         finally:
             release_lock(lock)
 
+    def registered_run_dirs(self) -> list[Path]:
+        base_dir = self.get_base_dir()
+        if not base_dir.is_dir():
+            return []
+        return [d for d in base_dir.iterdir() if d.is_dir() and (d / self.train_run_info_filename).exists()]
+
     def list_runs(self, limit: int = 20, offset: int = 0) -> Any:
         """
         List training runs for the current user.
@@ -297,13 +303,7 @@ class BaseTrainingRunManager(BaseFileManager, ABC):
         Returns:
             TrainingRunsResponse with list of training runs
         """
-        base_dir = self.get_base_dir()
-        candidates = []
-        if base_dir.exists():
-            for d in base_dir.iterdir():
-                if d.is_dir() and (d / self.train_run_info_filename).exists():
-                    candidates.append(d)
-
+        candidates = self.registered_run_dirs()
         candidates.sort(key=lambda d: (d / self.train_run_info_filename).stat().st_mtime, reverse=True)
 
         # All runs in the token directory belong to this user

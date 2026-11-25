@@ -393,10 +393,17 @@ class UploadToHubResponse(ResponseModel):
     revision: str
 
 
+class CheckpointStorageWarning(ResponseModel):
+    used_bytes: int
+    budget_bytes: int
+    message: str
+
+
 class SaveResponse(ResponseModel):
     """Response for /save endpoint (returns twinkle path + checkpoint dir)."""
     twinkle_path: str
     checkpoint_dir: str | None = None
+    warning: CheckpointStorageWarning | None = None
 
 
 class TrainingProgressResponse(ResponseModel):

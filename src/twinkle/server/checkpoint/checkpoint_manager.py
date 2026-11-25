@@ -10,9 +10,7 @@ weights, publish a version link, commit run metadata, then remove obsolete
 weights; failures before the commit restore the previous public path.
 """
 from __future__ import annotations
-
 import asyncio
-import json
 import os
 import re
 import shutil
@@ -20,14 +18,19 @@ import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
+import json
+from pydantic import BaseModel
+
 from twinkle import get_logger
 from twinkle.hub import HubOperation
 from twinkle.protocol.types import ResolvedLoadPath
+from twinkle.protocol.types.model import CheckpointStorageWarning
+from twinkle.server.config.env_propagation import CHECKPOINT_STORAGE_BUDGET_ENV
 from twinkle.server.exceptions import RequestRejectedError
 from twinkle.utils.parallel import FileLock, acquire_lock, release_lock
 from twinkle.utils.storage import is_remote_url
@@ -447,23 +450,52 @@ class BaseCheckpointManager(BaseFileManager, ABC):
         if not run_dir.exists():
             return None
 
-        checkpoints = []
-        # Iterate over weights and sampler_weights directories
+        checkpoints = sorted(self._iter_visible_checkpoints(model_id, run_dir), key=lambda checkpoint: checkpoint.time)
+        return self._create_checkpoints_response(checkpoints)
+
+    def _iter_visible_checkpoints(self, model_id: str, run_dir: Path) -> Iterator[Any]:
         for weights_type in ['weights', 'sampler_weights']:
             type_dir = run_dir / weights_type
-            if not type_dir.exists() or not type_dir.is_dir():
+            if not type_dir.is_dir():
                 continue
             for d in type_dir.iterdir():
                 if not d.name.startswith('.') and d.is_dir() and (d / CHECKPOINT_INFO_FILENAME).exists():
                     checkpoint_id = f'{weights_type}/{d.name}'
                     ckpt = self.get(model_id, checkpoint_id)
                     if ckpt and ckpt.checkpoint_id == checkpoint_id:
-                        checkpoints.append(ckpt)
+                        yield ckpt
 
-        # Sort by creation time
-        checkpoints.sort(key=lambda x: x.time)
+    def _storage_bytes(self) -> int:
+        total = 0
+        for registration in self.training_run_manager.registered_run_dirs():
+            model_id = registration.name
+            run_dir = self.training_run_manager.get_model_dir(model_id)
+            total += sum(checkpoint.size_bytes for checkpoint in self._iter_visible_checkpoints(model_id, run_dir))
+        return total
 
-        return self._create_checkpoints_response(checkpoints)
+    async def with_storage_warning(self, result: dict[str, Any] | BaseModel) -> dict[str, Any] | BaseModel:
+        """Add storage advice to a successful persistent save result."""
+        if not self.token:
+            return result
+        try:
+            budget = int(os.getenv(CHECKPOINT_STORAGE_BUDGET_ENV, '0'))
+            if budget <= 0:
+                return result
+            used = await asyncio.to_thread(self._storage_bytes)
+        except (OSError, ValueError):
+            # The checkpoint has committed. Usage collection cannot turn that save into a failure.
+            logger.warning('Could not calculate checkpoint storage usage after save', exc_info=True)
+            return result
+        if used * 10 < budget * 9:
+            return result
+        warning = CheckpointStorageWarning(
+            used_bytes=used,
+            budget_bytes=budget,
+            message=f'Checkpoint storage is {used / 1e9:.1f} GB of your {budget / 1e9:g} GB budget. '
+            'Upload checkpoints you want to keep to ModelScope, then delete unused local checkpoints.')
+        if isinstance(result, BaseModel):
+            result = result.model_dump()
+        return {**result, 'warning': warning.model_dump()}
 
     def delete(self, model_id: str, checkpoint_id: str) -> bool:
         """Remove a checkpoint and refresh only its kind's last-checkpoint pointer.

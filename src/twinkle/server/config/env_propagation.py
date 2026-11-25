@@ -5,11 +5,14 @@ import os
 
 from .telemetry import TELEMETRY_WORKER_ENV_KEYS
 
+CHECKPOINT_STORAGE_BUDGET_ENV = "TWINKLE_CHECKPOINT_STORAGE_BUDGET_BYTES"
+
 SHARED_WORKER_ENV_KEYS: tuple[str, ...] = (
     "TWINKLE_STATE_RAY_NAMESPACE",
     *TELEMETRY_WORKER_ENV_KEYS,
     "TWINKLE_TELEMETRY_USER_ID_KEY",
     "TWINKLE_MODEL_ID_ALIASES",
+    CHECKPOINT_STORAGE_BUDGET_ENV,
     "TWINKLE_TRUST_REMOTE_CODE",
     # Must reach every backend worker (RayRuntime.deployment_options), not just the
     # deployment replica: run_worker_setup_hook reads it to register startup plugins.

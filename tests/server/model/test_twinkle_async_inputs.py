@@ -302,8 +302,9 @@ async def test_forward_backward_binds_nested_dpo_ref_logps_without_coercion() ->
 @pytest.mark.parametrize('is_sampler,save_optimizer', [(False, False), (True, True)],
                          ids=['training-no-optimizer', 'sampler-with-optimizer'])
 @pytest.mark.parametrize('full_mode', [False, True], ids=['lora', 'full-model'])
+@pytest.mark.parametrize('warn', [False, True])
 async def test_save_forwards_backend_options_and_returns_public_path(
-        monkeypatch, tmp_path, is_sampler, save_optimizer, full_mode):
+        monkeypatch, tmp_path, is_sampler, save_optimizer, full_mode, warn):
     from pathlib import Path
     from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
     from twinkle.server.model.app import ModelManagement
@@ -321,6 +322,8 @@ async def test_save_forwards_backend_options_and_returns_public_path(
             return str(path)
 
     monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    if warn:
+        monkeypatch.setenv('TWINKLE_CHECKPOINT_STORAGE_BUDGET_BYTES', '1')
     runs = TwinkleTrainingRunManager('token')
     runs._write_info('training-a', {'base_model': 'test-model', 'is_lora': True})
     manager = TwinkleCheckpointManager('token', runs)
@@ -338,8 +341,14 @@ async def test_save_forwards_backend_options_and_returns_public_path(
     response = await endpoint(request, body, service)
     weights_type = 'sampler_weights' if is_sampler else 'weights'
     directory = manager.get_ckpt_dir('training-a', f'{weights_type}/step_one')
-    assert response.result == {'twinkle_path': f'twinkle://training-a/{weights_type}/step_one',
-                               'checkpoint_dir': str(directory)}
+    result = dict(response.result)
+    warning = result.pop('warning', None)
+    if warn:
+        assert warning['used_bytes'] == warning['budget_bytes'] == 1
+    else:
+        assert warning is None
+    assert result == {'twinkle_path': f'twinkle://training-a/{weights_type}/step_one',
+                      'checkpoint_dir': str(directory)}
     assert (directory / 'weights').read_text() == '1'
     assert service.model_calls == [('step_one', {'adapter_name': '' if full_mode else 'training-a',
                                                 'save_optimizer': save_optimizer, 'consumed_train_samples': 7})]

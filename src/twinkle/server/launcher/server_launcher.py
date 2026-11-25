@@ -15,7 +15,11 @@ from twinkle import get_logger
 from twinkle.hub.model_alias import MODEL_ID_ALIASES_ENV, build_model_alias_map, extract_model_alias
 from twinkle.server.config import ServerConfig
 from twinkle.server.config.application_spec import ApplicationSpec
-from twinkle.server.config.env_propagation import build_propagated_env_vars, build_worker_env_vars
+from twinkle.server.config.env_propagation import (
+    CHECKPOINT_STORAGE_BUDGET_ENV,
+    build_propagated_env_vars,
+    build_worker_env_vars,
+)
 from twinkle.utils.loader import WORKER_SETUP_HOOK
 from .builder_registry import get_builders, resolve_builder
 
@@ -94,6 +98,11 @@ class ServerLauncher:
         if any(app.import_path in ('model', 'sampler') for app in self.config.applications):
             os.environ['TWINKLE_STATE_RAY_NAMESPACE'] = self.ray_namespace
         os.environ.update(self.config.persistence.to_env_vars())
+        budget = self.config.checkpoint_storage_budget_bytes
+        if budget is not None:
+            os.environ[CHECKPOINT_STORAGE_BUDGET_ENV] = str(budget)
+        else:
+            os.environ.pop(CHECKPOINT_STORAGE_BUDGET_ENV, None)
         gateways = [app for app in self.config.applications if app.import_path == 'server']
         if gateways:
             os.environ.update(gateways[0].args.server_config.to_env_vars())

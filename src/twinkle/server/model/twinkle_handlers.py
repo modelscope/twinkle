@@ -532,7 +532,10 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
                 **backend_kwargs(body))
             save_checkpoint = checkpoint_manager.save_sampler if body.is_sampler else checkpoint_manager.save_training
             twinkle_path, checkpoint_dir = await save_checkpoint(adapter_name, body.name, save_weights)
-            return {'twinkle_path': twinkle_path, 'checkpoint_dir': checkpoint_dir}
+            result = {'twinkle_path': twinkle_path, 'checkpoint_dir': checkpoint_dir}
+            if body.is_sampler and not body.name:
+                return result
+            return await checkpoint_manager.with_storage_warning(result)
 
         if body.is_sampler:
             assert_sampler_weights_supported(self)

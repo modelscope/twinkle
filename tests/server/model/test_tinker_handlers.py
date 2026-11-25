@@ -318,11 +318,15 @@ async def test_tinker_loss_metric_survives_sdk_reduction(backward):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('name,sequence_id', [('step-1', None), (None, 0)], ids=['path', 'session'])
 @pytest.mark.parametrize('full_mode', [False, True], ids=['lora', 'full-model'])
-async def test_sampler_save_materializes_weights_and_returns_sdk_mode(monkeypatch, tmp_path, name, sequence_id, full_mode):
+@pytest.mark.parametrize('budget_enabled', [False, True])
+async def test_sampler_save_materializes_weights_and_returns_sdk_mode(
+        monkeypatch, tmp_path, name, sequence_id, full_mode, budget_enabled):
     from pathlib import Path
     from twinkle.server.checkpoint import create_checkpoint_manager
     import twinkle.server.model.tinker_handlers as handlers
     monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    if budget_enabled:
+        monkeypatch.setenv('TWINKLE_CHECKPOINT_STORAGE_BUDGET_BYTES', '1')
     manager = create_checkpoint_manager('token1', client_type='tinker')
     manager.training_run_manager._write_info('model1', {'base_model': 'test-model'})
     monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
@@ -348,6 +352,9 @@ async def test_sampler_save_materializes_weights_and_returns_sdk_mode(monkeypatc
     assert payload == {**body.model_dump(), 'model_path': uri, 'base_model': 'test-model'}
     checkpoint_id = manager.parse_path(uri).checkpoint_id
     assert Path(manager.get_ckpt_dir('model1', checkpoint_id), 'weights').read_text() == 'sampler'
+    if budget_enabled and name:
+        assert response['warning']['used_bytes'] == len('sampler')
+        response = types.SaveWeightsForSamplerResponseInternal.model_validate(response)
     assert response.path == (uri if sequence_id is None else None)
     if name:
         assert uri == 'twinkle://model1/sampler_weights/step-1'

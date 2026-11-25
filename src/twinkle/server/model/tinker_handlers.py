@@ -216,7 +216,8 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
                 adapter_name=self.resolve_model_adapter_name(adapter_name),
                 save_optimizer=True)
             tinker_path, _ = await checkpoint_manager.save_training(body.model_id, body.path, save_weights)
-            return types.SaveWeightsResponse(path=tinker_path, type='save_weights')
+            response = types.SaveWeightsResponse(path=tinker_path, type='save_weights')
+            return await checkpoint_manager.with_storage_warning(response)
 
         return await submit_training_task(
             self,
@@ -258,11 +259,11 @@ def _register_model_tinker_routes(app: FastAPI, self_fn: Callable[[], ModelManag
             # Tinker SDK distinguishes two modes by whether sampling_session_seq_id is set:
             # 1. save_weights_for_sampler(name): expects path != None
             # 2. save_weights_and_get_sampling_client(): expects path == None, sampling_session_id != None
-            if body.sampling_session_seq_id is not None:
-                return types.SaveWeightsForSamplerResponseInternal(path=None, sampling_session_id=sampling_session_id)
-            else:
-                return types.SaveWeightsForSamplerResponseInternal(
-                    path=tinker_path, sampling_session_id=sampling_session_id)
+            path = None if body.sampling_session_seq_id is not None else tinker_path
+            response = types.SaveWeightsForSamplerResponseInternal(path=path, sampling_session_id=sampling_session_id)
+            if body.path:
+                return await checkpoint_manager.with_storage_warning(response)
+            return response
 
         return await submit_training_task(
             self,

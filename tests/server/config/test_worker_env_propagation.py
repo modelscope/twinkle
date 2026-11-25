@@ -79,3 +79,14 @@ def test_launch_config_sets_driver_and_worker_trust_remote_code(monkeypatch, tmp
     override = {'ray_actor_options': {'runtime_env': {'env_vars': {key: 'deployment-override'}}}}
     assert launcher._deployment_options(override)['ray_actor_options']['runtime_env']['env_vars'][key] == (
         'deployment-override')
+
+
+def test_checkpoint_storage_budget_reaches_model_workers(monkeypatch):
+    from twinkle.server.config import ServerConfig
+    from twinkle.server.config.env_propagation import CHECKPOINT_STORAGE_BUDGET_ENV
+    from twinkle.server.launcher.server_launcher import ServerLauncher, build_ray_runtime_env
+
+    monkeypatch.setenv(CHECKPOINT_STORAGE_BUDGET_ENV, '')
+    launcher = ServerLauncher(ServerConfig(checkpoint_storage_budget_bytes=300_000_000_000))
+    launcher._configure_environment()
+    assert build_ray_runtime_env()['env_vars'][CHECKPOINT_STORAGE_BUDGET_ENV] == '300000000000'

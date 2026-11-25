@@ -444,7 +444,10 @@ class MultiLoraTransformersModel:
 
     def save(self, name: str, **kwargs) -> model_types.SaveResponse:
         """Save model checkpoint."""
-        return self._submit('save', model_types.SaveRequest, model_types.SaveResponse, name=name, **kwargs)
+        response = self._submit('save', model_types.SaveRequest, model_types.SaveResponse, name=name, **kwargs)
+        if response.warning is not None:
+            logger.warning('%s', response.warning.message)
+        return response
 
     def load(self, name: str, **kwargs) -> None:
         """Load model checkpoint."""

@@ -39,6 +39,7 @@ class ServerConfig(BaseModel):
     http_options: HttpOptions = Field(default_factory=HttpOptions)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
+    checkpoint_storage_budget_bytes: int | None = Field(default=None, gt=0, strict=True)
     task_queue: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     resources: ResourceOptions = Field(default_factory=ResourceOptions)
     applications: list[ApplicationSpec] = Field(default_factory=list)

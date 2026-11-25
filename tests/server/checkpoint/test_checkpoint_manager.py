@@ -30,6 +30,40 @@ def _writer(value, fail=False):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('manager', ['tinker', 'twinkle'], indirect=True)
+async def test_storage_warning_is_per_token_and_keeps_saves_over_budget(manager, monkeypatch, tmp_path):
+    monkeypatch.setenv('TWINKLE_CHECKPOINT_STORAGE_BUDGET_BYTES', '10')
+    other = create_checkpoint_manager('other-token', client_type='twinkle')
+    other.training_run_manager._write_info('other', {'base_model': 'test-model'})
+    await other.save_training('other', 'large', _writer('x' * 20))
+
+    result = {'path': 'test'}
+    await manager.save_training('run', 'first', _writer('x' * 8))
+    assert await manager.with_storage_warning(result) is result
+
+    # The run's files may live on a custom save root. The current live
+    # sampler version counts once, even though two links can resolve to it.
+    save_root = tmp_path / 'custom'
+    save_root.mkdir()
+    manager.training_run_manager._write_info('custom-run', {
+        'base_model': 'test-model', 'save_dir': str(save_root),
+    })
+    await manager.save_sampler('custom-run', None, _writer('x'))
+    warning = (await manager.with_storage_warning(result))['warning']
+    assert (warning['used_bytes'], warning['budget_bytes']) == (9, 10)
+    assert 'ModelScope' in warning['message']
+
+    uri, directory = await manager.save_training('run', 'over-budget', _writer('xxx'))
+    assert uri.endswith('/over-budget') and (Path(directory) / 'weights').exists()
+    assert (await manager.with_storage_warning(result))['warning']['used_bytes'] == 12
+
+    assert manager.delete('run', 'weights/over-budget')
+    assert (await manager.with_storage_warning(result))['warning']['used_bytes'] == 9
+    assert manager.delete('run', 'weights/first')
+    assert await manager.with_storage_warning(result) is result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('manager', ['tinker', 'twinkle'], indirect=True)
 async def test_named_and_live_versions_have_separate_lifetimes(manager):
     first, first_dir = await manager.save_sampler('run', 'x', _writer('x'))
     second, _ = await manager.save_sampler('run', 'y', _writer('y'))
