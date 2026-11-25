@@ -59,7 +59,10 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward_only(inputs=input_features, adapter_name=adapter_name, **kwargs)
-        results = self._tinker_build_output(inputs, outputs, return_full_logprobs=True)
+        # Tinker contract: one logprob per input token. Return the unpadded slice;
+        # the DPO reference round-trip stays intact because the server re-pads
+        # ragged client-supplied ref_logps in extract_rl_features_for_loss.
+        results = self._tinker_build_output(inputs, outputs)
         return [results, 0.0]
 
     @remote_function(dispatch='all')

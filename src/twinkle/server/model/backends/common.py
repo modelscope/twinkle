@@ -420,11 +420,13 @@ class TwinkleCompatModelBase:
                             return_full_logprobs: bool = False) -> list[dict]:
         """Convert raw logits to the expected output format with logprobs and elementwise_loss.
 
-        When return_full_logprobs is True (forward_only / reference pass), logprobs is returned
-        at the full TP/CP-padded sequence length so that when the client sends it back as
-        ref_logps in the DPO forward_backward step the shape already matches the padded labels.
-        When return_full_logprobs is False (default, forward_backward pass), logprobs is
-        truncated to the original unpadded sequence length.
+        By default (both the tinker forward and forward_backward passes) logprobs is
+        truncated to the original unpadded sequence length, so it stays aligned 1:1 with
+        the datum's input/target tokens as the Tinker protocol requires. The DPO reference
+        round-trip does not need pre-padded logprobs: the server re-pads ragged
+        client-supplied ref_logps in extract_rl_features_for_loss.
+        return_full_logprobs=True is an internal utility that retains the full TP/CP-padded
+        slice; it is not used by the public tinker endpoints.
         elementwise_loss is always computed on the original (unpadded) length because the
         per-datum weights tensor has that length.
         """
