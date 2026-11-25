@@ -416,6 +416,14 @@ class TwinkleClient:
         """
         return self.get_checkpoint_path(run_id, checkpoint_id).twinkle_path
 
+    def retrieve_task(self, request_id: str):
+        """Retrieve a task envelope with a short, bounded wait for reconciliation."""
+        from twinkle.protocol.types.lifecycle import TaskEnvelope
+
+        response = self._transport.post(self._get_url('/retrieve_future'), json_data={'request_id': request_id},
+                                        timeout=2)
+        return TaskEnvelope.model_validate(response.json())
+
     def delete_checkpoint(self, run_id: str, checkpoint_id: str) -> DeleteCheckpointResponse:
         """
         Delete a checkpoint.

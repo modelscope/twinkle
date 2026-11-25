@@ -7,13 +7,15 @@ inheritance relationship with the deployment class. Provides /twinkle/* sampler
 endpoints.
 """
 from __future__ import annotations
+
 import asyncio
+import hashlib
+import json
 import logging
 import uuid
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, List, Optional
 
-import json
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 
@@ -237,8 +239,11 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         Supports Trajectory or InputFeature inputs, with optional LoRA adapter.
         """
         token = await self._on_request_start(request)
+        request_id = body.tracked_request_id(token)
         submission = None
         if H_SAMPLE_IDEMPOTENCY_KEY in request.headers:
+            if request_id is not None:
+                raise RequestRejectedError('Use either client_sample_id or the sample idempotency header.')
             submission = sample_submission(request, 'twinkle/sample', self._telemetry_base_model, await request.json())
         if submission and await existing_sample(self.state, submission, token) is not None:
             return await self._peek_terminal(submission.request_id, fallback_status='pending')
@@ -289,15 +294,26 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         # Calculate metrics for queue scheduling. The body is wire-validated, so the
         # entries are models and ``input_ids`` is absent or a list of ints.
         input_tokens = sum(len(getattr(entry, 'input_ids', None) or ()) for entry in body.inputs)
-        return await self.submit_concurrent_and_peek(
+        schedule = {}
+        if submission is not None:
+            schedule = dict(request_id=submission.request_id, submission_fingerprint=submission.fingerprint)
+        elif request_id is not None:
+            fingerprint = hashlib.sha256(f'{request.url.path}\n{body.model_dump_json()}'.encode()).hexdigest()
+            schedule = dict(request_id=request_id, submission_fingerprint=fingerprint, track_execution=True)
+
+        reply = await self.submit_concurrent_and_peek(
             _task,
             token=token,
             input_tokens=input_tokens,
             task_type='sample',
             execution_scope=request_execution_scope(request),
             training_id=training_id,
-            request_id=submission.request_id if submission else None,
-            submission_fingerprint=submission.fingerprint if submission else None)
+            **schedule)
+        if request_id is not None:
+            record = await self.state.get_future(request_id)
+            if record is not None and record.get('submission_fingerprint') != fingerprint:
+                raise RequestRejectedError('client_sample_id is already bound to a different sampler request')
+        return reply
 
     @app.post('/twinkle/sample_to_data_plane', response_model=types.TaskEnvelope)
     async def sample_to_data_plane(

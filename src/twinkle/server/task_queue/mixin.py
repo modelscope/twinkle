@@ -368,6 +368,7 @@ class TaskQueueMixin:
         request_id: str | None = None,
         execution_scope: ExecutionScope | None = None,
         submission_fingerprint: str | None = None,
+        track_execution: bool = False,
         training_id: str | None = None,
     ) -> dict[str, Any]:
         """Schedule a compute task that runs now instead of in serial order.
@@ -402,7 +403,8 @@ class TaskQueueMixin:
             task,
             replica_id=getattr(self, 'replica_id', None),
             absolute_deadline=self._future_deadline(),
-            submission_fingerprint=submission_fingerprint)
+            submission_fingerprint=submission_fingerprint,
+            track_execution=track_execution)
         if started:
             logger.info(f'[TaskQueue] Task {request_id} started concurrently, type={task_type or "unknown"}, '
                         f'model_id={model_id}, input_tokens={input_tokens}', extra=task.log_fields('started'))
@@ -416,7 +418,18 @@ class TaskQueueMixin:
     async def submit_concurrent_and_peek(self, coro_factory: Callable[[], Coroutine],
                                          **schedule_kwargs) -> TaskEnvelope:
         """Concurrent compute submission with the existing Twinkle future envelope."""
-        ref = await self.schedule_concurrent_task(coro_factory, **schedule_kwargs)
+        admission = self.schedule_concurrent_task(coro_factory, **schedule_kwargs)
+        if schedule_kwargs.get('track_execution'):
+            # Once the tracked request is admitted it must be queryable even if the POST disconnects.
+            submission = asyncio.create_task(admission)
+            try:
+                ref = await asyncio.shield(submission)
+            except asyncio.CancelledError:
+                self._queue_tasks.add(submission)
+                submission.add_done_callback(self._queue_task_done)
+                raise
+        else:
+            ref = await admission
         return await self._peek_terminal(ref['request_id'], fallback_status='pending')
 
     async def _peek_terminal(self, request_id: str, *, fallback_status: str) -> TaskEnvelope:

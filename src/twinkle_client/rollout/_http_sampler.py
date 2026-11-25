@@ -3,6 +3,8 @@
 from __future__ import annotations
 import base64
 import threading
+from contextlib import nullcontext
+from functools import partial
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +32,8 @@ class HTTPSampler:
         self.template = template
         self.adapter_name = adapter_name
         self.adapter_path: Optional[str] = None
+        self.adapter_lease = None
+        self.on_adapter_task_unknown = None
 
     def sample(self,
                inputs: Any,
@@ -42,9 +46,13 @@ class HTTPSampler:
         del session_id
         if adapter_path and use_base_model:
             raise ValueError('adapter_path and use_base_model=True ask for opposite weights.')
-        adapter_uri = None if use_base_model else (adapter_path or self.adapter_path)
         items = inputs if isinstance(inputs, list) else [inputs]
-        return [self._sample_one(item, sampling_params, adapter_uri) for item in items]
+        if self.adapter_lease is not None and not use_base_model:
+            scope = self.adapter_lease(adapter_path or None)
+        else:
+            scope = nullcontext(None if use_base_model else (adapter_path or self.adapter_path))
+        with scope as adapter_uri:
+            return [self._sample_one(item, sampling_params, adapter_uri) for item in items]
 
     def _sample_one(self, item: Any, sampling_params: Any, adapter_uri: Optional[str]) -> SampleResponse:
         media = getattr(item, 'media', None)
@@ -52,8 +60,12 @@ class HTTPSampler:
             entry = {'input_ids': list(item.engine_input_ids), **_wire_media(media)}
         else:
             entry = dict(getattr(item, 'feature', item))
+        options = {}
+        if adapter_uri is not None and self.on_adapter_task_unknown is not None:
+            options['on_outcome_unknown'] = partial(self.on_adapter_task_unknown, adapter_uri)
         responses = self.sampler.sample(
-            [entry], sampling_params, adapter_name=self.adapter_name, adapter_uri=adapter_uri, token_only=bool(media))
+            [entry], sampling_params, adapter_name=self.adapter_name, adapter_uri=adapter_uri,
+            token_only=bool(media), **options)
         if len(responses) != 1:
             raise RuntimeError(f'the server returned {len(responses)} responses for one prompt.')
         response = responses[0]

@@ -126,6 +126,7 @@ def resolve(
     total_timeout: float = _DEFAULT_TOTAL_TIMEOUT,
     transport: ClientTransport | None = None,
     on_progress: Callable[[UploadProgress], None] | None = None,
+    on_terminal: Callable[[TaskEnvelope], None] | None = None,
 ) -> Any:
     """Block until ``submit``'s task reaches a terminal state, then return its result.
 
@@ -146,9 +147,14 @@ def resolve(
             cursor = progress.sequence
             on_progress(progress)
 
+    def unwrap(envelope: TaskEnvelope):
+        if on_terminal is not None:
+            on_terminal(envelope)
+        return _unwrap(envelope, model_cls)
+
     if submit.status in TERMINAL_STATUSES:
         report_progress(submit)
-        return _unwrap(submit, model_cls)  # same call as the retrieve path
+        return unwrap(submit)
 
     resolved_transport = capture_transport(transport)
     deadline = time.monotonic() + total_timeout
@@ -186,7 +192,7 @@ def resolve(
                 continue
             report_progress(reply)
             if reply.status in TERMINAL_STATUSES:
-                return _unwrap(reply, model_cls)  # same call as the submit path
+                return unwrap(reply)
             _log_queue_state(reply)
             poll_request_id = uuid.uuid4().hex
     except (KeyboardInterrupt, SystemExit):
@@ -209,3 +215,36 @@ def resolve_response(
         # Older servers reject unknown retrieve fields and omit progress in submit replies.
         on_progress=on_progress if 'progress' in payload else None,
     )
+
+
+def submit_tracked_task(transport, url, body, model_cls, on_outcome_unknown, *, request_id=None):
+    """Notify the caller only when a submitted task may still be running."""
+    try:
+        response = transport.post_model(url, body)
+    except (requests.ConnectTimeout, requests.exceptions.InvalidHeader, requests.exceptions.InvalidURL,
+            requests.exceptions.InvalidSchema, requests.exceptions.MissingSchema):
+        raise
+    except requests.HTTPError as exc:
+        status = _status_of(exc)
+        if status is None or status in (408, 499) or status >= 500:
+            on_outcome_unknown(request_id)
+        raise
+    except (requests.RequestException, KeyboardInterrupt, SystemExit):
+        on_outcome_unknown(request_id)
+        raise
+
+    def record_terminal(envelope):
+        if envelope.status == 'failed' and envelope.execution_finished is False:
+            on_outcome_unknown(envelope.request_id)
+
+    try:
+        submit = TaskEnvelope.model_validate(response.json())
+        request_id = submit.request_id
+        result = resolve(submit, model_cls=None, transport=transport, on_terminal=record_terminal)
+    except (TaskFailedError, TaskCancelledError):
+        raise
+    except BaseException:
+        on_outcome_unknown(request_id)
+        raise
+    # Response-model validation is local. The remote operation has ended.
+    return model_cls.model_validate(result) if model_cls is not None else result

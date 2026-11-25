@@ -753,3 +753,49 @@ async def test_backend_cancellation_is_an_explicit_server_failure(make_concurren
     envelope = envelope_from_record(ref['request_id'], record)
     assert envelope.error.error_code == 503
     assert envelope.error.category == 'server'
+
+
+@pytest.mark.asyncio
+async def test_tracked_sampler_failure_remains_unsettled_until_execution_exits(make_concurrent_queue):
+    from tests.server.state.fake_backend import FakeBackend
+    from twinkle.server.state.future_manager import FutureManager
+
+    class State(FutureManager):
+
+        async def get_future(self, request_id):
+            record = await self.get(request_id)
+            return record.model_dump() if record is not None else None
+
+        create_pending_future = FutureManager.create_pending
+        store_future_status = FutureManager.store_status
+        try_start_future = FutureManager.try_start
+        mark_future_execution_finished = FutureManager.mark_execution_finished
+
+    queue = make_concurrent_queue(TaskQueueConfig(execution_timeout=0.05, inline_fast_path_timeout=0.2))
+    queue.state = State(FakeBackend(), expiration_timeout=300)
+    queue._compute_worker._state = queue.state
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def work():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+            raise
+
+    try:
+        reply = await queue.submit_concurrent_and_peek(
+            work, token='token1', task_type='sample', request_id='req_sample_known',
+            submission_fingerprint='sample', track_execution=True)
+        assert reply.status == 'failed' and reply.execution_finished is False
+        await asyncio.wait_for(cancelled.wait(), 1)
+        assert (await queue.state.get('req_sample_known')).execution_finished is False
+    finally:
+        release.set()
+    for _ in range(100):
+        if (await queue.state.get('req_sample_known')).execution_finished is True:
+            break
+        await asyncio.sleep(0.01)
+    assert (await queue.state.get('req_sample_known')).execution_finished is True

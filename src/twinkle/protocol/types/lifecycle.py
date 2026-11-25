@@ -96,3 +96,4 @@ class TaskEnvelope(ResponseModel):
     queue_state: QueueState | None = None
     queue_state_reason: str | None = None
     progress: UploadProgress | None = None
+    execution_finished: bool | None = None  # tracked backend work has stopped

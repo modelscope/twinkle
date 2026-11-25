@@ -17,7 +17,8 @@ matching :mod:`twinkle.protocol.types.processor`.
 """
 from __future__ import annotations
 
-from pydantic import Field, JsonValue
+from hmac import digest
+from pydantic import UUID4, Field, JsonValue
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from .base import ResponseModel, StrictRequest, passthrough
@@ -38,10 +39,17 @@ class SampleRequest(StrictRequest):
     inputs: WireInputBatch = Field(..., description='Trajectory or InputFeature entries to sample from')
     sampling_params: dict[str, JsonValue] | None = Field(
         None, description='Sampling parameters (max_tokens, temperature, num_samples, etc.)')
+    client_sample_id: UUID4 | None = None
     adapter_name: str = Field('', description='Adapter name for LoRA inference')
     adapter_uri: str | None = Field(None, description='Adapter URI (twinkle:// path or local path) for LoRA inference')
     token_only: bool = Field(
         False, description='Return sampled tokens/logprobs only; encoded inputs are engine ids, media alongside')
+
+    def tracked_request_id(self, token: str) -> str | None:
+        if self.client_sample_id is None:
+            return None
+        identity = digest(token.encode(), self.client_sample_id.bytes, 'sha256')
+        return f'req_sample_{identity.hex()}'
 
 
 class SampledSequenceModel(ResponseModel):

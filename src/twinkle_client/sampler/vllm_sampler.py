@@ -1,8 +1,9 @@
 import asyncio
 import uuid
-from requests.exceptions import Timeout
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+from requests.exceptions import Timeout
 
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory
 from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTENCY_SUPPORTED
@@ -93,6 +94,7 @@ class vLLMSampler:
         token_only: bool = False,
         *,
         idempotency_key: str | None = None,
+        on_outcome_unknown=None,
     ) -> List[SampleResponseModel]:
         """Sample from the model.
 
@@ -114,10 +116,14 @@ class vLLMSampler:
                 inputs are the ids the engine runs on, with their media alongside.
             idempotency_key: Reuse this key and the same inputs when retrying this call after a
                 timeout. The server replays the existing receipt within its retention period.
+            on_outcome_unknown: Callback with the tracked task ID when the remote execution state
+                is unknown. Tracked sampling assigns its own identity.
 
         Returns:
             SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
+        if on_outcome_unknown is not None and idempotency_key is not None:
+            raise TwinkleClientValidationError('Tracked sampling already assigns its own request ID.')
         if adapter_uri is None:
             adapter_uri = adapter_path if adapter_path is not None else getattr(self, 'adapter_uri', None)
         url = f'{self.server_url}/sample'
@@ -127,7 +133,14 @@ class vLLMSampler:
             sampling_params=self._sampling_params(sampling_params, num_samples),
             adapter_name=adapter_name,
             adapter_uri=adapter_uri,
-            token_only=token_only)
+            token_only=token_only,
+            client_sample_id=uuid.uuid4() if on_outcome_unknown is not None else None)
+        if on_outcome_unknown is not None:
+            from twinkle_client._future import submit_tracked_task
+
+            request_id = body.tracked_request_id(self._transport.context.api_key)
+            return submit_tracked_task(
+                self._transport, url, body, SampleResponseModelList, on_outcome_unknown, request_id=request_id).samples
         if getattr(self, '_sample_idempotency', False):
             key = uuid.uuid4().hex if idempotency_key is None else idempotency_key
             headers = {H_SAMPLE_IDEMPOTENCY_KEY: key}

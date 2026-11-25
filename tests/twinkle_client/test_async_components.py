@@ -466,3 +466,37 @@ def test_sample_submission_retries_a_timeout_only_when_server_can_replay(monkeyp
         with pytest.raises(TwinkleClientValidationError, match='does not support'):
             sampler.sample([{'input_ids': [1, 2]}], idempotency_key='caller-key')
         assert len(posts) == 1
+
+
+def test_tracked_sample_reports_task_id_when_server_advertises_idempotency(monkeypatch):
+    from requests.exceptions import ReadTimeout
+    from types import SimpleNamespace
+
+    from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_SUPPORTED
+    from twinkle_client.exceptions import TwinkleClientValidationError
+    from twinkle_client.http import ClientContext, ClientTransport
+    from twinkle_client.sampler import vLLMSampler
+
+    posts = []
+    unknown = []
+
+    def post_model(url, body, *, headers=None):
+        posts.append((body, headers))
+        raise ReadTimeout()
+
+    transport = ClientTransport(ClientContext(base_url='http://stub', api_key='synthetic'))
+    monkeypatch.setattr(
+        transport, 'post', lambda *args, **kwargs: SimpleNamespace(headers={H_SAMPLE_IDEMPOTENCY_SUPPORTED: '1'}))
+    monkeypatch.setattr(transport, 'post_model', post_model)
+    sampler = vLLMSampler('mock', transport=transport)
+    rows = [{'input_ids': [1, 2]}]
+    with pytest.raises(TwinkleClientValidationError, match='own request ID'):
+        sampler.sample(rows, idempotency_key='caller-key', on_outcome_unknown=unknown.append)
+    assert not posts
+
+    with pytest.raises(ReadTimeout):
+        sampler.sample(rows, on_outcome_unknown=unknown.append)
+    (body, headers), = posts
+    assert headers is None
+    assert body.client_sample_id is not None
+    assert unknown == [body.tracked_request_id('synthetic')]

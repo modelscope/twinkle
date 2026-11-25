@@ -124,6 +124,12 @@ class FutureTransitions:
         return {**existing, 'progress': snapshot}
 
     @staticmethod
+    def finish_execution(existing: dict | None) -> dict | None:
+        if existing is None or existing.get('execution_finished') is not False:
+            return None
+        return {**existing, 'execution_finished': True}
+
+    @staticmethod
     def cancel(existing: dict | None, *, failure: dict, now: str) -> dict | None:
         """Atomic transform: cancel iff the task has not started (pending/queued).
 
@@ -243,6 +249,9 @@ class FutureManager(BaseManager[FutureRecord]):
     async def report_progress(self, request_id: str, progress: dict[str, Any]) -> None:
         await self._backend.update_atomic(
             self._make_key(request_id), functools.partial(FutureTransitions.report_progress, progress=progress))
+
+    async def mark_execution_finished(self, request_id: str) -> None:
+        await self._backend.update_atomic(self._make_key(request_id), FutureTransitions.finish_execution)
 
     async def cancel_if_pending(self, request_id: str) -> str | None:
         """Cancel a task iff it has not started; return the resulting status.
