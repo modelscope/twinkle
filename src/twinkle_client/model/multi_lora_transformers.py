@@ -64,6 +64,9 @@ class MultiLoraTransformersModel:
         self._training_ids: dict[str, str] = {}
         self._creating: set[str] = set()
         self._training_lock = threading.Lock()
+        self._training_changed = threading.Condition(self._training_lock)
+        self._close_lock = threading.Lock()
+        self._closing = False
         # Per-client monotonic sequence for idempotent dedup of stateful training ops:
         # the server dedups on (training_id, session, operation, seq_id), so each update is
         # applied at most once. Reserved once per call and reused on retry.
@@ -193,6 +196,8 @@ class MultiLoraTransformersModel:
         if save_dir:
             save_dir = Path(save_dir).expanduser().resolve().as_posix()
         with self._training_lock:
+            if self._closing:
+                raise RuntimeError('This model handle is closing and cannot create new trainings.')
             if adapter_name in self._creating:
                 raise RuntimeError('A training with this adapter_name is already being created on this object.')
             if adapter_name in self._training_ids:
@@ -217,8 +222,26 @@ class MultiLoraTransformersModel:
                     result.training_id, lambda: self._release_adapter(adapter_name, result.training_id, missing_ok=True))
             return result.training_id
         finally:
-            with self._training_lock:
+            with self._training_changed:
                 self._creating.discard(adapter_name)
+                self._training_changed.notify_all()
+
+    def close(self) -> None:
+        """Release only bindings created by this handle, keeping failed bindings available for retry."""
+        with self._close_lock:
+            with self._training_changed:
+                self._closing = True
+                self._training_changed.wait_for(lambda: not self._creating)
+                names = list(self._training_ids)
+            failures = []
+            for name in names:
+                try:
+                    self.remove_adapter(name)
+                except BaseException as error:
+                    failures.append(error)
+                    logger.exception('Failed to release client-owned training %s.', name)
+            if failures:
+                raise BaseExceptionGroup('Model binding cleanup is incomplete', failures)
 
     @_guarded_operation
     def remove_adapter(self, adapter_name: str | None = None) -> None:
@@ -436,6 +459,19 @@ class MultiLoraTransformersModel:
             model_types.CalculateMetricRequest,
             model_types.CalculateMetricResponse,
             is_training=is_training,
+            **kwargs)
+
+    def task_head_temperatures(self, **kwargs) -> model_types.TaskHeadTemperaturesResponse:
+        """Read or replace the current training handle's task-head temperatures.
+
+        The same method face the in-process TrainableModel serves for local/ray runs;
+        here it crosses HTTP to the training handle's head buffers. ``update`` is the
+        write form (global_temperature / kind_temperatures); without it the call reads.
+        """
+        return self._submit(
+            'task_head_temperatures',
+            model_types.TaskHeadTemperaturesRequest,
+            model_types.TaskHeadTemperaturesResponse,
             **kwargs)
 
     # ------------------------------------------------------------------ #

@@ -59,8 +59,8 @@ class CheckpointEngineManager:
     * ``colocate`` connects Ray model and sampler actors sharing GPUs through CUDA IPC.
     * ``standalone`` connects disaggregated Ray actors through NCCL/HCCL.
 
-    ``auto`` resolves local objects to ``naive`` and Ray actor handlers to ``standalone``. It never
-    guesses ``colocate`` because actor placement cannot be inferred reliably from the driver.
+    ``auto`` uses ``naive`` only when both endpoints share the caller's direct-stream execution
+    context; otherwise it uses ``standalone``. ``colocate`` remains an explicit allocation choice.
 
     The manager owns the policy version: every completed :meth:`sync_weights` adds one, and
     :meth:`version` reads it without waiting for a sync in progress. Built with a ``remote_group``
@@ -127,7 +127,18 @@ class CheckpointEngineManager:
         self.model = model
         self.sampler = sampler
         self.requested_mode = mode
-        self.mode = self._resolve_mode(mode, model, sampler)
+        model_capabilities = model.checkpoint_transfer_capabilities()
+        sampler_capabilities = sampler.checkpoint_transfer_capabilities()
+        self.mode = self._resolve_mode(mode, model_capabilities, sampler_capabilities)
+        if platform is None and self.mode != 'naive':
+            endpoints = (model_capabilities, sampler_capabilities)
+            capabilities = [_wait(item)
+                            for endpoint in endpoints
+                            for item in (endpoint if isinstance(endpoint, list) else [endpoint])]
+            devices = {item['device_type'] for item in capabilities}
+            if len(devices) != 1:
+                raise ValueError(f'Checkpoint endpoints require one compatible device platform, got {sorted(devices)}.')
+            platform = devices.pop()
         self.backend_cls = self.decide_backend_engine(platform, self.mode)
         if sync_backend not in ('full', 'delta_sharded'):
             raise ValueError(f'Unknown weight sync backend: {sync_backend}')
@@ -194,26 +205,29 @@ class CheckpointEngineManager:
     @staticmethod
     def _resolve_mode(
         mode: CheckpointEngineMode,
-        model: 'CheckpointEngineMixin',
-        sampler: 'CheckpointEngineMixin',
+        model_capabilities: Any,
+        sampler_capabilities: Any,
     ) -> Literal['naive', 'colocate', 'standalone']:
         if mode not in _VALID_MODES:
             valid = ', '.join(sorted(_VALID_MODES))
             raise ValueError(f'Unknown checkpoint engine mode {mode!r}; expected one of: {valid}.')
 
-        model_has_actors = bool(getattr(model, '_actors', None))
-        sampler_has_actors = bool(getattr(sampler, '_actors', None))
-        if model_has_actors != sampler_has_actors:
-            raise ValueError(
-                'CheckpointEngineManager requires model and sampler to use the same deployment shape: '
-                'both must be local objects or both must be Ray actor handlers.')
-
+        senders = model_capabilities if isinstance(model_capabilities, list) else [model_capabilities]
+        receivers = sampler_capabilities if isinstance(sampler_capabilities, list) else [sampler_capabilities]
+        if not senders or not receivers:
+            raise ValueError('Checkpoint synchronization requires at least one sender and receiver.')
+        # A lazy-collected capability answers with the plain dict ONLY when the call ran in
+        # THIS process; a remote endpoint answers with a pending handle. That shape -- chosen
+        # entirely by the infra transport, never by an identity embedded in the declaration --
+        # is the co-execution test: direct streaming needs both roles as local objects here,
+        # each declaring its half of the capability.
+        direct = (len(senders) == len(receivers) == 1
+                  and isinstance(senders[0], dict) and isinstance(receivers[0], dict)
+                  and bool(senders[0].get('direct_stream')) and bool(receivers[0].get('direct_stream')))
         if mode == 'auto':
-            return 'standalone' if model_has_actors else 'naive'
-        if mode == 'naive' and model_has_actors:
-            raise ValueError("mode='naive' requires local model and sampler objects without Ray actors.")
-        if mode in ('colocate', 'standalone') and not model_has_actors:
-            raise ValueError(f"mode={mode!r} requires model and sampler to be Ray actor handlers.")
+            return 'naive' if direct else 'standalone'
+        if mode == 'naive' and not direct:
+            raise ValueError("mode='naive' requires a shared direct-stream execution context.")
         return mode
 
     @staticmethod

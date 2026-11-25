@@ -29,6 +29,13 @@ def align_per_token_values(
     """
     import torch
 
+    from twinkle.infra._ray.ray_helper import LazyCollect
+    # forward_only / DataPlane hand back a LazyCollect Future; materialise it before conversion.
+    # torch.as_tensor treats an un-materialised Future as a nested sequence and recurses into its
+    # 0-d scalar leaves, where len() raises ("len() of a 0-d tensor").
+    if isinstance(values, LazyCollect):
+        values = values.result()
+
     row_lengths: list[int] | None = None
     if torch.is_tensor(values):
         tensor = values

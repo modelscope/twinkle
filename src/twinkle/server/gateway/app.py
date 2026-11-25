@@ -54,6 +54,12 @@ class GatewayServer(LazyCleanupMixin):
         # across replica rebuilds and made the OpenAI template tests non-isolatable.
         self._template_initialized: set[str] = set()
 
+    def reconfigure(self, config: dict | None) -> None:
+        """Apply the persisted discovery snapshot to every replica without replacing training/session state."""
+        if config is not None and 'supported_models' in config:
+            self.supported_models = self._normalize_models(config['supported_models'])
+            self._supported_model_names = frozenset(model.model_name for model in self.supported_models)
+
     @property
     def supported_model_names(self) -> frozenset[str]:
         """Base-model names this gateway accepts.

@@ -112,8 +112,18 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, SGLangDeltaSamplerMixin):
         # Only touched from ``self._async_loop``.
         self._inflight_request_ids: set = set()
 
-        from .sglang_engine import SGLangEngine
+        from .sglang_engine import SGLangEngine, _sglang_engine_arg_names
         engine_kwargs = engine_args.copy() if engine_args else {}
+        # User-set keys are validated fail-loud BEFORE twinkle's defaults merge in (same contract
+        # as vLLM's engine_kwargs guard): a typo'd or retired knob the user set on purpose must
+        # raise, not warn-and-vanish in the engine's injected-key filter downstream.
+        accepted = _sglang_engine_arg_names()
+        if accepted is not None:
+            own_params = {'tensor_parallel_size', 'data_parallel_size', 'enable_memory_saver'}
+            unknown_user_keys = set(engine_kwargs) - accepted - own_params
+            if unknown_user_keys:
+                raise RuntimeError('engine_args contain keys the installed sglang ServerArgs does not '
+                                   f'know: {sorted(unknown_user_keys)}')
         # The delta lane validates its engine-side registration (custom_weight_loader) against
         # the exact kwargs the engine was built with, so keep the post-defaults copy.
         self._sglang_engine_kwargs = engine_kwargs

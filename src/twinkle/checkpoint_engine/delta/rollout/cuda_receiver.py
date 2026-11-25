@@ -13,14 +13,16 @@ from collections.abc import Iterator
 
 import torch
 
+from twinkle import remote_class, remote_function
 from ..config import DeltaReceiverPlacement, DeltaSyncConfig, DeltaTransportEndpoint
 from ..transport.nccl_engine import DeltaShardedCheckpointEngine
 
 TensorFlush = tuple[list[tuple[str, torch.Tensor]], bool]
 
 
+@remote_class(execute='first')
 class CudaDeltaReceiver:
-    """Checkpoint worker colocated with one vLLM worker"""
+    """Checkpoint compute component sharing the initialized device of one vLLM worker."""
 
     def __init__(self, config: DeltaSyncConfig, endpoint: DeltaTransportEndpoint,
                  placement: DeltaReceiverPlacement) -> None:
@@ -43,13 +45,21 @@ class CudaDeltaReceiver:
         self.zmq_handle = placement['zmq_handle']
         self.engine = DeltaShardedCheckpointEngine(bucket_size=config.bucket_bytes)
         self.engine.prepare()
-        self.engine.init_process_group(placement['rank'], endpoint['world_size'], endpoint['master_metadata'])
+        self._endpoint = endpoint
+        self._rank = placement['rank']
+        self._ready = False
         self._flushes: Iterator[TensorFlush] | None = None
         self._current: TensorFlush | None = None
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def ready(self) -> int:
+        if not self._ready:
+            self.engine.init_process_group(self._rank, self._endpoint['world_size'],
+                                           self._endpoint['master_metadata'])
+            self._ready = True
         return self.engine.rank
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def next_flush(self) -> dict[str, bool] | None:
         if self._flushes is None:
             self._flushes = self.engine.receive_weights()
@@ -59,6 +69,7 @@ class CudaDeltaReceiver:
             return None
         return {'is_last': self._current[1]}
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def send_flush(self) -> None:
         from twinkle.sampler.vllm_sampler.delta.cuda_ipc import BucketedWeightSender
 
@@ -71,6 +82,7 @@ class CudaDeltaReceiver:
         finally:
             self._current = None
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def close(self) -> None:
         self._current = None
         if self._flushes is not None:

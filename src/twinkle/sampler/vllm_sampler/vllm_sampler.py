@@ -373,6 +373,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
                     stop_reason=seq.stop_reason,
                     tokens=[] if logprobs_only else seq.tokens,
                     logprobs=None if logprobs_only else seq.logprobs,
+                    routed_experts=_convert_ndarray_to_list(seq.routed_experts),
                     sampling_masks=seq.sampling_masks,
                 )
             elif logprobs_only:
@@ -996,20 +997,33 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
         """
         if self._shutdown_called:
             return
+        # Mark BEFORE the cleanup steps: a failure below must leave the instance in its
+        # terminal state, so a retried shutdown is a no-op instead of resubmitting work
+        # to an engine loop that a failed first attempt already stopped.
         self._shutdown_called = True
-
-        # 1. Shutdown vLLM engine (stops EngineCore process and output_handler)
+        failures = []
+        # Transfer participants must release their contexts while the engine loop is still available.
+        try:
+            if getattr(self, '_delta_receivers', None) or getattr(self, '_delta_endpoint', None) is not None:
+                self.close_delta_sampler()
+        except BaseException as error:
+            failures.append(error)
+            logger.exception('vLLMSampler delta shutdown failed.')
         try:
             if hasattr(self, 'engine') and self.engine is not None:
                 self._run_in_loop(self.engine.shutdown())
-        except Exception as e:
-            logger.warning(f'vLLMSampler engine shutdown error: {e}')
-
-        # 2. Stop the background event loop and join thread
+        except BaseException as error:
+            failures.append(error)
+            logger.exception('vLLMSampler engine shutdown failed.')
         try:
             if hasattr(self, '_async_loop') and self._async_loop.is_running():
                 self._async_loop.call_soon_threadsafe(self._async_loop.stop)
             if hasattr(self, '_async_thread') and self._async_thread.is_alive():
                 self._async_thread.join(timeout=5)
-        except Exception as e:
-            logger.warning(f'vLLMSampler event loop shutdown error: {e}')
+                if self._async_thread.is_alive():
+                    raise TimeoutError('vLLMSampler event loop did not stop within 5 seconds.')
+        except BaseException as error:
+            failures.append(error)
+            logger.exception('vLLMSampler event loop shutdown failed.')
+        if failures:
+            raise BaseExceptionGroup('vLLMSampler shutdown is incomplete', failures)

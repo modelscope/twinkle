@@ -58,6 +58,14 @@ logger = get_logger()
 _OPENAI_SAMPLE_TIMEOUT_ENV = 'TWINKLE_OPENAI_SAMPLE_TIMEOUT'
 _DEFAULT_OPENAI_SAMPLE_TIMEOUT = 1800.0
 
+_OPENAI_ROUTE_WAIT_ENV = 'TWINKLE_OPENAI_ROUTE_WAIT_TIMEOUT'
+_DEFAULT_OPENAI_ROUTE_WAIT_TIMEOUT = 300.0
+_ROUTE_MOUNT_POLL_INTERVAL = 1.0
+
+
+def _route_wait_timeout() -> float:
+    return float(os.environ.get(_OPENAI_ROUTE_WAIT_ENV, str(_DEFAULT_OPENAI_ROUTE_WAIT_TIMEOUT)))
+
 
 class SamplerWaitTimeoutError(TimeoutError):
     """The sampler task did not reach a terminal state inside the gateway's budget."""
@@ -394,16 +402,31 @@ async def _proxy_sample(
 
     sampler_headers = _sampler_headers(request)
     body_bytes = json.dumps(sample_request).encode()
-    await _ensure_template(gateway, base_model, sampler_headers, request)
 
-    response = await gateway.proxy.proxy_request(
-        request,
-        endpoint=endpoint,
-        base_model=base_model,
-        service_type='sampler',
-        body_override=body_bytes,
-        extra_headers=sampler_headers,
-    )
+    # The deployment registers the model (so _resolve_base_model succeeds and /models advertises
+    # it) well before the sampler replica mounts its HTTP routes -- that happens only after the
+    # engine finishes loading. A 404 on a resolved model's fixed twinkle/* route therefore means
+    # "route not yet mounted", not a terminal answer: wait it out (bounded) instead of passing
+    # the transient 404 through. This is the same readiness run_deploy's ready_probe enforces
+    # ("one real request succeeds"), applied on the shared body so every non-streaming OpenAI
+    # endpoint gets it at once. _ensure_template rides the same loop: its 404 is the same race,
+    # and it only caches on success, so each retry re-attempts set_template until it sticks.
+    route_deadline = time.monotonic() + _route_wait_timeout()
+    while True:
+        await _ensure_template(gateway, base_model, sampler_headers, request)
+        response = await gateway.proxy.proxy_request(
+            request,
+            endpoint=endpoint,
+            base_model=base_model,
+            service_type='sampler',
+            body_override=body_bytes,
+            extra_headers=sampler_headers,
+        )
+        if response.status_code != 404 or time.monotonic() >= route_deadline:
+            break
+        if await request.is_disconnected():
+            break
+        await asyncio.sleep(_ROUTE_MOUNT_POLL_INTERVAL)
     if response.status_code != 200:
         return JSONResponse(
             status_code=response.status_code,

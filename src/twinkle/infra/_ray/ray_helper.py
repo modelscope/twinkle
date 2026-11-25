@@ -1,12 +1,21 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import sys
 import threading
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar, Union
 
-from twinkle import Platform, find_free_port, find_node_ip, requires
+from twinkle import Platform, find_free_port, find_node_ip, get_logger, requires
 from .. import _torch_setup
-from .resource_manager import ResourceManager
+from .resource_manager import ResourceManager, _allocation_address
+
+
+def worker_setup_hook() -> None:
+    """Publish this worker's initialization address before loading startup plugins or child processes."""
+    os.environ['TWINKLE_NODE_IP'] = _allocation_address()
+    from twinkle.utils.loader import run_worker_setup_hook
+
+    run_worker_setup_hook()
 
 T = TypeVar('T')
 
@@ -33,33 +42,30 @@ class LazyCollect:
         self._method = method
         self._collect_func = collect_func
         self.device_mesh = device_mesh
-        self._result = None  # Cache collected results
+        self._result = None
+        self._has_result = False
         self._timeout = timeout
-        #: ObjectRef -> its Ray future, once ``add_done_callback`` asked for one; the collect then reads the
-        #: value that future already fetched instead of fetching it again.
-        self._ref_futures = {}
+        self._completion_ref = None
+        self._completion_future = None
 
     def __getstate__(self):
-        # Ray futures are this process's waiters; a copy in another process fetches on its own.
+        # Completion waiters belong to this process, not to a serialized handle.
         state = self.__dict__.copy()
-        state['_ref_futures'] = {}
+        state['_completion_future'] = None
         return state
 
     def _get_result(self, fetched: Optional[Dict[Any, Any]] = None):
         """Collect and cache the result; ``fetched`` holds ref values a caller already got in one batch."""
         import ray
-        if self._result is None:
-            result = []
-            for future in self._futures:
-                if not isinstance(future, ray.ObjectRef):
-                    result.append(future)
-                elif fetched is not None and future in fetched:
-                    result.append(fetched[future])
-                elif future in self._ref_futures:
-                    result.append(self._ref_futures[future].result(timeout=self._timeout))
-                else:
-                    result.append(ray.get(future, timeout=self._timeout))
+        if not self._has_result:
+            values = dict(fetched or {})
+            pending = list(dict.fromkeys(ref for ref in self._futures
+                                         if isinstance(ref, ray.ObjectRef) and ref not in values))
+            if pending:
+                values.update(zip(pending, ray.get(pending, timeout=self._timeout)))
+            result = [values[ref] if isinstance(ref, ray.ObjectRef) else ref for ref in self._futures]
             self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
+            self._has_result = True
         return self._result
 
     def __call__(self):
@@ -100,61 +106,81 @@ class LazyCollect:
         refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
         if not refs:
             return True
-        ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
+        refs = list(dict.fromkeys(refs))
+        ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0, fetch_local=False)
         return len(ready) == len(refs)
 
     def add_done_callback(self, fn: Callable[['LazyCollect'], Any]):
-        """Call ``fn(self)`` once every referenced task has finished, without polling.
-
-        Each ``ObjectRef.future()`` reports its own completion; the last one fires ``fn`` on Ray's
-        callback thread, so ``fn`` must not block (hand the handle to a queue and read it there).
-        A failed task also completes; the exception surfaces at :meth:`result`.
-        """
+        """Call ``fn(self)`` on completion; only a payload-free status token reaches the caller."""
         import ray
-        refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
+        refs = list(dict.fromkeys(ref for ref in self._futures if isinstance(ref, ray.ObjectRef)))
         if not refs:
             fn(self)
             return
-        remaining = [len(refs)]
-        lock = threading.Lock()
+        if self._completion_ref is None:
+            remote = RayHelper._get_remote_component(_completion_token)
+            self._completion_ref = remote.options(num_cpus=0).remote(refs)
+        if self._completion_future is None:
+            self._completion_future = self._completion_ref.future()
+        self._completion_future.add_done_callback(lambda _: fn(self))
 
-        def _on_ref_done(_):
-            with lock:
-                remaining[0] -= 1
-                last = remaining[0] == 0
-            if last:
-                fn(self)
-
-        for ref in refs:
-            future = self._ref_futures.get(ref)
-            if future is None:
-                future = self._ref_futures[ref] = ref.future()
-            future.add_done_callback(_on_ref_done)
+    def _project(self, operation, *arguments):
+        """Project the return value remotely; the caller retains only the selected reference."""
+        remote = RayHelper._get_remote_component(_project_collected)
+        ref = remote.options(num_cpus=0).remote(
+            self._futures, self._method, self._collect_func, self.device_mesh, operation, arguments,
+            self._timeout)
+        return LazyCollect([ref], 'none', self._collect_func, self.device_mesh, timeout=self._timeout)
 
     def __iter__(self):
-        """Support iteration: automatically collect results then iterate"""
-        return iter(self._get_result())
+        kind, structure = self._project('structure').result()
+        if kind == 'mapping':
+            return iter(structure)
+        return (self[index] for index in range(structure))
 
     def __len__(self):
-        """Support len() function"""
-        return len(self._get_result())
+        return self._project('len').result()
 
     def __getitem__(self, key):
-        """Index into the collected value (a dict key or a list index/slice); materialises it.
-
-        Together with :meth:`get` / :meth:`__contains__` this lets the SAME subscript syntax read a
-        lazy remote return and a local plain dict/list -- a caller writes ``out['logps']`` and works
-        in both deployment forms without a shape branch.
-        """
-        return self._get_result()[key]
+        return self._project('getitem', key)
 
     def get(self, key, default=None):
-        """Dict-style ``get`` over the collected value; materialises it (missing key -> ``default``)."""
-        return self._get_result().get(key, default)
+        return self._project('get', key, default)
 
     def __contains__(self, key):
-        """Membership over the collected value; materialises it."""
-        return key in self._get_result()
+        return self._project('contains', key).result()
+
+
+def _completion_token(refs):
+    """Wait for task completion without fetching any source payload."""
+    import ray
+    if refs:
+        ray.wait(refs, num_returns=len(refs), fetch_local=False)
+
+
+def _project_collected(futures, method, collect_func, device_mesh, operation, arguments, timeout):
+    """Project a collected value without assuming any domain-specific fields."""
+    import operator
+    import ray
+    from collections.abc import Mapping
+
+    value = LazyCollect(futures, method, collect_func, device_mesh, timeout=timeout).result()
+    # Open only the container; unselected stashed channels must remain references.
+    while RayHelper._is_handle(value):
+        value = value.result() if isinstance(value, LazyCollect) else ray.get(value, timeout=timeout)
+    if operation == 'structure':
+        if isinstance(value, Mapping):
+            return 'mapping', tuple(value)
+        if isinstance(value, (str, bytes)):
+            return 'scalar', None
+        try:
+            kind = 'tuple' if isinstance(value, tuple) else ('tensor' if hasattr(value, 'shape') else 'sequence')
+            return kind, len(value)
+        except TypeError:
+            return 'scalar', None
+    operations = {'getitem': operator.getitem, 'get': lambda value, key, default: value.get(key, default),
+                  'contains': operator.contains, 'len': len}
+    return operations[operation](value, *arguments)
 
 
 class RayHelper:
@@ -167,6 +193,8 @@ class RayHelper:
 
     #: Every actor this process created, so ``shutdown`` can terminate them.
     _created_actors: List[Any] = []
+    _actor_lifecycle_lock = threading.RLock()
+    _released_worker_ids: set[str] = set()
 
     @staticmethod
     def _get_ray_custom_resources(device_groups) -> Dict[str, float]:
@@ -292,11 +320,10 @@ class RayHelper:
             # ran, in the same worker process that hosted the actor, and the per-actor ``env_vars``
             # still applied. Nothing warned in the first arm, so a plugin the driver imported reached
             # every actor as a module name no worker could import.
-            from twinkle.utils.loader import WORKER_SETUP_HOOK
             ray.init(ignore_reinit_error=True,
                      resources=resources or None,
                      num_gpus=num_gpus,
-                     runtime_env={'worker_process_setup_hook': WORKER_SETUP_HOOK})
+                     runtime_env={'worker_process_setup_hook': 'twinkle.infra._ray.ray_helper.worker_setup_hook'})
 
         if RayHelper.resource_manager is None:
             # Resource manager initializes only once in the pipeline process.
@@ -314,44 +341,72 @@ class RayHelper:
         RayHelper.add_config(_RANKS_KEY, getattr(manager, 'rank_placements', {}))
 
     @staticmethod
-    def shutdown():
-        """Terminate the actors this process created, release the placement groups, stop Ray.
+    def release_workers(actors):
+        """Release process-owned replicas; retain failed handles for a later cleanup attempt."""
+        import ray
+        from ..continuous_work import worker_id_of
 
-        Only this process's own actors die: a shared namespace's other runs keep theirs and their
-        pool entries (killing through the registry would take out every replica of every pool in
-        the namespace). The registry itself is still killed and rebuilt by the next
-        ``initialize``; a peer holding a stale handle fails loudly rather than losing its
-        replicas. A crashed run leaves its dead replicas listed until freed by hand --
-        ``_free_placements`` then reports their slots as occupied.
+        failures = []
+        with RayHelper._actor_lifecycle_lock:
+            for actor in tuple(actors):
+                if actor not in RayHelper._created_actors:
+                    if actor in actors:
+                        actors.remove(actor)
+                    continue
+                try:
+                    ray.kill(actor, no_restart=True)
+                except BaseException as error:
+                    failures.append(error)
+                    get_logger().warning('Failed to release owned worker %s.', worker_id_of(actor), exc_info=True)
+                else:
+                    RayHelper._released_worker_ids.add(worker_id_of(actor))
+                    if actor in actors:
+                        actors.remove(actor)
+                    RayHelper._created_actors.remove(actor)
+            pending = list(RayHelper._released_worker_ids)
+            if pending and RayHelper._registry is not None:
+                try:
+                    ray.get(RayHelper._registry.remove_actors.remote(pending))
+                except BaseException as error:
+                    failures.append(error)
+                    get_logger().warning('Failed to remove released workers from the registry.', exc_info=True)
+                else:
+                    RayHelper._released_worker_ids.difference_update(pending)
+        if failures:
+            raise BaseExceptionGroup('Owned worker cleanup is incomplete', failures)
+
+    @staticmethod
+    def shutdown():
+        """Release owned actors and allocations; retain the shared registry for other clients.
+
+        Every step runs even when an earlier one fails; failures aggregate in one group
+        so a single bad cleanup cannot skip the placement-group teardown or ray shutdown.
         """
         import ray
         if not RayHelper.ray_inited():
             return
-        actors = list(RayHelper._created_actors)
-        for actor in actors:
-            try:
-                ray.kill(actor, no_restart=True)
-            except Exception:  # noqa
-                pass
-        RayHelper._created_actors.clear()
-        if RayHelper._registry is not None:
-            try:
-                from ..continuous_work import worker_id_of
-
-                ray.get(RayHelper._registry.remove_actors.remote(
-                    [worker_id_of(actor) for actor in actors]))
-            except Exception:  # noqa
-                pass
-        if RayHelper.resource_manager is not None:
-            RayHelper.resource_manager.destroy_placement_group()
-            RayHelper.resource_manager = None
-        if RayHelper._registry is not None:
-            try:
-                ray.kill(RayHelper._registry)
-            except Exception:  # noqa
-                pass
-            RayHelper._registry = None
-        ray.shutdown()
+        failures = []
+        try:
+            RayHelper.release_workers(list(RayHelper._created_actors))
+        except BaseException as error:
+            failures.append(error)
+            get_logger().warning('Owned worker release failed during shutdown.', exc_info=True)
+        try:
+            if RayHelper.resource_manager is not None:
+                RayHelper.resource_manager.destroy_placement_group()
+                RayHelper.resource_manager = None
+        except BaseException as error:
+            failures.append(error)
+            get_logger().warning('Placement group teardown failed during shutdown.', exc_info=True)
+        RayHelper._registry = None
+        RayHelper._remote_components.clear()
+        try:
+            ray.shutdown()
+        except BaseException as error:
+            failures.append(error)
+            get_logger().warning('Ray shutdown failed.', exc_info=True)
+        if failures:
+            raise BaseExceptionGroup('RayHelper shutdown is incomplete', failures)
 
     @staticmethod
     def ray_inited():
@@ -423,8 +478,35 @@ class RayHelper:
         return RayHelper._registry_call('occupied')
 
     @staticmethod
-    def group_info(group: str) -> Dict[str, Any]:
-        """Device type, worker width and placements of one device group, from any process."""
+    def group_info(group) -> Dict[str, Any]:
+        """Resolve a named group or a device-address view of allocations already registered at initialization."""
+        from twinkle.utils import DeviceGroup
+
+        if isinstance(group, DeviceGroup):
+            if not group.shared or not group.node_addresses:
+                raise ValueError('A constructor DeviceGroup must be a shared view with explicit node addresses.')
+            devices = group.visible_devices
+            devices = list(devices) if isinstance(devices, (list, tuple)) else [devices]
+            if len(devices) != len(group.node_addresses) * group.gpus_per_worker or any(
+                    device is None for device in devices):
+                raise ValueError('Each shared worker needs a node address and its visible device selectors.')
+            manager = RayHelper.resource_manager
+            groups = ({config.name: RayHelper.group_info(config.name) for config in manager.group_configs}
+                      if manager is not None else RayHelper.get_config(_GROUPS_KEY) or {})
+            allocations = [placement for info in groups.values()
+                           if info['device_type'].upper() == group.device_type.upper()
+                           for placement in info['placements']]
+            placements = []
+            for index, address in enumerate(group.node_addresses):
+                selectors = devices[index * group.gpus_per_worker:(index + 1) * group.gpus_per_worker]
+                matches = [placement for placement in allocations
+                           if placement.get('node_ip') == address
+                           and set(map(str, selectors)) <= set(map(str, placement.get('gpu_rank', ())))]
+                if not matches:
+                    raise ValueError(f'Shared devices {selectors!r} on {address!r} are not in an initialized allocation.')
+                placements.append(dict(matches[0], gpu_rank=selectors))
+            return {'device_type': group.device_type, 'gpus_per_worker': group.gpus_per_worker,
+                    'placements': placements}
         manager = RayHelper.resource_manager
         if manager is not None:
             config = manager.get_config(group)
@@ -460,6 +542,7 @@ class RayHelper:
             placements.append({
                 'gpu_rank': [table[rank]['gpu_rank'] for rank in chunk],
                 'placement_group': table[chunk[0]]['placement_group'],
+                'node_ip': table[chunk[0]]['node_ip'],
                 'ranks': chunk,
             })
         return placements
@@ -494,8 +577,8 @@ class RayHelper:
 
     @staticmethod
     def _is_handle(value) -> bool:
-        import ray
-        return isinstance(value, ray.ObjectRef) or isinstance(value, LazyCollect)
+        ray = sys.modules.get('ray')
+        return isinstance(value, LazyCollect) or (ray is not None and isinstance(value, ray.ObjectRef))
 
     @staticmethod
     def _resolve_arg_refs(value: Any, resolved: Dict[Any, Any]) -> Any:
@@ -508,9 +591,10 @@ class RayHelper:
         fetched beforehand in one batch (:meth:`do_get_and_collect`).
         """
         import ray
-        from dataclasses import fields, is_dataclass, replace
+        from copy import copy
+        from dataclasses import fields, is_dataclass
         if isinstance(value, ray.ObjectRef):
-            return resolved[value]
+            return resolved.get(value, value)
         if isinstance(value, LazyCollect):
             return value._get_result(resolved)
         if isinstance(value, list):
@@ -521,8 +605,11 @@ class RayHelper:
         if isinstance(value, dict):
             return {key: RayHelper._resolve_arg_refs(item, resolved) for key, item in value.items()}
         if is_dataclass(value) and not isinstance(value, type):
-            return replace(value, **{field.name: RayHelper._resolve_arg_refs(getattr(value, field.name), resolved)
-                                     for field in fields(value) if field.init})
+            result = copy(value)
+            for field in fields(value):
+                object.__setattr__(result, field.name,
+                                   RayHelper._resolve_arg_refs(getattr(value, field.name), resolved))
+            return result
         return value
 
     @staticmethod
@@ -543,24 +630,55 @@ class RayHelper:
                 RayHelper._collect_arg_refs(item, refs)
         elif is_dataclass(value) and not isinstance(value, type):
             for field in fields(value):
-                if field.init:
-                    RayHelper._collect_arg_refs(getattr(value, field.name), refs)
+                RayHelper._collect_arg_refs(getattr(value, field.name), refs)
 
     @staticmethod
-    def do_get_and_collect(args, kwargs):
-        """Materialise every remote handle the arguments carry, wherever it is nested, in ONE ``ray.get``.
+    def anchor_refs(value: Any):
+        """Anchor nested payload ObjectRefs so they outlive this process's local references.
 
-        A list of N trajectory refs is then fetched concurrently instead of in N sequential round trips.
+        A stashed payload rides back as a reference nested in a return value. The process that
+        receives it (e.g. a streaming driver reading ``rollout.step``) is only a *borrower*: once
+        it drops its local Python reference -- a group cleared after delivery, a close drain, or
+        the declarative teardown killing the actor -- Ray's reference-counting protocol can free
+        the payload on its owner BEFORE a downstream consumer (the trainer's ``forward_backward``)
+        retrieves it, surfacing as ``ReferenceCountingAssertionError`` (defect129). The race is
+        intermittent because it depends on when the borrower's release reaches the owner relative
+        to the consumer's borrow.
+
+        Submitting a payload-free completion token over the refs registers an independent borrower
+        session (the token task's argument references) that keeps the payload alive until consumed,
+        without fetching any payload into this process. Returns the anchoring :class:`LazyCollect`
+        -- the caller keeps it alive -- or ``None`` when ``value`` carries no reference.
         """
         import ray
         refs: List[Any] = []
-        for value in list(args) + list(kwargs.values()):
-            RayHelper._collect_arg_refs(value, refs)
-        refs = list(dict.fromkeys(refs))
-        resolved = dict(zip(refs, ray.get(refs))) if refs else {}
-        new_args = [RayHelper._resolve_arg_refs(arg, resolved) for arg in args]
-        new_kwargs = {key: RayHelper._resolve_arg_refs(value, resolved) for key, value in kwargs.items()}
-        return new_args, new_kwargs
+        RayHelper._collect_arg_refs(value, refs)
+        refs = [ref for ref in dict.fromkeys(refs) if isinstance(ref, ray.ObjectRef)]
+        if not refs:
+            return None
+        anchor = LazyCollect(refs, 'none', lambda method, result, device_mesh=None: result, None)
+        anchor.add_done_callback(lambda finished: None)
+        return anchor
+
+    @staticmethod
+    def do_get_and_collect(args, kwargs, timeout=None):
+        """Resolve nested handles in batches, sharing one timeout and fetching each reference once."""
+        import ray
+        from time import monotonic
+
+        deadline = None if timeout is None else monotonic() + timeout
+        resolved: Dict[Any, Any] = {}
+        while RayHelper.has_ref(args, kwargs):
+            refs: List[Any] = []
+            for value in list(args) + list(kwargs.values()):
+                RayHelper._collect_arg_refs(value, refs)
+            pending = [ref for ref in dict.fromkeys(refs) if ref not in resolved]
+            if pending:
+                remaining = None if deadline is None else max(0.0, deadline - monotonic())
+                resolved.update(zip(pending, ray.get(pending, timeout=remaining)))
+            args = [RayHelper._resolve_arg_refs(arg, resolved) for arg in args]
+            kwargs = {key: RayHelper._resolve_arg_refs(value, resolved) for key, value in kwargs.items()}
+        return args, kwargs
 
     @staticmethod
     def has_ref(args, kwargs) -> bool:
@@ -581,7 +699,31 @@ class RayHelper:
         return any(_carries_ref(arg) for arg in args) or any(_carries_ref(value) for value in kwargs.values())
 
     @staticmethod
-    def create_workers(worker_cls: Type[T],
+    def create_workers(*args, creation_timeout=None, **kwargs):
+        """Create all replicas before awaiting their constructors, rolling back on any failure.
+
+        The rollback releases only the handles THIS call produced: ``_create_workers``
+        cleans up its own partial submissions, and a failed readiness wait releases the
+        returned list -- never a slice of the global created-actors log, which could sweep
+        in actors appended by other concurrent creators.
+        """
+        import ray
+        with RayHelper._actor_lifecycle_lock:
+            workers = None
+            try:
+                workers = RayHelper._create_workers(*args, **kwargs)
+                ray.get([worker._twinkle_ready.remote() for worker in workers], timeout=creation_timeout)
+                return workers
+            except BaseException:
+                if workers:
+                    try:
+                        RayHelper.release_workers(list(workers))
+                    except BaseException:
+                        get_logger().exception('Worker-construction rollback is incomplete.')
+                raise
+
+    @staticmethod
+    def _create_workers(worker_cls: Type[T],
                        group: str,
                        execute: Literal['all', 'peer', 'first'],
                        *args,
@@ -607,7 +749,8 @@ class RayHelper:
         # built from the same line would collide on the same name.
         class_name = worker_cls.__name__
         worker_cls = RayHelper._get_remote_component(worker_cls)
-        key = f'{group}-{class_name}-{instance_id}'
+        group_name = group if isinstance(group, str) else group.name
+        key = f'{group_name}-{class_name}-{instance_id}'
         if execute == 'peer':
             placements = placements[Platform.get_peer_index(len(placements))]
             ip, port = RayHelper.get_master_id_port(placements[0]['placement_group'])
@@ -630,7 +773,8 @@ class RayHelper:
                 'WORLD_SIZE': str(world_size),
                 'RANK': str(index),
                 'LOCAL_RANK': str(0),
-                'CLUSTER_NAME': group,
+                'CLUSTER_NAME': group_name,
+                'TWINKLE_NODE_IP': placement['node_ip'],
                 'WORKER_NAME': worker_name,
                 'TWINKLE_MODE': 'ray',
                 _torch_setup.EXTRA_TORCH_KWARGS_ENV: _torch_setup.to_env_value(extra_torch_kwargs),
@@ -670,9 +814,14 @@ class RayHelper:
             try:
                 worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
             except BaseException:
-                for created in workers:
-                    ray.kill(created, no_restart=True)
+                # A failed submission rolls back only THIS call's already-created replicas;
+                # the global created-actors log is left untouched for concurrent creators.
+                if workers:
+                    try:
+                        RayHelper.release_workers(list(workers))
+                    except BaseException:
+                        get_logger().exception('Worker-construction rollback is incomplete.')
                 raise
             workers.append(worker)
-        RayHelper._created_actors.extend(workers)
+            RayHelper._created_actors.append(worker)
         return workers

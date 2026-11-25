@@ -46,6 +46,7 @@ from twinkle.utils.logger import get_logger
 
 logger = get_logger()
 
+
 # Type aliases for the per-builder customization points.
 RegisterRoutes = Callable[[FastAPI, Callable[[], Any]], None]
 OnShutdown = Callable[[Any], Awaitable[None]]
