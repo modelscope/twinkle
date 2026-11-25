@@ -97,6 +97,16 @@ def test_nccl_rejects_non_cuda_device():
         create_communicator(Rendezvous('127.0.0.1', 1), 0, 1, 'cpu', backend='nccl')
 
 
+def test_xccl_is_registered_and_lazily_resolved():
+    from twinkle.comm.backends.xccl import XCCLCommunicator
+
+    assert get_communicator_cls('xccl') is XCCLCommunicator
+    # Unlike nccl, the readiness barrier is a store round-trip: it has to work before the group
+    # has run any device collective. Only broadcast goes through XCCL itself.
+    assert XCCLCommunicator.supports('barrier')
+    assert not XCCLCommunicator.supports('all_reduce')
+
+
 def test_unknown_backend_lists_available():
     with pytest.raises(ValueError, match=r"'nope'.*gloo"):
         get_communicator_cls('nope')
@@ -166,7 +176,7 @@ def test_create_communicator_rejects_unknown_options(isolated_registry):
 
 def test_import_needs_no_accelerator_stack():
     code = ('import sys, twinkle.comm, twinkle.comm.backends.gloo, twinkle.comm.backends.nccl, '
-            'twinkle.comm.backends.hccl\n'
+            'twinkle.comm.backends.hccl, twinkle.comm.backends.xccl\n'
             "leaked = [m for m in ('torch_npu', 'vllm', 'vllm_ascend') if m in sys.modules]\n"
             'assert not leaked, leaked\n')
     # torch_npu registers a ``torch.backends`` entry point, so on an Ascend box a plain
