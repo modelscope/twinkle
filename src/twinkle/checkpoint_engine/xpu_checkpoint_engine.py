@@ -1,385 +1,527 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-# Adapted from https://github.com/baidu/vLLM-Kunlun/blob/v0.21.0-dev/vllm_kunlun/distributed/py_kunlun_communicator.py
-import os
-import pickle
-import socket
-import struct
-import time
-from datetime import timedelta
-from typing import List, Optional, Sequence
+"""XCCL-based checkpoint engine for Kunlunxin XPU.
 
+Weight payloads travel over a standalone ``twinkle.comm`` 'xccl' communicator (a
+``ProcessGroupXCCL`` on its own rendezvous store, outside any default process group) and
+bucket metadata over a reliable ZMQ REQ/REP control channel.
+
+Independent of :class:`NCCLCheckpointEngine` on purpose. A directly built
+``ProcessGroupNCCL`` deadlocks on XPU when two ranks share a local device index (every
+single-card Ray worker reports local index 0), so XPU needs its own group construction; and
+subclassing the GPU engine would mean every XPU need shows up as a seam inside the GPU path.
+Same shape as the Ascend engine instead: one platform, one engine, no cross-platform
+inheritance. The REQ/REP control channel also means there is no publisher/subscriber
+slow-joiner race to vote on, so ``broadcast`` is the only collective this engine needs.
+"""
+
+from __future__ import annotations
+
+import os
+import time
 import torch
-import torch.distributed as dist
+import zmq
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Any, AsyncGenerator, Generator
 
 from twinkle import get_logger
-from .nccl_checkpoint_engine import MasterMetadata, NCCLCheckpointEngine
+from twinkle.comm import Communicator, Rendezvous, create_communicator
+from twinkle.utils import find_free_port, find_node_ip, is_valid_ipv6_address
+from twinkle.utils.zmq_utils import configure_zmq_socket
+from .base import CheckpointEngine
+from .zmq_auth import generate_auth_key, recv_auth_pyobj, send_auth_pyobj
 
 logger = get_logger()
 
-_RELAY_SETUP_TIMEOUT = 300.0
-_RELAY_IO_TIMEOUT = 600.0
-_STORE_WAIT_TIMEOUT = timedelta(seconds=300)
+#: Building the group costs a store round-trip per rank and, when local device indices
+#: collide, a relay socket rendezvous; both need more room than the communicator default.
+_GROUP_TIMEOUT = timedelta(seconds=600)
 
 
-def _store_wait(store, keys: List[str], timeout: timedelta = _STORE_WAIT_TIMEOUT) -> None:
-    try:
-        store.wait(keys, timeout)
-    except TypeError:
-        # Older/newer signatures disagree on the timeout type.
-        store.wait(keys, timeout.total_seconds())
+@dataclass
+class MasterMetadata:
+    """Rendezvous the master hands to the receivers."""
+
+    zmq_ip: str
+    zmq_port: int
+    dist_ip: str
+    dist_port: int
+    auth_key: str = ''  # HMAC shared secret for authenticating ZMQ control messages
 
 
-def _recv_exact(sock, n: int) -> bytearray:
-    """Read exactly ``n`` bytes from ``sock`` into a fresh bytearray."""
-    buf = bytearray(n)
-    mv = memoryview(buf)
-    got = 0
-    while got < n:
-        k = sock.recv_into(mv[got:])
-        if k == 0:
-            raise ConnectionError('relay socket closed by peer')
-        got += k
-    return buf
+class XCCLCheckpointEngine(CheckpointEngine):
+    """Full-sync weight transport for Kunlunxin XPU over a standalone XCCL group."""
 
-
-def _sock_send_tensor(sock, tensor: torch.Tensor) -> None:
-    """Stream ``tensor`` as raw bytes: [meta_len][meta][payload_len][payload]."""
-    meta = pickle.dumps((tensor.dtype, tuple(tensor.shape)))
-    cpu = tensor.detach()
-    if cpu.device.type != 'cpu':
-        cpu = cpu.cpu()
-    if not cpu.is_contiguous():
-        cpu = cpu.contiguous()
-    cpu = cpu.reshape(-1)
-    sock.sendall(struct.pack('!Q', len(meta)))
-    sock.sendall(meta)
-    nbytes = cpu.numel() * cpu.element_size()
-    sock.sendall(struct.pack('!Q', nbytes))
-    sock.sendall(cpu.view(torch.uint8).numpy())
-
-
-def _sock_recv_tensor(sock, device: torch.device) -> torch.Tensor:
-    """Receive a tensor sent by ``_sock_send_tensor`` onto ``device``."""
-    (mlen,) = struct.unpack('!Q', _recv_exact(sock, 8))
-    dtype, shape = pickle.loads(bytes(_recv_exact(sock, mlen)))
-    (nbytes,) = struct.unpack('!Q', _recv_exact(sock, 8))
-    buf = _recv_exact(sock, nbytes)
-    flat = torch.frombuffer(buf, dtype=torch.uint8)
-    return flat.view(dtype).reshape(shape).to(device)
-
-
-def _pg_broadcast(pg, tensor: torch.Tensor, src: int = 0) -> None:
-    """Broadcast through an unregistered group's raw ``broadcast([tensor], opts)`` API."""
-    opts = dist.BroadcastOptions()
-    opts.rootRank = src
-    pg.broadcast([tensor], opts).wait()
-
-
-class _DoneWork:
-    """Already-completed work object (our collectives are synchronous)."""
-
-    def wait(self):
-        return None
-
-
-def _build_xccl_pg(store, name: str, ranks: Sequence[int], my_rank: int, device: torch.device):
-    """Assemble a stateless ProcessGroupXCCL over ``ranks`` (global ids).
-
-    Mirrors ms-swift's ``_build_pg``: a plain ``ProcessGroup`` wrapper with a
-    ``PrefixStore`` per group and a registered CUSTOM XCCL backend.
-    """
-    from torch._C._distributed_c10d import ProcessGroup
-    from torch.distributed import PrefixStore, ProcessGroupXCCL
-
-    n = len(ranks)
-    local_rank = ranks.index(my_rank)
-    pstore = PrefixStore(name, store)
-
-    pg = ProcessGroup(pstore, local_rank, n)
-    options = ProcessGroupXCCL.Options()
-    if hasattr(options, '_timeout'):
-        options._timeout = _RELAY_IO_TIMEOUT
-    backend = ProcessGroupXCCL(pstore, local_rank, n, options)
-    backend._set_sequence_number_for_group()
-
-    backend_type = ProcessGroup.BackendType.CUSTOM
-    pg._set_default_backend(backend_type)
-    pg._register_backend(device, backend_type, backend)
-    return pg
-
-
-class _FlatPG:
-    """Adapter: raw ``broadcast([tensor], opts)`` API over a ProcessGroupXCCL wrapper."""
-
-    def __init__(self, pg):
-        self.pg = pg
-
-    def broadcast(self, tensors, opts=None, *args, **kwargs):
-        tensor = tensors[0] if isinstance(tensors, (list, tuple)) else tensors
-        src = getattr(opts, 'rootRank', 0) if opts is not None else 0
-        self.pg.broadcast(tensor, src).wait()
-        return _DoneWork()
-
-
-class _RelayPG:
-    """Relay-mode collective facade (single host, duplicate local device indices).
-
-    Colliding ranks are kept out of the XCCL group and served through the
-    lowest-rank XCCL member over direct TCP sockets; the members themselves
-    keep the device-to-device XCCL path. ``src`` is always rank 0 (trainer
-    master) in the checkpoint engine's broadcast topology.
-    """
-
-    def __init__(self, rank: int, world_size: int, members: List[int],
-                 excluded: List[int], pg, device: torch.device):
-        self.rank = rank
-        self.world_size = world_size
-        self.members = members
-        self.excluded = excluded
-        self.leader = members[0] if members else 0
-        self.pg = pg  # ProcessGroupXCCL wrapper among members (None when degenerate)
-        self.device = device
-        self._listen = None
-        self._conns = {}  # leader: {excluded rank: socket}
-        self._sock = None  # excluded: socket to the leader
-
-    # -- direct-socket rendezvous (store-coordinated, tiny payloads) --
-    def setup_sockets(self, store, prefix: str) -> None:
-        addr_key = f'{prefix}_relay_addr'
-        if not self.excluded:
-            return
-        if self.rank == self.leader:
-            srv = socket.socket()
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind(('', 0))
-            srv.listen(len(self.excluded))
-            srv.settimeout(15)
-            store.set(addr_key, pickle.dumps((socket.gethostname(), srv.getsockname()[1])))
-            conns = {}
-            deadline = time.time() + _RELAY_SETUP_TIMEOUT
-            while len(conns) < len(self.excluded):
-                try:
-                    conn, _ = srv.accept()
-                except socket.timeout:
-                    if time.time() > deadline:
-                        raise RuntimeError('relay socket rendezvous timed out')
-                    continue
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.settimeout(_RELAY_IO_TIMEOUT)
-                (peer,) = struct.unpack('!I', bytes(_recv_exact(conn, 4)))
-                conns[peer] = conn
-            self._listen = srv
-            self._conns = conns
-        elif self.rank in self.excluded:
-            host, port = pickle.loads(store.get(addr_key))
-            deadline = time.time() + 60
-            while True:
-                try:
-                    s = socket.create_connection((host, port), timeout=10)
-                    break
-                except OSError:
-                    if time.time() > deadline:
-                        raise RuntimeError('relay socket connect timed out')
-                    time.sleep(0.5)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.settimeout(_RELAY_IO_TIMEOUT)
-            s.sendall(struct.pack('!I', self.rank))
-            self._sock = s
-
-    def close(self) -> None:
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
-        for c in self._conns.values():
-            try:
-                c.close()
-            except OSError:
-                pass
-        self._conns = {}
-        if self._listen is not None:
-            try:
-                self._listen.close()
-            except OSError:
-                pass
-            self._listen = None
-
-    # -- collective facade --
-    def broadcast(self, tensors, opts=None, *args, **kwargs):
-        tensor = tensors[0] if isinstance(tensors, (list, tuple)) else tensors
-        src = getattr(opts, 'rootRank', 0) if opts is not None else 0
-        if tensor.device != self.device:
-            tensor = tensor.to(self.device)
-        if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
-
-        if self.rank in self.excluded:
-            # Excluded from XCCL: TCP only (src pushes, or leader forwards).
-            if self.rank == src:
-                _sock_send_tensor(self._sock, tensor)
-            # else: the sender (src or leader) pushes to us over the socket.
-            else:
-                tensor.copy_(_sock_recv_tensor(self._sock, self.device))
-            return _DoneWork()
-
-        # This rank is an XCCL member.
-        if src in self.excluded:
-            if self.rank == self.leader:
-                conn = self._conns.get(src)
-                tensor.copy_(_sock_recv_tensor(conn, self.device))
-            if self.pg is not None:
-                self.pg.broadcast(tensor, 0).wait()  # leader == members[0]
-            if self.rank == self.leader:
-                for x in self.excluded:
-                    if x != src:
-                        _sock_send_tensor(self._conns[x], tensor)
-        else:
-            if self.rank == src:
-                for x in self.excluded:
-                    _sock_send_tensor(self._conns[x], tensor)
-            if self.pg is not None:
-                self.pg.broadcast(tensor, self.members.index(src)).wait()
-        return _DoneWork()
-
-
-class XCCLCheckpointEngine(NCCLCheckpointEngine):
-    """NCCL-checkpoint-engine drop-in for Kunlunxin XPU (BKCL as 'nccl').
-
-    Replaces the NCCL communicator (which deadlocks when two ranks share a
-    local device index, see module docstring) with a stateless
-    ``ProcessGroupXCCL`` plus a relay fallback, wired in through
-    ``_group_broadcast``. Everything else (bucketing, ZMQ metadata, double
-    buffering) is inherited unchanged.
-    """
-
-    # Distinct from the inherited 'nccl': the mixin keys persistent engine
-    # channels by this name, and 'xccl' selects this class on XPU.
     backend_name = 'xccl'
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._relay: Optional[_RelayPG] = None
-        self._pg = None
-        self._store: Optional[dist.Store] = None
+    def __init__(
+        self,
+        bucket_size: int = 3072 << 20,
+        group_name: str = 'twinkle_ckpt',
+        rebuild_group: bool = True,
+        rollout_dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
+    ) -> None:
+        self.bucket_size = bucket_size
+        self.group_name = group_name
+        self.rebuild_group = rebuild_group
+        self.rollout_dtype = rollout_dtype
+        # Standalone group for the weight broadcast, outside any default process group
+        self._comm: Communicator | None = None
 
-    def _group_broadcast(self, tensor: torch.Tensor) -> None:
-        _pg_broadcast(self._pg, tensor)
+        self.meta_timeout_s = int(os.environ.get('TWINKLE_CKPT_XCCL_META_TIMEOUT_S', '300'))
+        self.meta_timeout_ms = self.meta_timeout_s * 1000
 
-    def _init_xccl_pg(self) -> None:
-        store = self._store
-        prefix = self.group_name
+        try:
+            # torch_xmlir symbol-rewrites torch.cuda onto XPU, so the cards are 'cuda:N'.
+            self.device = torch.cuda.current_device()
+        except Exception:
+            # No XPU visible (e.g. device-neutral construction): keep a placeholder so
+            # __init__ succeeds. It is never silently USED -- prepare() allocates on
+            # _buffer_device and the communicator binds to it, both of which fail loudly.
+            self.device = 0
 
-        # Exchange (hostname, local device index) per rank through the store
-        # (a round-trip, not a device collective -- safe on every rank).
-        devidx = torch.cuda.current_device()
-        store.set(f'{prefix}_dev_{self.rank}', f'{socket.gethostname()}|{devidx}')
-        keys = [f'{prefix}_dev_{r}' for r in range(self.world_size)]
-        _store_wait(store, keys)
-        info = [store.get(k).decode().split('|') for k in keys]
-        devs = [(h, int(d)) for h, d in info]
+        self.is_master = False
 
-        device = torch.device('cuda', devidx)
+        self.rank: int | None = None
+        self.world_size: int | None = None
+        self.send_buf: torch.Tensor | None = None
+        self.recv_buf: torch.Tensor | None = None
+        self.socket: zmq.Socket | None = None
+        self._zmq_ctx: zmq.Context | None = None
 
-        # fix: With BKCL_NONUNIFORM_VISIBLE_DEVICES=1, BKCL identifies each rank
-        # by its PCI address instead of the local device index, so colliding
-        # local indices (every single-card worker is local 0) are fine and a
-        # flat XCCL group works — measured ~30 GB/s broadcast vs the socket
-        # relay's ~0.4 GB/s. Prefer the flat group whenever nonuniform mode is
-        # on; only fall back to the (hostname, index)-collision relay scheme
-        # when nonuniform is unavailable (older libbkcl).
-        if os.environ.get('BKCL_NONUNIFORM_VISIBLE_DEVICES') == '1':
-            self._pg = _FlatPG(_build_xccl_pg(store, f'{prefix}_ws',
-                                              list(range(self.world_size)), self.rank, device))
-            logger.info(
-                f'XCCLCheckpointEngine: flat XCCL group (nonuniform), world_size={self.world_size}')
+        self._prepared = False
+        self._group_initialized = False
+        self.ip: str | None = None
+        self.zmq_port: int | None = None
+        self.dist_port: int | None = None
+        self.auth_key: str = ''  # HMAC shared secret, generated by the master
+
+    @property
+    def _buffer_device(self) -> str:
+        """Device the bucket buffers live on; the communicator binds to the same one."""
+        return f'cuda:{self.device}'
+
+    def _new_socket(self, socket_type: int) -> zmq.Socket:
+        assert self._zmq_ctx is not None
+        socket = self._zmq_ctx.socket(socket_type)
+        configure_zmq_socket(socket, timeout_ms=self.meta_timeout_ms, linger=0)
+        return socket
+
+    def _recv_pyobj(self, where: str) -> Any:
+        """Receive a pickled object after verifying its HMAC signature.
+
+        The raw bytes are received first and the HMAC checked *before* ``pickle.loads``
+        runs, so a crafted pickle from an untrusted peer never reaches the deserializer.
+        """
+        assert self.socket is not None
+        return recv_auth_pyobj(self.socket, self.auth_key, where=where, timeout_s=self.meta_timeout_s)
+
+    def _send_pyobj(self, payload: Any, where: str) -> None:
+        """Send a pickled object with an HMAC signature prepended."""
+        assert self.socket is not None
+        send_auth_pyobj(self.socket, payload, self.auth_key, where=where, timeout_s=self.meta_timeout_s)
+
+    def _start_zmq_server(self):
+        self.ip = find_node_ip()
+        self.zmq_port = find_free_port()
+        self.dist_port = find_free_port()
+        self.auth_key = generate_auth_key()  # 256-bit shared secret
+
+        self._zmq_ctx = zmq.Context()
+        self.socket = self._new_socket(zmq.REP)
+        if is_valid_ipv6_address(self.ip):
+            address = f'tcp://[{self.ip}]:{self.zmq_port}'
+            self.socket.setsockopt(zmq.IPV6, 1)
+        else:
+            address = f'tcp://{self.ip}:{self.zmq_port}'
+        self.socket.bind(address)
+        logger.debug(f'ZMQ REP server started at {address}')
+
+    def _master_metadata(self) -> MasterMetadata:
+        return MasterMetadata(
+            zmq_ip=self.ip,
+            zmq_port=self.zmq_port,
+            dist_ip=self.ip,
+            dist_port=self.dist_port,
+            auth_key=self.auth_key,
+        )
+
+    def _connect_zmq_client(self, metadata: MasterMetadata):
+        self._zmq_ctx = zmq.Context()
+        self.socket = self._new_socket(zmq.REQ)
+        self.auth_key = metadata.auth_key  # inherit the master's HMAC secret
+        if is_valid_ipv6_address(metadata.zmq_ip):
+            address = f'tcp://[{metadata.zmq_ip}]:{metadata.zmq_port}'
+            self.socket.setsockopt(zmq.IPV6, 1)
+        else:
+            address = f'tcp://{metadata.zmq_ip}:{metadata.zmq_port}'
+        self.socket.connect(address)
+        logger.debug(f'ZMQ REQ client connected to {address}')
+
+    def prepare(self) -> MasterMetadata | None:
+        """Allocate the double buffers and, on the master, start the control server.
+
+        Idempotent: an already prepared engine returns its cached metadata.
+        """
+        if self._prepared:
+            return self._master_metadata() if self.is_master else None
+
+        self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device=self._buffer_device)
+        self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device=self._buffer_device)
+
+        if self.is_master:
+            self._start_zmq_server()
+            self._prepared = True
+            return self._master_metadata()
+
+        self._prepared = True
+        return None
+
+    def finalize(self):
+        """Release the round's resources; a reused channel (``rebuild_group=False``) keeps them."""
+        if not self.rebuild_group:
             return
 
-        # Single host assumed for the flat case; membership by first
-        # occurrence of each (host, local device index) pair.
-        first_owner = {}
-        excluded = set()
-        for r, hd in enumerate(devs):
-            if hd in first_owner:
-                excluded.add(r)
-            else:
-                first_owner[hd] = r
-        members = [r for r in range(self.world_size) if r not in excluded]
+        if self.socket is not None:
+            try:
+                self.socket.close()
+            except Exception as e:
+                logger.warning(f'Error closing ZMQ socket: {e}')
+            self.socket = None
 
-        if not excluded:
-            self._pg = _FlatPG(_build_xccl_pg(store, f'{prefix}_ws',
-                                              list(range(self.world_size)), self.rank, device))
-            logger.info(f'XCCLCheckpointEngine: flat XCCL group, world_size={self.world_size}')
-        else:
-            pg = None
-            if len(members) > 1:
-                pg = _build_xccl_pg(store, f'{prefix}_relay', members, self.rank, device)
-            self._relay = _RelayPG(self.rank, self.world_size, members, sorted(excluded), pg, device)
-            self._relay.setup_sockets(store, prefix)
-            self._pg = self._relay
-            logger.info(f'XCCLCheckpointEngine: relay mode, members={members}, excluded={sorted(excluded)}')
+        if self._zmq_ctx is not None:
+            try:
+                self._zmq_ctx.term()
+            except Exception as e:
+                logger.warning(f'Error terminating ZMQ context: {e}')
+            self._zmq_ctx = None
 
+        if self._comm is not None:
+            self._comm.destroy()
+            self._comm = None
 
-    def _store_barrier(self) -> None:
-        prefix = self.group_name
-        store = self._store
-        store.set(f'{prefix}_bar_{self.rank}', '1')
-        _store_wait(store, [f'{prefix}_bar_{r}' for r in range(self.world_size)])
+        self.rank = None
+        self.world_size = None
+        self.send_buf = None
+        self.recv_buf = None
+        self._prepared = False
+        self._group_initialized = False
+
+    def close(self):
+        """Destroy the persistent XCCL channel regardless of the reuse setting."""
+        rebuild_group, self.rebuild_group = self.rebuild_group, True
+        try:
+            self.finalize()
+        finally:
+            self.rebuild_group = rebuild_group
+
+    @classmethod
+    def build_topology(
+        cls,
+        trainer_world_size: int,
+        rollout_world_size: int,
+        metadata: list[dict],
+    ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
+        """Trainer rank 0 is the only sender; the other trainer ranks sit the group out."""
+        master_metadata = None
+        for m in metadata:
+            if m is not None:
+                master_metadata = m
+                break
+
+        trainer_kwargs = {
+            'rank': [0] + [-1] * (trainer_world_size - 1),
+            'world_size': [rollout_world_size + 1] * trainer_world_size,
+            'master_metadata': [master_metadata] * trainer_world_size,
+        }
+        rollout_kwargs = {
+            'rank': list(range(1, rollout_world_size + 1)),
+            'world_size': [rollout_world_size + 1] * rollout_world_size,
+            'master_metadata': [master_metadata] * rollout_world_size,
+        }
+        return trainer_kwargs, rollout_kwargs
 
     def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata):
-        """Initialize the weight-sync process group (XPU flavour).
+        """Join the standalone XCCL group and connect the control channel.
 
-        Same rendezvous as the NCCL engine (dedicated TCPStore hosted by the
-        master), but the XCCL group construction/relay decision happens here
-        and the readiness barrier runs through the store instead of a device
-        collective.
+        Idempotent while ``rebuild_group`` is False: the group is reused across rounds.
         """
-        # Non-participating trainer ranks: record rank and return.
+        # Non-participating trainer ranks: record the rank and return.
         if rank < 0:
             self.rank = rank
             self.world_size = world_size
             self._group_initialized = True
+            logger.info(f'init_process_group: rank={rank} not participating, no group joined')
             return
 
-        # Fast path: group already initialized, skip all setup.
         if self._group_initialized and not self.rebuild_group:
             return
 
-        if self._pg is None:
+        if self._comm is None:
             self.rank = rank
             self.world_size = world_size
-
-            is_store_master = (rank == 0)
-            self._store = dist.TCPStore(
-                host_name=master_metadata.nccl_store_host,
-                port=master_metadata.nccl_store_port,
-                world_size=world_size,
-                is_master=is_store_master,
-                wait_for_workers=True,
-            )
-            self._init_xccl_pg()
+            rendezvous = Rendezvous(master_metadata.dist_ip, master_metadata.dist_port, group_name=self.group_name)
+            # An indexed device rather than a bare 'cuda': a worker spanning several cards has
+            # an ambiguous ambient device, and the buffers were allocated on this one.
+            self._comm = create_communicator(rendezvous, rank, world_size, torch.device(self._buffer_device),
+                                             backend='xccl', timeout=_GROUP_TIMEOUT)
         else:
             assert self.rank == rank, f'rank {rank} != self.rank {self.rank}'
-            assert self.world_size == world_size, (
-                f'world_size {world_size} != self.world_size {self.world_size}')
+            assert self.world_size == world_size, (f'world_size {world_size} != self.world_size {self.world_size}')
 
-        # Receivers connect to master's ZMQ PUB server.
         if self.rank > 0 and self.socket is None:
             self._connect_zmq_client(master_metadata)
 
-        # Store-based readiness barrier (no device collective during init).
-        self._store_barrier()
+        try:
+            # Readiness point: every rank has joined before the first bucket handshake. The
+            # xccl backend answers this through the rendezvous store, so it is valid here even
+            # though the group has not run a device collective yet.
+            self._comm.barrier()
+        except BaseException:
+            # A half-initialized group must not be picked up by the next init_process_group
+            # call, which may arrive with fresh rendezvous metadata.
+            self._comm.destroy()
+            self._comm = None
+            raise
 
         self._group_initialized = True
-        logger.info(f'init_process_group: rank={self.rank}, world_size={self.world_size}')
+        logger.info(f'init_process_group: rank={self.rank}, world_size={self.world_size}, '
+                    f'comm_device={self._comm.device}')
 
-    def finalize(self):
-        """Tear down relay sockets before the base cleanup."""
-        if self._relay is not None:
-            self._relay.close()
-            self._relay = None
-        if self.rebuild_group:
-            self._pg = None
-            self._store = None
-        super().finalize()
+    def _serve_bucket_requests(self, bucket_id: int, metadata: dict[str, Any]) -> None:
+        """Hand this bucket's manifest to every receiver before broadcasting the payload."""
+        assert self.rank == 0
+        assert self.world_size is not None
+
+        if self.world_size <= 1:
+            return
+
+        pending = set(range(1, self.world_size))
+        while pending:
+            req = self._recv_pyobj(f'NEXT request for bucket={bucket_id}')
+
+            if not isinstance(req, dict) or req.get('type') != 'NEXT':
+                self._send_pyobj({'ok': False, 'error': f'unexpected message: {req}'}, 'NEXT reply')
+                continue
+
+            req_rank = int(req.get('rank', -1))
+            req_bucket_id = int(req.get('bucket_id', -1))
+
+            if req_rank not in pending:
+                self._send_pyobj({'ok': False, 'error': f'unexpected/duplicate rank={req_rank}'}, 'NEXT reply')
+                continue
+            if req_bucket_id != bucket_id:
+                self._send_pyobj(
+                    {
+                        'ok': False,
+                        'error': f'bucket mismatch rank={req_rank} got={req_bucket_id} expected={bucket_id}',
+                    }, 'NEXT reply')
+                continue
+
+            self._send_pyobj({'ok': True, 'metadata': metadata}, 'NEXT reply')
+            pending.remove(req_rank)
+
+    def _request_bucket(self, bucket_id: int) -> dict[str, Any]:
+        """Ask the master for this bucket's manifest; REQ/REP makes the delivery reliable."""
+        assert self.rank is not None and self.rank > 0
+
+        self._send_pyobj({'type': 'NEXT', 'rank': self.rank, 'bucket_id': bucket_id},
+                         f'NEXT send bucket={bucket_id}')
+        resp = self._recv_pyobj(f'NEXT recv bucket={bucket_id}')
+
+        if not isinstance(resp, dict):
+            raise RuntimeError(f'Invalid metadata response for bucket {bucket_id}: {resp}')
+        if not resp.get('ok', False):
+            raise RuntimeError(f'Metadata request failed for bucket {bucket_id}: {resp.get("error", "unknown")}')
+        metadata = resp.get('metadata')
+        if not isinstance(metadata, dict):
+            raise RuntimeError(f'Invalid metadata payload for bucket {bucket_id}: {metadata}')
+        got_bucket_id = int(metadata.get('bucket_id', -1))
+        if got_bucket_id != bucket_id:
+            raise RuntimeError(f'Metadata bucket mismatch: got {got_bucket_id}, expected {bucket_id}')
+        return metadata
+
+    def _broadcast_bucket(self, buf: torch.Tensor) -> None:
+        """Broadcast one bucket from group rank 0, then wait for the device to drain it.
+
+        The caller refills (sender) or reads (receiver) the buffer right after, so the host
+        must wait, not just the stream.
+        """
+        self._comm.broadcast(buf, src=0)
+        self._comm.synchronize()
+
+    @torch.no_grad()
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor]]):
+        assert self.rank is not None and self.rank <= 0
+        if self.rank < 0:
+            # Not in the group, but the generator still has to be drained so the caller's
+            # per-tensor plumbing completes on every trainer rank.
+            for _name, _weight in weights:
+                pass
+            return
+
+        assert self.send_buf is not None
+
+        send_buf = self.send_buf
+        start_time = time.time()
+        bucket_meta: list[dict[str, Any]] = []
+        offset = 0
+        bucket_id = 0
+        total_params = 0
+        total_chunks = 0
+        total_bytes = 0
+
+        def _flush(is_last: bool):
+            nonlocal bucket_meta, offset, bucket_id, total_chunks, total_bytes
+            if not bucket_meta and not is_last:
+                return
+
+            metadata = {
+                'bucket_id': bucket_id,
+                'is_last': is_last,
+                'bucket_meta': bucket_meta,
+                'payload_size': offset,
+            }
+            self._serve_bucket_requests(bucket_id, metadata)
+            self._broadcast_bucket(send_buf)
+
+            total_chunks += len(bucket_meta)
+            total_bytes += offset
+            bucket_id += 1
+            bucket_meta = []
+            offset = 0
+
+        for name, weight in weights:
+            total_params += 1
+            if weight.device != send_buf.device:
+                weight = weight.to(send_buf.device)
+            if not weight.is_contiguous():
+                weight = weight.contiguous()
+
+            weight_u8 = weight.view(-1).view(torch.uint8)
+            nbytes = int(weight_u8.numel())
+            if nbytes == 0:
+                # Zero-element tensors carry no payload but still have to reach the receivers.
+                if offset >= self.bucket_size:
+                    _flush(is_last=False)
+                bucket_meta.append({
+                    'name': name,
+                    'shape': weight.shape,
+                    'dtype': weight.dtype,
+                    'offset': offset,
+                    'nbytes': 0,
+                    'chunk_offset': 0,
+                    'total_nbytes': 0,
+                })
+                continue
+
+            chunk_offset = 0
+            while chunk_offset < nbytes:
+                if offset >= self.bucket_size:
+                    _flush(is_last=False)
+
+                chunk_nbytes = min(self.bucket_size - offset, nbytes - chunk_offset)
+                send_buf[offset:offset + chunk_nbytes].copy_(weight_u8[chunk_offset:chunk_offset + chunk_nbytes])
+                bucket_meta.append({
+                    'name': name,
+                    'shape': weight.shape,
+                    'dtype': weight.dtype,
+                    'offset': offset,
+                    'nbytes': chunk_nbytes,
+                    'chunk_offset': chunk_offset,
+                    'total_nbytes': nbytes,
+                })
+                offset += chunk_nbytes
+                chunk_offset += chunk_nbytes
+
+        _flush(is_last=True)
+
+        elapsed = time.time() - start_time
+        bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024) if elapsed > 0 else 0.0
+        logger.info(f'full-sync send_weights done: rank={self.rank}, params={total_params}, '
+                    f'chunks={total_chunks}, payload={total_bytes / (1 << 20):.1f}MB, '
+                    f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')
+
+    @torch.no_grad()
+    async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor]]:
+        assert self.rank is not None and self.rank > 0
+        assert self.recv_buf is not None
+
+        recv_buf = self.recv_buf
+        bucket_id = 0
+        total_params = 0
+        total_chunks = 0
+        total_bytes = 0
+        start_time = time.time()
+        # Weights larger than one bucket arrive in chunks and are reassembled here.
+        partial_tensors: dict[str, dict[str, Any]] = {}
+
+        while True:
+            metadata = self._request_bucket(bucket_id)
+            self._broadcast_bucket(recv_buf)
+
+            bucket_meta = metadata['bucket_meta']
+            entries = bucket_meta.values() if isinstance(bucket_meta, dict) else bucket_meta
+
+            total_bytes += int(metadata.get('payload_size', self.bucket_size))
+
+            for meta in entries:
+                name = meta['name']
+                dtype = meta['dtype']
+                shape = meta['shape']
+                shape = shape if isinstance(shape, torch.Size) else torch.Size(shape)
+                offset = int(meta['offset'])
+                nbytes = int(meta.get('nbytes', int(dtype.itemsize * shape.numel())))
+                chunk_offset = int(meta.get('chunk_offset', 0))
+                total_nbytes = int(meta.get('total_nbytes', int(dtype.itemsize * shape.numel())))
+                total_chunks += 1
+
+                if nbytes == total_nbytes and chunk_offset == 0:
+                    # Whole tensor in this bucket: hand out a view, no extra copy.
+                    yield name, recv_buf[offset:offset + nbytes].view(dtype=dtype).view(shape)
+                    total_params += 1
+                    continue
+
+                state = partial_tensors.get(name)
+                if state is None:
+                    state = {
+                        'buffer': torch.empty(total_nbytes, dtype=torch.uint8, device=recv_buf.device),
+                        'dtype': dtype,
+                        'shape': shape,
+                        'total': total_nbytes,
+                        'received': 0,
+                    }
+                    partial_tensors[name] = state
+                elif state['total'] != total_nbytes or state['dtype'] != dtype or state['shape'] != shape:
+                    raise RuntimeError(
+                        f'Inconsistent chunk metadata for weight {name}: '
+                        f'expected total={state["total"]}, dtype={state["dtype"]}, shape={state["shape"]}; '
+                        f'got total={total_nbytes}, dtype={dtype}, shape={shape}.')
+
+                if nbytes > 0:
+                    state['buffer'][chunk_offset:chunk_offset + nbytes].copy_(recv_buf[offset:offset + nbytes])
+                state['received'] += nbytes
+
+                if state['received'] > state['total']:
+                    raise RuntimeError(
+                        f'Chunk overrun for weight {name}: received={state["received"]}, total={state["total"]}.')
+                if state['received'] == state['total']:
+                    full_size = int(dtype.itemsize * shape.numel())
+                    yield name, state['buffer'][:full_size].view(dtype=dtype).view(shape)
+                    total_params += 1
+                    del partial_tensors[name]
+
+            if bool(metadata['is_last']):
+                if partial_tensors:
+                    pending = ', '.join(sorted(partial_tensors.keys())[:8])
+                    raise RuntimeError('Incomplete chunked weights at end of stream. '
+                                       f'Pending {len(partial_tensors)} weight(s): {pending}')
+                break
+            bucket_id += 1
+
+        elapsed = time.time() - start_time
+        bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024) if elapsed > 0 else 0.0
+        logger.info(f'full-sync receive_weights done: rank={self.rank}, params={total_params}, '
+                    f'chunks={total_chunks}, payload={total_bytes / (1 << 20):.1f}MB, '
+                    f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')
