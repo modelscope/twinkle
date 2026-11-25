@@ -13,7 +13,7 @@ from swift.dev.template_contract.output import _reasoning_is_open, decode_output
 from twinkle import remote_class
 from twinkle.data_format import InputFeature, Message, Trajectory, user_data_get
 from twinkle.hub import HubOperation
-from twinkle.utils import load_image, to_device
+from twinkle.utils import load_image, to_device, trust_remote_code
 from .contract import (
     CompletionEncoding,
     DecodeContext,
@@ -108,6 +108,12 @@ class Template:
     ):
         self.model_id = model_id
         model_id = HubOperation.download_model(model_id, ignore_model=True)
+        # Custom-code checkpoints (auto_map) without trust_remote_code send transformers into
+        # its interactive trust prompt, which installs signal.SIGALRM -- a ValueError on any
+        # non-main thread (e.g. the Ray actor worker thread running set_template). Follow the
+        # model loaders' trust convention, gated by twinkle's own policy
+        # (TWINKLE_TRUST_REMOTE_CODE); an explicit caller kwarg still wins.
+        kwargs.setdefault("trust_remote_code", trust_remote_code())
         if os.path.exists(os.path.join(model_id, "preprocessor_config.json")) or os.path.exists(
             os.path.join(model_id, "processor_config.json")
         ):
@@ -843,6 +849,17 @@ class Template:
         else:
             assert len(trajectory["messages"]) == 1 and trajectory["messages"][0]["role"] == "user"
             text = trajectory["messages"][0]["content"]
+            if isinstance(text, list):
+                # The multimodal pre-pipeline (_build_standard_messages) standardizes content
+                # into blocks and only collapses it back to str for non-multimodal templates,
+                # so a multimodal-family checkpoint reaches this branch with a block list.
+                # A raw tokenizer consumes text only: join the text blocks and fail loudly on
+                # media, which the non-chat path cannot encode.
+                media_types = [block.get("type") for block in text if block.get("type") != "text"]
+                if media_types:
+                    raise ValueError(f"use_chat_template=False cannot encode media content blocks: {media_types}. "
+                                     "Use a chat template to encode multimodal inputs.")
+                text = "".join(block.get("text") or "" for block in text)
             input_ids = self.tokenizer.encode(text, **kwargs)
             encoded = {}
             labels = deepcopy(input_ids)
