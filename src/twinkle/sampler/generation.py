@@ -138,6 +138,7 @@ def collate_extra_model_inputs(chunk: list[int], encoded: dict[int, dict[str, An
     """
     collected: dict[str, list[torch.Tensor]] = {}
     per_token: dict[str, list[torch.Tensor]] = {}
+    mrope_positions: dict[str, list[torch.Tensor]] = {}
     for index in chunk:
         for key, value in encoded[index].items():
             if key in ("input_ids", "attention_mask", "labels") or not isinstance(value, torch.Tensor):
@@ -146,7 +147,17 @@ def collate_extra_model_inputs(chunk: list[int], encoded: dict[int, dict[str, An
                 # A per-token companion (mm_token_type_ids and friends): the model indexes it as
                 # [batch, position] against the LEFT-PADDED input_ids the engine builds, so it is
                 # stacked to a [B, width] batch here, never concatenated flat like pixel_values.
+                # A template may already carry a leading batch dim ([1, L]); the stack adds the
+                # batch dim, so drop it first or the model receives [B, 1, L] and generate()'s
+                # per-step update fails on the dimension mismatch.
+                if value.dim() == 2 and value.shape[0] == 1:
+                    value = value[0]
                 per_token.setdefault(key, []).append(value)
+            elif key == "position_ids" and value.dim() == 3:
+                # M-RoPE position_ids are [sections, 1, L] per row: the batch dim is dim 1, so
+                # rows concatenate there (cat dim 0 would interleave sections across rows),
+                # left-padded along the sequence to the batch width like input_ids.
+                mrope_positions.setdefault(key, []).append(value)
             else:
                 collected.setdefault(key, []).append(value)
     result = {key: torch.cat(values, dim=0) for key, values in collected.items()}
@@ -154,6 +165,10 @@ def collate_extra_model_inputs(chunk: list[int], encoded: dict[int, dict[str, An
         width = max(value.shape[-1] for value in values)
         rows = [torch.nn.functional.pad(value, (width - value.shape[-1], 0)) for value in values]
         result[key] = torch.stack(rows, dim=0)
+    for key, values in mrope_positions.items():
+        width = max(value.shape[-1] for value in values)
+        rows = [torch.nn.functional.pad(value, (width - value.shape[-1], 0)) for value in values]
+        result[key] = torch.cat(rows, dim=1)
     return result
 
 
@@ -227,8 +242,15 @@ def run_chunk(
     try:
         return call_batch(prompts, extra)
     except Exception as exc:
-        if strict or len(chunk) == 1:
+        if strict:
             raise
+        if len(chunk) == 1:
+            # A single-row chunk (batch_size=1, or a tail chunk of size 1) has nothing to
+            # isolate, but the non-strict contract still holds: drop the bad row with an
+            # error placeholder instead of aborting the whole run. Raising here made
+            # strict=False depend on how the inputs happened to be chunked.
+            logger.warning(f"Input {chunk[0]} dropped, generate failed: {exc}")
+            return [error_response(encoded.get(chunk[0]) or {})]
         logger.warning(f"Batch of {len(chunk)} failed ({exc}); retrying individually to isolate the input")
         out: list[SampleResponse] = []
         for position, index in enumerate(chunk):
@@ -236,5 +258,5 @@ def run_chunk(
                 out.append(call_batch([prompts[position]], collate_extra_model_inputs([index], encoded))[0])
             except Exception as inner:
                 logger.warning(f"Input dropped, generate failed: {inner}")
-                out.append(error_response({}))
+                out.append(error_response(encoded.get(index) or {}))
         return out

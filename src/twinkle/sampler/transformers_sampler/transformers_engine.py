@@ -401,12 +401,28 @@ class TransformersEngine(BaseSamplerEngine):
         passthrough: Dict[str, Any],
     ) -> List[SampleResponse]:
         inputs = self._to_model_inputs(prompts, extra_model_inputs)
-        gen_kwargs = self._build_gen_kwargs(params, num_samples=num_samples, logprobs=want_logprobs)
-        gen_kwargs.update(passthrough)
-        prompt_width = inputs['input_ids'].shape[-1]
+        # A seeded request seeds torch for the generate call only: to_transformers spells
+        # the seed as torch.manual_seed, which is process-global. This engine also runs
+        # inside training workers (TransformersModel.generate), where leaving the global
+        # RNG reseeded would silently change every later consumer (dropout, data order).
+        # Snapshot and restore around the seeded section so the request stays reproducible
+        # without clobbering anyone else's randomness.
+        seeded = params.seed is not None
+        if seeded:
+            cpu_rng_state = torch.get_rng_state()
+            cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            gen_kwargs = self._build_gen_kwargs(params, num_samples=num_samples, logprobs=want_logprobs)
+            gen_kwargs.update(passthrough)
+            prompt_width = inputs['input_ids'].shape[-1]
 
-        with torch.inference_mode():
-            output = self.model.generate(**inputs, **gen_kwargs)
+            with torch.inference_mode():
+                output = self.model.generate(**inputs, **gen_kwargs)
+        finally:
+            if seeded:
+                torch.set_rng_state(cpu_rng_state)
+                if cuda_rng_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_rng_states)
         sequences = output.sequences if hasattr(output, 'sequences') else output
         # generate() returns prompt+completion; only the tail is new. With num_return_sequences=k the
         # batch dim is len(prompts)*k, ordered prompt-major.
@@ -414,8 +430,9 @@ class TransformersEngine(BaseSamplerEngine):
         step_logprobs = _step_logprobs(output, params) if want_logprobs and hasattr(output, 'scores') else None
 
         prompt_logprobs = None
+        topk_prompt_logprobs_out = None
         if include_prompt_logprobs:
-            prompt_logprobs = self._prompt_logprobs(inputs, topk_prompt_logprobs)
+            prompt_logprobs, topk_prompt_logprobs_out = self._prompt_logprobs(inputs, topk_prompt_logprobs)
 
         max_new = gen_kwargs.get('max_new_tokens')
         responses: List[SampleResponse] = []
@@ -439,6 +456,7 @@ class TransformersEngine(BaseSamplerEngine):
                     sequences=seqs,
                     prompt_token_ids=list(prompt),
                     prompt_logprobs=None if prompt_logprobs is None else prompt_logprobs[index],
+                    topk_prompt_logprobs=None if topk_prompt_logprobs_out is None else topk_prompt_logprobs_out[index],
                 ))
         return responses
 
@@ -455,20 +473,34 @@ class TransformersEngine(BaseSamplerEngine):
         end = start + len(stop) if params.include_stop_str_in_output else start
         return text[:end], True
 
-    def _prompt_logprobs(self, inputs: Dict[str, Any], topk: int) -> List[List[Optional[float]]]:
-        """Score the prompt itself -- ``generate()`` never does, so this is a second forward pass."""
+    def _prompt_logprobs(self, inputs: Dict[str, Any], topk: int) -> Tuple[List[List[Optional[float]]],
+                                                                          List[Optional[List[List[Tuple[int, float]]]]]]:
+        """Score the prompt itself -- ``generate()`` never does, so this is a second forward pass.
+
+        Returns ``(prompt_logprobs, topk_prompt_logprobs)``: the chosen-token logprob per
+        position, and (when ``topk > 0``) the ``topk`` most likely alternatives per position,
+        matching the vLLM engine's convention (leading None for the first real token).
+        """
         with torch.inference_mode():
             logits = self.model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask']).logits
         logprobs = torch.log_softmax(logits[:, :-1].float(), dim=-1)
         targets = inputs['input_ids'][:, 1:]
         picked = logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         out: List[List[Optional[float]]] = []
+        out_topk: List[Optional[List[List[Tuple[int, float]]]]] = []
         for row in range(picked.shape[0]):
             mask = inputs['attention_mask'][row, 1:].bool()
             # The first real token has no predecessor to be predicted from, hence the leading None,
             # matching vLLM's prompt_logprobs convention.
             out.append([None] + picked[row][mask].tolist())
-        return out
+            if topk > 0:
+                values, indices = torch.topk(logprobs[row], topk, dim=-1)
+                out_topk.append([None] + [
+                    list(zip(idx.tolist(), val.tolist())) for idx, val in zip(indices[mask], values[mask])
+                ])
+            else:
+                out_topk.append(None)
+        return out, out_topk
 
 
 def _step_logprobs(output: Any, params: SamplingParams) -> List[List[List[Tuple[int, float]]]]:

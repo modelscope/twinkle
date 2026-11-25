@@ -1574,6 +1574,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # loop-and-thread hop (and its lock, which would be bound to the wrong loop).
             return engine.generate_batch(
                 prompts, params, num_samples=params.num_samples, logprobs=params.logprobs is not None,
+                include_prompt_logprobs=params.prompt_logprobs is not None,
+                topk_prompt_logprobs=params.prompt_logprobs or 0,
                 extra_model_inputs=extra or None)
 
         lora_ctx = (unwrapped_model.disable_adapter()
@@ -1586,6 +1588,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         if not logprobs_only:
             generation.attach_features(template, results, encoded, states)
+        else:
+            # "Score, do not generate": discard the one token generated to carry the prompt
+            # logprobs, matching the vLLM backend and TransformersSampler.sample.
+            for response in results:
+                if response is None:
+                    continue
+                for seq in response.sequences:
+                    seq.tokens = []
+                    seq.logprobs = None
+                    seq.decoded = None
         return [
             r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
         ]

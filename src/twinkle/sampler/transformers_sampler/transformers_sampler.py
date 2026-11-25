@@ -277,6 +277,17 @@ class TransformersSampler(Sampler):
 
             if not logprobs_only:
                 generation.attach_features(self.template, results, encoded, states)
+            else:
+                # "Score, do not generate": the one token generated to carry the prompt
+                # logprobs is discarded, matching the vLLM backend's contract (tokens=[],
+                # no step logprobs); the prompt_logprobs ride on the response itself.
+                for response in results:
+                    if response is None:
+                        continue
+                    for seq in response.sequences:
+                        seq.tokens = []
+                        seq.logprobs = None
+                        seq.decoded = None
             return [r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)]
 
     def sample_stream(
@@ -398,6 +409,8 @@ class TransformersSampler(Sampler):
                     params,
                     num_samples=params.num_samples,
                     logprobs=params.logprobs is not None,
+                    include_prompt_logprobs=params.prompt_logprobs is not None,
+                    topk_prompt_logprobs=params.prompt_logprobs or 0,
                     adapter_uri=adapter_uri,
                     extra_model_inputs=extra or None,
                 )

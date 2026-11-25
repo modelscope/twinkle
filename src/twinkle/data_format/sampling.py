@@ -95,8 +95,11 @@ class SamplingParams:
         if self.seed is not None:
             kwargs["seed"] = self.seed
 
-        if self.top_k > 0:
-            kwargs["top_k"] = self.top_k
+        # Always carried, including -1 ("disabled"): omitting it would let the engine's
+        # default sampling params -- which vLLM may seed from the model's
+        # generation_config.json (e.g. gemma's top_k=50) -- silently keep filtering even
+        # though the request asked for no top-k cut. An explicit caller override wins.
+        kwargs.setdefault("top_k", self.top_k)
 
         if self.repetition_penalty != 1.0:
             kwargs["repetition_penalty"] = self.repetition_penalty
@@ -144,8 +147,9 @@ class SamplingParams:
         if self.seed is not None:
             params["sampling_seed"] = self.seed
 
-        if self.top_k > 0:
-            params["top_k"] = self.top_k
+        # -1 means "all tokens" to sglang; carry it explicitly so a model-declared
+        # default top_k cannot survive a request that disabled top-k (see to_vllm).
+        params.setdefault("top_k", self.top_k)
 
         if self.repetition_penalty != 1.0:
             params["repetition_penalty"] = self.repetition_penalty
@@ -180,8 +184,11 @@ class SamplingParams:
         if self.seed is not None:
             torch.manual_seed(self.seed)
 
-        if self.top_k > 0:
-            gen_kwargs["top_k"] = self.top_k
+        # HF spells "disabled" as 0. Carry it explicitly: omitting top_k would let
+        # model.generation_config's own top_k (loaded from the checkpoint's
+        # generation_config.json, e.g. gemma's 50) keep filtering a request that asked
+        # for no top-k cut.
+        gen_kwargs["top_k"] = self.top_k if self.top_k > 0 else 0
 
         if self.repetition_penalty != 1.0:
             gen_kwargs["repetition_penalty"] = self.repetition_penalty
@@ -204,7 +211,14 @@ class SamplingParams:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SamplingParams":
-        """Create SamplingParams from a dict."""
+        """Create SamplingParams from a dict.
+
+        The caller's dict is never mutated: the max_new_tokens -> max_tokens rename
+        happens on a copy, so a config dict reused across requests (or shared with
+        other consumers that still read max_new_tokens) keeps its original keys.
+        Keys that are not fields are ignored.
+        """
+        d = dict(d)
         if "max_new_tokens" in d and "max_tokens" not in d:
             d["max_tokens"] = d.pop("max_new_tokens")
 
