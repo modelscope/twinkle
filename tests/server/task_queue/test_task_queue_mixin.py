@@ -654,19 +654,17 @@ async def test_unknown_start_ack_never_executes_backend(make_concurrent_queue, m
     queue = make_concurrent_queue()
     backend = FakeBackend()
     queue.state = queue._compute_worker._state = ServerState(backend=backend)
-    original = backend.update_atomic
+    original = queue.state.try_start_future
     executed = []
 
-    async def lost_ack(*args, **kwargs):
-        result = await original(*args, **kwargs)
-        if kwargs.get('return_changed'):
-            raise ConnectionError('start acknowledgement lost')
-        return result
+    async def lost_ack(request_id):
+        assert await original(request_id)
+        raise ConnectionError('start acknowledgement lost')
 
     async def work():
         executed.append(True)
 
-    monkeypatch.setattr(backend, 'update_atomic', lost_ack)
+    monkeypatch.setattr(queue.state, 'try_start_future', lost_ack)
     ref = await queue.schedule_concurrent_task(work)
     for _ in range(100):
         if not queue._compute_worker._detached_tasks:

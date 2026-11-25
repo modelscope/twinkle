@@ -222,11 +222,11 @@ async def test_active_sessions_no_4x_inflation() -> None:
     from twinkle.server.state.backend.memory_backend import RayActorBackend
     from twinkle.server.telemetry import MetricsRegistry
 
-    MetricsRegistry.reset()
+    MetricsRegistry._instance = None
     service = f'twinkle-test-inflation-{uuid.uuid4().hex[:6]}'
     with _telemetry_session(service, export_interval_ms=500):
         # Re-create the registry under the fresh meter provider.
-        MetricsRegistry.reset()
+        MetricsRegistry._instance = None
         backend = RayActorBackend()
         instances = [
             ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.2) for _ in range(4)
@@ -253,7 +253,7 @@ async def test_active_sessions_no_4x_inflation() -> None:
         finally:
             for s in instances:
                 await s.stop_cleanup_task()
-            MetricsRegistry.reset()
+            MetricsRegistry._instance = None
 
 
 # ---------- trace correlation visible end-to-end ------------------------- #

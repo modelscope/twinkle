@@ -1,0 +1,884 @@
+{
+  "uid": "twinkle-multitenant",
+  "title": "Twinkle Multitenant Operations",
+  "schemaVersion": 40,
+  "version": 1,
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": {"from": "now-1h", "to": "now"},
+  "editable": false,
+  "links": [
+    {
+      "type": "link",
+      "title": "Find task traces",
+      "tooltip": "Open task traces for the selected time, fingerprint, and training",
+      "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?viewPanel=16",
+      "keepTime": true,
+      "includeVars": true,
+      "targetBlank": true
+    },
+    {
+      "type": "link",
+      "title": "Find training logs",
+      "tooltip": "Open task logs for the selected time, training, and outcome",
+      "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?viewPanel=21",
+      "keepTime": true,
+      "includeVars": true,
+      "targetBlank": true
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "tenant_fingerprint",
+        "label": "User fingerprint prefix",
+        "type": "textbox",
+        "description": "Use the full fingerprint, its prefix, or unassigned. Leave blank for all tenants.",
+        "query": "",
+        "current": {"text": "", "value": ""}
+      },
+      {
+        "name": "base_model",
+        "label": "Base model",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+        "definition": "label_values({__name__=~\"twinkle_http_requests_total|twinkle_usage_requests_total\"}, base_model)",
+        "query": "label_values({__name__=~\"twinkle_http_requests_total|twinkle_usage_requests_total\"}, base_model)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"text": "All", "value": "$__all"}
+      },
+      {
+        "name": "training_id",
+        "label": "Training ID",
+        "type": "textbox",
+        "description": "Filter the training tables, logs and traces by training ID or prefix.",
+        "query": "",
+        "current": {"text": "", "value": ""}
+      },
+      {
+        "name": "node",
+        "label": "Resource node",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+        "definition": "label_values({__name__=~\"twinkle_system_memory_usage_bytes|twinkle_gpu_utilization|twinkle_gpu_memory_usage_bytes\"}, node)",
+        "query": "label_values({__name__=~\"twinkle_system_memory_usage_bytes|twinkle_gpu_utilization|twinkle_gpu_memory_usage_bytes\"}, node)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {"text": "All", "value": "$__all"}
+      },
+      {
+        "name": "task_outcome",
+        "label": "Log outcome",
+        "type": "custom",
+        "query": "Abnormal : failed|timeout|refused,queued,started,completed,failed,timeout,refused,cancelled",
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {"text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Trainings",
+      "collapsed": false,
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1},
+      "panels": []
+    },
+    {
+      "id": 18,
+      "type": "table",
+      "title": "Current trainings",
+      "description": "Click a training ID to open its logs in the selected time range.",
+      "datasource": {"type": "redis-datasource", "uid": "twinkle-redis"},
+      "gridPos": {"x": 0, "y": 1, "w": 18, "h": 8},
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Token fingerprint"},
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [{"type": "value", "options": {"unassigned": {"text": "Unattributed"}}}]
+              }
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "Training ID"},
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open training logs",
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__value.raw}&${tenant_fingerprint:queryparam}&${base_model:queryparam}&viewPanel=21"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "transformations": [
+        {"id": "extractFields", "options": {"source": "Value", "format": "json"}},
+        {"id": "extractFields", "options": {"source": "rows", "format": "json"}},
+        {"id": "filterFieldsByName", "options": {"exclude": {"names": ["updated_at", "row_count", "rows"]}}},
+        {"id": "transpose", "options": {}},
+        {"id": "extractFields", "options": {"source": "Value", "format": "json", "replace": true}},
+        {
+          "id": "filterByValue",
+          "options": {
+            "type": "include",
+            "match": "all",
+            "filters": [
+              {
+                "fieldName": "tenant_fingerprint",
+                "config": {"id": "regex", "options": {"value": "^(${tenant_fingerprint:regex}).*$"}}
+              },
+              {
+                "fieldName": "training_id",
+                "config": {"id": "regex", "options": {"value": "^(${training_id:regex}).*$"}}
+              },
+              {
+                "fieldName": "base_model",
+                "config": {"id": "regex", "options": {"value": "^${base_model:regex}$"}}
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "state": 0,
+              "base_model": 1,
+              "tenant_fingerprint": 2,
+              "created_at": 3,
+              "training_id": 4,
+              "session_id": 5
+            },
+            "renameByName": {
+              "state": "State",
+              "base_model": "Base model",
+              "tenant_fingerprint": "Token fingerprint",
+              "created_at": "Started",
+              "training_id": "Training ID",
+              "session_id": "Session ID"
+            }
+          }
+        }
+      ],
+      "targets": [{"refId": "A", "type": "command", "command": "get", "keyName": "admin:index:trainings"}],
+      "options": {"sortBy": [{"displayName": "Started", "desc": true}]}
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "title": "Training snapshot",
+      "description": "Last refresh and total live trainings before filters. Zero means no active trainings. Unavailable means no current snapshot.",
+      "datasource": {"type": "datasource", "uid": "-- Dashboard --"},
+      "gridPos": {"x": 18, "y": 1, "w": 6, "h": 8},
+      "fieldConfig": {
+        "defaults": {"noValue": "Unavailable"},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "updated_at"},
+            "properties": [{"id": "unit", "value": "time:MM-DD HH:mm:ss"}, {"id": "displayName", "value": "Last refresh"}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "row_count"},
+            "properties": [{"id": "unit", "value": "short"}, {"id": "displayName", "value": "Current trainings"}]
+          }
+        ]
+      },
+      "options": {
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "reduceOptions": {"values": false, "calcs": ["last"], "fields": "/^(updated_at|row_count)$/"}
+      },
+      "targets": [{"refId": "A", "panelId": 18}],
+      "transformations": [
+        {"id": "extractFields", "options": {"source": "Value", "format": "json", "replace": true}},
+        {
+          "id": "convertFieldType",
+          "options": {"conversions": [{"targetField": "updated_at", "destinationType": "time"}]}
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "table",
+      "title": "Recent training activity",
+      "description": "Latest recorded task activity by training, including completed and failed trainings.",
+      "datasource": {"type": "loki", "uid": "twinkle-loki"},
+      "gridPos": {"x": 0, "y": 9, "w": 24, "h": 8},
+      "options": {"sortBy": [{"displayName": "Last activity", "desc": true}]},
+      "fieldConfig": {
+        "defaults": {"noValue": "—"},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Training ID"},
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open training logs",
+                    "url": "/d/twinkle-multitenant/twinkle-multitenant-operations?from=${__from}&to=${__to}&var-training_id=${__value.raw}&${tenant_fingerprint:queryparam}&${base_model:queryparam}&viewPanel=21"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "Token fingerprint"},
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [{"type": "value", "options": {"unassigned": {"text": "Unattributed"}}}]
+              }
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "Last activity"},
+            "properties": [{"id": "unit", "value": "time:MM-DD HH:mm:ss"}]
+          }
+        ]
+      },
+      "transformations": [
+        {"id": "labelsToFields", "options": {"mode": "columns"}},
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "twinkle_base_model": 0,
+              "twinkle_tenant_fingerprint": 1,
+              "twinkle_training_id": 2,
+              "Value": 3,
+              "Value #A": 4
+            },
+            "renameByName": {
+              "twinkle_base_model": "Base model",
+              "twinkle_tenant_fingerprint": "Token fingerprint",
+              "twinkle_training_id": "Training ID",
+              "Value": "Last activity",
+              "Value #A": "Last activity"
+            },
+            "excludeByName": {"Time": true}
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {"conversions": [{"targetField": "Last activity", "destinationType": "time"}]}
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(30, max_over_time({service_name=~\".+\"} | twinkle_training_id != \"\" | twinkle_training_id =~ \"(${training_id:regex}).*\" | twinkle_tenant_fingerprint =~ \"(${tenant_fingerprint:regex}).*\" | twinkle_base_model =~ \"${base_model:regex}\" | twinkle_task_outcome != \"\" | label_format event_time=`{{ __timestamp__ | unixEpochMillis }}` | unwrap event_time | __error__=\"\" [$__range]) by (twinkle_training_id, twinkle_base_model, twinkle_tenant_fingerprint))",
+          "queryType": "instant"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "row",
+      "title": "Training diagnostics",
+      "collapsed": false,
+      "gridPos": {"x": 0, "y": 17, "w": 24, "h": 1},
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "logs",
+      "title": "Training task logs",
+      "description": "Task events for the selected training, including GRPO rollouts (sample) using its saved checkpoints. Open the panel menu and choose Explore to search more logs.",
+      "datasource": {"type": "loki", "uid": "twinkle-loki"},
+      "gridPos": {"x": 0, "y": 18, "w": 24, "h": 10},
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none",
+        "showLogDetails": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=~\".+\"} | twinkle_training_id != \"\" | twinkle_training_id =~ \"(${training_id:regex}).*\" | twinkle_tenant_fingerprint =~ \"(${tenant_fingerprint:regex}).*\" | twinkle_base_model =~ \"${base_model:regex}\" | twinkle_task_outcome =~ \"${task_outcome:raw}\"",
+          "queryType": "range",
+          "maxLines": 200
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "table",
+      "title": "Runtime task traces",
+      "description": "Filter by Token fingerprint or training ID. Open a Trace ID to see training compute or the rollout sample path from forwarding to execution. On task_queue.execute, use Logs for this span to see the task’s Runtime logs.",
+      "datasource": {"type": "tempo", "uid": "twinkle-tempo"},
+      "gridPos": {"x": 0, "y": 28, "w": 24, "h": 9},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "traceql",
+          "query": "{ name = \"task_queue.execute\" && span.twinkle.training_id != nil && span.twinkle.training_id =~ \"^(${training_id:regex}).*$\" && span.twinkle.base_model =~ \"^${base_model:regex}$\" && \"${tenant_fingerprint:regex}\" = \"\" } || { name = \"task_queue.execute\" && span.twinkle.training_id != nil && span.twinkle.training_id =~ \"^(${training_id:regex}).*$\" && span.twinkle.base_model =~ \"^${base_model:regex}$\" && span.twinkle.tenant_fingerprint =~ \"^(${tenant_fingerprint:regex}).*$\" }",
+          "limit": 25
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "row",
+      "title": "Tenant usage and performance",
+      "collapsed": false,
+      "gridPos": {"x": 0, "y": 37, "w": 24, "h": 1},
+      "panels": []
+    },
+    {
+      "id": 20,
+      "type": "stat",
+      "title": "Estimated accepted requests",
+      "description": "Estimated increase across replicas. Each series needs two samples. Activity already included in its first sample can be missed.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 38, "w": 8, "h": 5},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}
+        },
+        "overrides": []
+      },
+      "options": {"graphMode": "none", "colorMode": "value", "textMode": "value_and_name"},
+      "transformations": [{"id": "renameByRegex", "options": {"regex": "^([0-9a-f]{12})[0-9a-f]{52}$", "renamePattern": "$1"}}],
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (tenant_fingerprint) (increase(twinkle_usage_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[$__range]))",
+          "legendFormat": "{{tenant_fingerprint}}",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Estimated input tokens",
+      "description": "Estimated increase across replicas. Each series needs two samples. Activity already included in its first sample can be missed.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 8, "y": 38, "w": 8, "h": 5},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}
+        },
+        "overrides": []
+      },
+      "options": {"graphMode": "none", "colorMode": "value", "textMode": "value_and_name"},
+      "transformations": [{"id": "renameByRegex", "options": {"regex": "^([0-9a-f]{12})[0-9a-f]{52}$", "renamePattern": "$1"}}],
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (tenant_fingerprint) (increase(twinkle_usage_input_tokens_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[$__range]))",
+          "legendFormat": "{{tenant_fingerprint}}",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Estimated execution seconds",
+      "description": "Estimated increase across replicas. Each series needs two samples. Activity already included in its first sample can be missed.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 16, "y": 38, "w": 8, "h": 5},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}
+        },
+        "overrides": []
+      },
+      "options": {"graphMode": "none", "colorMode": "value", "textMode": "value_and_name"},
+      "transformations": [{"id": "renameByRegex", "options": {"regex": "^([0-9a-f]{12})[0-9a-f]{52}$", "renamePattern": "$1"}}],
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (tenant_fingerprint) (increase(twinkle_task_execution_seconds_sum{tenant_fingerprint!=\"\",tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\",task_type=~\"forward|forward_only|forward_backward|step|clip_grad_and_step|optim_step|sample\"}[$__range]))",
+          "legendFormat": "{{tenant_fingerprint}}",
+          "instant": true,
+          "range": false
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Accepted requests / second",
+      "description": "Five-minute rate per tenant across replicas. The line marks the deployment reference.",
+      "referenceLimit": "requests_per_second",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 43, "w": 12, "h": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+          "custom": {"thresholdsStyle": {"mode": "line"}}
+        },
+        "overrides": []
+      },
+      "options": {},
+      "transformations": [{"id": "renameByRegex", "options": {"regex": "^([0-9a-f]{12})[0-9a-f]{52}$", "renamePattern": "$1"}}],
+      "targets": [{"refId": "A", "expr": "sum by (tenant_fingerprint) (rate(twinkle_usage_requests_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))", "legendFormat": "{{tenant_fingerprint}}"}]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Input tokens / second",
+      "description": "Five-minute rate per tenant across replicas. The line marks the deployment reference.",
+      "referenceLimit": "input_tokens_per_second",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 12, "y": 43, "w": 12, "h": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:tok/s",
+          "min": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+          "custom": {"thresholdsStyle": {"mode": "line"}}
+        },
+        "overrides": []
+      },
+      "options": {},
+      "transformations": [{"id": "renameByRegex", "options": {"regex": "^([0-9a-f]{12})[0-9a-f]{52}$", "renamePattern": "$1"}}],
+      "targets": [{"refId": "A", "expr": "sum by (tenant_fingerprint) (rate(twinkle_usage_input_tokens_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))", "legendFormat": "{{tenant_fingerprint}}"}]
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Serve ingress waits over 1 s",
+      "description": "Estimated number of requests waiting over one second for a replica in each five-minute window. Global across tenants. Uses the optional Ray metrics scrape.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 51, "w": 12, "h": 7},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "options": {},
+      "targets": [{"refId": "A", "expr": "clamp_min(sum by (application, deployment) (increase(ray_serve_request_router_fulfillment_time_ms_count{handle_source=\"PROXY\"}[5m])) - sum by (application, deployment) (increase(ray_serve_request_router_fulfillment_time_ms_bucket{handle_source=\"PROXY\",le=\"1000\"}[5m])), 0)", "legendFormat": "{{application}} / {{deployment}}"}]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Business admission rejections / second",
+      "description": "Rate limits, resource quota and unavailable capacity at the admission decision. Includes rejected training futures even when HTTP returned 200. Forwarded replies and repeated future polls do not add a rejection.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 12, "y": 51, "w": 12, "h": 7},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{reason}} · {{base_model}} · {{tenant_fingerprint}}",
+          "expr": "sum by (reason,base_model,tenant_fingerprint) (rate(twinkle_admission_rejections_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Compute queue wait p95",
+      "description": "Wait after task admission. Requests waiting at the Serve ingress or for a sampler to become ready are counted separately from compute queue wait.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 58, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, deployment, base_model) (rate(twinkle_task_wait_seconds_bucket{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m])))",
+          "legendFormat": "{{deployment}} {{base_model}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Task execution p95",
+      "description": "",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 12, "y": 58, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, deployment, base_model) (rate(twinkle_task_execution_seconds_bucket{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"}[5m])))",
+          "legendFormat": "{{deployment}} {{base_model}}"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Serve ingress wait p95",
+      "description": "Time for the Ray Serve HTTP proxy to assign a request to a replica, by application and deployment across all tenants. Requires the optional Ray metrics scrape. This histogram ends at replica assignment. For a sampler request, open sampler.wait_for_replica in the trace to inspect cold-start waiting.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 66, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le,application,deployment) (rate(ray_serve_request_router_fulfillment_time_ms_bucket{handle_source=\"PROXY\"}[5m]))) / 1000",
+          "legendFormat": "{{application}} / {{deployment}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Runtime HTTP latency p95",
+      "description": "HTTP request latency across tenants for the selected base model.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 74, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, deployment, base_model) (rate(twinkle_http_request_duration_seconds_bucket{base_model=~\"${base_model:regex}\"}[5m])))",
+          "legendFormat": "{{deployment}} {{base_model}}"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "stat",
+      "title": "Recorded business rejections",
+      "description": "Latest cumulative count reported by running processes at the end of the selected time range. Visible from the first scrape. Counts reset when a process restarts.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 12, "y": 74, "w": 12, "h": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "No rejection series received"
+        },
+        "overrides": []
+      },
+      "options": {"graphMode": "none", "colorMode": "none", "textMode": "value_and_name"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason,base_model,tenant_fingerprint) (twinkle_admission_rejections_total{tenant_fingerprint=~\"(${tenant_fingerprint:regex}).*\",base_model=~\"${base_model:regex}\"})",
+          "instant": true,
+          "range": false,
+          "legendFormat": "{{reason}} · {{base_model}} · {{tenant_fingerprint}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Global compute queue depth",
+      "description": "Admitted tasks waiting in Twinkle’s serial compute queues across all tenants and models.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 12, "y": 66, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (deployment) (twinkle_queue_depth)",
+          "legendFormat": "{{deployment}}"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "row",
+      "title": "Node resources",
+      "collapsed": false,
+      "gridPos": {"x": 0, "y": 82, "w": 24, "h": 1},
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "CPU utilization",
+      "description": "",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 83, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node) (twinkle_system_cpu_utilization{node=~\"${node:regex}\"})",
+          "legendFormat": "{{node}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "System memory used",
+      "description": "",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 12, "y": 83, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node) (twinkle_system_memory_usage_bytes{node=~\"${node:regex}\"})",
+          "legendFormat": "{{node}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "GPU utilization",
+      "description": "Physical devices. A device can be shared by multiple models.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 91, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node, gpu_index, gpu_uuid) (twinkle_gpu_utilization{node=~\"${node:regex}\"})",
+          "legendFormat": "{{node}} GPU {{gpu_index}} {{gpu_uuid}}"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "GPU memory used",
+      "description": "",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 12, "y": 91, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node, gpu_index, gpu_uuid) (twinkle_gpu_memory_usage_bytes{node=~\"${node:regex}\"})",
+          "legendFormat": "{{node}} GPU {{gpu_index}} {{gpu_uuid}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Process memory (RSS)",
+      "description": "",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 100, "w": 12, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (node, pid) (twinkle_process_memory_usage_bytes{node=~\"${node:regex}\"})",
+          "legendFormat": "{{node}} pid {{pid}}"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "Last Runtime metric received",
+      "description": "Age of the most recent exporter heartbeat at the selected time. A missing heartbeat can indicate a stopped Runtime or an unreachable telemetry backend.",
+      "gridPos": {"x": 12, "y": 100, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [{"type": "value", "options": {"-1": {"text": "No recent metrics", "color": "orange"}}}]
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "range": false,
+          "expr": "(time() - max by (node) (timestamp(twinkle_telemetry_heartbeat{node=~\"${node:regex}\"}))) or on() vector(-1)",
+          "legendFormat": "{{node}}"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "type": "row",
+      "title": "Sessions and service activity",
+      "collapsed": false,
+      "gridPos": {"x": 0, "y": 108, "w": 24, "h": 1},
+      "panels": []
+    },
+    {
+      "id": 17,
+      "type": "table",
+      "title": "Current sessions",
+      "description": "No data means the snapshot has expired, is unavailable, or has no rows matching the filter.",
+      "datasource": {"type": "redis-datasource", "uid": "twinkle-redis"},
+      "gridPos": {"x": 0, "y": 109, "w": 24, "h": 8},
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Token fingerprint"},
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [{"type": "value", "options": {"unassigned": {"text": "Unattributed"}}}]
+              }
+            ]
+          }
+        ]
+      },
+      "transformations": [
+        {"id": "extractFields", "options": {"source": "Value", "format": "json"}},
+        {"id": "extractFields", "options": {"source": "rows", "format": "json"}},
+        {"id": "filterFieldsByName", "options": {"exclude": {"names": ["updated_at", "row_count", "rows"]}}},
+        {"id": "transpose", "options": {}},
+        {"id": "extractFields", "options": {"source": "Value", "format": "json", "replace": true}},
+        {
+          "id": "filterByValue",
+          "options": {
+            "type": "include",
+            "match": "all",
+            "filters": [
+              {
+                "fieldName": "tenant_fingerprint",
+                "config": {"id": "regex", "options": {"value": "^(${tenant_fingerprint:regex}).*$"}}
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {"session_id": 0, "tenant_fingerprint": 1, "created_at": 2, "last_heartbeat": 3},
+            "renameByName": {
+              "session_id": "Session ID",
+              "tenant_fingerprint": "Token fingerprint",
+              "created_at": "Started",
+              "last_heartbeat": "Last heartbeat"
+            }
+          }
+        }
+      ],
+      "targets": [{"refId": "A", "type": "command", "command": "get", "keyName": "admin:index:sessions"}]
+    },
+    {
+      "id": 19,
+      "type": "table",
+      "title": "Current sampling sessions",
+      "description": "No data means the snapshot has expired, is unavailable, or has no rows matching the filter.",
+      "datasource": {"type": "redis-datasource", "uid": "twinkle-redis"},
+      "gridPos": {"x": 0, "y": 117, "w": 24, "h": 8},
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Token fingerprint"},
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [{"type": "value", "options": {"unassigned": {"text": "Unattributed"}}}]
+              }
+            ]
+          }
+        ]
+      },
+      "transformations": [
+        {"id": "extractFields", "options": {"source": "Value", "format": "json"}},
+        {"id": "extractFields", "options": {"source": "rows", "format": "json"}},
+        {"id": "filterFieldsByName", "options": {"exclude": {"names": ["updated_at", "row_count", "rows"]}}},
+        {"id": "transpose", "options": {}},
+        {"id": "extractFields", "options": {"source": "Value", "format": "json", "replace": true}},
+        {
+          "id": "filterByValue",
+          "options": {
+            "type": "include",
+            "match": "all",
+            "filters": [
+              {
+                "fieldName": "tenant_fingerprint",
+                "config": {"id": "regex", "options": {"value": "^(${tenant_fingerprint:regex}).*$"}}
+              },
+              {
+                "fieldName": "base_model",
+                "config": {"id": "regex", "options": {"value": "^${base_model:regex}$"}}
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "sampling_session_id": 0,
+              "session_id": 1,
+              "base_model": 2,
+              "tenant_fingerprint": 3,
+              "state": 4,
+              "created_at": 5
+            },
+            "renameByName": {
+              "sampling_session_id": "Sampling session ID",
+              "session_id": "Session ID",
+              "base_model": "Base model",
+              "tenant_fingerprint": "Token fingerprint",
+              "state": "State",
+              "created_at": "Started"
+            }
+          }
+        }
+      ],
+      "targets": [{"refId": "A", "type": "command", "command": "get", "keyName": "admin:index:sampling"}]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Heartbeats and result polls / second",
+      "description": "Service activity across all tenants.",
+      "datasource": {"type": "prometheus", "uid": "twinkle-mimir"},
+      "gridPos": {"x": 0, "y": 125, "w": 24, "h": 8},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (operation) (rate(twinkle_http_requests_total{operation=~\"session_heartbeat|retrieve_future\",status!=\"429\"}[5m]))",
+          "legendFormat": "{{operation}}"
+        }
+      ]
+    }
+  ]
+}

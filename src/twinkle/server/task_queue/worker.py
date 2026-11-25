@@ -7,35 +7,47 @@ GPU compute tasks serially across all per-adapter/per-token queues using
 a round-robin policy.
 """
 from __future__ import annotations
-
 import asyncio
+import logging
 import time
 import traceback
 from collections import deque
 from dataclasses import replace
-from ray.exceptions import RayTaskError
 from typing import TYPE_CHECKING, Any, Callable, Deque
+
+from ray.exceptions import RayTaskError
 
 from twinkle.protocol.types.errors import ErrorCategory, QueueState
 from twinkle.protocol.types.lifecycle import TaskStatus
 from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.exceptions import (BackendBusyError, BatchSizeError, EndpointUnavailableError, FullModeBusyError,
-                                       InputTokensExceededError, RateLimitExceededError, RequestRejectedError,
-                                       ResourceExhaustedError, ResourceNotFoundError, ResourceQuotaExceededError,
-                                       StateBackendError, TrainModeMismatchError, TwinkleServerError)
+from twinkle.server.exceptions import (
+    BackendBusyError,
+    BatchSizeError,
+    EndpointUnavailableError,
+    FullModeBusyError,
+    InputTokensExceededError,
+    RateLimitExceededError,
+    RequestRejectedError,
+    ResourceExhaustedError,
+    ResourceNotFoundError,
+    ResourceQuotaExceededError,
+    StateBackendError,
+    TrainModeMismatchError,
+    TwinkleServerError,
+)
+from twinkle.server.identity import current_tenant_fingerprint
 from twinkle.server.state.backend.base import ConcurrencyError
 from twinkle.server.state.models import FutureFailureRecord
 from twinkle.server.task_queue.backend_gate import BACKEND_TIMEOUT_EXCEPTIONS
-from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
-from twinkle.server.telemetry.tracing import traced_operation
-from twinkle.utils.logger import get_logger
+from twinkle.server.telemetry.metrics import METERED_TASK_TYPES
+from twinkle.server.telemetry.tracing import get_trace_id, set_span_error, traced_operation
 from .types import QueuedTask
 
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
-    from twinkle.server.telemetry.metrics import TaskMetrics
+    from twinkle.server.telemetry.metrics import MetricsRegistry
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 def _exception_summary(exc: BaseException) -> str:
@@ -97,7 +109,7 @@ class ComputeWorker:
         self,
         state: ServerState,
         config: TaskQueueConfig,
-        task_metrics: TaskMetrics | None,
+        task_metrics: MetricsRegistry | None,
         deployment_name: str,
         on_backend_timeout: Callable[[], Any] | None = None,
     ) -> None:
@@ -154,6 +166,8 @@ class ComputeWorker:
         await asyncio.gather(*(running for running, _ in detached), return_exceptions=True)
         for running, task in detached:
             if running.cancelled() and not await self._is_record_terminal(task.request_id):
+                logger.warning(f'[ComputeWorker] Task {task.request_id} cancelled during replica shutdown',
+                               extra=task.log_fields('cancelled'))
                 await self._store_task_failed(
                     task,
                     'Sampler task stopped during replica shutdown.',
@@ -233,39 +247,38 @@ class ComputeWorker:
     # Metrics helpers
     # ------------------------------------------------------------------
 
-    def _record_tasks_total(self, task_type: str, status: str) -> None:
-        """Increment the tasks_total counter if metrics are enabled."""
-        if self._task_metrics:
-            self._task_metrics.tasks_total.inc(tags={
-                'deployment': self._deployment_name,
-                'task_type': task_type,
-                'status': status,
-            })
+    def _task_tags(self, task: QueuedTask) -> dict[str, str]:
+        tags = {'deployment': self._deployment_name, 'task_type': task.task_type or 'unknown'}
+        if task.tenant_fingerprint:
+            tags['tenant_fingerprint'] = task.tenant_fingerprint
+        if task.base_model:
+            tags['base_model'] = task.base_model
+        return tags
 
-    def _record_execution_time(self, task_type: str, exec_time: float) -> None:
-        """Observe execution duration in the execution_seconds histogram if metrics are enabled."""
+    def record_admission(self, task: QueuedTask) -> None:
+        if self._task_metrics and task.tenant_fingerprint and task.task_type in METERED_TASK_TYPES:
+            tags = self._task_tags(task)
+            self._task_metrics.usage_requests.add(1, attributes=tags)
+            self._task_metrics.usage_input_tokens.add(task.input_tokens, attributes=tags)
+
+    def _record_tasks_total(self, task: QueuedTask, status: str) -> None:
         if self._task_metrics:
-            self._task_metrics.execution_seconds.observe(
-                exec_time, tags={
-                    'deployment': self._deployment_name,
-                    'task_type': task_type,
-                })
+            self._task_metrics.tasks_total.add(1, attributes={**self._task_tags(task), 'status': status})
+
+    def _record_execution_time(self, task: QueuedTask, exec_time: float) -> None:
+        if self._task_metrics:
+            tags = self._task_tags(task)
+            self._task_metrics.task_execution_seconds.record(exec_time, attributes=tags)
 
     def _record_queue_depth(self) -> None:
         """Single writer of the queue-depth gauge."""
         if self._task_metrics:
             total_depth = sum(qq.qsize() for qq in self.task_queues.values())
-            self._task_metrics.queue_depth.set(total_depth, tags={'deployment': self._deployment_name})
+            self._task_metrics.queue_depth.set(total_depth, attributes={'deployment': self._deployment_name})
 
-    def _record_queue_metrics(self, task_type: str, queue_wait: float) -> None:
-        """Observe queue wait time and update current queue depth if metrics are enabled."""
+    def _record_queue_metrics(self, task: QueuedTask, queue_wait: float) -> None:
         if self._task_metrics:
-            self._task_metrics.queue_wait_seconds.observe(
-                queue_wait, tags={
-                    'deployment': self._deployment_name,
-                    'task_type': task_type,
-                })
-        self._record_queue_depth()
+            self._task_metrics.task_wait_seconds.record(queue_wait, attributes=self._task_tags(task))
 
     # ------------------------------------------------------------------
 
@@ -310,6 +323,8 @@ class ComputeWorker:
                 break
 
         for task in drained:
+            logger.warning(f'[ComputeWorker] Task {task.request_id} failed before execution: {reason}',
+                           extra=task.log_fields('failed'))
             await self._store_task_failed(task, reason, QueueState.UNKNOWN.value, queue_state_reason=reason)
             q.task_done()
             await self.finish_task(task, False)
@@ -336,19 +351,20 @@ class ComputeWorker:
     async def _fail_timed_out_task(self, task: QueuedTask, waited: float, q: asyncio.Queue) -> None:
         """Mark a queue-timed-out task as FAILED and release it from the queue."""
         error = f'Queue timeout exceeded: waited {waited:.2f}s'
+        logger.warning(f'[ComputeWorker] Task {task.request_id} {error}', extra=task.log_fields('timeout'))
         await self._store_task_failed(task, error, QueueState.PAUSED_CAPACITY.value, queue_state_reason=error)
-        self._record_tasks_total(task.task_type or 'unknown', 'timeout')
+        self._record_tasks_total(task, 'timeout')
         q.task_done()
         await self.finish_task(task, False)
 
-    async def _execute_task(self, task: QueuedTask, queue_key: str, q: asyncio.Queue) -> None:
+    async def _execute_task(self, task: QueuedTask, queue_wait: float, q: asyncio.Queue) -> None:
         """Execute a dequeued task, then release its queue slot."""
         try:
-            await self._process_task(task, queue_key)
+            await self._process_task(task, queue_wait)
         finally:
             q.task_done()
 
-    async def submit_detached(self, task: QueuedTask, queue_key: str, *, replica_id: str | None,
+    async def submit_detached(self, task: QueuedTask, *, replica_id: str | None,
                               absolute_deadline: float, submission_fingerprint: str | None = None,
                               track_execution: bool = False) -> bool:
         """Own admission, future persistence and startup as one lifecycle."""
@@ -370,17 +386,20 @@ class ComputeWorker:
                 self.release_detached()
                 return False
             wrote_status = True
-            self.run_detached(task, queue_key, track_execution=track_execution)
-            return True
+            self.run_detached(task, track_execution=track_execution)
         except BaseException:
             self.release_detached()
             if wrote_status:
+                logger.warning(f'[ComputeWorker] Task {task.request_id} could not start',
+                               extra=task.log_fields('failed'))
                 await self._store_task_failed(
                     task,
                     'Replica stopped before the concurrent task could start.',
                     QueueState.ACTIVE.value,
                     reason_code='orphaned_replica')
             raise
+        self.record_admission(task)
+        return True
 
     def reserve_detached(self) -> None:
         """Reserve before the future write, so capacity rejection leaves no record."""
@@ -392,7 +411,7 @@ class ComputeWorker:
     def release_detached(self) -> None:
         self._detached_reserved -= 1
 
-    def run_detached(self, task: QueuedTask, queue_key: str, *, track_execution: bool = False) -> None:
+    def run_detached(self, task: QueuedTask, *, track_execution: bool = False) -> None:
         """Start ``task`` now, beside the serial loop instead of in its turn.
 
         For backends that batch concurrent requests themselves (vLLM). The task
@@ -410,7 +429,9 @@ class ComputeWorker:
 
         async def run():
             try:
-                await self._process_task(replace(task, coro_factory=start), queue_key)
+                queue_wait = time.monotonic() - task.created_at
+                self._record_queue_metrics(task, queue_wait)
+                await self._process_task(replace(task, coro_factory=start), queue_wait)
             finally:
                 # A timeout ends the client future, not the backend operation.
                 # Retain this task's sole capacity reservation until it exits.
@@ -447,125 +468,132 @@ class ComputeWorker:
 
         running.add_done_callback(done)
 
-    async def _process_task(self, task: QueuedTask, queue_key: str) -> None:
+    async def _process_task(self, task: QueuedTask, queue_wait: float) -> None:
         """Run a single task: update status, run coroutine, record metrics.
 
         Handles execution timeout and general exceptions.
         """
         task_type = task.task_type or 'unknown'
-        exec_start = time.monotonic()
         task_status = 'completed'
         exec_time = 0.0
         executed = False
         finished_at = None
-        # One span per queued task execution, tagged `<deployment>.<task_type>`
-        # (e.g. `model.forward`, `sampler.sample`).
         queue_attrs = {
-            TOKEN_ID: task.token,
-            MODEL_ID: task.model_id,
-            'twinkle.task_type': task_type,
+            **task.correlation_attrs(),
             'twinkle.deployment': self._deployment_name or 'unknown',
-            'twinkle.queue_key': queue_key,
+            'twinkle.wait_seconds': queue_wait,
         }
-        handler_attrs = {TOKEN_ID: task.token, MODEL_ID: task.model_id}
-        handler_span_name = f'{self._deployment_name or "deployment"}.{task_type}'
-        try:
-            if not await self._state.try_start_future(task.request_id):
-                task_status = 'cancelled'
-                logger.info(f'[ComputeWorker] Task {task.request_id} was not acquired; skipping.')
-                return
-            with traced_operation('task_queue.execute', attrs=queue_attrs):
-                logger.debug(f'[ComputeWorker] Task {task.request_id} executing, '
-                             f'type={task_type}, queue_key={queue_key}')
-                with traced_operation(handler_span_name, attrs=handler_attrs):
+        with traced_operation('task_queue.execute', attrs=queue_attrs, parent_context=task.trace_context) as span:
+            trace_id = get_trace_id()
+            try:
+                if not await self._state.try_start_future(task.request_id):
+                    task_status = 'cancelled'
+                    logger.info(f'[ComputeWorker] Task {task.request_id} was not acquired; skipping.',
+                                extra=task.log_fields(task_status))
+                    return
+                binding = current_tenant_fingerprint.set(task.tenant_fingerprint)
+                exec_start = time.monotonic()
+                try:
                     executed = True
-                    coro = task.coro_factory()
-                    # effective_execution_timeout is always positive (0 -> finite fallback),
-                    # so wait_for is always in effect.
-                    result = await asyncio.wait_for(coro, timeout=self._config.effective_execution_timeout)
+                    result = await asyncio.wait_for(
+                        task.coro_factory(), timeout=self._config.effective_execution_timeout)
                     finished_at = time.time()
-            exec_time = time.monotonic() - exec_start
-            logger.info(f'[ComputeWorker] Task {task.request_id} completed in {exec_time:.2f}s, type={task_type}')
-            await self._state.store_future_status(
-                task.request_id,
-                TaskStatus.COMPLETED.value,
-                task.model_id,
-                result=result,
-                queue_state=QueueState.ACTIVE.value,
-            )
-        except asyncio.CancelledError:
-            task_status = 'cancelled'
-            exec_time = time.monotonic() - exec_start
-            if not await self._is_record_terminal(task.request_id):
+                finally:
+                    exec_time = time.monotonic() - exec_start
+                    current_tenant_fingerprint.reset(binding)
+                    span.set_attribute('twinkle.execution_seconds', exec_time)
+                await self._state.store_future_status(
+                    task.request_id,
+                    TaskStatus.COMPLETED.value,
+                    task.model_id,
+                    result=result,
+                    queue_state=QueueState.ACTIVE.value,
+                )
+                logger.info(f'[ComputeWorker] Task {task.request_id} completed in {exec_time:.2f}s, type={task_type}',
+                            extra=task.log_fields(task_status, trace_id))
+            except asyncio.CancelledError:
+                task_status = 'cancelled'
+                logger.warning('[ComputeWorker] Task %s cancelled, type=%s', task.request_id, task_type,
+                               extra=task.log_fields(task_status, trace_id))
+                if not await self._is_record_terminal(task.request_id):
+                    await self._store_task_failed(
+                        task,
+                        ('Task stopped during replica shutdown.' if self._stopping
+                         else 'Backend generation was cancelled.'),
+                        QueueState.ACTIVE.value,
+                        reason_code='orphaned_replica' if self._stopping else 'backend_cancelled')
+                raise
+            except BACKEND_TIMEOUT_EXCEPTIONS:
+                task_status = 'timeout'
+                set_span_error(span, 'execution_timeout')
+                error = (f'Backend call timed out (bound {self._config.effective_execution_timeout}s), '
+                         f'actual execution time: {exec_time:.2f}s')
+                logger.error(f'[ComputeWorker] Task {task.request_id} TIMEOUT after {exec_time:.2f}s, '
+                             f'type={task_type}', extra=task.log_fields(task_status, trace_id))
+                # asyncio.TimeoutError and Ray_Get_Timeout are 504/Server.
+                await self._store_task_failed(task, error, QueueState.ACTIVE.value, reason_code='execution_timeout')
+                # Probe actor liveness after a timeout so an operator learns the replica's
+                # state without waiting for a second request to also time out.
+                if self._on_backend_timeout is not None:
+                    try:
+                        await self._on_backend_timeout()
+                    except Exception as exc:
+                        logger.error('[ComputeWorker] Backend-timeout probe failed (%s)', type(exc).__name__)
+            except BackendBusyError as exc:
+                task_status = 'failed'
+                set_span_error(span, 'backend_gate_unavailable')
+                error = str(exc)
+                logger.error('[ComputeWorker] Task %s refused after %.2fs, type=%s, reason=backend_gate_unavailable',
+                             task.request_id, exec_time, task_type, extra=task.log_fields('refused', trace_id))
+                # Gate held by a leaked timed-out call -> 503/Server.
+                await self._store_task_failed(
+                    task, error, QueueState.ACTIVE.value, reason_code='backend_gate_unavailable')
+            except TwinkleServerError as exc:
+                # A typed server error carries its own status + category (e.g.
+                # ResourceNotFoundError = 404/User from a deferred
+                # assert_resource_exists). Honour them instead of collapsing every
+                # such failure to 500/Server. Only Server-category errors keep a
+                # traceback; a User rejection does not.
+                task_status = 'failed'
+                is_server = exc.category is ErrorCategory.Server
+                reason_code = _reason_code_for_server_error(exc)
+                if is_server:
+                    set_span_error(span, reason_code)
+                    logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
+                                 f'type={task_type}, reason={reason_code}',
+                                 extra=task.log_fields(task_status, trace_id))
+                else:
+                    logger.info(f'[ComputeWorker] Task {task.request_id} rejected, type={task_type}, '
+                                f'reason={reason_code}', extra=task.log_fields('refused', trace_id))
                 await self._store_task_failed(
                     task,
-                    'Task stopped during replica shutdown.' if self._stopping else 'Backend generation was cancelled.',
+                    f'{type(exc).__name__}: {exc}',
                     QueueState.ACTIVE.value,
-                    reason_code='orphaned_replica' if self._stopping else 'backend_cancelled')
-            raise
-        except BACKEND_TIMEOUT_EXCEPTIONS:
-            task_status = 'timeout'
-            exec_time = time.monotonic() - exec_start
-            error = (f'Backend call timed out (bound {self._config.effective_execution_timeout}s), '
-                     f'actual execution time: {exec_time:.2f}s')
-            logger.error(f'[ComputeWorker] Task {task.request_id} TIMEOUT after {exec_time:.2f}s, '
-                         f'type={task_type}, queue_key={queue_key}')
-            # asyncio.TimeoutError and Ray_Get_Timeout are 504/Server.
-            await self._store_task_failed(task, error, QueueState.ACTIVE.value, reason_code='execution_timeout')
-            # Probe actor liveness after a timeout so an operator learns the replica's
-            # state without waiting for a second request to also time out.
-            if self._on_backend_timeout is not None:
-                try:
-                    await self._on_backend_timeout()
-                except Exception:
-                    logger.error(f'[ComputeWorker] backend-timeout probe failed:\n{traceback.format_exc(limit=3)}')
-        except BackendBusyError as exc:
-            task_status = 'failed'
-            exec_time = time.monotonic() - exec_start
-            error = str(exc)
-            logger.error(f'[ComputeWorker] Task {task.request_id} REFUSED (admission gate held) after '
-                         f'{exec_time:.2f}s, type={task_type}, queue_key={queue_key}')
-            # Gate held by a leaked timed-out call -> 503/Server.
-            await self._store_task_failed(task, error, QueueState.ACTIVE.value, reason_code='backend_gate_unavailable')
-        except TwinkleServerError as exc:
-            # A typed server error carries its own status + category (e.g.
-            # ResourceNotFoundError = 404/User from a deferred
-            # assert_resource_exists). Honour them instead of collapsing every
-            # such failure to 500/Server. Only Server-category errors keep a
-            # traceback; a User rejection does not.
-            task_status = 'failed'
-            exec_time = time.monotonic() - exec_start
-            is_server = exc.category is ErrorCategory.Server
-            if is_server:
+                    reason_code=reason_code,
+                    attribution=exc.category.value,
+                    traceback_text=traceback.format_exc() if is_server else None,
+                )
+            except Exception as exc:
+                task_status = 'failed'
+                set_span_error(span, type(exc).__name__)
+                error = _exception_summary(exc)
                 logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
-                             f'type={task_type}:\n{traceback.format_exc(limit=3)}')
-            await self._store_task_failed(
-                task,
-                f'{type(exc).__name__}: {exc}',
-                QueueState.ACTIVE.value,
-                reason_code=_reason_code_for_server_error(exc),
-                attribution=exc.category.value,
-                traceback_text=traceback.format_exc() if is_server else None,
-            )
-        except Exception as exc:
-            task_status = 'failed'
-            exec_time = time.monotonic() - exec_start
-            # error is a single-line summary; the full traceback goes only to the
-            # traceback field, never into `error`.
-            error = _exception_summary(exc)
-            logger.error(f'[ComputeWorker] Task {task.request_id} FAILED after {exec_time:.2f}s, '
-                         f'type={task_type}:\n{traceback.format_exc(limit=3)}')
-            await self._store_task_failed(
-                task,
-                error,
-                QueueState.ACTIVE.value,
-                reason_code='internal_error',
-                traceback_text=traceback.format_exc(),
-            )
-        finally:
-            await self.finish_task(task, executed, executed and task_status in ('timeout', 'cancelled'), finished_at)
-            self._record_execution_time(task_type, exec_time)
-            self._record_tasks_total(task_type, task_status)
+                             f'type={task_type}, error={type(exc).__name__}',
+                             extra=task.log_fields(task_status, trace_id))
+                await self._store_task_failed(
+                    task,
+                    error,
+                    QueueState.ACTIVE.value,
+                    reason_code='internal_error',
+                    traceback_text=traceback.format_exc(),
+                )
+            finally:
+                span.set_attribute('twinkle.task_outcome', task_status)
+                if executed:
+                    self._record_execution_time(task, exec_time)
+                self._record_tasks_total(task, task_status)
+                await self.finish_task(
+                    task, executed, executed and task_status in ('timeout', 'cancelled'), finished_at)
 
     async def _try_run_one(self) -> bool:
         """Round-robin: pick one runnable task and execute it.
@@ -590,14 +618,15 @@ class ComputeWorker:
 
             # Record queue-wait metrics and check queue-level timeout
             queue_wait = time.monotonic() - task.created_at
-            self._record_queue_metrics(task.task_type or 'unknown', queue_wait)
+            self._record_queue_metrics(task, queue_wait)
+            self._record_queue_depth()
 
             if queue_wait > self._config.queue_timeout:
                 await self._fail_timed_out_task(task, queue_wait, q)
                 continue  # try the next queue
 
             # Execute the task (serial: stops after the first execution)
-            await self._execute_task(task, queue_key, q)
+            await self._execute_task(task, queue_wait, q)
             return True
 
         return False
@@ -629,6 +658,6 @@ class ComputeWorker:
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.error(f'[ComputeWorker] Unexpected error:\n{traceback.format_exc(limit=3)}')
+                logger.error('[ComputeWorker] Unexpected worker error', exc_info=True)
                 continue
         logger.info('[ComputeWorker] Worker stopped')

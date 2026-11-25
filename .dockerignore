@@ -1,0 +1,15 @@
+**
+!Dockerfile
+!pyproject.toml
+!setup.cfg
+!README.md
+!LICENSE
+!src/
+!src/**
+!cookbook/
+!cookbook/**
+**/.env
+**/.env.*
+**/__pycache__
+**/*.egg-info
+**/.DS_Store

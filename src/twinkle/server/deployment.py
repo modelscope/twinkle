@@ -26,25 +26,32 @@ the per-builder execution order exactly
 wrapping the full response path when enabled.
 """
 from __future__ import annotations
-
+import logging
 import traceback
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Any
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from ray import serve
-from typing import Any
 
 from twinkle.protocol.types.errors import ErrorCategory
-from twinkle.server.exceptions import TwinkleServerError
+from twinkle.server.exceptions import (
+    RateLimitExceededError,
+    ResourceExhaustedError,
+    ResourceQuotaExceededError,
+    TwinkleServerError,
+)
 from twinkle.server.middleware.auth import verify_request_token
+from twinkle.server.resources.allocation import CapacityUnavailableError
 from twinkle.server.task_errors import build_error_payload
+from twinkle.server.telemetry.admission import record_admission_rejection
 from twinkle.server.telemetry.http_middleware import create_metrics_middleware
 from twinkle.server.telemetry.tracing import create_tracing_middleware
-from twinkle.utils.logger import get_logger
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 # Type aliases for the per-builder customization points.
 RegisterRoutes = Callable[[FastAPI, Callable[[], Any]], None]
@@ -60,6 +67,21 @@ async def twinkle_server_error_handler(request: Request, exc: TwinkleServerError
     (``category=user``) carries no traceback.
     """
     request_id = getattr(request.state, 'request_id', None) or ''
+    if isinstance(exc, RateLimitExceededError):
+        reason = 'rate_limit'
+    elif isinstance(exc, ResourceQuotaExceededError):
+        reason = 'quota'
+    elif isinstance(exc, (CapacityUnavailableError, ResourceExhaustedError)):
+        reason = 'capacity'
+    else:
+        reason = None
+    if reason is not None:
+        record_admission_rejection(
+            reason,
+            deployment=getattr(request.state, 'metrics_deployment', 'unknown'),
+            fingerprint=getattr(request.state, 'tenant_fingerprint', None),
+            base_model=getattr(request.state, 'base_model', None),
+        )
     payload = build_error_payload(
         str(exc) or exc.__class__.__name__,
         category=exc.category,
@@ -156,7 +178,7 @@ def build_deployment_app(
 
     1. lifespan startup → ``ensure_telemetry_initialized()``;
        shutdown → ``on_shutdown(get_servable())`` (best-effort) then
-       ``flush_telemetry_safely()`` so buffered OTLP batches flush on graceful
+       ``shutdown_telemetry_safely()`` so buffered OTLP batches flush on graceful
        replica termination;
     2. the ``TwinkleServerError`` and ``RequestValidationError`` handlers, so a
        rejected request body carries the same ``ErrorPayload`` shape as any other
@@ -205,8 +227,8 @@ def build_deployment_app(
         # Flush buffered OTLP batches on graceful replica termination.
         import asyncio
 
-        from twinkle.server.telemetry import flush_telemetry_safely
-        await asyncio.to_thread(flush_telemetry_safely)
+        from twinkle.server.telemetry import shutdown_telemetry_safely
+        await asyncio.to_thread(shutdown_telemetry_safely)
 
     app = FastAPI(lifespan=lifespan, **(fastapi_kwargs or {}))
 
@@ -237,7 +259,7 @@ def build_deployment_app(
             return await call_next(request)
         except Exception as exc:
             tb = traceback.format_exc()
-            logger.error(tb)
+            logger.error("Unhandled HTTP error (%s)", type(exc).__name__)
             # Unify the last-resort 500 with the rest of the wire: an
             # ``ErrorPayload`` body (Server category keeps the traceback) instead
             # of the legacy ``{'detail': <traceback>}`` shape.
@@ -323,6 +345,6 @@ class LazyCleanupMixin:
             # Idempotent via the ResourceCleanupCoordinator's own start guard.
             await self.state.start_cleanup_task()
         except Exception as e:
-            logger.warning(f'Failed to start ServerState cleanup task: {e}')
+            logger.warning('Failed to start ServerState cleanup task (%s)', type(e).__name__)
         else:
             self._state_cleanup_started = True

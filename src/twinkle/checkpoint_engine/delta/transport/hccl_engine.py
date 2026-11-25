@@ -31,7 +31,7 @@ from typing import Any
 import torch
 
 from twinkle.utils import find_free_port, find_node_ip, stateless_init_process_group
-from twinkle.utils.platforms import hccl_socket_env
+from twinkle.utils.platforms import ensure_hccl_socket_env, hccl_socket_env
 from ...base import CheckpointEngine
 from ...hccl_checkpoint_engine import MasterMetadata
 from ...zmq_pubsub import start_publisher
@@ -88,7 +88,10 @@ class DeltaHCCLCheckpointEngine(DeltaSyncMixin, CheckpointEngine):
             self.zmq_port = find_free_port()
             self.dist_port = find_free_port()
             self.socket = start_publisher(self.ip, self.zmq_port)
-            # The FSDP process group may already have pinned these from MASTER_PORT; workers must match.
+            # The FSDP process group may already have pinned these from MASTER_PORT; workers must
+            # match. Pin here too, so the published layout is the one this process will apply --
+            # a snapshot of a layout another group might pin first would be a different answer.
+            ensure_hccl_socket_env(self.dist_port)
             self.hccl_env = hccl_socket_env(self.dist_port)
         return MasterMetadata(zmq_ip=self.ip, zmq_port=self.zmq_port, dist_ip=self.ip, dist_port=self.dist_port)
 

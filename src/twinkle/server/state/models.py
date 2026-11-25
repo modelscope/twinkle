@@ -30,6 +30,7 @@ class SessionRecord(BaseModel):
     tags: list[str] = Field(default_factory=list)
     user_metadata: dict[str, Any] = Field(default_factory=dict)
     sdk_version: str | None = None
+    user_id: str | None = None
     created_at: str = Field(default_factory=_now_iso)
     last_heartbeat: float = Field(default_factory=time.time)
 
@@ -57,6 +58,7 @@ class SamplingSessionRecord(BaseModel):
     seq_id: Any = None
     base_model: str | None = None
     model_path: str | None = None
+    user_id: str | None = None
     created_at: str = Field(default_factory=_now_iso)
 
 

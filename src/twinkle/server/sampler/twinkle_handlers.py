@@ -11,11 +11,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from collections.abc import Callable, Mapping
-from fastapi import Depends, FastAPI, Request
-from fastapi.responses import StreamingResponse
 from typing import TYPE_CHECKING, Any, List, Optional
+
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
 
 if TYPE_CHECKING:
     from .app import SamplerManagement
@@ -24,19 +26,21 @@ import numpy as np
 
 import twinkle.protocol.types as types
 from twinkle.data_format import PoolingParams, SamplingParams
+from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTENCY_SUPPORTED
 from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
+from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
+from twinkle.server.sampler.submission import existing_sample, sample_submission
 from twinkle.server.sampler.weights import resolve_sampler_weights, sample_with_weights
 from twinkle.server.task_errors import task_error_payload
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
-from twinkle.utils.logger import get_logger
 from .runtime import request_execution_scope
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 #: Sentinel for a value that cannot cross the HTTP boundary and must be omitted from its container.
@@ -222,8 +226,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
     @app.post('/twinkle/create', response_model=sampler_types.SamplerCreateResponse)
     async def create(
-        request: Request, self: SamplerManagement = Depends(self_fn)) -> sampler_types.SamplerCreateResponse:
+        response: Response, self: SamplerManagement = Depends(self_fn)) -> sampler_types.SamplerCreateResponse:
         """Health check / session creation endpoint."""
+        response.headers[H_SAMPLE_IDEMPOTENCY_SUPPORTED] = '1'
         return sampler_types.SamplerCreateResponse()
 
     @app.post('/twinkle/sample', response_model=types.TaskEnvelope)
@@ -234,6 +239,19 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         Supports Trajectory or InputFeature inputs, with optional LoRA adapter.
         """
         token = await self._on_request_start(request)
+        request_id = body.tracked_request_id(token)
+        submission = None
+        if H_SAMPLE_IDEMPOTENCY_KEY in request.headers:
+            if request_id is not None:
+                raise RequestRejectedError('Use either client_sample_id or the sample idempotency header.')
+            submission = sample_submission(request, 'twinkle/sample', self._telemetry_base_model, await request.json())
+        if submission and await existing_sample(self.state, submission, token) is not None:
+            return await self._peek_terminal(submission.request_id, fallback_status='pending')
+
+        training_id = None
+        if body.adapter_uri:
+            checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
+            training_id = await asyncio.to_thread(checkpoint_manager.sampling_training_id, body.adapter_uri)
 
         async def _task():
             # Resolve adapter
@@ -242,8 +260,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             full_adapter_name = resolve_twinkle_adapter_name(request, adapter_name) or ''
 
             if body.adapter_uri:
-                from twinkle.server.checkpoint import create_checkpoint_manager
-                checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
             else:
                 # No explicit uri: the OpenAI-gateway shape carries only the adapter's public
@@ -278,9 +294,10 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         # Calculate metrics for queue scheduling. The body is wire-validated, so the
         # entries are models and ``input_ids`` is absent or a list of ints.
         input_tokens = sum(len(getattr(entry, 'input_ids', None) or ()) for entry in body.inputs)
-        request_id = body.tracked_request_id(token)
         schedule = {}
-        if request_id is not None:
+        if submission is not None:
+            schedule = dict(request_id=submission.request_id, submission_fingerprint=submission.fingerprint)
+        elif request_id is not None:
             fingerprint = hashlib.sha256(f'{request.url.path}\n{body.model_dump_json()}'.encode()).hexdigest()
             schedule = dict(request_id=request_id, submission_fingerprint=fingerprint, track_execution=True)
 
@@ -290,6 +307,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             input_tokens=input_tokens,
             task_type='sample',
             execution_scope=request_execution_scope(request),
+            training_id=training_id,
             **schedule)
         if request_id is not None:
             record = await self.state.get_future(request_id)

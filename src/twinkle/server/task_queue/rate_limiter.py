@@ -7,13 +7,11 @@ requests-per-second (rps) and tokens-per-second (tps) limits with automatic
 memory cleanup to prevent unbounded memory growth.
 """
 from __future__ import annotations
-
 import asyncio
+import logging
 import time
 
-from twinkle.utils.logger import get_logger
-
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
@@ -127,13 +125,13 @@ class RateLimiter:
                                      f'Active tokens remaining: {len(self._token_requests)}')
 
                     if self._active_tokens_gauge is not None:
-                        self._active_tokens_gauge.set(len(self._token_requests), tags=self._metric_tags)
+                        self._active_tokens_gauge.set(len(self._token_requests), attributes=self._metric_tags)
 
             except asyncio.CancelledError:
                 logger.debug('[RateLimiter] Cleanup task cancelled')
                 break
             except Exception as e:
-                logger.warning(f'[RateLimiter] Error in cleanup task: {e}')
+                logger.warning('[RateLimiter] Error in cleanup task (%s)', type(e).__name__)
                 continue
 
     def start_cleanup_task(self) -> None:
@@ -179,5 +177,5 @@ class RateLimiter:
 
             self._token_requests[token].append((current_time, input_tokens))
             if self._active_tokens_gauge is not None:
-                self._active_tokens_gauge.set(len(self._token_requests), tags=self._metric_tags)
+                self._active_tokens_gauge.set(len(self._token_requests), attributes=self._metric_tags)
             return True, None

@@ -9,7 +9,7 @@ sys.modules[__name__] = _LazyModule(
         'backend': ['create_backend'],
         'base': ['BaseManager'],
         'cleanup_coordinator': ['ResourceCleanupCoordinator'],
-        'count_publisher': ['ResourceCountPublisher'],
+        'resource_snapshot_publisher': ['ResourceSnapshotPublisher'],
         'future_manager': ['FutureManager'],
         'model_manager': ['ModelManager'],
         'models': ['FutureRecord', 'ModelRecord', 'SamplingSessionRecord', 'SessionRecord'],
@@ -37,7 +37,7 @@ sys.modules[__name__].__all__ = [
     'ServerState',
     'ReplicaRegistry',
     'ResourceCleanupCoordinator',
-    'ResourceCountPublisher',
+    'ResourceSnapshotPublisher',
     'get_server_state',
     # Persistence backend factory
     'create_backend',

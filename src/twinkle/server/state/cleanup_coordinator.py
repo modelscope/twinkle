@@ -137,7 +137,7 @@ class ResourceCleanupCoordinator:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f'[ServerState Cleanup] Error during cleanup: {e}')
+                logger.warning('[ServerState Cleanup] Error during cleanup (%s)', type(e).__name__)
                 continue
 
     # ----- Leader election -----
@@ -150,7 +150,7 @@ class ResourceCleanupCoordinator:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f'[ServerState Leader] renew error: {e}')
+                logger.warning('[ServerState Leader] Renewal failed (%s)', type(e).__name__)
             await asyncio.sleep(LEASE_RENEW)
 
     async def _try_acquire_or_renew(self) -> None:
@@ -166,7 +166,7 @@ class ResourceCleanupCoordinator:
             else:
                 self._is_leader = await self._backend.set_nx(LEADER_KEY, self._leader_id, ttl=LEASE_TTL)
         except Exception as e:
-            logger.warning(f'[ServerState Leader] backend error during election: {e}')
+            logger.warning('[ServerState Leader] Backend error during election (%s)', type(e).__name__)
             self._is_leader = False
             # A renewal failure does not prove current ownership. Leave the key
             # untouched: our lease expires naturally, or a successor owns it.

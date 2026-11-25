@@ -11,8 +11,8 @@ class _RecordingGauge:
     def __init__(self) -> None:
         self.calls: list[tuple[int, dict[str, str]]] = []
 
-    def set(self, value: int, *, tags: dict[str, str]) -> None:
-        self.calls.append((value, tags))
+    def set(self, value: int, *, attributes: dict[str, str]) -> None:
+        self.calls.append((value, attributes))
 
 
 @pytest.mark.asyncio

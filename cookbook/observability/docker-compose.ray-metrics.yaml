@@ -1,0 +1,7 @@
+services:
+  collector:
+    command: ["--config=/etc/collector.yaml", "--config=/etc/collector-ray.yaml"]
+    environment:
+      OBS_RAY_METRICS_TARGET: "${OBS_RAY_METRICS_TARGET:?Set the private Ray metrics host:port}"
+    volumes:
+      - ./production/collector-ray.yaml:/etc/collector-ray.yaml:ro
