@@ -115,7 +115,14 @@ def encode_all(
 def prompt_ids(feat: dict[str, Any], state: RolloutState | None) -> list[int]:
     if state is None and feature_has_media(feat):
         raise NotImplementedError("multimodal sampling requires a Trajectory or RolloutState.")
-    input_ids = state.engine_input_ids if state is not None else feat["input_ids"]
+    # Every caller of this helper drives a HF (transformers) engine, which consumes the
+    # MODEL-READY feature ids: the template already expanded each media placeholder to the
+    # model's token count and precomputed the matching tensors (pixel_values / image_grid_thw).
+    # ``state.engine_input_ids`` is the COLLAPSED serving-engine prompt -- vLLM/SGLang re-expand
+    # placeholders themselves (VLLMSampler.sample reads engine_input_ids directly) -- and feeding
+    # it to a HF forward leaves one placeholder against N image features ("Image features and
+    # image tokens do not match: tokens: 1, features N", e.g. PaddleOCR-VL-1.5).
+    input_ids = feat["input_ids"]
     return input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
 
 
