@@ -86,10 +86,29 @@ class Accelerators:
         npu = getattr(torch, 'npu', None)
         return npu.device_count() if npu is not None and npu.is_available() else 0
 
+    @staticmethod
+    def backend() -> str | None:
+        """The communicator backend this box collectives over, or None if undetectable.
+
+        Counting devices is not enough to decide what a test can run: Kunlunxin mounts BKCL
+        under torch's ``cuda`` namespace, so an XPU box reports CUDA devices and would collect
+        -- then fail -- every NCCL test. The platform's own answer is what separates them.
+        """
+        try:
+            from twinkle.comm import default_backend
+            return default_backend()
+        except Exception:  # noqa: BLE001 -- an undetectable platform must not break collection
+            return None
+
 
 def pytest_collection_modifyitems(config, items):
-    """Skip -- never fail -- tests asking for more accelerators than this box has."""
+    """Skip -- never fail -- tests this box cannot run.
+
+    ``accel(n)`` asks for n accelerators; ``accel(n, backend='nccl')`` additionally asks for a
+    box whose collectives go through that backend.
+    """
     available = Accelerators.count()
+    box_backend = Accelerators.backend()
     for item in items:
         marker = item.get_closest_marker('accel')
         if marker is None:
@@ -97,3 +116,8 @@ def pytest_collection_modifyitems(config, items):
         needed = marker.args[0] if marker.args else 1
         if available < needed:
             item.add_marker(pytest.mark.skip(reason=f'needs {needed} accelerator(s), found {available}'))
+            continue
+        wanted = marker.kwargs.get('backend')
+        if wanted is not None and wanted != box_backend:
+            item.add_marker(pytest.mark.skip(reason=f'needs a {wanted} box, this one collectives over '
+                                             f'{box_backend!r}'))
