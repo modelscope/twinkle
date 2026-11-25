@@ -593,6 +593,17 @@ class VLLMEngine(BaseSamplerEngine):
             topk_prompt_logprobs=result_topk_prompt_logprobs,
         )
 
+    async def _supported_pooling_tasks(self):
+        """Pooling tasks this engine's model supports, or None when the engine cannot report them.
+
+        vLLM v1 AsyncLLM exposes the cached ``get_supported_tasks``; older engines lack it, so the
+        caller leaves the request task untouched rather than guessing a backend mapping.
+        """
+        getter = getattr(self.engine, 'get_supported_tasks', None)
+        if getter is None:
+            return None
+        return await getter()
+
     async def encode(self,
                      prompt: Union[List[int], str],
                      pooling_params: Optional[Union[PoolingParams, Dict[str, Any]]] = None,
@@ -625,7 +636,16 @@ class VLLMEngine(BaseSamplerEngine):
             pooling_params = PoolingParams()
         elif isinstance(pooling_params, dict):
             pooling_params = PoolingParams.from_dict(pooling_params)
-        vllm_pooling = pooling_params.to_vllm(**kwargs)
+        # Some reward architectures (e.g. vLLM's native InternLM2ForRewardModel) build a
+        # token_classify pooler and reject task='classify' ("Unsupported task: 'classify'"). Map the
+        # classify request onto token_classify for such engines and read the reward off the last
+        # prompt token's row below; engines that support classify natively are left untouched.
+        backend_task = None
+        if pooling_params.task == "classify":
+            supported = await self._supported_pooling_tasks()
+            if supported is not None and "classify" not in supported and "token_classify" in supported:
+                backend_task = "token_classify"
+        vllm_pooling = pooling_params.to_vllm(task=backend_task, **kwargs)
 
         if request_id is None:
             request_id = uuid.uuid4().hex
@@ -661,7 +681,12 @@ class VLLMEngine(BaseSamplerEngine):
         if result is None:
             raise RuntimeError('Pooling encode did not produce a result')
 
-        data = pooling_to_list(result.outputs.data, normalize=pooling_params.normalize)
+        raw = result.outputs.data
+        if backend_task == "token_classify":
+            # token_classify returns one row per prompt token ([T, C]); the classify/reward readout
+            # is the LAST prompt token's row -- the position a sequence-classification head scores.
+            raw = raw[-1]
+        data = pooling_to_list(raw, normalize=pooling_params.normalize)
         return PoolingResponse(data=data, task=pooling_params.task, prompt_token_ids=prompt_token_ids)
 
     async def generate_stream(self,

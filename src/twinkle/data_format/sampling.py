@@ -330,8 +330,13 @@ class PoolingParams:
             if self.dimensions <= 0:
                 raise ValueError(f"dimensions must be > 0, got {self.dimensions}")
 
-    def to_vllm(self, **kwargs):
-        """Convert to vLLM's ``PoolingParams``, keeping only the fields the installed version takes."""
+    def to_vllm(self, *, task: str | None = None, **kwargs):
+        """Convert to vLLM's ``PoolingParams``, keeping only the fields the installed version takes.
+
+        ``task`` overrides the request task for the backend call (e.g. the vLLM backend maps a
+        ``classify`` request onto ``token_classify`` for a reward architecture whose pooler only
+        supports that task); the caller-facing :class:`PoolingResponse` keeps the original task.
+        """
         import inspect
 
         from vllm.pooling_params import PoolingParams as VLLMPoolingParams
@@ -339,7 +344,7 @@ class PoolingParams:
         params = dict(kwargs)
         signature = inspect.signature(VLLMPoolingParams).parameters
         if "task" in signature:
-            params["task"] = self.task
+            params["task"] = task if task is not None else self.task
         if self.use_activation:
             if "use_activation" in signature:
                 params["use_activation"] = True
