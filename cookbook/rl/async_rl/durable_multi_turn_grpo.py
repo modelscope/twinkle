@@ -2,13 +2,18 @@
 """Crash-safe GSM8K multi-turn GRPO using model component state.
 
 The StreamingDriver persists only original prompt queries. The trainer writes that component
-state in the same checkpoint as the adapter, optimizer, scheduler and RNG state:
+state and the checkpoint manager's logical version with the adapter, optimizer, scheduler and RNG:
 
-    component = driver.state_dict()
-    model.save(..., component_states={"streaming_driver": component})
+    component_states = {
+        "streaming_driver": driver.state_dict(),
+        "checkpoint_manager": checkpoint_manager.state_dict(),
+    }
+    model.save(..., component_states=component_states)
+    checkpoint_manager.sync_weights(merge_and_sync=False)
 
-On resume, the model checkpoint is loaded first and the saved queries are submitted as fresh
-rollout attempts. No environment snapshot, turn journal or second commit protocol is involved.
+On resume, the model checkpoint is loaded first, then the manager restores its version and syncs
+before the driver loads its queries. Saved queries are submitted as fresh rollout attempts. No
+environment snapshot, turn journal or second commit protocol is involved.
 """
 
 from __future__ import annotations
@@ -160,16 +165,26 @@ def main() -> None:
         remote_group="sampler",
     )
     sampler.set_template("Qwen3_5Template", model_id=args.model_id, enable_thinking=False)
-    checkpoint_manager = CheckpointEngineManager(model=model, sampler=sampler, merge_and_sync=False)
+    checkpoint_manager = CheckpointEngineManager(model=model, sampler=sampler)
 
     checkpoint = args.resume_checkpoint or _latest_checkpoint(checkpoint_root)
     component_states: dict[str, Any] = {}
+    driver_state = None
     optim_step = 0
     if checkpoint:
         progress = model.resume_from_checkpoint(checkpoint, adapter_name=args.adapter_name)
         component_states = dict(progress.get("component_states") or {})
         optim_step = int(progress.get("cur_step") or 0)
-        checkpoint_manager.sync_weights()
+        driver_state = component_states.get("streaming_driver")
+        manager_state = component_states.get("checkpoint_manager")
+        if driver_state is not None and manager_state is None:
+            raise ValueError(
+                "checkpoint contains streaming_driver state but is missing checkpoint_manager component state; "
+                "cannot resume safely"
+            )
+        if manager_state is not None:
+            checkpoint_manager.load_state_dict(manager_state)
+        checkpoint_manager.sync_weights(merge_and_sync=False)
         logger.info("resumed %s at optimizer step %s", checkpoint, optim_step)
 
     dataset = Dataset()
@@ -219,7 +234,7 @@ def main() -> None:
         orms=[_reward_future(GSM8KAccuracyReward()), _reward_future(GSM8KBrevityReward())],
         orm_names=["accuracy", "brevity"],
     )
-    driver.load_state_dict(component_states.get("streaming_driver"))
+    driver.load_state_dict(driver_state)
 
     advantage_fn = GRPOAdvantage(num_generations=args.num_generations)
     metrics = CompletionRewardMetric()
@@ -243,16 +258,19 @@ def main() -> None:
             model.clip_grad_and_step()
             optim_step += 1
 
-            component = driver.state_dict()
+            component_states = {
+                "streaming_driver": driver.state_dict(),
+                "checkpoint_manager": checkpoint_manager.state_dict(),
+            }
             checkpoint = model.save(
                 f"policy-step-{optim_step}",
                 output_dir=str(checkpoint_root),
                 adapter_name=args.adapter_name,
                 save_optimizer=True,
                 async_save=False,
-                component_states={"streaming_driver": component},
+                component_states=component_states,
             )
-            checkpoint_manager.sync_weights()
+            checkpoint_manager.sync_weights(merge_and_sync=False)
             sampler.reset_prefix_cache()
 
             log_dict = metrics.calculate()

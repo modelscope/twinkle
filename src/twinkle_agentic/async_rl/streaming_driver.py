@@ -320,8 +320,11 @@ class StreamingDriver:
         self._exhausted = False
         self._error: Optional[BaseException] = None
         self._rows: Optional[Iterator[Any]] = None
+        self._pending_rows: deque[Any] = deque()
         self._prompt_seq = 0
         self._skip_prompts = 0
+        self._start_epoch = 0
+        self._loader_resumed = False
         self._groups: Dict[str, _Group] = {}
         #: Member rows admitted and not dropped (baselines excluded): what the version bound caps.
         self._live = 0
@@ -581,6 +584,7 @@ class StreamingDriver:
                 'prompts_drawn': self._prompt_seq,
                 'policy_version': self._version,
                 'loader_state': loader_state,
+                'pending_rows': [copy.deepcopy(row) for row in self._pending_rows],
                 'queries': [
                     {
                         'key': group.key,
@@ -628,6 +632,11 @@ class StreamingDriver:
             self._base_version = self._version
             self._handed = int(state.get('handed') or 0)
             self._prompt_seq = int(state.get('prompts_drawn') or 0)
+            self._exhausted = self.max_steps is not None and self._handed >= self.max_steps
+            pending_rows = state.get('pending_rows') or ()
+            if not isinstance(pending_rows, (list, tuple)):
+                raise ValueError('StreamingDriver pending_rows must be a list or tuple')
+            self._pending_rows = deque(copy.deepcopy(row) for row in pending_rows)
 
             seen = set()
             for query in queries:
@@ -638,13 +647,14 @@ class StreamingDriver:
                 row = copy.deepcopy(query.get('row'))
                 group = _Group(key=key, row=row)
                 self._groups[key] = group
-                self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
-                self._counters['resumed_queries'] += 1
-                logger.info(
-                    'restored rollout query %s at policy version %s',
-                    key,
-                    self._version,
-                )
+                if not self._exhausted:
+                    self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
+                    self._counters['resumed_queries'] += 1
+                    logger.info(
+                        'restored rollout query %s at policy version %s',
+                        key,
+                        self._version,
+                    )
 
             loader_state = state.get('loader_state')
             loader = (
@@ -656,10 +666,13 @@ class StreamingDriver:
                 if not callable(loader):
                     raise ValueError('component state has a dataloader snapshot, but the dataloader cannot load it')
                 loader(loader_state)
+                position = self._loader_state() or loader_state
+                if isinstance(position, dict):
+                    self._start_epoch = int(position.get('epoch') or 0)
+                self._loader_resumed = True
             else:
-                # A plain iterable has no cursor; skip the prompts already represented by ``queries``
-                # and continue from the snapshot's dataloader position.
-                self._skip_prompts = self._prompt_seq
+                # A plain iterable has no cursor; skip every row the old iterator already consumed.
+                self._skip_prompts = self._prompt_seq + len(self._pending_rows)
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
     def close(self, timeout: float = 30.0) -> None:
@@ -938,20 +951,24 @@ class StreamingDriver:
         return next(self._rows, None)
 
     def _iter_rows(self) -> Iterator[Any]:
-        for epoch in range(max(1, math.ceil(self.num_epochs))):
+        while self._pending_rows:
+            yield self._pending_rows.popleft()
+        for epoch in range(self._start_epoch, max(1, math.ceil(self.num_epochs))):
             set_epoch = getattr(self.dataloader, 'set_epoch', None)
-            if set_epoch is not None:
+            if set_epoch is not None and (not self._loader_resumed or epoch != self._start_epoch):
                 set_epoch(epoch)
             for batch in self.dataloader:
                 if isinstance(batch, (list, tuple)):
                     rows = batch
                 else:
                     rows = (batch,)
-                for row in rows:
+                self._pending_rows.extend(rows)
+                while self._pending_rows:
                     if self._skip_prompts:
+                        self._pending_rows.popleft()
                         self._skip_prompts -= 1
                         continue
-                    yield row
+                    yield self._pending_rows.popleft()
 
     def _start_attempt(self, group: _Group, trajectories: List[Any]) -> None:
         """Submit one attempt's trajectories: the non-baseline ones replace the members (under the lock)."""

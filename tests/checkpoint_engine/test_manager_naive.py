@@ -122,6 +122,34 @@ def test_local_merge_sync_generates_a_full_weight_set_each_time():
     assert [call['base_sync_done'] for call in model.generator_calls] == [False, True]
 
 
+def test_manager_component_state_restores_version_without_restoring_transport_state():
+    def weights(call):
+        return ([('q_proj.lora_A', 'adapter')]
+                if call['base_sync_done'] else [('q_proj.weight', 'base')])
+
+    source = CheckpointEngineManager(_Model(weights), _Sampler(), platform='CPU')
+    for _ in range(4):
+        source.sync_weights(merge_and_sync=False)
+    state = source.state_dict()
+
+    assert state == {'format': 'twinkle.checkpoint-engine-manager.v1', 'version': 4}
+    model = _Model(weights)
+    sampler = _Sampler()
+    restored = CheckpointEngineManager(model, sampler, platform='CPU')
+    restored.load_state_dict(state)
+    assert restored.version() == 4
+    assert restored.base_sync_done is False
+
+    restored.sync_weights(merge_and_sync=False)
+    restored.sync_weights(merge_and_sync=False)
+
+    assert restored.version() == 6
+    assert sampler.loaded == [[('q_proj.weight', 'base')], [('q_proj.lora_A', 'adapter')]]
+    assert [call['base_sync_done'] for call in model.generator_calls] == [False, True]
+    with pytest.raises(ValueError, match='state version'):
+        restored.load_state_dict({'format': 'twinkle.checkpoint-engine-manager.v1', 'version': 1.5})
+
+
 def test_local_failure_does_not_mark_base_sync_done():
     model = _Model([('q_proj.weight', 'base')])
     error = RuntimeError('sampler failed')
