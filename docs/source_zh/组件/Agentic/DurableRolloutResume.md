@@ -37,16 +37,15 @@ ckpt_manager.sync_weights()
 
 | 字段 | 含义 |
 | --- | --- |
-| `queries` | 尚未被新 checkpoint 覆盖的原始 query，以及仍在运行或等待消费的 query |
-| `admitted_through` | 本次快照覆盖的最后一个 admission 序号 |
+| `queries` | checkpoint 时仍在运行或等待消费的原始 query |
 | `handed` | 已交给训练器的 batch 数 |
 | `prompts_drawn` | 已从 dataloader 读取的 prompt 数 |
 | `policy_version` | 快照时 driver 观察到的策略版本 |
 | `loader_state` | dataloader 自带的状态；不存在时使用 `prompts_drawn` 恢复游标 |
 
-`state_dict()` 是一次性 checkpoint 快照：生成后即释放已交付 group 的 query 历史。若
-`model.save()` 抛出异常，训练进程应按上一个 checkpoint 恢复；同一进程若要重试，应直接
-复用刚返回的 `component` 对象。仍在运行或尚未消费的 group 会继续出现在后续快照中。
+`state_dict()` 只读取当前活跃和 ready group，不修改 admission、staleness 或采样调度状态。
+已经交给训练器的 batch 不写入下一个 checkpoint；若新 checkpoint 写入失败，从上一个
+checkpoint 恢复时仍会重放该 batch。
 
 ## 恢复
 

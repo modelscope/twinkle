@@ -45,7 +45,6 @@ def test_component_state_persists_raw_query_and_replays_it():
     assert state["queries"] == [
         {
             "key": "0",
-            "admitted_at": 1,
             "row": query,
         }
     ]
@@ -95,7 +94,7 @@ def test_policy_advance_does_not_delete_an_inflight_tool_query():
     _finish(driver, rollout)
 
 
-def test_component_snapshot_releases_delivered_query_history():
+def test_component_snapshot_does_not_mutate_scheduling_state():
     rollout = _Rollout()
     driver = StreamingDriver(
         [{"messages": [{"role": "user", "content": "one"}]}],
@@ -104,10 +103,10 @@ def test_component_snapshot_releases_delivered_query_history():
         num_generations=1,
     )
     driver._admit()
+    before = (set(driver._groups), driver._live, driver._inflight, dict(driver._counters))
     state = driver.state_dict()
 
-    assert driver._uncheckpointed == {}
-
-    # The active group is still part of the live run, so the next snapshot includes it again.
-    assert driver.state_dict()["queries"][0]["row"] == state["queries"][0]["row"]
+    assert driver._groups.keys() == before[0]
+    assert (driver._live, driver._inflight, driver._counters) == before[1:]
+    assert state["queries"][0]["row"] == {"messages": [{"role": "user", "content": "one"}]}
     _finish(driver, rollout)

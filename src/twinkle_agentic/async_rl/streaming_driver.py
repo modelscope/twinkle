@@ -134,8 +134,6 @@ class _Group:
     """One prompt row's episodes: the current attempt's members and the baseline episodes it waits for."""
     key: str
     row: Any
-    #: Monotonic admission order used by the component checkpoint.
-    admitted_at: int = 0
     attempt: int = 0
     #: The current attempt's member trajectories, aligned with ``members`` (a lost one is redone from here).
     source: List[Any] = field(default_factory=list)
@@ -324,15 +322,7 @@ class StreamingDriver:
         self._rows: Optional[Iterator[Any]] = None
         self._prompt_seq = 0
         self._skip_prompts = 0
-        self._admit_seq = 0
         self._groups: Dict[str, _Group] = {}
-        #: Queries admitted after the last committed model checkpoint. Finished groups stay here
-        #: until the next component snapshot; a bounded window keeps the default path leak-free.
-        self._uncheckpointed: Dict[str, _Group] = {}
-        self._query_history_limit = max(
-            1,
-            (max_staleness + 1) * sync_interval * (batch_size // num_generations),
-        )
         #: Member rows admitted and not dropped (baselines excluded): what the version bound caps.
         self._live = 0
         self._inflight = 0
@@ -585,42 +575,30 @@ class StreamingDriver:
         with self._lock:
             groups = self._snapshot_groups()
             loader_state = self._loader_state()
-            state = {
+            return {
                 'format': 'twinkle.streaming-driver.v1',
                 'handed': self._handed,
                 'prompts_drawn': self._prompt_seq,
-                'admitted_through': self._admit_seq,
                 'policy_version': self._version,
                 'loader_state': loader_state,
                 'queries': [
                     {
                         'key': group.key,
-                        'admitted_at': group.admitted_at,
                         'row': copy.deepcopy(group.row),
                     }
                     for group in groups
                 ],
             }
-            # ``state_dict()`` is the value handed to model.save(). Collecting it consumes the
-            # delivered-query history: a failed save crashes the run before another iteration, while
-            # the returned in-memory ``state`` remains available to a same-process retry. Active and
-            # ready groups still appear in the next snapshot through their live containers.
-            for group in groups:
-                if group.admitted_at <= self._admit_seq:
-                    self._uncheckpointed.pop(group.key, None)
-            return state
 
     def _snapshot_groups(self) -> List[_Group]:
-        """Collect every admitted query that the next checkpoint must be able to recover."""
+        """Collect active and ready queries that have not yet been handed to the trainer."""
         by_key: Dict[str, _Group] = {}
-        for group in self._uncheckpointed.values():
-            by_key[group.key] = group
         for group in self._groups.values():
             by_key[group.key] = group
         for members in self._ready:
             if members:
                 by_key[members[0].group.key] = members[0].group
-        return sorted(by_key.values(), key=lambda group: group.admitted_at)
+        return sorted(by_key.values(), key=lambda group: int(group.key))
 
     def _loader_state(self) -> Any:
         getter = getattr(self.dataloader, 'state_dict', None) or getattr(self.dataloader, 'get_state', None)
@@ -650,7 +628,6 @@ class StreamingDriver:
             self._base_version = self._version
             self._handed = int(state.get('handed') or 0)
             self._prompt_seq = int(state.get('prompts_drawn') or 0)
-            self._admit_seq = int(state.get('admitted_through') or 0)
 
             seen = set()
             for query in queries:
@@ -658,16 +635,9 @@ class StreamingDriver:
                 if not key or key in seen:
                     raise ValueError(f'invalid or duplicate StreamingDriver query key {key!r}')
                 seen.add(key)
-                admitted_at = int(query.get('admitted_at') or 0)
                 row = copy.deepcopy(query.get('row'))
-                group = _Group(
-                    key=key,
-                    row=row,
-                    admitted_at=admitted_at,
-                )
+                group = _Group(key=key, row=row)
                 self._groups[key] = group
-                self._remember_query(group)
-                self._admit_seq = max(self._admit_seq, admitted_at)
                 self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
                 self._counters['resumed_queries'] += 1
                 logger.info(
@@ -958,17 +928,9 @@ class StreamingDriver:
                 return
             key = str(self._prompt_seq)
             self._prompt_seq += 1
-            self._admit_seq += 1
-            group = _Group(key=key, row=row, admitted_at=self._admit_seq)
+            group = _Group(key=key, row=row)
             self._groups[key] = group
-            self._remember_query(group)
             self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
-
-    def _remember_query(self, group: _Group) -> None:
-        self._uncheckpointed[group.key] = group
-        while len(self._uncheckpointed) > self._query_history_limit:
-            oldest = min(self._uncheckpointed.values(), key=lambda item: item.admitted_at)
-            self._uncheckpointed.pop(oldest.key, None)
 
     def _next_row(self) -> Any:
         if self._rows is None:
@@ -1307,7 +1269,6 @@ class StreamingDriver:
         """Give the group up: its counted rows leave the bound, its unfinished episodes stop (under the lock)."""
         if self._groups.pop(group.key, None) is None:
             return
-        self._uncheckpointed.pop(group.key, None)
         self._counters['dropped_group'] += 1
         for episode in group.members + group.baselines:
             if episode.lost:
