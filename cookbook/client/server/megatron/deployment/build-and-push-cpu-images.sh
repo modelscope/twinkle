@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+role=all
+case "${1:-}" in
+    all|gateway|observability)
+        role=$1
+        shift
+        ;;
+esac
 if [[ $# -gt 1 ]]; then
-    printf 'Usage: %s [version]\n' "${0##*/}" >&2
+    printf 'Usage: %s [all|gateway|observability] [version]\n' "${0##*/}" >&2
     exit 2
 fi
 
@@ -12,37 +19,48 @@ if [[ ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,109}$ ]]; then
     exit 2
 fi
 
-cpu1_dockerfile=cookbook/client/server/megatron/deployment/Dockerfile.cpu1
-cpu2_dockerfile=cookbook/observability/Dockerfile.runtime
+gateway_dockerfile=cookbook/client/server/megatron/deployment/Dockerfile.gateway
+observability_dockerfile=cookbook/observability/Dockerfile.runtime
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 context=$PWD
-if [[ -f "$script_dir/Dockerfile.cpu1" ]]; then
+if [[ -f "$script_dir/Dockerfile.gateway" ]]; then
     context=$(cd -- "$script_dir/../../../../.." && pwd)
-elif [[ -f "$script_dir/$cpu1_dockerfile" ]]; then
+elif [[ -f "$script_dir/$gateway_dockerfile" ]]; then
     context=$script_dir
 fi
-if [[ ! -f "$context/$cpu1_dockerfile" || ! -f "$context/$cpu2_dockerfile" ]]; then
+if [[ ! -f "$context/$gateway_dockerfile" || ! -f "$context/$observability_dockerfile" ]]; then
     printf 'Run from the extracted build context or the Twinkle repository.\n' >&2
     exit 2
 fi
 
 registry=openmind-registry.cn-hangzhou.cr.aliyuncs.com
-cpu1_image="$registry/openmind/modelscope:twinkle-cpu1-$version"
-cpu2_image="$registry/openmind/modelscope:twinkle-cpu2-$version"
 alpine_mirror=${ALPINE_MIRROR-https://mirrors.aliyun.com/alpine}
+dockerhub_mirror=${DOCKERHUB_MIRROR:-docker.io}
+dockerhub_mirror=${dockerhub_mirror#https://}
 
 sudo -v
 sudo docker info >/dev/null
 sudo docker login "$registry"
 
-build_image() {
-    sudo env DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
+roles=("$role")
+if [[ "$role" == all ]]; then
+    roles=(gateway observability)
+fi
+images=()
+for component in "${roles[@]}"; do
+    case "$component" in
+        gateway) dockerfile=$gateway_dockerfile ;;
+        observability) dockerfile=$observability_dockerfile ;;
+    esac
+    image="$registry/openmind/modelscope:twinkle-$component-$version"
+    printf '\nBuilding %s\n' "$image"
+    sudo env DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --progress=plain \
         --build-arg "ALPINE_MIRROR=$alpine_mirror" \
-        -f "$context/$1" -t "$2" "$context"
-}
-
-build_image "$cpu1_dockerfile" "$cpu1_image"
-build_image "$cpu2_dockerfile" "$cpu2_image"
-sudo docker push "$cpu1_image"
-sudo docker push "$cpu2_image"
-printf '\nPublished images\n%s\n%s\n' "$cpu1_image" "$cpu2_image"
+        --build-arg "DOCKERHUB_PREFIX=${dockerhub_mirror%/}/" \
+        -f "$context/$dockerfile" -t "$image" "$context"
+    images+=("$image")
+done
+for image in "${images[@]}"; do
+    sudo docker push "$image"
+done
+printf '\nPublished images\n%s\n' "${images[@]}"

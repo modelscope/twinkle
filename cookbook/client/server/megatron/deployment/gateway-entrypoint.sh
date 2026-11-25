@@ -2,9 +2,9 @@
 set -euo pipefail
 umask 077
 
-root=/opt/twinkle-cpu
+root=/opt/twinkle-gateway
 source "$root/twinkle-runtime-common.sh"
-load_config "${1:-/config/twinkle-cpu1.env}"
+load_config "${1:-/config/twinkle-gateway.env}"
 
 : "${TWINKLE_UPSTREAM:?Set the private Serve address, including its port}"
 : "${TWINKLE_REDIS_DATA_DIR:?Set the persistent Redis data directory}"

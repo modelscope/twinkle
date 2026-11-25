@@ -4,7 +4,7 @@ umask 077
 
 root=/opt/twinkle-observability
 source "$root/twinkle-runtime-common.sh"
-load_config "${1:-/config/twinkle-cpu2.env}"
+load_config "${1:-/config/twinkle-observability.env}"
 
 : "${OBS_DATA_DIR:?Set the persistent observability data directory}"
 : "${OBS_REDIS_URL:?Set the private Redis address}"

@@ -1,8 +1,9 @@
-FROM otel/opentelemetry-collector-contrib:0.132.0 AS collector
-FROM grafana/mimir:2.17.1 AS mimir
-FROM grafana/loki:3.5.5 AS loki
-FROM grafana/tempo:2.8.2 AS tempo
-FROM grafana/grafana:12.1.1
+ARG DOCKERHUB_PREFIX=docker.io/
+FROM ${DOCKERHUB_PREFIX}otel/opentelemetry-collector-contrib:0.132.0 AS collector
+FROM ${DOCKERHUB_PREFIX}grafana/mimir:2.17.1 AS mimir
+FROM ${DOCKERHUB_PREFIX}grafana/loki:3.5.5 AS loki
+FROM ${DOCKERHUB_PREFIX}grafana/tempo:2.8.2 AS tempo
+FROM ${DOCKERHUB_PREFIX}grafana/grafana:12.1.1
 
 USER root
 ARG ALPINE_MIRROR
@@ -28,10 +29,10 @@ COPY cookbook/observability/production/collector.yaml \
      cookbook/observability/production/render_runtime.py \
      cookbook/observability/production/usage-limits.example.json /opt/twinkle-observability/production/
 COPY cookbook/observability/grafana/dashboards/twinkle-multitenant.json /opt/twinkle-observability/grafana/dashboards/
-COPY cookbook/observability/production/runtime-entrypoint.sh /usr/local/bin/twinkle-cpu2
-RUN chmod +x /usr/local/bin/twinkle-cpu2
+COPY cookbook/observability/production/runtime-entrypoint.sh /usr/local/bin/twinkle-observability
+RUN chmod +x /usr/local/bin/twinkle-observability
 USER 472
 
 EXPOSE 3000 4317
 ENTRYPOINT []
-CMD ["/sbin/tini", "--", "/usr/local/bin/twinkle-cpu2"]
+CMD ["/sbin/tini", "--", "/usr/local/bin/twinkle-observability"]

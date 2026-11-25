@@ -1,5 +1,6 @@
-FROM redis:7.4.9-alpine AS redis
-FROM nginx:1.28-alpine
+ARG DOCKERHUB_PREFIX=docker.io/
+FROM ${DOCKERHUB_PREFIX}library/redis:7.4.9-alpine AS redis
+FROM ${DOCKERHUB_PREFIX}library/nginx:1.28-alpine
 
 ARG ALPINE_MIRROR
 RUN if [ -n "$ALPINE_MIRROR" ]; then \
@@ -10,10 +11,10 @@ RUN redis-server --version && redis-cli --version
 COPY cookbook/client/server/megatron/deployment/redis.conf \
      cookbook/client/server/megatron/deployment/nginx.conf.template \
      cookbook/client/server/megatron/deployment/render_redis_acl.py \
-     cookbook/client/server/twinkle-runtime-common.sh /opt/twinkle-cpu/
-COPY cookbook/client/server/megatron/deployment/cpu1-entrypoint.sh /usr/local/bin/twinkle-cpu1
-RUN chmod +x /usr/local/bin/twinkle-cpu1
+     cookbook/client/server/twinkle-runtime-common.sh /opt/twinkle-gateway/
+COPY cookbook/client/server/megatron/deployment/gateway-entrypoint.sh /usr/local/bin/twinkle-gateway
+RUN chmod +x /usr/local/bin/twinkle-gateway
 
 EXPOSE 9000 6380
 ENTRYPOINT []
-CMD ["/sbin/tini", "--", "/usr/local/bin/twinkle-cpu1"]
+CMD ["/sbin/tini", "--", "/usr/local/bin/twinkle-gateway"]
