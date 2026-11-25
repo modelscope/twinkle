@@ -424,10 +424,21 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                     init_method(self, *args, **kwargs)
                 else:
                     if hasattr(cls, '__iter__'):
-                        _dispatch = self.__iter__._dispatch
-                        _execute = self.__iter__._execute
-                        _collect = self.__iter__._collect
-                        _lazy = self.__iter__._lazy_collect
+                        # Read the iterator's dispatch contract off the ORIGINAL user-declared
+                        # ``__iter__`` (``iter_origin``), never off ``self.__iter__``: on a SECOND
+                        # instantiation of the same class ``self.__iter__`` is already the round-1
+                        # re-wrapper below (``collect='none'``, ``lazy_collect=None``), so reading it
+                        # would silently drop the user's ``collect``/``lazy_collect`` and make every
+                        # later round's ``__next__`` fall back to the global ``infra._lazy_collect``
+                        # (True under ray) -- handing the trainer an unmaterialised LazyCollect batch
+                        # instead of the plain (rows, facts) it declared (G35 item7 round-2 crash:
+                        # 'LazyCollect' object has no attribute 'values'). ``iter_origin`` is the
+                        # pre-wrap method on the first instantiation and the preserved original on
+                        # every later one, so the contract is stable across rounds.
+                        _dispatch = iter_origin._dispatch
+                        _execute = iter_origin._execute
+                        _collect = iter_origin._collect
+                        _lazy = iter_origin._lazy_collect
                         import ray
                         # The user's original iterator is recorded ONCE: a later instantiation of
                         # the same class must not overwrite it with our own wrapper, whose body
