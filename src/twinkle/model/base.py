@@ -29,6 +29,29 @@ if TYPE_CHECKING:
 from twinkle.utils.storage import LocalDiskStorage, Storage, WriteLease
 
 
+def warn_cumulative_metric_state_not_restored(optimizer_config, backend: str) -> None:
+    """Name the metric-restore capability gap at a full resume, never silently.
+
+    Checkpoints persist weights/optimizer/scheduler/scaler/RNG/progress, but the in-memory
+    accumulators of registered metrics (numerator/denominator counters that span steps until
+    ``calculate()`` drains them) are NOT written to disk and NOT reinstalled on resume: a
+    resumed run's cumulative statistics cover only the post-resume window. Per-step metrics
+    are unaffected. Warn whenever a full resume lands on a group that already has metrics
+    registered, so the truncated accumulation is an announced boundary, not a silent reset.
+    """
+    from twinkle.utils import get_logger
+    names = []
+    for status in (getattr(optimizer_config, 'train_status', None),
+                   getattr(optimizer_config, 'eval_status', None)):
+        names += [type(m).__name__ for m in (getattr(status, 'metrics', None) or [])]
+    if names:
+        get_logger().warning(
+            'Cumulative metric state is not part of the checkpoint (%s backend): registered '
+            'metrics %s keep only post-resume accumulation; counters built up before the '
+            'checkpoint are not restored. Per-step calculate_metric values are unaffected.',
+            backend, sorted(set(names)))
+
+
 def copy_checkpoint_args(output_dir: str, checkpoint_dir: str) -> None:
     """Copy the run-level CLI metadata into a completed local checkpoint (master rank).
 

@@ -1912,6 +1912,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                                           'trainer_state.json')
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
+        from twinkle.model.base import warn_cumulative_metric_state_not_restored
+        warn_cumulative_metric_state_not_restored(optimizer_config, 'megatron')
         result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],

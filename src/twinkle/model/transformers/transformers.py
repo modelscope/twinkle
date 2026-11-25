@@ -3072,6 +3072,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             }
 
         trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
+        from twinkle.model.base import warn_cumulative_metric_state_not_restored
+        warn_cumulative_metric_state_not_restored(optimizer_config, 'transformers')
         result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],

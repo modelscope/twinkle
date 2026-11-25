@@ -419,11 +419,21 @@ class MultiLoraMegatronModel(MegatronModel):
             if optimizer_config.lr_scheduler is not None and 'opt_param_scheduler' in state_dict:
                 optimizer_config.lr_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
         # RNG is intentionally not restored: the global RNG is shared across tenants, and
-        # restoring it would silently affect other active adapters' dropout / init.
-        if not no_load_rng and 'rng_state' in state_dict:
-            logger.warning('Skipping RNG state restoration in multi-tenant mode. '
-                           'Global RNG is shared across tenants; restoring it would '
-                           'affect other active adapters.')
+        # restoring it would silently affect other active adapters' dropout / init. The skip
+        # must never be silent: the checkpoint DOES carry rng_state, and this path drops it
+        # even when the caller asked for restoration (no_load_rng=False) -- and the default
+        # here (True) plus the remote resume protocol (no no_load_rng field) reach the same
+        # skip without any explicit opt-out, so warn on every dropped rng_state.
+        if 'rng_state' in state_dict:
+            if not no_load_rng:
+                logger.warning('Skipping RNG state restoration in multi-tenant mode. '
+                               'Global RNG is shared across tenants; restoring it would '
+                               'affect other active adapters.')
+            else:
+                logger.warning('Checkpoint carries RNG state but multi-tenant mode does not restore it '
+                               '(no_load_rng defaults to True on this path, and remote resume cannot '
+                               'pass no_load_rng=false). The shared global RNG keeps its current stream; '
+                               'stochastic ops (e.g. lora_dropout) will not replay the source run.')
         if optimizer_config is not None and 'iteration' in state_dict:
             optimizer_config.cur_step = state_dict['iteration']
 
@@ -569,6 +579,8 @@ class MultiLoraMegatronModel(MegatronModel):
                                     f'Ensure the checkpoint was saved with save_optimizer=True.')
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
+        from twinkle.model.base import warn_cumulative_metric_state_not_restored
+        warn_cumulative_metric_state_not_restored(optimizer_config, 'multi-lora megatron')
 
         if optimizer_config is not None:
             optimizer_config.cur_step = trainer_state['cur_step']
