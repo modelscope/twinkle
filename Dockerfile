@@ -31,6 +31,8 @@ RUN pip install --no-cache-dir --no-deps --no-build-isolation \
 # Install twinkle itself (with server extras: redis + otel + telemetry)
 RUN pip install -e ".[server]" --no-build-isolation
 COPY cookbook/ ./cookbook/
+COPY cookbook/client/server/twinkle-runtime.sh /usr/local/bin/twinkle-runtime
+COPY cookbook/client/server/twinkle-runtime-common.sh /usr/local/bin/
 
 # ---------- Redis server ----------
 COPY --from=redis /usr/local/bin/redis-server /usr/local/bin/redis-server

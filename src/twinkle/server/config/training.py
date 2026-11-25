@@ -53,6 +53,7 @@ class TrainingArguments(BaseModel):
     adapter_config: AdapterConfig = Field(default_factory=AdapterConfig)
     strategy: Literal["accelerate", "native_fsdp"] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
+    node_selector: dict[str, str] = Field(default_factory=dict)
     max_length: int | None = Field(default=None, gt=0, strict=True)
     template: dict[str, Any] | None = None
     model_cls: str | None = None

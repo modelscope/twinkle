@@ -1,0 +1,37 @@
+FROM otel/opentelemetry-collector-contrib:0.132.0 AS collector
+FROM grafana/mimir:2.17.1 AS mimir
+FROM grafana/loki:3.5.5 AS loki
+FROM grafana/tempo:2.8.2 AS tempo
+FROM grafana/grafana:12.1.1
+
+USER root
+ARG ALPINE_MIRROR
+RUN if [ -n "$ALPINE_MIRROR" ]; then \
+        sed -i "s|https\?://dl-cdn\.alpinelinux\.org/alpine|${ALPINE_MIRROR%/}|g" /etc/apk/repositories; \
+    fi && apk add --no-cache bash python3 py3-yaml tini
+COPY --from=collector /otelcol-contrib /usr/local/bin/otelcol-contrib
+COPY --from=mimir /bin/mimir /usr/local/bin/mimir
+COPY --from=loki /usr/bin/loki /usr/local/bin/loki
+COPY --from=tempo /tempo /usr/local/bin/tempo
+RUN otelcol-contrib --version && mimir -version && loki -version && tempo -version
+RUN mkdir -p /opt/twinkle-observability/plugins && \
+    grafana cli --pluginsDir /opt/twinkle-observability/plugins plugins install redis-datasource 2.2.0
+
+COPY cookbook/client/server/twinkle-runtime-common.sh /opt/twinkle-observability/
+COPY cookbook/observability/production/collector.yaml \
+     cookbook/observability/production/mimir.yaml \
+     cookbook/observability/production/loki.yaml \
+     cookbook/observability/production/tempo.yaml \
+     cookbook/observability/production/datasources.yaml \
+     cookbook/observability/production/dashboards.yaml \
+     cookbook/observability/production/render_dashboard.py \
+     cookbook/observability/production/render_runtime.py \
+     cookbook/observability/production/usage-limits.example.json /opt/twinkle-observability/production/
+COPY cookbook/observability/grafana/dashboards/twinkle-multitenant.json /opt/twinkle-observability/grafana/dashboards/
+COPY cookbook/observability/production/runtime-entrypoint.sh /usr/local/bin/twinkle-cpu2
+RUN chmod +x /usr/local/bin/twinkle-cpu2
+USER 472
+
+EXPOSE 3000 4317
+ENTRYPOINT []
+CMD ["/sbin/tini", "--", "/usr/local/bin/twinkle-cpu2"]

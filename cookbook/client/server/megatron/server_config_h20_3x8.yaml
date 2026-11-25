@@ -1,0 +1,290 @@
+# Twinkle Server launch candidate | 3 nodes × 8 H20 | ModelScope
+# twinkle-runtime head waits for all 24 GPUs, then launches this YAML.
+# Use the Ray node labels documented in the deployment guide.
+# Set RAY_ADDRESS to the Ray head address for the server and worker roles.
+# Supply the private Redis and OTLP endpoints through the deployment environment.
+# Open the external gateway after both resident trainers and samplers are READY.
+# All Ray nodes need the same model/runtime dependencies and shared checkpoint path
+# via TWINKLE_DEFAULT_SAVE_DIR. Keep the Serve port on the private network.
+# Set TWINKLE_TELEMETRY_USER_ID_KEY for tenant usage and Redis snapshots.
+# The external gateway must authenticate callers and preserve tenant identity.
+# Record the exact ModelScope checkpoint revisions used in acceptance testing.
+# Each resident trainer or sampler reserves a single-node 4-GPU group.
+# Node selectors place 27B on A, 35B on B and dynamic models on C.
+# The three GPU nodes share the same checkpoint mount.
+# Resident budget: 8 training GPUs + 8 sampling GPUs. Dynamic budget: 7 + 1.
+ray_namespace: twinkle-h20
+# Routers forward via localhost. Each node with a Serve replica needs a proxy.
+proxy_location: EveryNode
+trust_remote_code: false
+
+http_options:
+  # Bind on each proxy node. Restrict this port to the private network and gateway.
+  host: 0.0.0.0
+  port: 8000
+
+persistence:
+  mode: redis
+  redis_url: "${oc.env:TWINKLE_REDIS_URL}"
+  key_prefix: "twinkle:h20:"
+
+# Per-token soft budget in bytes. Persistent saves report a warning from 90%.
+checkpoint_storage_budget_bytes: 300000000000
+
+telemetry:
+  enabled: true
+  service_name: twinkle-h20
+  otlp_endpoint: "${oc.env:TWINKLE_OTLP_ENDPOINT}"
+  export_interval_ms: 15000
+
+resources:
+  allocation_timeout_s: 10
+  startup_timeout_s: 1800
+  shutdown_timeout_s: 180
+  sweep_interval_s: 5
+
+applications:
+  # Deploy one gateway. Training and sampler routes come from this catalog.
+  - name: server
+    import_path: server
+    route_prefix: /api/v1
+    args:
+      server_config:
+        per_token_model_limit: 3
+        metrics_update_interval: 15
+    deployments:
+      - name: GatewayServer
+        num_replicas: 1
+        max_ongoing_requests: 64
+        ray_actor_options: {num_cpus: 1}
+
+  # Resident 27B trainer: 4 = DP1 × TP4 × PP1 × CP1.
+  # Compare this H20 memory-first layout with the previous DP2 × PP2 layout.
+  - name: train-qwen38-27b
+    import_path: model
+    route_prefix: /api/v1/model/Qwen/Qwen3.8-27B
+    args:
+      model_id: ms://Qwen/Qwen3.8-27B
+      node_selector: {twinkle-node: a}
+      backend: megatron
+      train_mode: lora
+      task_type: causal_lm
+      language_model_only: true
+      mixed_precision: bf16
+      min_replicas: 1
+      max_replicas: 1
+      adapter_config: &lora_lifetime {adapter_timeout: 1800, adapter_max_lifetime: 36000}
+      max_loras: 3
+      max_r: 32
+      # One full-length sample per request on DP1. Use micro_batch_size=1 for long-context runs.
+      max_length: 32768
+      queue_config: &lm_queue {rps_limit: 20, max_input_tokens: 32768, tps_limit: 65536}
+      # Preallocate supported text linear layers. Twinkle clients can select a subset.
+      target_modules: all-linear
+      nproc_per_node: 4
+      device_group: {name: model, ranks: 4, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 1, tp_size: 4, pp_size: 1, cp_size: 1, sequence_parallel: true}
+
+  # Resident 35B trainer: attention DP2 × TP2. Experts use EP4 × ETP1.
+  - name: train-qwen36-35b-a3b
+    import_path: model
+    route_prefix: /api/v1/model/Qwen/Qwen3.6-35B-A3B
+    args:
+      model_id: ms://Qwen/Qwen3.6-35B-A3B
+      node_selector: {twinkle-node: b}
+      backend: megatron
+      train_mode: lora
+      task_type: causal_lm
+      language_model_only: true
+      mixed_precision: bf16
+      min_replicas: 1
+      max_replicas: 1
+      adapter_config: *lora_lifetime
+      max_loras: 3
+      max_r: 32
+      # Two full-length samples fit the 32768-token request budget, one on each DP rank.
+      max_length: 16384
+      queue_config: *lm_queue
+      # Preallocate supported text linear layers. Twinkle clients can select a subset.
+      target_modules: all-linear
+      nproc_per_node: 4
+      device_group: {name: model, ranks: 4, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 2, tp_size: 2, pp_size: 1, cp_size: 1, ep_size: 4, etp_size: 1, sequence_parallel: true}
+
+  # Each resident sampler has one pool instance containing two TP2 engines.
+  # DP here is across Twinkle workers. Each vLLM engine sees just its two GPUs.
+  - name: sample-qwen38-27b
+    import_path: sampler
+    route_prefix: /api/v1/sampler/Qwen/Qwen3.8-27B
+    args:
+      model_id: ms://Qwen/Qwen3.8-27B
+      node_selector: {twinkle-node: a}
+      sampler_type: vllm
+      min_replicas: 1
+      max_replicas: 1
+      nproc_per_node: 4
+      device_group: &resident_sampler_group {name: sampler, ranks: 4, gpus_per_worker: 2, device_type: cuda}
+      device_mesh: &resident_sampler_mesh {device_type: cuda, dp_size: 2, tp_size: 2}
+      queue_config: {rps_limit: 20, max_input_tokens: 32768, tps_limit: 65536, concurrent_task_limit: 8}
+      engine_args: &resident_sampler_engine
+        tensor_parallel_size: 2
+        dtype: bfloat16
+        language_model_only: true
+        # Includes prompt and generated tokens in each sequence.
+        max_model_len: 32768
+        max_num_seqs: 16
+        gpu_memory_utilization: 0.75
+        enable_lora: true
+        max_loras: 5
+        max_lora_rank: 32
+        logprobs_mode: processed_logprobs
+        trust_remote_code: false
+
+  - name: sample-qwen36-35b-a3b
+    import_path: sampler
+    route_prefix: /api/v1/sampler/Qwen/Qwen3.6-35B-A3B
+    args:
+      model_id: ms://Qwen/Qwen3.6-35B-A3B
+      node_selector: {twinkle-node: b}
+      sampler_type: vllm
+      min_replicas: 1
+      max_replicas: 1
+      nproc_per_node: 4
+      device_group: *resident_sampler_group
+      device_mesh: *resident_sampler_mesh
+      queue_config: &sampler_queue {rps_limit: 20, max_input_tokens: 16384, tps_limit: 32768, concurrent_task_limit: 8}
+      engine_args:
+        <<: *resident_sampler_engine
+        max_model_len: 16384
+
+  # Dynamic pool: 2 + 2 + 1 + 2 training GPUs, plus 1 GPU for 4B rollouts.
+  - name: train-qwen35-4b
+    import_path: model
+    route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
+    args:
+      model_id: ms://Qwen/Qwen3.5-4B
+      node_selector: {twinkle-node: c}
+      backend: megatron
+      train_mode: lora
+      task_type: causal_lm
+      language_model_only: true
+      mixed_precision: bf16
+      min_replicas: 0
+      max_replicas: 1
+      idle_timeout_s: 900
+      adapter_config: *lora_lifetime
+      max_loras: 2
+      max_r: 16
+      max_length: 4096
+      queue_config: *lm_queue
+      target_modules: [linear_qkv]
+      nproc_per_node: 2
+      device_group: {name: model, ranks: 2, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 2}
+
+  - name: train-qwen35-9b
+    import_path: model
+    route_prefix: /api/v1/model/Qwen/Qwen3.5-9B
+    args:
+      model_id: ms://Qwen/Qwen3.5-9B
+      node_selector: {twinkle-node: c}
+      backend: megatron
+      train_mode: lora
+      task_type: causal_lm
+      language_model_only: true
+      mixed_precision: bf16
+      min_replicas: 0
+      max_replicas: 1
+      idle_timeout_s: 900
+      adapter_config: *lora_lifetime
+      max_loras: 2
+      max_r: 16
+      max_length: 4096
+      queue_config: *lm_queue
+      target_modules: [linear_qkv]
+      nproc_per_node: 2
+      device_group: {name: model, ranks: 2, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 1, tp_size: 2, sequence_parallel: true}
+
+  # Preserve the published SentenceTransformer pooling pipeline with the
+  # Swift class already used by Twinkle's SentenceTransformer cookbook.
+  # Install sentence-transformers and the pinned Swift build on every worker.
+  - name: train-qwen3-embedding-06b
+    import_path: model
+    route_prefix: /api/v1/model/Qwen/Qwen3-Embedding-0.6B
+    args:
+      model_id: ms://Qwen/Qwen3-Embedding-0.6B
+      node_selector: {twinkle-node: c}
+      backend: transformers
+      model_cls: "swift.dev.model.multi_lora_sentence_transformer_model:MultiLoraSentenceTransformerModel"
+      env_vars: {TWINKLE_TRUST_REMOTE_CODE: "1"}
+      train_mode: lora
+      task_type: embedding
+      mixed_precision: bf16
+      gradient_checkpointing: false
+      min_replicas: 0
+      max_replicas: 1
+      idle_timeout_s: 900
+      adapter_config: *lora_lifetime
+      max_loras: 2
+      max_r: 16
+      max_length: 2048
+      queue_config: &retrieval_queue {rps_limit: 20, max_input_tokens: 16384, tps_limit: 32768}
+      target_modules: [q_proj, v_proj]
+      nproc_per_node: 1
+      device_group: {name: model, ranks: 1, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 1}
+
+  # The published reranker is a causal LM with yes/no scoring.
+  # Train with the official pair prompt and answer-token supervision.
+  - name: train-qwen3-reranker-06b
+    import_path: model
+    route_prefix: /api/v1/model/Qwen/Qwen3-Reranker-0.6B
+    args:
+      model_id: ms://Qwen/Qwen3-Reranker-0.6B
+      node_selector: {twinkle-node: c}
+      backend: megatron
+      train_mode: lora
+      task_type: causal_lm
+      mixed_precision: bf16
+      min_replicas: 0
+      max_replicas: 1
+      idle_timeout_s: 900
+      adapter_config: *lora_lifetime
+      max_loras: 2
+      max_r: 16
+      max_length: 2048
+      queue_config: *retrieval_queue
+      target_modules: [linear_qkv]
+      nproc_per_node: 2
+      device_group: {name: model, ranks: 2, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 2}
+
+  # One on-demand vLLM sampler for the 4B model, including LoRA GRPO rollouts.
+  - name: sample-qwen35-4b
+    import_path: sampler
+    route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
+    args:
+      model_id: ms://Qwen/Qwen3.5-4B
+      node_selector: {twinkle-node: c}
+      sampler_type: vllm
+      min_replicas: 0
+      max_replicas: 1
+      idle_timeout_s: 600
+      target_ongoing_requests: 8
+      queue_config: *sampler_queue
+      nproc_per_node: 1
+      device_group: {name: sampler, ranks: 1, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 1}
+      engine_args:
+        tensor_parallel_size: 1
+        dtype: bfloat16
+        language_model_only: true
+        max_model_len: 8192
+        max_num_seqs: 16
+        gpu_memory_utilization: 0.70
+        enable_lora: true
+        max_loras: 2
+        max_lora_rank: 16
+        logprobs_mode: processed_logprobs
+        trust_remote_code: false

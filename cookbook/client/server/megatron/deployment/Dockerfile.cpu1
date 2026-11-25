@@ -1,0 +1,19 @@
+FROM redis:7.4.9-alpine AS redis
+FROM nginx:1.28-alpine
+
+ARG ALPINE_MIRROR
+RUN if [ -n "$ALPINE_MIRROR" ]; then \
+        sed -i "s|https\?://dl-cdn\.alpinelinux\.org/alpine|${ALPINE_MIRROR%/}|g" /etc/apk/repositories; \
+    fi && apk add --no-cache bash python3 tini
+COPY --from=redis /usr/local/bin/redis-server /usr/local/bin/redis-cli /usr/local/bin/
+RUN redis-server --version && redis-cli --version
+COPY cookbook/client/server/megatron/deployment/redis.conf \
+     cookbook/client/server/megatron/deployment/nginx.conf.template \
+     cookbook/client/server/megatron/deployment/render_redis_acl.py \
+     cookbook/client/server/twinkle-runtime-common.sh /opt/twinkle-cpu/
+COPY cookbook/client/server/megatron/deployment/cpu1-entrypoint.sh /usr/local/bin/twinkle-cpu1
+RUN chmod +x /usr/local/bin/twinkle-cpu1
+
+EXPOSE 9000 6380
+ENTRYPOINT []
+CMD ["/sbin/tini", "--", "/usr/local/bin/twinkle-cpu1"]

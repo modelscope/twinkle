@@ -73,6 +73,7 @@ class SamplerArgs(_ArgsBase):
     sampler_type: Literal['mock', 'vllm', 'vllm_async', 'sglang', 'sglang_async', 'torch']
     engine_args: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
+    node_selector: dict[str, str] = Field(default_factory=dict)
     data_plane_url: str | None = None
     template: dict[str, Any] | None = None
     #:
