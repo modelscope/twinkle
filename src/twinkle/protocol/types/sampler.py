@@ -41,7 +41,11 @@ class SampleRequest(StrictRequest):
     adapter_name: str = Field('', description='Adapter name for LoRA inference')
     adapter_uri: str | None = Field(None, description='Adapter URI (twinkle:// path or local path) for LoRA inference')
     token_only: bool = Field(
-        False, description='Return sampled tokens/logprobs only; encoded inputs are engine ids, media alongside')
+        False, description='Return sampled tokens/logprobs only; encoded inputs are engine ids, media alongside'
+    )
+    project_request_fields: bool = Field(
+        False, description='Opt into request-field/history projection restored by the materialized sampler client'
+    )
 
 
 class SamplingMaskModel(ResponseModel):

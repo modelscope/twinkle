@@ -89,7 +89,16 @@ def collate_extra_model_inputs(chunk: list[int], encoded: dict[int, dict[str, An
     blocked = engine_fields | (Trajectory.__annotations__.keys() - InputFeature.__annotations__.keys())
     result, consumed = {}, set()
     if template is not None and hasattr(template, 'pop_media') and hasattr(template, 'collate_media'):
-        media = [template.pop_media(copy_trajectory(encoded[index])) for index in chunk]
+        media = []
+        for index in chunk:
+            row = copy_trajectory(encoded[index])
+            if '_trajectory_columns' not in row:
+                row["_trajectory_columns"] = [
+                    key
+                    for key, value in row.items()
+                    if key not in InputFeature.__annotations__ and isinstance(value, (str, int, float, bool))
+                ]
+            media.append(template.pop_media(row))
         consumed = {key for row in media for key in row}
         result = {key: value for key, value in template.collate_media(media).items() if key not in engine_fields}
     collected: dict[str, list[torch.Tensor]] = {}

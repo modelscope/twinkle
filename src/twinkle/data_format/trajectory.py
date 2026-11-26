@@ -70,7 +70,10 @@ RESPONSE_FRAME_FIELDS = frozenset({
 
 def copy_trajectory(trajectory: Mapping[str, Any]) -> Trajectory:
     """Copy mutable containers while sharing media and tensors across independent candidates."""
+    from .sampling import SamplingMask
     def copy_value(value):
+        if isinstance(value, SamplingMask):
+            return SamplingMask(token_ids=list(value.token_ids), offsets=list(value.offsets))
         if isinstance(value, dict):
             return {key: copy_value(item) for key, item in value.items()}
         if isinstance(value, list):

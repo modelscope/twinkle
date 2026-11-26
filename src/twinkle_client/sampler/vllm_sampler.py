@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from twinkle.data_format import InputFeature, SamplingParams, Trajectory, copy_trajectory
 from twinkle.protocol.json_utils import wire_trajectory
-from twinkle.protocol.types.data import export_batch
 from twinkle.protocol.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
 from twinkle.protocol.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
                                             SampleResponseModel, SampleResponseModelList, SamplerApplyPatchRequest,
@@ -119,23 +118,28 @@ class vLLMSampler:
             sampling_params=self._sampling_params(sampling_params, num_samples),
             adapter_name=adapter_name,
             adapter_uri=adapter_uri,
-            token_only=token_only)
-        wire_inputs = export_batch(request.inputs)
+            token_only=token_only,
+            project_request_fields=not token_only)
         response = self._transport.post_model(f'{self.server_url}/sample', request)
         samples = self._await_task(response, SampleResponseModelList).samples
         if not token_only:
             if len(samples) != len(originals):
                 raise RuntimeError('server response count does not match the input batch')
-            for original, wire_input, result in zip(originals, wire_inputs, samples):
+            for original, result in zip(originals, samples):
                 for sequence in result.sequences:
                     if sequence.new_input_feature is None:
                         raise RuntimeError('server omitted a complete trajectory from a normal sample response')
-                    restored = {**copy_trajectory(original), **copy_trajectory(sequence.new_input_feature)}
-                    before, after = original.get('messages') or [], restored.get('messages') or []
-                    # Restore local media objects only when the server retained this exact history.
-                    # Truncated or split messages belong to the server's encoded token sequence.
-                    if before and after[:len(before)] == wire_input.get('messages'):
-                        restored['messages'] = copy_trajectory({'messages': before})['messages'] + after[len(before):]
+                    feature = copy_trajectory(sequence.new_input_feature)
+                    omitted = feature.pop('_request_fields')
+                    if not isinstance(omitted, list) or any(not isinstance(key, str) or key not in original for key in omitted):
+                        raise RuntimeError('server referenced fields absent from the sampling request')
+                    count = feature.pop('_request_message_count', None)
+                    restored = {**copy_trajectory({key: original[key] for key in omitted}), **feature}
+                    if count is not None:
+                        before = original.get('messages') or []
+                        if type(count) is not int or count != len(before) or not isinstance(restored.get('messages'), list):
+                            raise RuntimeError('server returned an invalid sampling history projection')
+                        restored['messages'] = copy_trajectory({'messages': before})['messages'] + restored['messages']
                     sequence.new_input_feature = restored
         return samples
 

@@ -31,7 +31,7 @@ class vLLMSampler:
 
 正常候选的 `new_input_feature` 是完整轨迹，保留 messages、tools、user_data、原始媒体和数值编码字段。`SampledSequence` 继续携带 tokens、logprobs、decoded、stop_reason、routed_experts 和 sampling_masks，不再另有 `new_state`。`max_tokens=0` 仅对 prompt 打分，不追加 assistant 消息。
 
-HTTP 客户端从本次请求恢复响应省略的原始媒体和 user_data。显式 `token_only=True` 是只返回 tokens 与统计信息的传输原语；`HTTPSampler` 使用本地模板将实际 tokens 追加到完整轨迹，不重新 tokenize 回复。服务端 DataPlane 保存完整轨迹，与 HTTP 响应投影分开处理。
+普通 HTTP 客户端显式启用 `project_request_fields=True`，响应标出未变的请求字段，客户端无需 tokenizer 即可恢复；历史消息未变时，响应只发送生成的消息，历史由客户端恢复。未协商投影的调用方保留原有完整历史响应。改变后的历史和新编码的数值字段仍须返回。显式 `token_only=True` 只返回 tokens 与统计信息；`HTTPSampler` 使用本地模板追加实际 tokens，不重新 tokenize 回复。服务端 DataPlane 保留完整轨迹，不受 HTTP 投影影响。这减少的是响应重复，每轮媒体上传并未去重。
 
 ## 可用的采样器
 

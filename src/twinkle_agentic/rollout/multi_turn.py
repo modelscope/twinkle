@@ -1395,6 +1395,10 @@ class MultiTurnRollout:
             ep.ledger = ledger
             ep.segments += 1
         ep.stop_reason = seq.stop_reason
+        if seq.stop_reason in ('abort', 'error'):
+            ep.truncated = True
+            request.reply.set_exception(APIGenerationError(f'generation terminated with {seq.stop_reason}'))
+            return self._finish(ep, segments=ep.segments)
 
         # Decoded off the sampled ids rather than taken from ``seq.decoded``, which keeps
         # the template's end-of-turn marker -- a marker the agent would write into its files.
@@ -1454,6 +1458,10 @@ class MultiTurnRollout:
             raise EpisodeError(f'episode {ep.episode_id!r}: generation failed: {error}') from error
         ledger.record_continuation(seq)
         ep.stop_reason = seq.stop_reason
+        if seq.stop_reason in ('abort', 'error'):
+            ep.truncated = True
+            request.reply.set_exception(APIGenerationError(f'generation terminated with {seq.stop_reason}'))
+            return self._finish(ep, segments=ep.segments)
         text = ledger.decode_tokens(seq)
         parsed = ledger.parse_tool_call(prev_raw + text)
         message = assistant_message(text, parsed, self.template.clean_tool_call(text) if parsed else text)

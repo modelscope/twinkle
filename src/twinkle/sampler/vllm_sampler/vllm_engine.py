@@ -535,17 +535,18 @@ class VLLMEngine(BaseSamplerEngine):
                 seq_logprobs = []
                 for i, lp in enumerate(output.logprobs):
                     if i < len(token_ids):
-                        if logprobs == 1:
-                            # Single logprob mode: return the sampled token's logprob
-                            # in the same [(tid, logprob)] format as multi-logprob mode
-                            tid = token_ids[i]
-                            assert tid in lp, (f'Sampled token {tid} not found in logprobs at position {i}. '
-                                               f'Available tokens: {list(lp.keys())}')
-                            seq_logprobs.append([(tid, lp[tid].logprob)])
-                        else:
-                            # Multiple logprobs mode: return top-k logprobs
+                        tid = token_ids[i]
+                        assert tid in lp, (
+                            f'Sampled token {tid} not found in logprobs at position {i}. '
+                            f'Available tokens: {list(lp.keys())}'
+                        )
+                        entries = [(tid, lp[tid].logprob)]
+                        if logprobs != 1:
                             sorted_items = sorted(lp.items(), key=lambda x: -(x[1].logprob))[:logprobs]
-                            seq_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
+                            entries.extend(
+                                (candidate, item.logprob) for candidate, item in sorted_items if candidate != tid
+                            )
+                        seq_logprobs.append(entries)
 
             stop_reason: StopReason = _map_finish_reason(output.finish_reason)
 
@@ -562,7 +563,7 @@ class VLLMEngine(BaseSamplerEngine):
         # Extract prompt logprobs if requested
         result_prompt_logprobs = None
         result_topk_prompt_logprobs = None
-        if prompt_logprobs_k > 0 and result.prompt_logprobs is not None:
+        if sampling_params.prompt_logprobs is not None and result.prompt_logprobs is not None:
             result_prompt_logprobs = []
             result_topk_prompt_logprobs = []
 

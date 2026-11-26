@@ -1573,8 +1573,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # responsive and Ray forbids asyncio.run, so there is nothing to gain from batch_sample's
             # loop-and-thread hop (and its lock, which would be bound to the wrong loop).
             return engine.generate_batch(
-                prompts, params, num_samples=params.num_samples, logprobs=params.logprobs is not None,
-                extra_model_inputs=extra or None)
+                prompts,
+                params,
+                num_samples=params.num_samples,
+                logprobs=params.logprobs is not None,
+                include_prompt_logprobs=params.prompt_logprobs is not None,
+                topk_prompt_logprobs=params.prompt_logprobs or 0,
+                extra_model_inputs=extra or None,
+            )
 
         lora_ctx = (unwrapped_model.disable_adapter()
                     if use_base_model and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())

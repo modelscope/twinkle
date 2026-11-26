@@ -2,6 +2,7 @@
 import importlib
 import inspect
 from copy import copy, deepcopy
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from twinkle.data_format import Message, Trajectory
@@ -45,8 +46,14 @@ def construct_template(template_cls, *, _default_model_id=None, **kwargs):
         if factory is None:
             raise TypeError(f'{template_cls!r} does not implement from_spec().')
         return factory(template_spec)
-    if _default_model_id is not None and 'model_id' in inspect.signature(template_cls.__init__).parameters:
-        kwargs.setdefault('model_id', _default_model_id)
+    if _default_model_id is not None:
+        for base in template_cls.__mro__:
+            parameters = inspect.signature(base.__init__).parameters
+            if 'model_id' in parameters:
+                kwargs.setdefault('model_id', _default_model_id)
+                break
+            if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+                break
     return template_cls(**kwargs)
 
 
@@ -257,6 +264,161 @@ def get_inputs_embeds_hf(inputs_embeds, inputs, visual, processor, config):
     return inputs_embeds
 
 
+@lru_cache(maxsize=128)
+def _compile_assistant_template(chat_template):
+    from jinja2 import nodes
+    from jinja2.visitor import NodeTransformer
+    from transformers.utils.chat_template_utils import _compile_jinja_template
+
+    original = _compile_jinja_template(chat_template)
+    environment = original.environment
+
+    class TrackAssistant(NodeTransformer):
+        def __init__(self):
+            self.targets = []
+
+        @staticmethod
+        def boundary(target, kind):
+            message = nodes.Name(target, 'load')
+            selected = nodes.Call(nodes.Name('_assistant_is_selected', 'load'), [message], [], None, None)
+            marker = nodes.Call(nodes.Name('_assistant_boundary', 'load'), [message, nodes.Const(kind)], [], None, None)
+            return nodes.If(selected, [nodes.Output([marker])], [], [])
+
+        def visit_For(self, node, *args, **kwargs):
+            target = node.target.name if isinstance(node.target, nodes.Name) else None
+            self.targets.append(target)
+            node = self.generic_visit(node, *args, **kwargs)
+            self.targets.pop()
+            if target is not None:
+                node.body = [self.boundary(target, 'S'), *node.body, self.boundary(target, 'E')]
+            return node
+
+        def visit_Continue(self, node, *args, **kwargs):
+            if self.targets and self.targets[-1] is not None:
+                return [self.boundary(self.targets[-1], 'E'), node]
+            return node
+
+        visit_Break = visit_Continue
+
+    return original, environment.from_string(TrackAssistant().visit(environment.parse(chat_template)))
+
+
+def jinja_assistant_ranges(tokenizer, messages, selected, expected_text, **kwargs):
+    import re
+    import uuid
+
+    if not selected:
+        return []
+    template = tokenizer.get_chat_template(kwargs.pop('chat_template', None), tools=kwargs.get('tools'))
+    original, compiled = _compile_assistant_template(template)
+    for key in (
+        'tokenize',
+        'return_dict',
+        'return_tensors',
+        'return_assistant_tokens_mask',
+        'padding',
+        'truncation',
+        'max_length',
+        'continue_final_message',
+        'tokenizer_kwargs',
+    ):
+        kwargs.pop(key, None)
+    message_indices = {id(messages[index]): index for index in selected}
+    selected_ids = set(message_indices)
+    seen = set()
+    prefix = f'<<ASSISTANT_{uuid.uuid4().hex}:'
+    block_count = 0
+    pending = {}
+    owners = {}
+
+    def is_selected(message):
+        return id(message) in selected_ids
+
+    def boundary(message, kind):
+        nonlocal block_count
+        message_id = id(message)
+        if kind == 'S':
+            index = block_count
+            block_count += 1
+            pending.setdefault(message_id, []).append(index)
+            owners[index] = message_id
+            seen.add(message_id)
+        else:
+            index = pending[message_id].pop()
+        return f'{prefix}{kind}{index}>>'
+
+    render_kwargs = {
+        **tokenizer.special_tokens_map,
+        'tools': None,
+        'documents': None,
+        'add_generation_prompt': False,
+        **kwargs,
+    }
+    rendered = compiled.render(
+        **{
+            **render_kwargs,
+            'messages': messages,
+            '_assistant_is_selected': is_selected,
+            '_assistant_boundary': boundary,
+        }
+    )
+    parts, stack, spans = [], [], []
+    productive = set()
+    cursor, length = 0, 0
+    for match in re.finditer(re.escape(prefix) + r'([SE])(\d+)>>', rendered):
+        part = rendered[cursor : match.start()]
+        parts.append(part)
+        length += len(part)
+        kind, index = match.group(1), int(match.group(2))
+        if kind == 'S':
+            stack.append((index, length))
+        elif not stack or stack[-1][0] != index:
+            raise ValueError('Jinja assistant ownership markers are not balanced')
+        else:
+            start = stack.pop()[1]
+            spans.append((start, length, owners[index]))
+            if length > start:
+                productive.add(owners[index])
+        cursor = match.end()
+    parts.append(rendered[cursor:])
+    if (
+        stack
+        or len(spans) != block_count
+        or seen != selected_ids
+        or productive != selected_ids
+        or ''.join(parts) != expected_text
+    ):
+        raise ValueError('Jinja template cannot preserve assistant ownership without changing its rendering')
+    openers = {}
+    result = []
+    for start, end, owner in sorted(spans):
+        if start == end:
+            continue
+        if owner not in openers:
+            options = {**render_kwargs, 'messages': messages[: message_indices[owner]], 'add_generation_prompt': False}
+            before = original.render(**options)
+            after = original.render(**{**options, 'add_generation_prompt': True})
+            if not after.startswith(before):
+                raise ValueError('Jinja generation opener cannot be isolated without changing its prefix rendering')
+            openers[owner] = after[len(before) :], before, options
+        opener, before, options = openers[owner]
+        content = expected_text[start:end]
+        if content.startswith(opener):
+            cut = len(opener)
+        else:
+            chat_options = {**options, 'enable_thinking': False, 'thinking': False}
+            chat_before = original.render(**chat_options)
+            chat_after = original.render(**{**chat_options, 'add_generation_prompt': True})
+            if chat_before != before or not chat_after.startswith(before):
+                raise ValueError('Jinja history opener cannot be isolated without changing its prefix rendering')
+            chat_opener = chat_after[len(before) :]
+            if not content.startswith(chat_opener):
+                raise ValueError('Jinja assistant opener does not match its generation prefix')
+            cut = len(chat_opener)
+        result.append((start + cut, end))
+    return result
+
+
 class TokenizeByRound:
     """Tokenize by encoding messages round-by-round.
 
@@ -281,7 +443,7 @@ class TokenizeByRound:
         """Tokenize trajectory and generate labels for assistant turns.
 
         Args:
-            tokenizer: The tokenizer (unused, kept for interface compatibility).
+            tokenizer: Fast tokenizer for full-render offsets, or None for verified round encoders.
             encode_func: Function to encode a trajectory. Must support add_generation_prompt.
             trajectory: The trajectory containing messages.
             train_indices: If provided, only label assistant messages whose
@@ -305,27 +467,45 @@ class TokenizeByRound:
         if not messages:
             return full_ids, labels, encoded
 
+        spans = None
+        if getattr(tokenizer, 'is_fast', False) and getattr(tokenizer, 'chat_template', None):
+            options = {**kwargs, 'tools': list(trajectory.get('tools') or []),
+                       'tokenize': False, 'return_dict': False, 'return_tensors': None,
+                       'return_assistant_tokens_mask': False, 'add_generation_prompt': False}
+            from jinja2 import TemplateError
+
+            # Any template the marker pass cannot handle falls through to the round-by-round
+            # encoder below, which is correct whenever the template is prefix-stable.
+            try:
+                text = tokenizer.apply_chat_template(messages, **options)
+                tokenized = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+                if tokenized['input_ids'] == full_ids:
+                    selected = {index for index, message in enumerate(messages)
+                                if message['role'] == 'assistant' and (train_indices is None or index in train_indices)}
+                    spans = jinja_assistant_ranges(tokenizer, messages, selected, text, **options)
+            except (TemplateError, TypeError, ValueError):
+                pass
+        if spans is not None:
+            for index, (start, end) in enumerate(tokenized['offset_mapping']):
+                if end > start and any(left <= start and end <= right for left, right in spans):
+                    labels[index] = full_ids[index]
+            return full_ids, labels, encoded
+
+        def render_length(prefix, add_generation_prompt=False):
+            partial_trajectory = copy(trajectory)
+            partial_trajectory['messages'] = list(prefix)
+            partial_ids = _coerce_ids_to_list(encode_func(
+                partial_trajectory, add_generation_prompt=add_generation_prompt, **kwargs)['input_ids'])
+            if full_ids[:len(partial_ids)] != partial_ids:
+                raise ValueError('Chat template is not prefix-stable and cannot provide safe assistant boundaries')
+            return len(partial_ids)
+
         for i, msg in enumerate(messages):
-            if msg['role'] != 'assistant':
+            if msg['role'] != 'assistant' or train_indices is not None and i not in train_indices:
                 continue
-            if train_indices is not None and i not in train_indices:
-                continue
-
-            # Get position AFTER assistant prefix:
-            # encode(messages[:i], add_generation_prompt=True) includes the prefix
-            partial_trajectory = copy(trajectory)
-            partial_trajectory['messages'] = list(messages[:i])
-            partial_ids = _coerce_ids_to_list(
-                encode_func(partial_trajectory, add_generation_prompt=True, **kwargs)['input_ids'])
-            start_pos = len(partial_ids)
-
-            # Get end position: encode(messages[:i+1]) includes full assistant turn
-            partial_trajectory = copy(trajectory)
-            partial_trajectory['messages'] = list(messages[:i + 1])
-            partial_ids = _coerce_ids_to_list(encode_func(partial_trajectory, **kwargs)['input_ids'])
-            end_pos = len(partial_ids)
-
-            # Mark assistant CONTENT tokens as trainable (excluding prefix)
+            # start: after the assistant prefix, which the add_generation_prompt encode includes
+            start_pos = render_length(messages[:i], add_generation_prompt=True)
+            end_pos = render_length(messages[:i + 1])
             for j in range(start_pos, min(end_pos, len(full_ids))):
                 labels[j] = full_ids[j]
 

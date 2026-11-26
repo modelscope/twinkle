@@ -54,7 +54,7 @@ class Template:
 
 ## 共享接口
 
-`swift.dev.template.Template` 继承该基类，保留 swift 原有工厂和模型家族实现。默认或 False 使用 TRAIN，True 使用 INFER；两边共用显式编码意图。INFER/ENGINE/SCORE 不返回训练 labels；`encode_prompt(..., add_generation_prompt=False)` 使用 SCORE。因果训练的 labels 只左移一次，末位填 -100；存在时 loss_scale/completion_mask 同步移位。非空 `user_data.key_rounds` 按 system 消息归一后的 assistant 消息索引选择监督范围。
+`swift.dev.template.Template` 继承该基类，保留 swift 原有工厂和模型家族实现。默认或 False 使用 TRAIN，True 使用 INFER；两边共用显式编码意图。INFER/ENGINE/SCORE 不返回训练 labels；`encode_prompt(..., add_generation_prompt=False)` 使用 SCORE，允许以 user 结尾的前缀且不添加 assistant 开头；非聊天预训练允许显式 False。因果训练的 labels 只左移一次，末位填 -100；存在时 loss_scale/completion_mask 同步移位。非空 `user_data.key_rounds` 按 system 消息归一后、内部工具调用拆分前的 assistant 消息索引选择监督范围。Jinja 从完整渲染中记录所选消息的输出范围；原生 token 标注只在 IDs 与该渲染一致时使用 offsets。逐轮回退遇到不满足前缀一致性的编码会明确拒绝，不猜测边界。
 
 list 批次返回平铺 list，列存批次返回等长列。单条 encode 在 split 下可以返回多条轨迹；encode_prompt 拒绝多条结果。left/right 保留受保护媒体 token，并同步切片序列字段；不能安全切分的多模态和配对样本拒绝 split。追加不能截断已记录 token。decode 不带 context 返回文本，带 context 返回共享的 DecodedResponse。
 

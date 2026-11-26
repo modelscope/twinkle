@@ -243,11 +243,14 @@ class TransformersEngine(BaseSamplerEngine):
             gen_kwargs['streamer'] = streamer
             inputs = self._to_model_inputs([prompt], extra_model_inputs)
             produced: List[int] = []
+            eos_ids = gen_kwargs.get('eos_token_id')
+            eos_ids = set(eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids]) - {None}
 
             def _run():
                 try:
                     out = self.model.generate(**inputs, **gen_kwargs)
-                    produced.append(out.shape[-1] - inputs['input_ids'].shape[-1])
+                    sequences = out.sequences if hasattr(out, 'sequences') else out
+                    produced.extend(_strip_padding(sequences[0, inputs['input_ids'].shape[-1] :], eos_ids))
                 except Exception as exc:  # surfaced to the consumer via the queue below
                     streamer.on_finalized_text('', stream_end=True)
                     raise exc
@@ -264,8 +267,15 @@ class TransformersEngine(BaseSamplerEngine):
                 if delta:
                     yield delta, None
             thread.join()
-            new_tokens = produced[0] if produced else 0
-            yield '', ('length' if params.max_tokens and new_tokens >= params.max_tokens else 'stop')
+            max_new = gen_kwargs.get('max_new_tokens')
+            yield (
+                '',
+                (
+                    'length'
+                    if max_new and len(produced) >= max_new and (not produced or produced[-1] not in eos_ids)
+                    else 'stop'
+                ),
+            )
 
     # ------------------------------------------------------------------ weights / memory
 
@@ -399,20 +409,26 @@ class TransformersEngine(BaseSamplerEngine):
         completions = sequences[:, prompt_width:]
         step_logprobs = _step_logprobs(output, params) if want_logprobs and hasattr(output, 'scores') else None
 
-        prompt_logprobs = None
+        prompt_logprobs, topk_logprobs = None, None
         if include_prompt_logprobs:
-            prompt_logprobs = self._prompt_logprobs(inputs, topk_prompt_logprobs)
+            prompt_logprobs, topk_logprobs = self._prompt_logprobs(inputs, topk_prompt_logprobs)
 
+        eos_ids = gen_kwargs.get('eos_token_id')
+        eos_ids = set(eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids]) - {None}
         max_new = gen_kwargs.get('max_new_tokens')
         responses: List[SampleResponse] = []
         for index, prompt in enumerate(prompts):
             seqs = []
             for offset in range(num_samples):
                 row = index * num_samples + offset
-                tokens = _strip_padding(completions[row], self.tokenizer.pad_token_id)
+                tokens = _strip_padding(completions[row], eos_ids)
                 seqs.append(
                     SampledSequence(
-                        stop_reason='length' if max_new and len(tokens) >= max_new else 'stop',
+                        stop_reason=(
+                            'length'
+                            if max_new and len(tokens) >= max_new and (not tokens or tokens[-1] not in eos_ids)
+                            else 'stop'
+                        ),
                         tokens=tokens,
                         logprobs=None if step_logprobs is None else step_logprobs[row][:len(tokens)],
                         decoded=self.tokenizer.decode(tokens, skip_special_tokens=True),
@@ -422,23 +438,33 @@ class TransformersEngine(BaseSamplerEngine):
                     sequences=seqs,
                     prompt_token_ids=list(prompt),
                     prompt_logprobs=None if prompt_logprobs is None else prompt_logprobs[index],
-                ))
+                    topk_prompt_logprobs=None if topk_logprobs is None else topk_logprobs[index],
+                )
+            )
         return responses
 
-    def _prompt_logprobs(self, inputs: Dict[str, Any], topk: int) -> List[List[Optional[float]]]:
-        """Score the prompt itself -- ``generate()`` never does, so this is a second forward pass."""
+    def _prompt_logprobs(self, inputs: Dict[str, Any], topk: int):
         with torch.inference_mode():
-            logits = self.model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask']).logits
+            logits = self.model(**inputs).logits
         logprobs = torch.log_softmax(logits[:, :-1].float(), dim=-1)
         targets = inputs['input_ids'][:, 1:]
         picked = logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        out: List[List[Optional[float]]] = []
+        out, alternatives = [], [] if topk else None
         for row in range(picked.shape[0]):
-            mask = inputs['attention_mask'][row, 1:].bool()
-            # The first real token has no predecessor to be predicted from, hence the leading None,
-            # matching vLLM's prompt_logprobs convention.
-            out.append([None] + picked[row][mask].tolist())
-        return out
+            attention = inputs['attention_mask'][row].bool()
+            mask = attention[1:] & attention[:-1]
+            first = [None] if attention.any() else []
+            out.append(first + picked[row][mask].tolist())
+            if topk:
+                values, indices = logprobs[row][mask].topk(topk, dim=-1)
+                alternatives.append(
+                    first
+                    + [
+                        list(zip(ids, scores, strict=False))
+                        for ids, scores in zip(indices.tolist(), values.tolist(), strict=False)
+                    ]
+                )
+        return out, alternatives
 
 
 def _step_logprobs(output: Any, params: SamplingParams) -> List[List[List[Tuple[int, float]]]]:
@@ -464,11 +490,10 @@ def _step_logprobs(output: Any, params: SamplingParams) -> List[List[List[Tuple[
     return result
 
 
-def _strip_padding(tokens: torch.Tensor, pad_id: Optional[int]) -> List[int]:
-    """Drop the trailing pads a short sequence in a batch accumulates once it hits eos."""
+def _strip_padding(tokens: torch.Tensor, eos_ids: set[int]) -> List[int]:
+    """Keep the sampled EOS; discard only the padding produced after termination."""
     ids = tokens.tolist()
-    if pad_id is None:
-        return ids
-    while ids and ids[-1] == pad_id:
-        ids.pop()
+    for index, token in enumerate(ids):
+        if token in eos_ids:
+            return ids[: index + 1]
     return ids

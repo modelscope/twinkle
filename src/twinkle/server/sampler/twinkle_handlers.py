@@ -27,6 +27,7 @@ from twinkle.data_format.sampling import sampled_token_logprobs
 from twinkle.protocol.json_utils import json_safe, wire_trajectory
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
+from twinkle.protocol.types.data import export_batch
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
 from twinkle.server.sampler.weights import resolve_sampler_weights, sample_with_weights
@@ -76,12 +77,26 @@ def _json_safe_value(value):
     return _DROP
 
 
-def _serialize_input_feature(feature: dict) -> dict:
-    """Convert an InputFeature into a JSON-safe dict for the HTTP response."""
-    # The requester retains original media and user data; keep token and model payloads complete.
-    safe = _json_safe_value(json_safe({key: value for key, value in feature.items()
-                                       if key not in ('images', 'videos', 'audios', 'user_data')}))
-    return safe if isinstance(safe, dict) else {}
+def _serialize_input_feature(feature: dict, original: dict, *, project_request_fields: bool = False) -> dict:
+    if not project_request_fields:
+        return _json_safe_value(
+            json_safe(
+                {key: value for key, value in feature.items() if key not in ('images', 'videos', 'audios', 'user_data')}
+            )
+        )
+    omitted = [key for key in ('images', 'videos', 'audios', 'user_data') if key in original and key in feature]
+    safe = _json_safe_value(json_safe({key: value for key, value in feature.items() if key not in omitted}))
+    for key in list(safe):
+        if key != 'messages' and key in original and safe[key] == original[key]:
+            omitted.append(key)
+            safe.pop(key)
+    before = original.get('messages') or []
+    messages = safe.get('messages')
+    if before and messages is not None and messages[: len(before)] == before:
+        safe['messages'] = messages[len(before) :]
+        safe['_request_message_count'] = len(before)
+    safe['_request_fields'] = omitted
+    return safe
 
 
 def _build_rollout_rows_and_tags(
@@ -124,19 +139,28 @@ def _build_rollout_rows_and_tags(
     return rows, tags
 
 
-def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
+def _to_sample_response_models(
+    responses, inputs, *, project_request_fields: bool = False
+) -> List[types.SampleResponseModel]:
     """Convert internal sampler responses to the HTTP response schema."""
     sample_models = []
-    for response in responses:
+    for response, original in zip(responses, inputs, strict=True):
         sequences = [
             types.SampledSequenceModel(
                 stop_reason=sequence.stop_reason,
                 tokens=list(sequence.tokens),
                 logprobs=list(sequence.logprobs) if sequence.logprobs is not None else None,
                 decoded=sequence.decoded,
-                text=last_assistant_text(sequence.new_input_feature) if sequence.new_input_feature is not None else None,
-                new_input_feature=(_serialize_input_feature(sequence.new_input_feature)
-                                   if sequence.new_input_feature is not None else None),
+                text=last_assistant_text(sequence.new_input_feature)
+                if sequence.new_input_feature is not None
+                else None,
+                new_input_feature=(
+                    _serialize_input_feature(
+                        sequence.new_input_feature, original, project_request_fields=project_request_fields
+                    )
+                    if sequence.new_input_feature is not None
+                    else None
+                ),
                 routed_experts=json_safe(sequence.routed_experts),
                 sampling_masks=({'token_ids': json_safe(sequence.sampling_masks.token_ids),
                                  'offsets': json_safe(sequence.sampling_masks.offsets)}
@@ -321,7 +345,11 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 )
 
             responses = await sample_with_weights(self, resolved_uri, generate)
-            return types.SampleResponseModelList(samples=_to_sample_response_models(responses)).model_dump()
+            return types.SampleResponseModelList(
+                samples=_to_sample_response_models(
+                    responses, export_batch(body.inputs), project_request_fields=body.project_request_fields
+                )
+            ).model_dump()
 
         # Calculate metrics for queue scheduling. The body is wire-validated, so the
         # entries are models and ``input_ids`` is absent or a list of ints.

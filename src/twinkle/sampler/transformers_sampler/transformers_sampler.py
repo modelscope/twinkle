@@ -389,6 +389,8 @@ class TransformersSampler(Sampler):
                     params,
                     num_samples=params.num_samples,
                     logprobs=params.logprobs is not None,
+                    include_prompt_logprobs=params.prompt_logprobs is not None,
+                    topk_prompt_logprobs=params.prompt_logprobs or 0,
                     adapter_uri=adapter_uri,
                     extra_model_inputs=extra or None,
                 )

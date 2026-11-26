@@ -10,7 +10,7 @@ import math
 import re
 from typing import Any, Dict, List
 
-from twinkle.data_format import last_assistant_text
+from twinkle.data_format import ground_truth, last_assistant_text
 from twinkle.reward.base import Reward
 from twinkle.utils import get_logger
 
@@ -244,14 +244,9 @@ class OlympiadBenchAccuracyReward(Reward):
         for trajectory in trajectories:
             completion = _get_completion(trajectory)
             predicted = _extract_boxed_answers(completion)
-            user_data = trajectory.get('user_data', [])
-            gt = ''
-            is_multiple = False
-            for item in user_data:
-                if item[0] == 'ground_truth':
-                    gt = item[1]
-                elif item[0] == 'is_multiple_answer':
-                    is_multiple = item[1]
+            gt = ground_truth(trajectory)
+            gt = '' if gt is None else str(gt)
+            is_multiple = ground_truth(trajectory, 'is_multiple_answer')
 
             if not predicted or not gt:
                 rewards.append(0.0)

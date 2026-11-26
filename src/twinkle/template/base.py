@@ -693,7 +693,7 @@ class Template:
         )
         return self._engine_input_ids(delta) if engine else delta
 
-    def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
+    def _prepare_chat_template(self, trajectory: Trajectory, **kwargs):
         if self._explicit_enable_thinking:
             kwargs.setdefault('enable_thinking', self.enable_thinking)
         if self.preserve_thinking is not None:
@@ -710,6 +710,10 @@ class Template:
                 {k: v for k, v in b.items() if v is not None} for b in msg["content"] if isinstance(b, dict)
             ]
         messages = [self.decode_tool_calls(msg) for msg in messages]
+        return messages, kwargs
+
+    def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
+        messages, kwargs = self._prepare_chat_template(trajectory, **kwargs)
         # ``tool_calls`` / ``tools`` are already OpenAI-shaped (see
         # :mod:`twinkle.data_format.message`); pass them through verbatim.
         tools = list(trajectory.get("tools") or [])
@@ -745,7 +749,10 @@ class Template:
         # trainable. Collapsing here (idempotent) keeps full and prefix encodes on the
         # same message sequence; key_rounds indices count the normalized rounds. The
         # render entries collapse again for direct inference callers -- idempotent.
-        trajectory["messages"] = self._collapse_system_messages(trajectory["messages"])
+        if self.use_chat_template:
+            trajectory['messages'], kwargs = self._prepare_chat_template(trajectory, **kwargs)
+        else:
+            trajectory['messages'] = self._collapse_system_messages(trajectory['messages'])
         labels = None
         input_ids = None
         # key-round selective training
@@ -849,7 +856,7 @@ class Template:
             if return_length:
                 result['lengths'] = [result[key]['length'] for key in nested if 'length' in result[key]]
             return result
-        if explicit:
+        if explicit and self.use_chat_template and (intent.with_labels or intent.add_generation_prompt):
             check_generation_prompt(sample, intent.add_generation_prompt)
         output = self._encode_one(sample, intent, engine=engine, return_length=return_length, **kwargs)
         return output[0] if len(output) == 1 else output
@@ -954,6 +961,8 @@ class Template:
 
     def _get_trajectory_keys(self, trajectories: Mapping, is_columnar: bool) -> list[str]:
         """Get keys whose values are lists of Trajectories."""
+        if self._is_trajectory(trajectories):
+            return []
         keys = []
         if is_columnar:
             for k, v in trajectories.items():
