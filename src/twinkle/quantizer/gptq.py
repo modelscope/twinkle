@@ -103,16 +103,22 @@ class GptqQuantizer(CalibrationQuantizer):
         return any(module in name for module in (self.modules_to_not_convert or ()))
 
     def get_modules_in_block_to_quantize(self, model, block_name: str) -> Optional[List[List[str]]]:
-        """Group a block's linears for MoE models.
-
-        Only meaningful for MoE: the router ('mlp.gate') must stay in full precision, and the expert
-        linears sharing a suffix are quantized as one group. ``modules_to_not_convert`` entries drop
-        further linears (shared expert gates and the like). Dense models return None, letting
-        optimum use its own default grouping.
-        """
-        if not self.is_moe_model:
-            return None
+        """Group quantized linears, excluding full-precision modules before comparing blocks."""
         from optimum.gptq.utils import get_layers
+
+        if not self.is_moe_model:
+            if not self.modules_to_not_convert:
+                return None
+            layers = [get_layers(block) for block in _deep_getattr(model, block_name)]
+            kept = [[name for name in block if not self._should_not_quantize(name)] for block in layers]
+            if all(len(names) == len(block) for names, block in zip(kept, layers)):
+                return None
+            # Optimum applies one grouping to every block; skipped layers need not be identical.
+            if any(set(names) != set(kept[0]) for names in kept[1:]):
+                raise ValueError('Dense GPTQ requires identical quantized linear names after '
+                                 'applying modules_to_not_convert to every decoder block.')
+            # An empty outer list selects optimum's defaults; [[]] explicitly quantizes nothing.
+            return [[name] for name in kept[0]] or [[]]
 
         # Do not quantize the gate part.
         block = _deep_getattr(model, block_name)[-1]
