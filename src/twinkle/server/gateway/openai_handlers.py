@@ -143,27 +143,22 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 translate=lambda data, m: translate_response(data, m, request_id),
             )
 
-        # Streaming: proxy to /twinkle/sample_stream, translate to SSE
-        route = await _resolve_model_route(self, model, sample_request)
-        if route is None:
-            return _model_not_found(model)
-        sampler_headers = _sampler_headers(request)
-        await _ensure_template(self, route.base_model, sampler_headers, request)
         request_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
-        first_chunk = {'is_first': True}
+        is_first = True
 
-        def _chat_chunk(delta_text: str, finish_reason: str | None) -> dict[str, Any]:
-            is_first = first_chunk['is_first']
-            first_chunk['is_first'] = False
-            return translate_stream_chunk(
+        def _chat_chunk(delta_text: str, finish_reason: str | None, response_model: str) -> dict[str, Any]:
+            nonlocal is_first
+            chunk = translate_stream_chunk(
                 delta_text=delta_text,
-                model=route.response_model,
+                model=response_model,
                 finish_reason=finish_reason,
                 request_id=request_id,
                 is_first=is_first,
             )
+            is_first = False
+            return chunk
 
-        return _streaming_response(self, request, sample_request, route, sampler_headers, _chat_chunk)
+        return await _streaming_response(self, request, sample_request, model, _chat_chunk)
 
     @app.post('/completions')
     async def completions(
@@ -182,20 +177,14 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         except ValueError as e:
             return _bad_request(e)
 
+        request_id = f'cmpl-{uuid.uuid4().hex[:24]}'
         if body.get('stream', False):
-            route = await _resolve_model_route(self, model, sample_request)
-            if route is None:
-                return _model_not_found(model)
-            sampler_headers = _sampler_headers(request)
-            await _ensure_template(self, route.base_model, sampler_headers, request)
-            request_id = f'cmpl-{uuid.uuid4().hex[:24]}'
-            return _streaming_response(
-                self, request, sample_request, route, sampler_headers,
-                lambda delta, finish: translate_completion_stream_chunk(
-                    delta_text=delta, model=route.response_model, finish_reason=finish, request_id=request_id),
+            return await _streaming_response(
+                self, request, sample_request, model,
+                lambda delta, finish, response_model: translate_completion_stream_chunk(
+                    delta_text=delta, model=response_model, finish_reason=finish, request_id=request_id),
             )
 
-        request_id = f'cmpl-{uuid.uuid4().hex[:24]}'
         return await _proxy_sample(
             self,
             request,
@@ -288,7 +277,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
 class _ModelRoute:
     base_model: str
     response_model: str
-    adapter_name: str = ''
+    deployed_adapter: bool = False
 
 
 async def _resolve_model_route(
@@ -300,7 +289,7 @@ async def _resolve_model_route(
 
     for entry in gateway.supported_models:
         if entry.base_model and entry.model_name == model:
-            return _ModelRoute(entry.base_model, model, adapter_name=model)
+            return _ModelRoute(entry.base_model, model, deployed_adapter=True)
 
     target = gateway.openai_model_aliases.get(model)
     if target in gateway.supported_model_names:
@@ -315,11 +304,11 @@ async def _resolve_model_route(
 
 
 def _sampler_body(sample_request: dict[str, Any], route: _ModelRoute) -> bytes:
-    body = {**sample_request, 'adapter_name': route.adapter_name}
-    if route.adapter_name:
-        body['require_deployed_adapter'] = True
-    elif sample_request.get('adapter_uri'):
+    body = {**sample_request, 'adapter_name': ''}
+    if route.deployed_adapter or sample_request.get('adapter_uri'):
         body['adapter_name'] = route.response_model
+    if route.deployed_adapter:
+        body['require_deployed_adapter'] = True
     return json.dumps(body).encode()
 
 
@@ -456,14 +445,18 @@ async def _proxy_sample(
     return JSONResponse(content=result, headers=resp_headers)
 
 
-def _streaming_response(
+async def _streaming_response(
     gateway: GatewayServer,
     request: Request,
     sample_request: dict[str, Any],
-    route: _ModelRoute,
-    sampler_headers: dict[str, str],
-    chunk_translator: Callable[[str, str | None], dict[str, Any]],
+    model: str,
+    chunk_translator: Callable[[str, str | None, str], dict[str, Any]],
 ) -> Response:
+    route = await _resolve_model_route(gateway, model, sample_request)
+    if route is None:
+        return _model_not_found(model)
+    sampler_headers = _sampler_headers(request)
+    await _ensure_template(gateway, route.base_model, sampler_headers, request)
     upstream = gateway.proxy.proxy_request_stream(
         request,
         endpoint='twinkle/sample_stream',
@@ -480,9 +473,9 @@ class _SamplerStreamingResponse(Response):
 
     def __init__(
         self,
-        upstream: AbstractAsyncContextManager[AsyncIterator[str]],
+        upstream: AbstractAsyncContextManager[httpx.Response],
         model: str,
-        translate: Callable[[str, str | None], dict[str, Any]],
+        translate: Callable[[str, str | None, str], dict[str, Any]],
     ):
         super().__init__(media_type='text/event-stream')
         self.upstream = upstream
@@ -493,18 +486,19 @@ class _SamplerStreamingResponse(Response):
         async with AsyncExitStack() as stack:
             # Check the upstream status before committing HTTP 200 to the client.
             try:
-                lines = await stack.enter_async_context(self.upstream)
-            except httpx.HTTPStatusError as error:
-                response = _sampler_http_error(
-                    self.model, error.response.status_code, f'Sampler error: {error.response.text[:500]}')
+                upstream = await stack.enter_async_context(self.upstream)
+                if upstream.status_code >= 400:
+                    await upstream.aread()
+                    response = _sampler_http_error(
+                        self.model, upstream.status_code, f'Sampler error: {upstream.text[:500]}')
+                else:
+                    response = StreamingResponse(
+                        self._events(upstream.aiter_lines()),
+                        media_type=self.media_type,
+                        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+                    )
             except httpx.RequestError as error:
                 response = _sampler_http_error(self.model, 502, f'Sampler connection failed: {type(error).__name__}')
-            else:
-                response = StreamingResponse(
-                    self._events(lines),
-                    media_type=self.media_type,
-                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
-                )
             await response(scope, receive, send)
 
     async def _events(self, lines: AsyncIterator[str]) -> AsyncIterator[str]:
@@ -516,7 +510,7 @@ class _SamplerStreamingResponse(Response):
                 error = make_error(message=chunk['error'], error_type='server_error')
                 yield f'data: {json.dumps(error)}\n\n'
                 return
-            event = self.translate(chunk.get('delta', ''), chunk.get('finish_reason'))
+            event = self.translate(chunk.get('delta', ''), chunk.get('finish_reason'), self.model)
             yield f'data: {json.dumps(event)}\n\n'
         yield 'data: [DONE]\n\n'
 

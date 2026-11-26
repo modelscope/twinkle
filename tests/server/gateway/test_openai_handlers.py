@@ -552,34 +552,31 @@ class TestChatCompletions:
 
 class TestChatCompletionsStreaming:
 
-    def test_stream_request_uses_sample_stream_endpoint(self, mock_gateway):
+    @pytest.mark.parametrize('endpoint, input_body', [
+        ('/chat/completions', {'messages': [{'role': 'user', 'content': 'Hi'}]}),
+        ('/completions', {'prompt': 'Hi'}),
+    ])
+    def test_stream_request_uses_sample_stream_endpoint(self, mock_gateway, endpoint, input_body):
         mock_self, app = mock_gateway
         mock_self.openai_model_aliases = {'default': 'Qwen/Qwen3.5-4B'}
         mock_self.proxy.proxy_request.return_value = Response(status_code=200)
 
-        async def upstream_lines():
-            yield json.dumps({'delta': 'Hello', 'finish_reason': None})
-            yield json.dumps({'delta': ' world', 'finish_reason': 'stop'})
-
         @asynccontextmanager
         async def fake_stream(*args, **kwargs):
+            assert kwargs['endpoint'] == 'twinkle/sample_stream'
             assert kwargs['base_model'] == 'Qwen/Qwen3.5-4B'
             assert json.loads(kwargs['body_override'])['adapter_name'] == ''
-            yield upstream_lines()
+            yield httpx.Response(200, content='\n'.join([
+                json.dumps({'delta': 'Hello', 'finish_reason': None}),
+                json.dumps({'delta': ' world', 'finish_reason': 'stop'}),
+            ]).encode())
 
         mock_self.proxy.proxy_request_stream = fake_stream
 
         client = TestClient(app)
         resp = client.post(
-            '/chat/completions',
-            json={
-                'model': 'default',
-                'messages': [{
-                    'role': 'user',
-                    'content': 'Hi'
-                }],
-                'stream': True,
-            },
+            endpoint,
+            json={**input_body, 'model': 'default', 'stream': True},
             headers={'Authorization': 'Bearer key'},
         )
         assert resp.status_code == 200
@@ -590,16 +587,17 @@ class TestChatCompletionsStreaming:
         assert len(lines) == 3  # 2 chunks + [DONE]
         assert lines[-1] == 'data: [DONE]'
 
-        # First chunk should have role
         chunk1 = json.loads(lines[0].removeprefix('data: '))
-        assert chunk1['model'] == 'Qwen/Qwen3.5-4B'
-        assert chunk1['object'] == 'chat.completion.chunk'
-        assert chunk1['choices'][0]['delta']['role'] == 'assistant'
-        assert chunk1['choices'][0]['delta']['content'] == 'Hello'
-
-        # Second chunk
         chunk2 = json.loads(lines[1].removeprefix('data: '))
-        assert chunk2['choices'][0]['delta']['content'] == ' world'
+        assert chunk1['model'] == chunk2['model'] == 'Qwen/Qwen3.5-4B'
+        if endpoint == '/chat/completions':
+            assert chunk1['object'] == 'chat.completion.chunk'
+            assert chunk1['choices'][0]['delta'] == {'role': 'assistant', 'content': 'Hello'}
+            assert chunk2['choices'][0]['delta']['content'] == ' world'
+        else:
+            assert chunk1['object'] == 'text_completion.chunk'
+            assert chunk1['choices'][0]['text'] == 'Hello'
+            assert chunk2['choices'][0]['text'] == ' world'
         assert chunk2['choices'][0]['finish_reason'] == 'stop'
 
     @pytest.mark.parametrize('stream', [False, True])
@@ -609,10 +607,7 @@ class TestChatCompletionsStreaming:
 
         @asynccontextmanager
         async def missing_stream(*args, **kwargs):
-            upstream_request = httpx.Request('POST', 'http://sampler')
-            raise httpx.HTTPStatusError('missing', request=upstream_request,
-                                        response=httpx.Response(404, request=upstream_request))
-            yield
+            yield httpx.Response(404)
 
         gateway.proxy.proxy_request_stream = missing_stream
         response = TestClient(app).post('/chat/completions', json={
