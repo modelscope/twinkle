@@ -170,14 +170,16 @@ class ServerLauncher:
         return options
 
     def _gateway_arguments(self) -> dict[str, Any]:
-        args = {'http_options': self.config.http_options.model_dump()}
+        args = {
+            'http_options': self.config.http_options.model_dump(),
+            'supported_models': list(
+                dict.fromkeys(
+                    alias for app in self.config.applications
+                    if app.import_path == 'sampler' and (alias := extract_model_alias(app.route_prefix, 'sampler')))),
+        }
         models = self.config.training_config.models
         if models:
             args['training_models'] = [model.name for model in models]
-            args['supported_models'] = list(
-                dict.fromkeys(
-                    alias for app in self.config.applications
-                    if app.import_path == 'sampler' and (alias := extract_model_alias(app.route_prefix, 'sampler'))))
         return args
 
     def _deploy_sampler(self, app: ApplicationSpec) -> None:
@@ -210,6 +212,8 @@ class ServerLauncher:
         args = {key: value for key, value in dict(app_spec.args).items() if value is not None}
         if app_spec.import_path == 'server':
             defaults = self._gateway_arguments()
+            if 'supported_models' not in args and defaults['supported_models']:
+                defaults.setdefault('training_models', [])
             for key, value in defaults.items():
                 args.setdefault(key, value)
         deployment = app_spec.deployments[0] if app_spec.deployments else {}

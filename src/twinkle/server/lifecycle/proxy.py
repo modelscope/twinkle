@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import logging
+from contextlib import asynccontextmanager
 from typing import Any, TypedDict
 
 import httpx
@@ -105,6 +106,7 @@ class ServiceProxy:
             )
             return JSONResponse(status_code=502, content=payload.model_dump(mode="json", exclude_none=True))
 
+    @asynccontextmanager
     async def proxy_request_stream(
         self,
         request: Request,
@@ -136,9 +138,7 @@ class ServiceProxy:
                         request=response.request,
                         response=httpx.Response(status_code=response.status_code, content=body),
                     )
-                async for line in response.aiter_lines():
-                    if line:
-                        yield line
+                yield response.aiter_lines()
 
     async def proxy_to_model(self, request: Request, endpoint: str, base_model: str) -> Response:
         return await self.proxy_request(request, f"tinker/{endpoint}", base_model, "model")

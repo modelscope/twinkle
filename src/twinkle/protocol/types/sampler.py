@@ -17,7 +17,7 @@ matching :mod:`twinkle.protocol.types.processor`.
 """
 from __future__ import annotations
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, model_validator
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from .base import ResponseModel, StrictRequest, passthrough
@@ -40,8 +40,16 @@ class SampleRequest(StrictRequest):
         None, description='Sampling parameters (max_tokens, temperature, num_samples, etc.)')
     adapter_name: str = Field('', description='Adapter name for LoRA inference')
     adapter_uri: str | None = Field(None, description='Adapter URI (twinkle:// path or local path) for LoRA inference')
+    require_deployed_adapter: bool | None = Field(
+        None, description='Require adapter_name to be deployed on this sampler')
     token_only: bool = Field(
         False, description='Return sampled tokens/logprobs only; encoded inputs are engine ids, media alongside')
+
+    @model_validator(mode='after')
+    def _validate_adapter_selection(self) -> SampleRequest:
+        if self.require_deployed_adapter and self.adapter_uri:
+            raise ValueError('Select either the deployed adapter or an explicit adapter_uri')
+        return self
 
 
 class SampledSequenceModel(ResponseModel):
@@ -80,6 +88,8 @@ class EncodeRequest(StrictRequest):
     pooling_params: dict[str, JsonValue] | None = Field(
         None, description='Pooling parameters (task, dimensions, etc.)')
     adapter_name: str = Field('', description='Adapter name for LoRA inference')
+    require_deployed_adapter: bool | None = Field(
+        None, description='Require adapter_name to be deployed on this sampler')
 
 
 class SamplerSetTemplateRequest(StrictRequest):

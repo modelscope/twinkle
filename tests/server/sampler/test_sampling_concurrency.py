@@ -15,7 +15,7 @@ from starlette.requests import Request
 from tinker import types as tinker_types
 
 from twinkle.data_format import SampledSequence, SampleResponse
-from twinkle.protocol.types import SampleRequest
+from twinkle.protocol.types import EncodeRequest, SampleRequest
 from twinkle.server.sampler.app import SamplerManagement
 from twinkle.server.sampler.concurrency import SamplerConcurrency
 from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
@@ -23,7 +23,7 @@ from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_ro
 from twinkle.utils import FullWeightLoadError
 from twinkle.server.task_queue.backend_gate import BackendGate
 from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.exceptions import BackendBusyError
+from twinkle.server.exceptions import BackendBusyError, ResourceNotFoundError
 from twinkle.server.task_queue.worker import ComputeWorker
 
 
@@ -211,6 +211,39 @@ async def test_real_routes_overlap_and_keep_request_results(make_service, dialec
     records = await asyncio.gather(*(service.result(ref) for ref in refs))
     assert [_tokens(record, dialect) for record, dialect in zip(records, jobs)] == [[i + 1] for i in range(count)]
     assert service._compute_worker._worker_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('endpoint', 'request_type'), [
+    ('/twinkle/sample', SampleRequest),
+    ('/twinkle/sample_stream', SampleRequest),
+    ('/twinkle/encode', EncodeRequest),
+])
+async def test_required_adapter_cannot_fall_back_to_base(make_service, endpoint, request_type):
+    service = make_service()
+    request = Request({'type': 'http', 'headers': [], 'state': {'client_id': 'test'}})
+    body = request_type(inputs=[{'input_ids': [7]}], adapter_name='missing-lora', require_deployed_adapter=True)
+    with pytest.raises(ResourceNotFoundError, match='missing-lora'):
+        await service.endpoints[endpoint](request, body, service)
+    assert not service.state.records
+
+
+@pytest.mark.asyncio
+async def test_encode_uses_deployed_adapter_weights(make_service):
+    service = make_service()
+    service.deploy_adapters['pooling-lora'] = 'deployed/adapter'
+
+    def encode(inputs, pooling_params, *, adapter_name, adapter_path):
+        assert adapter_name == 'test-pooling-lora'
+        assert adapter_path == 'deployed/adapter'
+        return [SimpleNamespace(data=[0.5])]
+
+    service.sampler.encode = encode
+    request = Request({'type': 'http', 'headers': [], 'state': {'client_id': 'test'}})
+    body = EncodeRequest(inputs=[{'input_ids': [7]}], adapter_name='pooling-lora', require_deployed_adapter=True)
+    envelope = await service.endpoints['/twinkle/encode'](request, body, service)
+    record = await service.result(envelope.request_id)
+    assert record['result'] == {'data': [[0.5]]}
 
 
 @pytest.mark.asyncio

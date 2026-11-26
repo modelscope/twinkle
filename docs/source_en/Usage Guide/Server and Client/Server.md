@@ -162,6 +162,12 @@ twinkle-server print-config -c server_config.yaml --format json
 twinkle-server clear persistence -c server_config.yaml
 ```
 
+### Model names in the OpenAI-compatible API
+
+Use `GET /api/v1/models` to find registered base models and deployed LoRA adapters. Unknown and stopped model names return `404 model_not_found`, including on single-model deployments.
+
+To support an existing short name, configure an explicit mapping in the gateway's `args.openai_model_aliases`, such as `{default: Qwen/Qwen3.5-4B}`. An alias must have a distinct name and target a registered base model. A request with `model="default"` reports `Qwen/Qwen3.5-4B` in the response. For LoRA, use the deployed adapter name or specify the base model and an explicit `adapter_uri`.
+
 ## YAML Configuration Details
 
 The configuration file defines the complete deployment plan for the Server, including HTTP listening, application components, and resource allocation. The Server simultaneously supports both Twinkle and Tinker clients through a unified configuration file.

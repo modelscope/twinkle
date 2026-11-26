@@ -98,7 +98,6 @@ def translate_chat_request(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
     sample_request = {
         'inputs': trajectory,
         'sampling_params': sampling_params or None,
-        'adapter_name': model,
     }
 
     adapter_uri = body.get('adapter_uri')
@@ -256,7 +255,6 @@ def translate_completion_request(body: dict[str, Any]) -> tuple[dict[str, Any], 
     sample_request = {
         'inputs': inputs,
         'sampling_params': sampling_params or None,
-        'adapter_name': model,
     }
 
     adapter_uri = body.get('adapter_uri')
@@ -372,7 +370,6 @@ def translate_embedding_request(body: dict[str, Any]) -> tuple[dict[str, Any], s
     encode_request = {
         'inputs': inputs,
         'pooling_params': pooling_params,
-        'adapter_name': model,
     }
     return encode_request, model
 
@@ -445,7 +442,6 @@ def translate_infer_request(body: Any) -> tuple[dict[str, Any], str]:
     sample_request = {
         'inputs': inputs,
         'sampling_params': sampling_params,
-        'adapter_name': model,
     }
     return sample_request, model
 

@@ -29,7 +29,7 @@ from twinkle.protocol.json_utils import json_safe
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
 from twinkle.server.checkpoint import create_checkpoint_manager
-from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
+from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError, ResourceNotFoundError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
 from twinkle.server.sampler.submission import existing_sample, sample_submission
 from twinkle.server.sampler.weights import resolve_sampler_weights, sample_with_weights
@@ -39,6 +39,13 @@ from twinkle.server.telemetry.tracing import traced_operation
 from .runtime import request_execution_scope
 
 logger = logging.getLogger(__name__)
+
+
+def _deployed_adapter_uri(service: SamplerManagement, adapter_name: str, required: bool | None) -> str | None:
+    uri = service.deploy_adapters.get(adapter_name) if adapter_name else None
+    if required and not uri:
+        raise ResourceNotFoundError(f"Adapter '{adapter_name}' is not deployed on this sampler.")
+    return uri
 
 
 #: Sentinel for a value that cannot cross the HTTP boundary and must be omitted from its container.
@@ -244,22 +251,18 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             return await self._peek_terminal(submission.request_id, fallback_status='pending')
 
         training_id = None
+        deployed_uri = None
         if body.adapter_uri:
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             training_id = await asyncio.to_thread(checkpoint_manager.sampling_training_id, body.adapter_uri)
+        else:
+            deployed_uri = _deployed_adapter_uri(self, body.adapter_name, body.require_deployed_adapter)
 
         async def _task():
-            # Resolve adapter
-            resolved_uri = None
-            adapter_name = body.adapter_name or ''
-            full_adapter_name = resolve_twinkle_adapter_name(request, adapter_name) or ''
-
+            resolved_uri = deployed_uri
             if body.adapter_uri:
                 _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
-            else:
-                # No explicit uri: the OpenAI-gateway shape carries only the adapter's public
-                # name -- resolve it against the deployment's static name->path mapping.
-                resolved_uri = self.deploy_adapters.get(adapter_name)
+            adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name) or ''
 
             # Parse inputs (shared seam; batch form)
             inputs = to_backend_inputs(body.inputs)
@@ -278,7 +281,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                     self.sampler.sample,
                     inputs,
                     params,
-                    adapter_name=full_adapter_name,
+                    adapter_name=adapter_name,
                     adapter_path=adapter_path,
                     **extra,
                 )
@@ -374,13 +377,16 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         task, which comes back as a failed envelope.
         """
         token = await self._on_request_start(request)
+        adapter_path = _deployed_adapter_uri(self, body.adapter_name, body.require_deployed_adapter)
 
         async def _task():
             inputs = to_backend_inputs(body.inputs)
             pooling_params = PoolingParams.from_dict(body.pooling_params) if body.pooling_params else None
             adapter_name = resolve_twinkle_adapter_name(request, body.adapter_name) or ''
+            adapter_kwargs = {'adapter_path': adapter_path} if adapter_path else {}
             responses = await self.sampling_guard.run(
-                lambda: self.call_backend(self.sampler.encode, inputs, pooling_params, adapter_name=adapter_name))
+                lambda: self.call_backend(
+                    self.sampler.encode, inputs, pooling_params, adapter_name=adapter_name, **adapter_kwargs))
             return {'data': [list(response.data) for response in responses]}
 
         return await self.submit_concurrent_and_peek(
@@ -488,7 +494,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         """
         token = await self._on_request_start(request)
 
-        resolved_uri = None
         adapter_name = body.adapter_name or ''
         full_adapter_name = resolve_twinkle_adapter_name(request, adapter_name) or ''
 
@@ -497,8 +502,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
             _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
         else:
-            # Same as /twinkle/sample: no explicit uri, fall back to the deployment's mapping.
-            resolved_uri = self.deploy_adapters.get(adapter_name)
+            resolved_uri = _deployed_adapter_uri(self, adapter_name, body.require_deployed_adapter)
 
         # Streaming accepts exactly one input; the shared seam enforces that and
         # returns a single parsed object. Its ValueError maps to the same 400 this

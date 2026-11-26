@@ -58,7 +58,8 @@ async def test_stream_without_actor_returns_structured_error():
     _register_twinkle_sampler_routes(app, lambda: service)
     route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/sample_stream')
     request = SimpleNamespace(state=SimpleNamespace(request_id='request'))
-    body = SimpleNamespace(adapter_name='', adapter_uri=None, inputs={'input_ids': [1]}, sampling_params=None)
+    body = SimpleNamespace(adapter_name='', adapter_uri=None, require_deployed_adapter=False,
+                           inputs={'input_ids': [1]}, sampling_params=None)
 
     response = await route.endpoint(request, body, service)
     chunks = [chunk async for chunk in response.body_iterator]

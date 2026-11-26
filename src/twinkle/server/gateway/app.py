@@ -39,11 +39,15 @@ class GatewayServer(LazyCleanupMixin):
         self.state = get_server_state(**state_kwargs)
         self.route_prefix = kwargs.get('route_prefix', '/api/v1')
         self.http_options = http_options or {}
-        self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
         self.supported_models = self._normalize_models(supported_models)
         self.training_models = self._normalize_models(kwargs.get('training_models', supported_models))
         self._training_model_names = frozenset(m.model_name for m in self.training_models)
-        self._supported_model_names = frozenset(m.model_name for m in self.supported_models)
+        self._supported_model_names = frozenset(m.model_name for m in self.supported_models if not m.base_model)
+        self.openai_model_aliases = kwargs.get('openai_model_aliases') or {}
+        conflicts = self.openai_model_aliases.keys() & {m.model_name for m in self.supported_models}
+        if conflicts:
+            raise ValueError(f'OpenAI aliases conflict with registered model names: {", ".join(sorted(conflicts))}')
+        self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
         # OpenAI-compat surface knobs: ``api_key`` gates every inference route with a Bearer check
         # (None = unauthenticated), ``owned_by`` is the ``owned_by`` field of ``/models`` entries.
         self.api_key = kwargs.get('api_key')
@@ -56,11 +60,7 @@ class GatewayServer(LazyCleanupMixin):
 
     @property
     def supported_model_names(self) -> frozenset[str]:
-        """Base-model names this gateway accepts.
-
-        Public because ``openai_handlers._resolve_base_model`` reads it; it used to
-        reach into ``gateway._supported_model_names`` directly.
-        """
+        """Registered public names of base samplers."""
         return self._supported_model_names
 
     @staticmethod

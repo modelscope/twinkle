@@ -5,14 +5,15 @@ Uses a minimal FastAPI app with the OpenAI routes directly registered
 (bypassing the full app_scaffold middleware stack) to test handler logic.
 """
 from __future__ import annotations
-
 import asyncio
-import json
-import httpx
-import pytest
-from fastapi import FastAPI, Request
-from fastapi.testclient import TestClient
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
+
+import httpx
+import json
+import pytest
+from fastapi import FastAPI, Request, Response
+from fastapi.testclient import TestClient
 
 from twinkle.server.gateway.openai_bridge import translate_response
 
@@ -37,6 +38,7 @@ def mock_gateway():
     mock_self.proxy = mock_proxy
     mock_self.supported_models = [types.SupportedModel(model_name='Qwen/Qwen3.5-4B')]
     mock_self.supported_model_names = frozenset(['Qwen/Qwen3.5-4B'])
+    mock_self.openai_model_aliases = {}
     # Per-instance template cache; a fresh mock per test isolates it, so the
     # former module-global clear fixture is no longer needed.
     mock_self._template_initialized = set()
@@ -159,6 +161,30 @@ class TestChatCompletions:
         assert resp.status_code == 404
         assert resp.json()['error']['type'] == 'model_not_found'
 
+    @pytest.mark.parametrize(('endpoint', 'body'), [
+        ('/chat/completions', {'messages': [{'role': 'user', 'content': 'Hello'}]}),
+        ('/chat/completions', {'messages': [{'role': 'user', 'content': 'Hello'}], 'stream': True}),
+        ('/completions', {'prompt': 'Hello'}),
+        ('/completions', {'prompt': 'Hello', 'stream': True}),
+        ('/embeddings', {'input': 'Hello'}),
+        ('/infer', {'infer_requests': [{'model': 'stopped-model', 'messages': [{'role': 'user', 'content': 'Hi'}]}]}),
+    ])
+    def test_only_remaining_model_cannot_take_another_models_requests(self, mock_gateway, endpoint, body):
+        gateway, app = mock_gateway
+        response = TestClient(app).post(endpoint, json={'model': 'stopped-model', **body})
+        assert response.status_code == 404
+        assert response.json()['error']['code'] == 'model_not_found'
+        gateway.proxy.proxy_request.assert_not_called()
+        gateway.proxy.proxy_request_stream.assert_not_called()
+
+    def test_alias_to_removed_model_is_not_rebound(self, mock_gateway):
+        gateway, app = mock_gateway
+        gateway.openai_model_aliases = {'default': 'stopped-model'}
+        response = TestClient(app).post(
+            '/chat/completions', json={'model': 'default', 'messages': [{'role': 'user', 'content': 'Hello'}]})
+        assert response.status_code == 404
+        gateway.proxy.proxy_request.assert_not_called()
+
     @pytest.mark.parametrize('has_request_id', [False, True])
     def test_sampler_forwards_request_and_client_identity(self, mock_gateway, has_request_id):
         mock_self, app = mock_gateway
@@ -211,32 +237,49 @@ class TestChatCompletions:
         body_bytes = call_kwargs.kwargs.get('body_override')
         assert body_bytes is not None
         body = json.loads(body_bytes)
-        assert body['adapter_name'] == 'Qwen/Qwen3.5-4B'
+        assert body['adapter_name'] == ''
         assert body['inputs'] == {'messages': [{'role': 'user', 'content': 'Hello'}]}
         assert body['sampling_params']['temperature'] == 0.5
 
-    def test_adapter_resolves_via_metadata(self, mock_gateway):
+    def test_training_metadata_requires_explicit_checkpoint(self, mock_gateway):
         mock_self, app = mock_gateway
         mock_self.state.get_model_metadata.return_value = {'base_model': 'Qwen/Qwen3.5-4B'}
         mock_self.proxy.proxy_request.return_value = self._make_sample_response()
 
         client = TestClient(app)
-        resp = client.post(
-            '/chat/completions',
-            json={
-                'model': 'my-fine-tuned-adapter',
-                'messages': [{
-                    'role': 'user',
-                    'content': 'Hello'
-                }],
-            },
-            headers={'Authorization': 'Bearer key'},
-        )
+        body = {
+            'model': 'my-fine-tuned-adapter',
+            'messages': [{'role': 'user', 'content': 'Hello'}],
+        }
+        assert client.post('/chat/completions', json=body).status_code == 404
+        mock_self.proxy.proxy_request.assert_not_called()
+        resp = client.post('/chat/completions', json={**body, 'adapter_uri': 'twinkle://checkpoint'})
         assert resp.status_code == 200
+        forwarded = mock_self.proxy.proxy_request.call_args.kwargs
+        assert forwarded['base_model'] == 'Qwen/Qwen3.5-4B'
+        assert json.loads(forwarded['body_override'])['adapter_uri'] == 'twinkle://checkpoint'
 
-        # Verify proxy was called with the correct base_model
-        call_kwargs = mock_self.proxy.proxy_request.call_args
-        assert call_kwargs.kwargs.get('base_model') or call_kwargs.args[2] == 'Qwen/Qwen3.5-4B'
+    @pytest.mark.parametrize(('name', 'response_model', 'adapter_name'), [
+        ('default', 'Qwen/Qwen3.5-4B', ''),
+        ('served-lora', 'served-lora', 'served-lora'),
+    ])
+    def test_resolved_name_controls_response_and_adapter(self, mock_gateway, name, response_model, adapter_name):
+        from twinkle.protocol.types import SupportedModel
+
+        gateway, app = mock_gateway
+        gateway.openai_model_aliases = {'default': 'Qwen/Qwen3.5-4B'}
+        gateway.supported_models.append(SupportedModel(model_name='served-lora', base_model='Qwen/Qwen3.5-4B'))
+        gateway.proxy.proxy_request.return_value = self._make_sample_response()
+        response = TestClient(app).post(
+            '/chat/completions', json={'model': name, 'messages': [{'role': 'user', 'content': 'Hello'}]})
+
+        assert response.status_code == 200
+        assert response.json()['model'] == response_model
+        forwarded = gateway.proxy.proxy_request.call_args.kwargs
+        assert forwarded['base_model'] == 'Qwen/Qwen3.5-4B'
+        sampler_body = json.loads(forwarded['body_override'])
+        assert sampler_body['adapter_name'] == adapter_name
+        assert sampler_body.get('require_deployed_adapter', False) == bool(adapter_name)
 
     def test_non_stream_polls_queued_task_to_completion(self, mock_gateway):
         """A queued sampler envelope is polled until completed, then translated."""
@@ -510,10 +553,18 @@ class TestChatCompletionsStreaming:
 
     def test_stream_request_uses_sample_stream_endpoint(self, mock_gateway):
         mock_self, app = mock_gateway
+        mock_self.openai_model_aliases = {'default': 'Qwen/Qwen3.5-4B'}
+        mock_self.proxy.proxy_request.return_value = Response(status_code=200)
 
-        async def fake_stream(*args, **kwargs):
+        async def upstream_lines():
             yield json.dumps({'delta': 'Hello', 'finish_reason': None})
             yield json.dumps({'delta': ' world', 'finish_reason': 'stop'})
+
+        @asynccontextmanager
+        async def fake_stream(*args, **kwargs):
+            assert kwargs['base_model'] == 'Qwen/Qwen3.5-4B'
+            assert json.loads(kwargs['body_override'])['adapter_name'] == ''
+            yield upstream_lines()
 
         mock_self.proxy.proxy_request_stream = fake_stream
 
@@ -521,7 +572,7 @@ class TestChatCompletionsStreaming:
         resp = client.post(
             '/chat/completions',
             json={
-                'model': 'Qwen/Qwen3.5-4B',
+                'model': 'default',
                 'messages': [{
                     'role': 'user',
                     'content': 'Hi'
@@ -540,6 +591,7 @@ class TestChatCompletionsStreaming:
 
         # First chunk should have role
         chunk1 = json.loads(lines[0].removeprefix('data: '))
+        assert chunk1['model'] == 'Qwen/Qwen3.5-4B'
         assert chunk1['object'] == 'chat.completion.chunk'
         assert chunk1['choices'][0]['delta']['role'] == 'assistant'
         assert chunk1['choices'][0]['delta']['content'] == 'Hello'
@@ -549,6 +601,24 @@ class TestChatCompletionsStreaming:
         assert chunk2['choices'][0]['delta']['content'] == ' world'
         assert chunk2['choices'][0]['finish_reason'] == 'stop'
 
+    @pytest.mark.parametrize('stream', [False, True])
+    def test_missing_sampler_returns_http_404(self, mock_gateway, stream):
+        gateway, app = mock_gateway
+        gateway.proxy.proxy_request.return_value = Response(status_code=404)
+
+        @asynccontextmanager
+        async def missing_stream(*args, **kwargs):
+            upstream_request = httpx.Request('POST', 'http://sampler')
+            raise httpx.HTTPStatusError('missing', request=upstream_request,
+                                        response=httpx.Response(404, request=upstream_request))
+            yield
+
+        gateway.proxy.proxy_request_stream = missing_stream
+        response = TestClient(app).post('/chat/completions', json={
+            'model': 'Qwen/Qwen3.5-4B', 'messages': [{'role': 'user', 'content': 'Hello'}], 'stream': stream,
+        })
+        assert response.status_code == 404
+        assert response.json()['error']['code'] == 'model_not_found'
 
 # ---------- /models tests -------------------------------------------------- #
 
@@ -565,3 +635,11 @@ class TestListModels:
         assert len(data['data']) == 1
         assert data['data'][0]['id'] == 'Qwen/Qwen3.5-4B'
         assert data['data'][0]['object'] == 'model'
+
+    def test_alias_cannot_reuse_a_registered_name(self, monkeypatch):
+        from twinkle.server.gateway import app as gateway_app
+
+        monkeypatch.setattr(gateway_app, 'get_server_state', MagicMock())
+        with pytest.raises(ValueError, match='conflict with registered model names: model-a'):
+            gateway_app.GatewayServer(
+                supported_models=['model-a', 'model-b'], openai_model_aliases={'model-a': 'model-b'})
