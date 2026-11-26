@@ -481,15 +481,18 @@ class TransformersEngine(BaseSamplerEngine):
         position, and (when ``topk > 0``) the ``topk`` most likely alternatives per position,
         matching the vLLM engine's convention (leading None for the first real token).
         """
+        # Score the same model-ready inputs as generation, including media and position tensors.
+        model_inputs = {**inputs, 'use_cache': False}
         with torch.inference_mode():
-            logits = self.model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask']).logits
+            logits = self.model(**model_inputs).logits
         logprobs = torch.log_softmax(logits[:, :-1].float(), dim=-1)
         targets = inputs['input_ids'][:, 1:]
         picked = logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
         out: List[List[Optional[float]]] = []
         out_topk: List[Optional[List[List[Tuple[int, float]]]]] = []
         for row in range(picked.shape[0]):
-            mask = inputs['attention_mask'][row, 1:].bool()
+            attention = inputs['attention_mask'][row].bool()
+            mask = attention[:-1] & attention[1:]
             # The first real token has no predecessor to be predicted from, hence the leading None,
             # matching vLLM's prompt_logprobs convention.
             out.append([None] + picked[row][mask].tolist())
