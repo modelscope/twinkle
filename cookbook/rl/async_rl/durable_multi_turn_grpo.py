@@ -9,11 +9,16 @@ state and the checkpoint manager's logical version with the adapter, optimizer, 
         "checkpoint_manager": checkpoint_manager.state_dict(),
     }
     model.save(..., component_states=component_states)
-    checkpoint_manager.sync_weights(merge_and_sync=False)
+    warm_policy_weights(checkpoint_manager)
 
-On resume, the model checkpoint is loaded first, then the manager restores its version and syncs
-before the driver loads its queries. Saved queries are submitted as fresh rollout attempts. No
-environment snapshot, turn journal or second commit protocol is involved.
+``merge_and_sync=False`` has a two-phase startup: the first sync publishes the base model and the
+second publishes the LoRA adapter. ``warm_policy_weights`` performs both before the driver admits
+queries, so the first and every resumed rollout observe the checkpointed adapter. Later steps need
+one call because the base is already present.
+
+On resume, the model checkpoint is loaded first, then the manager restores its version and warms
+both weight phases before the driver loads its queries. Saved queries are submitted as fresh
+rollout attempts. No environment snapshot, turn journal or second commit protocol is involved.
 """
 
 from __future__ import annotations
@@ -48,6 +53,12 @@ from twinkle_agentic.async_rl import StreamingDriver
 from twinkle_agentic.rollout.multi_turn import MultiTurnRollout
 
 logger = get_logger()
+
+
+def warm_policy_weights(checkpoint_manager: CheckpointEngineManager) -> None:
+    """Publish both phases of a LoRA policy before rollouts start."""
+    checkpoint_manager.sync_weights(merge_and_sync=False)  # base model
+    checkpoint_manager.sync_weights(merge_and_sync=False)  # LoRA adapter
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,8 +195,8 @@ def main() -> None:
             )
         if manager_state is not None:
             checkpoint_manager.load_state_dict(manager_state)
-        checkpoint_manager.sync_weights(merge_and_sync=False)
         logger.info("resumed %s at optimizer step %s", checkpoint, optim_step)
+    warm_policy_weights(checkpoint_manager)
 
     dataset = Dataset()
     dataset.add_dataset(DatasetMeta("ms://modelscope/gsm8k", subset_name="main", split="train"))
@@ -270,6 +281,7 @@ def main() -> None:
                 async_save=False,
                 component_states=component_states,
             )
+            # The startup warm-up installed both phases; this publishes the step's adapter alone.
             checkpoint_manager.sync_weights(merge_and_sync=False)
             sampler.reset_prefix_cache()
 

@@ -21,7 +21,6 @@ queue when it finishes, and the driver's thread only reads that queue, so its co
 with the number of episodes in flight.
 """
 from __future__ import annotations
-
 import copy
 import math
 import queue
@@ -37,6 +36,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 from twinkle import remote_class, remote_function
 from twinkle.data_format import user_data_get
 from twinkle.utils import get_logger
+from twinkle_agentic.async_rl.component_state_codec import decode_component_state, encode_component_state
 from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutStatus
 
 logger = get_logger()
@@ -66,8 +66,9 @@ def _record_driver_probe(event: str, episode_id: str = '', **fields: Any) -> Non
     ordering the slow-injection efficiency oracles assert on, with ``t`` stamps from the same
     monotonic clock.
     """
-    import json
     import os
+
+    import json
     root = os.environ.get('TWINKLE_DRIVER_PROBE')
     if not root:
         return
@@ -578,21 +579,22 @@ class StreamingDriver:
         with self._lock:
             groups = self._snapshot_groups()
             loader_state = self._loader_state()
-            return {
+            state = {
                 'format': 'twinkle.streaming-driver.v1',
                 'handed': self._handed,
                 'prompts_drawn': self._prompt_seq,
                 'policy_version': self._version,
                 'loader_state': loader_state,
-                'pending_rows': [copy.deepcopy(row) for row in self._pending_rows],
+                'pending_rows': list(self._pending_rows),
                 'queries': [
                     {
                         'key': group.key,
-                        'row': copy.deepcopy(group.row),
+                        'row': group.row,
                     }
                     for group in groups
                 ],
             }
+            return encode_component_state(state)
 
     def _snapshot_groups(self) -> List[_Group]:
         """Collect active and ready queries that have not yet been handed to the trainer."""
@@ -618,6 +620,7 @@ class StreamingDriver:
         """
         if state is None:
             return
+        state = decode_component_state(state)
         if state.get('format') != 'twinkle.streaming-driver.v1':
             raise ValueError('unsupported StreamingDriver component state')
         queries = list(state.get('queries') or ())
@@ -636,7 +639,7 @@ class StreamingDriver:
             pending_rows = state.get('pending_rows') or ()
             if not isinstance(pending_rows, (list, tuple)):
                 raise ValueError('StreamingDriver pending_rows must be a list or tuple')
-            self._pending_rows = deque(copy.deepcopy(row) for row in pending_rows)
+            self._pending_rows = deque(pending_rows)
 
             seen = set()
             for query in queries:
@@ -644,10 +647,11 @@ class StreamingDriver:
                 if not key or key in seen:
                     raise ValueError(f'invalid or duplicate StreamingDriver query key {key!r}')
                 seen.add(key)
-                row = copy.deepcopy(query.get('row'))
+                row = query.get('row')
                 group = _Group(key=key, row=row)
                 self._groups[key] = group
                 if not self._exhausted:
+                    # _live is derived from the restored queries; persisting it would double count.
                     self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
                     self._counters['resumed_queries'] += 1
                     logger.info(

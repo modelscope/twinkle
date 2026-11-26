@@ -1,6 +1,9 @@
 import copy
 from concurrent.futures import Future
 
+import json
+import torch
+
 from twinkle_agentic.async_rl import StreamingDriver
 from twinkle_agentic.rollout.multi_turn import RolloutStatus
 
@@ -110,6 +113,38 @@ def test_component_snapshot_does_not_mutate_scheduling_state():
     assert (driver._live, driver._inflight, driver._counters) == before[1:]
     assert state["queries"][0]["row"] == {"messages": [{"role": "user", "content": "one"}]}
     _finish(driver, rollout)
+
+
+def test_component_state_persists_multimodal_query_and_replays_it():
+    query = {
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "url": "image://fixture"},
+                {"type": "text", "text": "what is this?"},
+            ],
+        }],
+        "pixel_values": torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),
+        "images": [{"bytes": b"raw-image", "path": None}],
+    }
+    source_rollout = _Rollout()
+    source = StreamingDriver([query], source_rollout, batch_size=2, num_generations=2)
+    source._admit()
+
+    state = source.state_dict()
+    json.dumps(state)
+
+    restored_rollout = _Rollout()
+    restored = StreamingDriver([], restored_rollout, batch_size=2, num_generations=2)
+    restored.load_state_dict(state)
+
+    assert restored._live == 2
+    assert "live" not in state
+    assert torch.equal(restored._groups["0"].row["pixel_values"], query["pixel_values"])
+    assert restored._groups["0"].row["images"][0]["bytes"] == b"raw-image"
+    assert torch.equal(restored_rollout.calls[0]["pixel_values"], query["pixel_values"])
+    _finish(source, source_rollout)
+    _finish(restored, restored_rollout)
 
 
 def _query(text):

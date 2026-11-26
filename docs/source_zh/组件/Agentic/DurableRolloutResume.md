@@ -37,6 +37,10 @@ checkpoint = model.save(
 ckpt_manager.sync_weights(merge_and_sync=False)
 ```
 
+`merge_and_sync=False` 的 LoRA 同步分为两个阶段：第一次同步基模，第二次同步 adapter。
+训练开始和 checkpoint 恢复后都必须先调用两次完成预热，再让 driver 提交 query；之后每个
+optimizer step 只需同步一次 adapter。示例脚本通过 `warm_policy_weights()` 封装这两步。
+
 `StreamingDriver.state_dict()` 包含以下信息：
 
 | 字段 | 含义 |
@@ -52,6 +56,25 @@ ckpt_manager.sync_weights(merge_and_sync=False)
 已经交给训练器的 batch 不写入下一个 checkpoint；若新 checkpoint 写入失败，从上一个
 checkpoint 恢复时仍会重放该 batch。
 
+### 多模态状态
+
+`component_states` 最终写入 `trainer_state.json`，因此状态编码保持为 JSON，不使用 pickle。
+`queries` 和 `pending_rows` 中的以下值会透明往返：
+
+- `torch.Tensor`：保存 dtype、shape 和 C-order 原始字节，加载后恢复 tensor；
+- `numpy.ndarray`：保存 dtype、shape 和原始字节；
+- `PIL.Image.Image`：保存为 PNG 字节；
+- `bytes` / `bytearray`：base64 编码；
+- 嵌套的 list、tuple、mapping 和 path。
+
+较大的二进制 payload 只有在 zlib 压缩后更小时才启用压缩。`pixel_values`、`image_grid_thw`、
+`video_grid_thw` 以及 HF 数据集常见的 `{"bytes": ..., "path": ...}` 图片行都可以直接保存。
+该方案会增加 `trainer_state.json` 的大小，但保持 checkpoint 自包含，不需要额外 sidecar
+协议或改变 `model.save()` 接口。
+
+`_live` 不写入状态。恢复 query 时会重新执行 admission，并按照 `num_generations` 重新计算
+正在运行的 member 数；持久化 `_live` 反而会造成重复计数。
+
 ## 恢复
 
 先恢复模型，再恢复 checkpoint manager 并同步权重，最后恢复 driver：
@@ -64,7 +87,7 @@ manager_state = component_states.get("checkpoint_manager")
 
 if manager_state is not None:
     ckpt_manager.load_state_dict(manager_state)
-ckpt_manager.sync_weights(merge_and_sync=False)
+warm_policy_weights(ckpt_manager)
 driver.load_state_dict(driver_state)
 ```
 
