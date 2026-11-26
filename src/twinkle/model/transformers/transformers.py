@@ -1310,8 +1310,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         own micro-batch scales. Parallel-list kwargs (``ref_logps`` and friends) are sliced by
         ``select_batch`` alongside the inputs, so per-feature alignment survives the split.
         """
-        if get_task_spec(kwargs.get('task', 'causal_lm')).readout:
-            # Readout tasks organize labels / decision meta per RECORD, not per sample: the
+        spec = get_task_spec(kwargs.get('task', 'causal_lm'))
+        if spec.readout and not spec.token_level_labels:
+            # Record-level readouts organize labels / decision meta per RECORD, not per sample: the
             # sample-level split here would desynchronize them from the micro-batch logits.
             # Decision always reads out (its task_forward families included); the seq_cls
             # family only when the model carries an attached head -- its legacy in-model

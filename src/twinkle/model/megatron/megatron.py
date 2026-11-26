@@ -694,8 +694,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # would reject). eval/training omit it; megatron's calculate_loss is a raise, so eval_loss
         # depends on forward_only computing it here.
         compute_loss = kwargs.pop('compute_loss', not (forward_only and disable_lora))
-        return_logits = kwargs.pop('return_logits', False) or 'logits' in output_fields
         task = kwargs.pop('task', 'causal_lm')
+        return_logits = (kwargs.pop('return_logits', False) or 'logits' in output_fields
+                         or (task == 'value' and 'values' in output_fields))
         # MoE routing replay (R2/R3): the driver passes the MODE scalar, resolved below to this
         # backend's action. Popped before loss_extra_kwargs_per_mb so it never reaches the loss.
         router_replay_mode = kwargs.pop('router_replay_mode', None)
@@ -1012,6 +1013,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                                 _packed = batch.get('packed_seq_params')
                                 cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
                                 per_token = head(output_tensor, None, None)
+                                if per_token.dim() == 3 and per_token.shape[-1] == 1:
+                                    per_token = per_token.squeeze(-1)
                                 per_token = processor.postprocess_tensor_cp(per_token, cu_seqlens=cu_seqlens_q)
                                 unpacked_logits = per_token
                         else:
@@ -1050,10 +1053,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                             unpacked_logits = _generative_reranker_score(
                                 unpacked_logits, self.optimizer_group[adapter_name].template)
                 elif task == 'value':
-                    # Legacy path -- PPO critic over the bridge-built head: keep its per-token
-                    # V(s_t) riding the logits channel ([b, s]); PPOValueLoss masks to response
-                    # tokens. Non-packed / non-SP only, mirroring the transformers
-                    # TransformersValuePatch scope.
+                    # Legacy path -- PPO critic over the bridge-built head: keep per-token V(s_t)
+                    # on the logits channel. The common token-level tail below restores sequence
+                    # rows before PPOValueLoss masks and aligns its response-token targets.
                     if is_last_pp and labels is not None:
                         _packed = batch.get('packed_seq_params')
                         cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
@@ -1082,31 +1084,33 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         logps = processor.postprocess_tensor_cp(logps, cu_seqlens=cu_seqlens_q)
                         if entropies is not None:
                             entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
+                if labels is not None and is_last_pp and spec.token_level_labels:
+                    # All token-level tasks restore the same label/output frame before loss:
+                    # vocabulary logps and critic values must share the packed sequence boundaries.
+                    _packed = batch.get('packed_seq_params')
+                    cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
                     batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
-                    if batch.get('loss_scale') is not None:
-                        batch['loss_scale'] = processor.postprocess_tensor_cp(
-                            batch['loss_scale'], cu_seqlens=cu_seqlens_q)
+                    if loss_scale is not None:
+                        batch['loss_scale'] = processor.postprocess_tensor_cp(loss_scale, cu_seqlens=cu_seqlens_q)
                     if completion_mask is not None:
-                        # Same index space as labels, so it needs the same CP reassembly.
                         batch['completion_mask'] = processor.postprocess_tensor_cp(
                             completion_mask, cu_seqlens=cu_seqlens_q)
                     if 'position_ids' in batch:
                         pos = batch['position_ids']
                         if pos.dim() == 3:
-                            pos = pos[0]  # [2/3, 1, seq] → [1, seq]
+                            pos = pos[0]  # [2/3, 1, seq] -> [1, seq]
                         batch['position_ids'] = processor.postprocess_tensor_cp(pos, cu_seqlens=cu_seqlens_q)
-                    # Unpack packed sequences into per-sequence batch format
                     _outputs = {'logps': logps}
                     if entropies is not None:
                         _outputs['entropies'] = entropies
-                    if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
+                    if unpacked_logits is not None:
+                        _outputs['logits'] = unpacked_logits
+                    elif getattr(_loss_instance, 'require_logits', False) or 'logits' in output_fields:
                         _outputs['logits'] = output_tensor
-                    elif 'logits' in output_fields:
-                        _outputs['logits'] = output_tensor
-                    batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
+                    batch, _outputs = processor.unpack_packed_sequences(batch, _outputs, task=task)
                     logps = _outputs['logps']
-                    entropies = _outputs.get('entropies', None)
-                    unpacked_logits = _outputs.get('logits', None)
+                    entropies = _outputs.get('entropies')
+                    unpacked_logits = _outputs.get('logits')
             except Exception as e:
                 # Log the rank-attributed failure, then re-raise: swallowing it would let this DP
                 # rank skip the PP collectives while the others wait, and a degraded value would
