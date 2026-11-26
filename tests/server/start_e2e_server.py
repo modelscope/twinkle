@@ -114,10 +114,10 @@ def run(cmd, env=None, check=True):
 
 
 def kill_server():
-    """Kill any existing twinkle.server processes."""
+    """Kill any existing twinkle_server processes."""
     print("[1/4] Killing existing Twinkle server processes...")
     result = subprocess.run(
-        "ps aux | grep 'twinkle.server' | grep -v grep | awk '{print $2}'",
+        "ps aux | grep 'twinkle_server' | grep -v grep | awk '{print $2}'",
         shell=True, capture_output=True, text=True
     )
     pids = result.stdout.strip().split()
@@ -162,7 +162,7 @@ def launch_server(config: str):
         print(f"    ERROR: config not found: {config_path}", file=sys.stderr)
         sys.exit(1)
 
-    cmd = f"{PYTHON} -m twinkle.server launch --config {config_path}"
+    cmd = f"{PYTHON} -m twinkle_server launch --config {config_path}"
     log_fd = open(SERVER_LOG, "w")
     subprocess.Popen(
         cmd, shell=True, cwd=WORKDIR, stdout=log_fd, stderr=log_fd,

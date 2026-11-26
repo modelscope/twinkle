@@ -65,7 +65,7 @@ class TrainingHandle:
             self.client.set_processor('InputProcessor', padding_side='right')
 
     def datums(self):
-        from twinkle.server.model.tinker_datum import input_feature_to_datum
+        from twinkle_client.utils.tinker_datum import input_feature_to_datum
         return [input_feature_to_datum(feature) for feature in self.inputs]
 
     def step(self):

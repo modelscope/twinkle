@@ -8,9 +8,9 @@ from unittest.mock import Mock
 import pytest
 import ray
 
-from twinkle.server.config import ServerConfig
-from twinkle.server.launcher.server_launcher import ServerLauncher
-from twinkle.server.model.pool.actor import controller_name
+from twinkle_server.config import ServerConfig
+from twinkle_server.launcher.server_launcher import ServerLauncher
+from twinkle_server.model.pool.actor import controller_name
 
 
 def test_unresponsive_controller_does_not_block_other_cleanup():
@@ -132,7 +132,7 @@ def test_startup_rollback_preserves_startup_error_and_cleans_all_owners(monkeypa
 
     monkeypatch.setattr(launcher, '_deploy_application', deploy)
     monkeypatch.setattr(launcher, '_stop_training_controller', failed_cleanup)
-    monkeypatch.setattr('twinkle.server.telemetry.shutdown_telemetry_safely', lambda: calls.append('telemetry'))
+    monkeypatch.setattr('twinkle_server.telemetry.shutdown_telemetry_safely', lambda: calls.append('telemetry'))
     with pytest.raises(ValueError) as caught:
         launcher.launch()
     assert caught.value is error
@@ -192,12 +192,12 @@ def test_start_serve_starts_missing_instance_with_configured_listener(monkeypatc
 
 @pytest.mark.parametrize('blocking', [False, True])
 def test_launch_server_forwards_blocking_policy(monkeypatch, blocking):
-    from twinkle.server.launcher.server_launcher import launch_server
+    from twinkle_server.launcher.server_launcher import launch_server
 
     config = ServerConfig()
     launcher = Mock()
     factory = Mock(return_value=launcher)
-    monkeypatch.setattr('twinkle.server.launcher.server_launcher.ServerLauncher', factory)
+    monkeypatch.setattr('twinkle_server.launcher.server_launcher.ServerLauncher', factory)
     launch_server(config=config, blocking=blocking)
     factory.assert_called_once_with(config=config, ray_namespace=config.ray_namespace)
     launcher.launch.assert_called_once_with(blocking=blocking)

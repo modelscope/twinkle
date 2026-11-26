@@ -9,14 +9,14 @@ import pytest
 import pytest_asyncio
 
 from tests.server.state.fake_backend import FakeBackend
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.deployment import build_deployment_app
-from twinkle.server.gateway.tinker_handlers import _register_gateway_tinker_routes
-from twinkle.server.sampler.concurrency import SamplerConcurrency
-from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
-from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
-from twinkle.server.state.server_state import ServerState
-from twinkle.server.task_queue.mixin import TaskQueueMixin
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.deployment import build_deployment_app
+from twinkle_server.gateway.tinker_handlers import _register_gateway_tinker_routes
+from twinkle_server.sampler.concurrency import SamplerConcurrency
+from twinkle_server.sampler.tinker_handlers import _register_tinker_sampler_routes
+from twinkle_server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
+from twinkle_server.state.server_state import ServerState
+from twinkle_server.task_queue.mixin import TaskQueueMixin
 
 
 @pytest.fixture(scope="session")

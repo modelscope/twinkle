@@ -755,7 +755,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
 
     def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name='', adapter_path=None):
         """Push streaming deltas to a cross-process Ray queue."""
-        from twinkle.server.sampler.backends.streaming import stream_to_queue
+        from twinkle.sampler.streaming import stream_to_queue
         stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False)

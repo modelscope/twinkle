@@ -12,7 +12,7 @@ import dotenv
 import os
 
 from twinkle import get_logger
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 
 dotenv.load_dotenv('.env')
 logger = get_logger()

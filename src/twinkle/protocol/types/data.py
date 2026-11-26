@@ -4,7 +4,7 @@
 These models are the *declared* type of the ``inputs`` request field, so FastAPI
 validates a batch during body parsing -- before the handler runs, before a future
 record exists, and before anything reaches a GPU. The seam that hands data to the
-backend (``twinkle.server.lifecycle.submit.to_backend_inputs``) therefore only
+backend (``twinkle_server.lifecycle.submit.to_backend_inputs``) therefore only
 exports an already-valid object; it is not the first place a malformed batch is
 noticed.
 

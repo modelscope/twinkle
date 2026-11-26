@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Static / structural guards for the lifecycle refactor.
 
-- the deleted symbols occur zero times under ``src/twinkle/**``.
+- the deleted symbols occur zero times under ``twinkle_cs/server/src/twinkle_server/**``.
 - ``TaskEnvelope`` has exactly one construction site.
 - The client-side invariant: the client HTTP timeout is <= 120 and strictly
   greater than the server Long_Poll_Window.
@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_SRC = _REPO_ROOT / 'src' / 'twinkle'
+_SRC = _REPO_ROOT / 'twinkle_cs' / 'server' / 'src' / 'twinkle_server'
 
 # Symbols the refactor removed. A wildcard search (not a per-file list) must find
 # each of them zero times across the whole server tree.
@@ -40,7 +40,7 @@ def test_deleted_symbol_has_zero_occurrences(symbol):
 
 
 def test_client_http_timeout_bounds():
-    from twinkle.server.lifecycle.poll_config import long_poll_window
+    from twinkle_server.lifecycle.poll_config import long_poll_window
     from twinkle_client.http.client import _HTTP_TIMEOUT
 
     assert _HTTP_TIMEOUT <= 120
@@ -64,7 +64,7 @@ def test_task_envelope_has_exactly_one_construction_site():
             if 'TaskEnvelope(' in line and 'class TaskEnvelope' not in line:
                 sites.append(f'{path.relative_to(_REPO_ROOT)}:{lineno}')
 
-    offenders = [site for site in sites if 'server/lifecycle/envelope.py' not in site]
+    offenders = [site for site in sites if 'twinkle_server/lifecycle/envelope.py' not in site]
     assert offenders == [], ('TaskEnvelope must only be constructed in lifecycle/envelope.py '
                              f'(via envelope_from_record); found: {offenders}')
     assert sites, 'expected to find the construction sites inside envelope.py'

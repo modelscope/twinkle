@@ -5,9 +5,9 @@ from fastapi import FastAPI
 from starlette.requests import Request
 
 import twinkle.protocol.types as types
-from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.model.data_plane_inputs import model_result_rows
-from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
+from twinkle_server.exceptions import RequestRejectedError
+from twinkle_server.model.data_plane_inputs import model_result_rows
+from twinkle_server.model.twinkle_handlers import _register_model_twinkle_routes
 
 
 def test_model_result_rows_keeps_one_output_row_per_sample() -> None:
@@ -118,7 +118,7 @@ async def test_topk_teacher_scores_round_trip_and_follow_uneven_rows():
     from twinkle.infra.collectors import tensor_dict
     from twinkle.infra.dispatch import _dispatch_args
     from twinkle.loss.gkd import GKDLoss
-    from twinkle.server.model.backends.transformers_model import _TransformersTinkerCompatMixin
+    from twinkle_server.model.backends.transformers_model import _TransformersTinkerCompatMixin
     from twinkle.utils.device_mesh import DeviceMesh
     from twinkle_client._request_builder import build_request
 
@@ -305,9 +305,9 @@ async def test_forward_backward_binds_nested_dpo_ref_logps_without_coercion() ->
 async def test_save_forwards_backend_options_and_returns_public_path(
         monkeypatch, tmp_path, is_sampler, save_optimizer, full_mode):
     from pathlib import Path
-    from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
-    from twinkle.server.model.app import ModelManagement
-    import twinkle.server.model.twinkle_handlers as handlers
+    from twinkle_server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
+    from twinkle_server.model.app import ModelManagement
+    import twinkle_server.model.twinkle_handlers as handlers
 
     class Management(_SchedulingManagement):
         is_full_mode = ModelManagement.is_full_mode
@@ -320,7 +320,7 @@ async def test_save_forwards_backend_options_and_returns_public_path(
             (path / 'weights').write_text(str(len(self.model_calls)))
             return str(path)
 
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     runs = TwinkleTrainingRunManager('token')
     runs._write_info('training-a', {'base_model': 'test-model', 'is_lora': True})
     manager = TwinkleCheckpointManager('token', runs)
@@ -347,14 +347,14 @@ async def test_save_forwards_backend_options_and_returns_public_path(
 
 @pytest.mark.asyncio
 async def test_training_save_failure_does_not_publish_checkpoint(monkeypatch, tmp_path):
-    from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
-    import twinkle.server.model.twinkle_handlers as handlers
+    from twinkle_server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
+    import twinkle_server.model.twinkle_handlers as handlers
 
     class Management(_SchedulingManagement):
         def save(self, **kwargs):
             raise RuntimeError('backend save failed')
 
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     runs = TwinkleTrainingRunManager('token')
     runs._write_info('training-a', {'base_model': 'test-model'})
     manager = TwinkleCheckpointManager('token', runs)
@@ -379,10 +379,10 @@ async def test_training_save_failure_does_not_publish_checkpoint(monkeypatch, tm
 @pytest.mark.parametrize('local', [False, True], ids=['external', 'checkpoint-uri'])
 async def test_checkpoint_consumers_keep_backend_path_and_options(monkeypatch, tmp_path, operation, local):
     from unittest.mock import MagicMock
-    import twinkle.server.model.twinkle_handlers as handlers
-    from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
+    import twinkle_server.model.twinkle_handlers as handlers
+    from twinkle_server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
 
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     manager = TwinkleCheckpointManager('token', TwinkleTrainingRunManager('token'))
     path = manager.save('run', 'step') if local else 'org/model'
     directory = str(manager.get_ckpt_dir('run', 'weights/step')) if local else path
@@ -557,11 +557,11 @@ async def test_forward_backward_skips_preflight_without_rl_inputs() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize('is_sampler', [True, False], ids=['sampler', 'training'])
 async def test_hybrid_sampler_save_is_rejected_before_enqueue(monkeypatch, tmp_path, is_sampler):
-    from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
-    from twinkle.server.exceptions import RequestRejectedError
-    import twinkle.server.model.twinkle_handlers as handlers
+    from twinkle_server.checkpoint.twinkle import TwinkleCheckpointManager, TwinkleTrainingRunManager
+    from twinkle_server.exceptions import RequestRejectedError
+    import twinkle_server.model.twinkle_handlers as handlers
 
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     runs = TwinkleTrainingRunManager('token')
     runs._write_info('training-a', {'base_model': 'test-model', 'is_lora': True})
     manager = TwinkleCheckpointManager('token', runs)

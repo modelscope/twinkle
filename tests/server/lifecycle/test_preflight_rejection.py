@@ -11,11 +11,11 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from twinkle.server.deployment import twinkle_server_error_handler
-from twinkle.server.exceptions import (BatchSizeError, InputTokensExceededError, RateLimitExceededError,
+from twinkle_server.deployment import twinkle_server_error_handler
+from twinkle_server.exceptions import (BatchSizeError, InputTokensExceededError, RateLimitExceededError,
                                        RequestRejectedError, TwinkleServerError)
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.task_queue.mixin import TaskQueueMixin
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.task_queue.mixin import TaskQueueMixin
 
 
 class _SpyState:

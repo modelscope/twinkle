@@ -5,8 +5,8 @@ import pytest
 from pydantic import ValidationError
 
 from twinkle.protocol.types.model import ForwardOnlyRequest
-from twinkle.server.config.training import TrainingArguments
-from twinkle.server.model.backends.common import TwinkleCompatModelBase
+from twinkle_server.config.training import TrainingArguments
+from twinkle_server.model.backends.common import TwinkleCompatModelBase
 from twinkle_client._request_builder import build_request
 
 

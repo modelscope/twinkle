@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from twinkle.server.resources.allocation import DevicePool
+from twinkle_server.resources.allocation import DevicePool
 
 
 def test_stale_resource_summary_does_not_reject_a_schedulable_group(monkeypatch):

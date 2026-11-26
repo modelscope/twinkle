@@ -7,12 +7,12 @@ from types import SimpleNamespace
 import pytest
 from starlette.requests import Request
 
-from twinkle.server.config.application_spec import SamplerArgs
-from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.lifecycle.submit import resolve_twinkle_adapter_name
-from twinkle.server.middleware.auth import verify_request_token
-from twinkle.server.sampler.pool.controller import SamplerController
-from twinkle.server.sampler.submission import SampleSubmission
+from twinkle_server.config.application_spec import SamplerArgs
+from twinkle_server.exceptions import RequestRejectedError
+from twinkle_server.lifecycle.submit import resolve_twinkle_adapter_name
+from twinkle_server.middleware.auth import verify_request_token
+from twinkle_server.sampler.pool.controller import SamplerController
+from twinkle_server.sampler.submission import SampleSubmission
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -107,7 +107,7 @@ async def test_cold_sample_retry_joins_disconnected_submission(monkeypatch):
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-    from twinkle.server.telemetry import tracing
+    from twinkle_server.telemetry import tracing
 
     exporter = InMemorySpanExporter()
     provider = TracerProvider()

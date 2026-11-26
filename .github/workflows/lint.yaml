@@ -26,12 +26,23 @@ jobs:
   # would otherwise never be exercised. Resolve them here -- metadata only, nothing installed --
   # so an unsatisfiable or contradictory declaration fails loudly on every push.
   dependency-resolution:
+    name: Dependency resolution (${{ matrix.package }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: twinkle-kit
+            requirements: .
+          - package: twinkle-client
+            requirements: . ./twinkle_cs/client
+          - package: twinkle-server
+            requirements: . ./twinkle_cs/server
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Resolve declared dependency ranges
-        run: pip install --dry-run --ignore-installed .
+        run: python -m pip install --dry-run --ignore-installed ${{ matrix.requirements }}

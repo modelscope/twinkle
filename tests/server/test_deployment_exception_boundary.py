@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from twinkle.server.deployment import build_deployment_app
+from twinkle_server.deployment import build_deployment_app
 
 
 def test_deployment_app_catches_unhandled_route_exception_and_keeps_serving(monkeypatch):
@@ -12,7 +12,7 @@ def test_deployment_app_catches_unhandled_route_exception_and_keeps_serving(monk
     class _Context:
         replica_id = _ReplicaId()
 
-    from twinkle.server import deployment
+    from twinkle_server import deployment
 
     monkeypatch.setattr(deployment.serve, 'get_replica_context', lambda: _Context())
     calls = {'health': 0}
@@ -56,7 +56,7 @@ def test_deployment_app_bounds_overlong_unhandled_error(monkeypatch):
     class _Context:
         replica_id = _ReplicaId()
 
-    from twinkle.server import deployment
+    from twinkle_server import deployment
 
     monkeypatch.setattr(deployment.serve, 'get_replica_context', lambda: _Context())
 

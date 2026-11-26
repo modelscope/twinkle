@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 import json
 import numpy as np
-from swift.dev.template_contract.encoding import render_delta as render_delta_tokens
-from swift.dev.template_contract.output import _reasoning_is_open, decode_output
+from twinkle.template.contract.encoding import render_delta as render_delta_tokens
+from twinkle.template.contract.output import _reasoning_is_open, decode_output
 
 from twinkle import remote_class
 from twinkle.data_format import InputFeature, Message, Trajectory, user_data_get

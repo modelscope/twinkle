@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle.server.sampler.weights import resolve_sampler_weights
+from twinkle_server.sampler.weights import resolve_sampler_weights
 
 
 class _FakeSampler:
@@ -17,7 +17,7 @@ class _FakeService:
     """Minimal stand-in exposing the two attributes the helper touches."""
 
     def __init__(self):
-        from twinkle.server.sampler.concurrency import SamplerConcurrency
+        from twinkle_server.sampler.concurrency import SamplerConcurrency
         self.sampling_guard = SamplerConcurrency()
         self.sampler = _FakeSampler()
         self.full_weight_loads: list[str] = []

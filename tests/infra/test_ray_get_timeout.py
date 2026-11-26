@@ -2,7 +2,7 @@
 """Unit tests for the Sync_Dispatch_Path time bound.
 
 These exercise only ``twinkle.infra`` against a plain sleeping Ray actor. They
-depend on neither GPU, Megatron, nor any ``src/twinkle/server/**`` component.
+depend on neither GPU, Megatron, nor any ``twinkle_cs/server/src/twinkle_server/**`` component.
 """
 from __future__ import annotations
 

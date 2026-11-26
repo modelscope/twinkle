@@ -130,7 +130,7 @@ twinkle-server launch --config server_config.yaml
 Or via the Python module:
 
 ```bash
-python -m twinkle.server launch --config server_config.yaml
+python -m twinkle_server launch --config server_config.yaml
 ```
 
 ### CLI Subcommands

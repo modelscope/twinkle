@@ -5,7 +5,7 @@
 # It will:
 #   1. Check if conda is installed; if not, download and install Miniconda
 #   2. Create a new conda environment with Python 3.11
-#   3. Install twinkle-kit with tinker dependencies
+#   3. Install twinkle-client and its twinkle-kit dependency
 #
 # Usage (run in PowerShell):
 #   .\INSTALL_CLIENT.ps1 [ENV_NAME]
@@ -225,17 +225,17 @@ if (Test-Path "$ScriptDir\pyproject.toml") {
     Write-Host ""
     Write-Host "Installing twinkle from source (with tinker support)..." -ForegroundColor Cyan
     if ($UseCondaRun) {
-        conda run -n $EnvName pip install -e "$ScriptDir[tinker]"
+        conda run -n $EnvName pip install -e "$ScriptDir" -e "$ScriptDir/twinkle_cs/client"
     } else {
-        pip install -e "$ScriptDir[tinker]"
+        pip install -e "$ScriptDir" -e "$ScriptDir/twinkle_cs/client"
     }
 } else {
     Write-Host ""
-    Write-Host "Installing twinkle-kit from PyPI (with tinker support)..." -ForegroundColor Cyan
+    Write-Host "Installing twinkle-client from PyPI (with tinker support)..." -ForegroundColor Cyan
     if ($UseCondaRun) {
-        conda run -n $EnvName pip install "twinkle-kit[tinker]"
+        conda run -n $EnvName pip install "twinkle-client"
     } else {
-        pip install "twinkle-kit[tinker]"
+        pip install "twinkle-client"
     }
 }
 

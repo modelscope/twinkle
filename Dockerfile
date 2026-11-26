@@ -23,13 +23,10 @@ WORKDIR /twinkle
 COPY pyproject.toml setup.cfg README.md LICENSE ./
 COPY src/ ./src/
 
-# The base release predates swift.dev.template_contract. Use the same
-# revision as the Twinkle client setup, with the base runtime dependencies.
-RUN pip install --no-cache-dir --no-deps --no-build-isolation \
-    "ms-swift @ https://codeload.github.com/modelscope/ms-swift/tar.gz/e1ac89d24f47cb8fd73a7245dd79df0959aec284"
+COPY twinkle_cs/server/ ./twinkle_cs/server/
 
-# Install twinkle itself (with server extras: redis + otel + telemetry)
-RUN pip install -e ".[server]" --no-build-isolation
+# Shared template contracts are provided by kit; Swift is optional for concrete Swift components.
+RUN pip install -e . -e ./twinkle_cs/server --no-build-isolation
 COPY cookbook/ ./cookbook/
 
 # ---------- Redis server ----------

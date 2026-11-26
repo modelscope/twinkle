@@ -15,6 +15,7 @@ import twinkle
 
 _TWINKLE_SRC = pathlib.Path(twinkle.__file__).resolve().parent
 _REPO_ROOT = _TWINKLE_SRC.parent.parent  # .../src/twinkle -> repo root
+_SERVER_SRC = _REPO_ROOT / 'twinkle_cs' / 'server' / 'src' / 'twinkle_server'
 _TESTS = _REPO_ROOT / 'tests'
 _COOKBOOK = _REPO_ROOT / 'cookbook'
 _SELF = pathlib.Path(__file__).resolve()
@@ -52,7 +53,7 @@ def _cookbook_files():
 
 def test_no_degraded_symbols_remain():
     offenders: dict[str, list[str]] = {}
-    for path in _py_files(_TWINKLE_SRC, _TESTS):
+    for path in _py_files(_TWINKLE_SRC, _SERVER_SRC, _TESTS):
         text = path.read_text()
         for name, pat in _IDENT.items():
             if pat.search(text):
@@ -65,7 +66,7 @@ def test_no_fail_fast_switch_in_src_cookbook_and_test_configs():
     # Match shipped config names, not the ignored _generated_e2e.yaml that
     # start_e2e_server.py may have produced from an older checkout.
     test_configs = list(_TESTS.rglob('server_config_*.yaml')) + list(_TESTS.rglob('server_config_*.yml'))
-    for path in list(_py_files(_TWINKLE_SRC)) + list(_cookbook_files()) + test_configs:
+    for path in list(_py_files(_TWINKLE_SRC, _SERVER_SRC)) + list(_cookbook_files()) + test_configs:
         if _FAIL_FAST.search(path.read_text()):
             offenders.append(str(path))
     assert not offenders, f'TWINKLE_FAIL_FAST still present: {offenders}'

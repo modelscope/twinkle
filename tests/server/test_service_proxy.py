@@ -11,7 +11,7 @@ import pytest
 from starlette.requests import Request
 from unittest.mock import AsyncMock
 
-from twinkle.server.lifecycle.proxy import ServiceProxy
+from twinkle_server.lifecycle.proxy import ServiceProxy
 from twinkle.protocol.headers import H_CLIENT_ID, H_REQUEST_ID
 
 

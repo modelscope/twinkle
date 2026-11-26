@@ -10,8 +10,8 @@ from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import create, request, setup
 from tests.server.training.helpers import RPC, RuntimeQueue, settle
 from twinkle.protocol.types.errors import ErrorCategory
-from twinkle.server.exceptions import ResourceExhaustedError, ResourceNotFoundError
-from twinkle.server.state.models import FutureFailureRecord
+from twinkle_server.exceptions import ResourceExhaustedError, ResourceNotFoundError
+from twinkle_server.state.models import FutureFailureRecord
 
 
 async def wait_idle(queue):
@@ -262,7 +262,7 @@ async def test_sweep_heartbeat_io_does_not_hold_route_lock(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_explicit_tinker_request_id_is_preserved():
-    from twinkle.server.lifecycle.submit import submit_training_task
+    from twinkle_server.lifecycle.submit import submit_training_task
     controller, state, _, _ = await setup(backend=FakeBackend())
     identity = await create(controller, state, 'explicit-id')
     instance = controller.instances[controller.trainings[identity].instance_id]
@@ -283,9 +283,9 @@ async def test_shutdown_waits_for_late_serve_deployment_before_confirming_releas
     import importlib
     import threading
     from types import SimpleNamespace
-    from twinkle.server.config.training import TrainingConfig
-    from twinkle.server.state.training_records import InstanceRecord
-    from twinkle.server.model.pool.driver import RayInstanceDriver
+    from twinkle_server.config.training import TrainingConfig
+    from twinkle_server.state.training_records import InstanceRecord
+    from twinkle_server.model.pool.driver import RayInstanceDriver
     from ray import serve
     config = TrainingConfig(models=[{'name': 'small', 'model_id': 'weights', 'backend': 'mock', 'device_type': 'cpu', 'mode': 'lora', 'config': {'num_devices': 1, 'device_mesh': {'dp_size': 1}}}])
     store = SimpleNamespace(models=SimpleNamespace(unregister_replica_capacity=AsyncMock()))
@@ -300,7 +300,7 @@ async def test_shutdown_waits_for_late_serve_deployment_before_confirming_releas
         if not release.wait(10):
             raise TimeoutError('test did not release Serve')
 
-    monkeypatch.setattr('twinkle.server.model.app.build_model_app', lambda **kwargs: 'app')
+    monkeypatch.setattr('twinkle_server.model.app.build_model_app', lambda **kwargs: 'app')
     monkeypatch.setattr(importlib.import_module('ray.util.placement_group'), 'get_placement_group', lambda name: 'pg')
     monkeypatch.setattr('ray.util.list_named_actors', lambda **kwargs: [])
     monkeypatch.setattr(serve, 'run', deploy)
@@ -346,7 +346,7 @@ async def test_capacity_unregister_does_not_retire_managed_model():
 @pytest.mark.parametrize('mode', ['lora', 'full'])
 @pytest.mark.parametrize('failure_stage', ['stopped', 'quarantined', 'persist_draining'])
 async def test_late_release_ack_cannot_retire_a_failed_instance_user(mode, failure_stage, monkeypatch):
-    from twinkle.server.config.training import TrainingConfig
+    from twinkle_server.config.training import TrainingConfig
 
     controller, state, runtime, _ = await setup(backend=FakeBackend())
     config = controller.config.model_dump()

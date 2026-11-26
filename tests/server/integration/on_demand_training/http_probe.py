@@ -12,9 +12,9 @@ from pathlib import Path
 from on_demand_sdk import unload_tinker_model
 from ray import serve
 
-from twinkle.server.config import ServerConfig
-from twinkle.server.launcher.server_launcher import ServerLauncher, build_ray_runtime_env
-from twinkle.server.processor import build_processor_app
+from twinkle_server.config import ServerConfig
+from twinkle_server.launcher.server_launcher import ServerLauncher, build_ray_runtime_env
+from twinkle_server.processor import build_processor_app
 from twinkle_client import init_tinker_client, init_twinkle_client
 from twinkle_client.dataloader import DataLoader
 from twinkle_client.dataset import Dataset
