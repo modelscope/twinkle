@@ -29,6 +29,10 @@ class vLLMSampler:
 
 核心方法 `sample` 返回 `SampleResponse` 列表。通过 `SamplingParams(num_samples=N)` 设置每个 prompt 的生成数量，每个响应的 `sequences` 包含生成结果。
 
+正常候选的 `new_input_feature` 是完整轨迹，保留 messages、tools、user_data、原始媒体和数值编码字段。`SampledSequence` 继续携带 tokens、logprobs、decoded、stop_reason、routed_experts 和 sampling_masks，不再另有 `new_state`。`max_tokens=0` 仅对 prompt 打分，不追加 assistant 消息。
+
+HTTP 客户端从本次请求恢复响应省略的原始媒体和 user_data。显式 `token_only=True` 是只返回 tokens 与统计信息的传输原语；`HTTPSampler` 使用本地模板将实际 tokens 追加到完整轨迹，不重新 tokenize 回复。服务端 DataPlane 保存完整轨迹，与 HTTP 响应投影分开处理。
+
 ## 可用的采样器
 
 Twinkle 提供 `vLLMSampler` 实现:

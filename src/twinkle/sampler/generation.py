@@ -24,8 +24,8 @@ from typing import Any, Optional
 import torch
 
 from twinkle import get_logger
-from twinkle.data_format import InputFeature, SampledSequence, SampleResponse
-from twinkle.template.contract import DatasetTemplate, PromptEncoder, RolloutState, feature_has_media
+from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, Trajectory, copy_trajectory, is_encoded
+from twinkle.template.contract import engine_input_ids
 
 logger = get_logger()
 
@@ -38,30 +38,14 @@ def not_encoded(inputs: Any) -> bool:
     ``TransformersModel._not_encoded`` so all three agree on the boundary.
     """
     assert isinstance(inputs, dict), f"Expected dict, got {type(inputs)}"
-    return "input_ids" not in inputs and "input_embedding" not in inputs
+    return not is_encoded(inputs)
 
 
-def encode_trajectory(template: DatasetTemplate, trajectory: Any, add_generation_prompt: bool = True) -> InputFeature:
-    """Encode one ``Trajectory`` into an ``InputFeature`` prompt, keeping every template key but labels.
-
-    ``labels`` is dropped because a prompt has no targets yet; they are rebuilt by
-    ``template.append_completion`` once the completion tokens exist. Every other key the template
-    produced (``pixel_values`` / ``image_grid_thw`` for a vision-language row, ``attention_mask``, ...)
-    is carried through so generation and the later stitch see the full feature.
-    """
+def encode_trajectory(template, trajectory, add_generation_prompt: bool = True):
+    """Encode a complete prompt while retaining conversation and numerical fields."""
     if template is None:
-        raise ValueError("Template not set; call set_template() before encoding a Trajectory.")
-    encoded = template.encode(trajectory, add_generation_prompt=add_generation_prompt)
-    input_ids = encoded.get("input_ids")
-    if input_ids is None:
-        raise ValueError("Template.encode() must return 'input_ids'")
-    if hasattr(input_ids, "tolist"):
-        input_ids = input_ids.tolist()
-    result = InputFeature(input_ids=input_ids)
-    for key, value in encoded.items():
-        if key not in ("input_ids", "labels"):
-            result[key] = value
-    return result
+        raise ValueError('Template not set; call set_template() before encoding a Trajectory')
+    return template.encode_prompt(trajectory, backend='transformers', add_generation_prompt=add_generation_prompt)
 
 
 def error_response(feat: dict[str, Any]) -> SampleResponse:
@@ -71,55 +55,38 @@ def error_response(feat: dict[str, Any]) -> SampleResponse:
     against its inputs stays aligned and one bad row cannot end a long offline run.
     """
     return SampleResponse(
-        sequences=[SampledSequence(stop_reason="error", tokens=[], decoded="")],
-        prompt_token_ids=list(feat.get("input_ids") or []),
+        sequences=[SampledSequence(stop_reason="error", tokens=[], decoded="", new_input_feature=copy_trajectory(feat))],
+        prompt_token_ids=list(feat.get("input_ids", [])),
     )
 
 
-def encode_all(
-    template: PromptEncoder | None,
-    inputs_list: list[dict[str, Any]],
-    *,
-    logprobs_only: bool,
-    strict: bool,
-) -> tuple[dict[int, dict[str, Any]], dict[int, RolloutState | None], dict[int, SampleResponse]]:
-    encoded: dict[int, dict[str, Any]] = {}
-    states: dict[int, RolloutState | None] = {}
-    failures: dict[int, SampleResponse] = {}
+def encode_all(template, inputs_list, *, logprobs_only: bool, strict: bool):
+    encoded, failures = {}, {}
     for index, item in enumerate(inputs_list):
         try:
-            if isinstance(item, RolloutState):
-                encoded[index] = item.feature
-                states[index] = item
-            elif not not_encoded(item):
-                if feature_has_media(item):
-                    raise NotImplementedError("multimodal sampling requires a Trajectory or RolloutState.")
-                encoded[index] = item
-                states[index] = None
-            else:
+            feature = copy_trajectory(item)
+            if not_encoded(feature):
                 if template is None:
-                    raise ValueError("Template not set; call set_template() before encoding a Trajectory.")
-                prompt = template.encode_prompt(item, backend="transformers", add_generation_prompt=not logprobs_only)
-                encoded[index] = prompt.state.feature
-                states[index] = prompt.state
+                    raise ValueError('Template not set; call set_template() before encoding a Trajectory')
+                feature = template.encode_prompt(feature, backend='transformers',
+                                                 add_generation_prompt=not logprobs_only)
+            engine_input_ids(feature)
+            encoded[index] = feature
         except Exception as exc:
             if strict:
                 raise
-            logger.warning(f"Dropping input {index}, encode failed: {exc}")
-            encoded[index] = {}
-            states[index] = None
-            failures[index] = error_response({})
-    return encoded, states, failures
+            logger.warning(f'Dropping input {index}, encode failed: {exc}')
+            encoded[index] = copy_trajectory(item)
+            failures[index] = error_response(encoded[index])
+    return encoded, failures
 
 
-def prompt_ids(feat: dict[str, Any], state: RolloutState | None) -> list[int]:
-    if state is None and feature_has_media(feat):
-        raise NotImplementedError("multimodal sampling requires a Trajectory or RolloutState.")
-    input_ids = state.engine_input_ids if state is not None else feat["input_ids"]
-    return input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+def prompt_ids(feat):
+    ids = feat['input_ids']
+    return [int(value) for value in (ids.tolist() if hasattr(ids, 'tolist') else ids)]
 
 
-def collate_extra_model_inputs(chunk: list[int], encoded: dict[int, dict[str, Any]]) -> dict[str, Any]:
+def collate_extra_model_inputs(chunk: list[int], encoded: dict[int, dict[str, Any]], template=None) -> dict[str, Any]:
     """Collate the multimodal tensors the template encoded for ``chunk`` into one batched dict.
 
     A vision-language row carries ``pixel_values`` / ``image_grid_thw``; HF's processor lays those out
@@ -129,49 +96,79 @@ def collate_extra_model_inputs(chunk: list[int], encoded: dict[int, dict[str, An
     would clobber the padding mask), and labels are not a model input. Text-only rows contribute no
     tensor keys, so a plain batch returns ``{}``.
     """
+    engine_fields = {'input_ids', 'attention_mask', 'labels', 'completion_mask', 'loss_scale',
+                     'routed_experts', 'replay_mask', 'engine_input_ids'}
+    blocked = engine_fields | (Trajectory.__annotations__.keys() - InputFeature.__annotations__.keys())
+    result, consumed = {}, set()
+    if template is not None and hasattr(template, 'pop_media') and hasattr(template, 'collate_media'):
+        media = [template.pop_media(copy_trajectory(encoded[index])) for index in chunk]
+        consumed = {key for row in media for key in row}
+        result = {key: value for key, value in template.collate_media(media).items() if key not in engine_fields}
     collected: dict[str, list[torch.Tensor]] = {}
-    per_token: dict[str, list[torch.Tensor]] = {}
+    companions = set()
     for index in chunk:
         for key, value in encoded[index].items():
-            if key in ("input_ids", "attention_mask", "labels") or not isinstance(value, torch.Tensor):
+            if (value is None or key in result or key in consumed or key in blocked
+                    or key in encoded[index].get('_trajectory_columns', ())):
                 continue
-            if key.endswith("_token_type_ids"):
-                # A per-token companion (mm_token_type_ids and friends): the model indexes it as
-                # [batch, position] against the LEFT-PADDED input_ids the engine builds, so it is
-                # stacked to a [B, width] batch here, never concatenated flat like pixel_values.
-                per_token.setdefault(key, []).append(value)
-            else:
+            if key in ('token_type_ids', 'position_ids') or key.endswith('_token_type_ids'):
+                companions.add(key)
+            elif isinstance(value, torch.Tensor):
                 collected.setdefault(key, []).append(value)
-    result = {key: torch.cat(values, dim=0) for key, values in collected.items()}
-    for key, values in per_token.items():
-        width = max(value.shape[-1] for value in values)
-        rows = [torch.nn.functional.pad(value, (width - value.shape[-1], 0)) for value in values]
-        result[key] = torch.stack(rows, dim=0)
+            elif type(value).__module__.startswith('numpy'):
+                collected.setdefault(key, []).append(torch.as_tensor(value))
+    result.update({key: torch.cat(values, dim=0) for key, values in collected.items()})
+    width = max(len(encoded[index]['input_ids']) for index in chunk)
+    for key in companions:
+        prototype = torch.as_tensor(next(encoded[index][key] for index in chunk if encoded[index].get(key) is not None))
+        if key == 'position_ids' and prototype.ndim == 3 and prototype.shape[1] == 1:
+            prototype = prototype.squeeze(1)
+        elif key == 'position_ids' and prototype.ndim == 2 and prototype.shape[0] == 1:
+            prototype = prototype.squeeze(0)
+        leading = prototype.shape[:-1] if key == 'position_ids' else ()
+        rows = []
+        for index in chunk:
+            length = len(encoded[index]['input_ids'])
+            value = encoded[index].get(key)
+            if value is None:
+                value = (torch.arange(length, device=prototype.device).expand(*leading, length)
+                         if key == 'position_ids' else prototype.new_zeros(length))
+            else:
+                value = torch.as_tensor(value, device=prototype.device)
+                if key == 'position_ids' and value.ndim == 3 and value.shape[1] == 1:
+                    value = value.squeeze(1)
+                elif key == 'position_ids' and value.ndim == 2 and value.shape[0] == 1:
+                    value = value.squeeze(0)
+                elif key != 'position_ids':
+                    value = value.reshape(-1)
+            if value.shape != (*leading, length):
+                raise ValueError(f'{key} must align with the prompt input_ids')
+            rows.append(torch.nn.functional.pad(value, (width - length, 0)))
+        result[key] = torch.stack(rows, dim=1 if leading else 0)
     return result
 
 
-def attach_features(
-    template: Any,
-    results: list[SampleResponse | None],
-    encoded: dict[int, dict[str, Any]],
-    states: dict[int, RolloutState | None],
-) -> None:
-    """Fill in ``new_input_feature`` so downstream training code can consume the samples directly.
-
-    The prompt feature plus the generated tokens, run through the template so labels, ``completion_mask``
-    and any post-pipeline stay consistent -- matching what the training path expects from a rollout.
-    """
-    if template is None:
-        return
+def attach_features(template, results, encoded, *, logprobs_only=False):
+    """Attach each complete trajectory, retaining even zero-token generation results."""
     for index, response in enumerate(results):
         feat = encoded.get(index)
-        if response is None or not feat:
+        if response is None or feat is None:
             continue
         for seq in response.sequences:
-            if seq.tokens:
-                completion = template.append_completion(states.get(index) or feat, seq.tokens)
-                seq.new_input_feature = completion.state.feature
-                seq.new_state = completion.state
+            if logprobs_only:
+                seq.tokens = []
+                seq.logprobs = None
+                seq.decoded = None
+                seq.sampling_masks = None
+            if logprobs_only or (seq.stop_reason == 'error' and not seq.tokens):
+                seq.new_input_feature = copy_trajectory(feat)
+            else:
+                if template is None:
+                    raise ValueError('normal sampling requires a template')
+                seq.new_input_feature = template.append_completion(feat, list(seq.tokens or ()))
+            seq.new_input_feature.pop('routed_experts', None)
+            if seq.routed_experts is not None:
+                seq.new_input_feature['routed_experts'] = seq.routed_experts
 
 
 def group_by_adapter(
@@ -200,9 +197,9 @@ def chunks(items: list[int], size: int):
 def run_chunk(
     chunk: list[int],
     encoded: dict[int, dict[str, Any]],
-    states: dict[int, RolloutState | None],
     call_batch,
     *,
+    template=None,
     strict: bool = True,
 ) -> list[SampleResponse]:
     """Generate one padded batch, falling back to one-at-a-time to isolate a bad input when not strict.
@@ -213,21 +210,23 @@ def run_chunk(
     that call -- prompt fixup, multimodal collation, the isolating retry and the error placeholder -- is
     shared so the two entry points cannot drift.
     """
-    prompts = [prompt_ids(encoded[i], states.get(i)) for i in chunk]
+    prompts = [prompt_ids(encoded[i]) for i in chunk]
     # A vision-language model needs the image tensors the template encoded (pixel_values and friends)
     # alongside the prompt ids; a text-only batch collates to nothing and passes an empty dict.
-    extra = collate_extra_model_inputs(chunk, encoded)
     try:
+        extra = collate_extra_model_inputs(chunk, encoded, template)
         return call_batch(prompts, extra)
     except Exception as exc:
-        if strict or len(chunk) == 1:
+        if strict:
             raise
+        if len(chunk) == 1:
+            return [error_response(encoded[chunk[0]])]
         logger.warning(f"Batch of {len(chunk)} failed ({exc}); retrying individually to isolate the input")
         out: list[SampleResponse] = []
         for position, index in enumerate(chunk):
             try:
-                out.append(call_batch([prompts[position]], collate_extra_model_inputs([index], encoded))[0])
+                out.append(call_batch([prompts[position]], collate_extra_model_inputs([index], encoded, template))[0])
             except Exception as inner:
                 logger.warning(f"Input dropped, generate failed: {inner}")
-                out.append(error_response({}))
+                out.append(error_response(encoded[index]))
         return out

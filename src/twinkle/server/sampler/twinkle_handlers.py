@@ -22,8 +22,9 @@ if TYPE_CHECKING:
 import numpy as np
 
 import twinkle.protocol.types as types
-from twinkle.data_format import PoolingParams, SamplingParams
-from twinkle.protocol.json_utils import json_safe
+from twinkle.data_format import PoolingParams, SamplingParams, last_assistant_text
+from twinkle.data_format.sampling import sampled_token_logprobs
+from twinkle.protocol.json_utils import json_safe, wire_trajectory
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
@@ -77,12 +78,14 @@ def _json_safe_value(value):
 
 def _serialize_input_feature(feature: dict) -> dict:
     """Convert an InputFeature into a JSON-safe dict for the HTTP response."""
-    safe = _json_safe_value(feature)
+    # The requester retains original media and user data; keep token and model payloads complete.
+    safe = _json_safe_value(json_safe({key: value for key, value in feature.items()
+                                       if key not in ('images', 'videos', 'audios', 'user_data')}))
     return safe if isinstance(safe, dict) else {}
 
 
 def _build_rollout_rows_and_tags(
-    sample_models: list[types.SampleResponseModel],
+    sample_models: list,
     *,
     group_ids: list[str] | None,
     policy_version: int | None,
@@ -97,15 +100,15 @@ def _build_rollout_rows_and_tags(
     tags = []
     for prompt_index, (response, group_id) in enumerate(zip(sample_models, resolved_group_ids)):
         for generation_idx, sequence in enumerate(response.sequences):
-            sampled_logprobs = [
-                0.0 if not position else float(position[0][1]) for position in (sequence.logprobs or [])
-            ]
+            sampled_logprobs = sampled_token_logprobs(sequence.tokens, sequence.logprobs)
             rows.append({
                 'train_input': sequence.new_input_feature,
                 'sampled_logprobs': sampled_logprobs,
                 'tokens': sequence.tokens,
                 'decoded': sequence.decoded,
                 'stop_reason': sequence.stop_reason,
+                'routed_experts': json_safe(sequence.routed_experts),
+                'sampling_masks': json_safe(sequence.sampling_masks),
                 'prompt_logprobs': response.prompt_logprobs,
                 'topk_prompt_logprobs': response.topk_prompt_logprobs,
             })
@@ -131,7 +134,7 @@ def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
                 tokens=list(sequence.tokens),
                 logprobs=list(sequence.logprobs) if sequence.logprobs is not None else None,
                 decoded=sequence.decoded,
-                text=sequence.new_state.messages[-1].get('content') if sequence.new_state is not None else None,
+                text=last_assistant_text(sequence.new_input_feature) if sequence.new_input_feature is not None else None,
                 new_input_feature=(_serialize_input_feature(sequence.new_input_feature)
                                    if sequence.new_input_feature is not None else None),
                 routed_experts=json_safe(sequence.routed_experts),
@@ -396,12 +399,12 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
             responses = await self.sampling_guard.run(generate)
             rows, tags = _build_rollout_rows_and_tags(
-                _to_sample_response_models(responses),
+                responses,
                 group_ids=body.group_ids,
                 policy_version=body.policy_version,
                 adapter_uri=body.adapter_uri,
             )
-            ref = await self.data_plane.put([json_safe(item) for item in rows], kind='rollout', tags=tags)
+            ref = await self.data_plane.put(wire_trajectory(rows), kind='rollout', tags=tags)
             return ref.model_dump()
 
         return await self.submit_concurrent_and_peek(

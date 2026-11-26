@@ -1,14 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Sampler-shaped adapter for external generation APIs."""
 
-from dataclasses import replace
 from typing import Any, Literal, Optional, Union
 
-from twinkle.data_format import Trajectory
+from twinkle.data_format import Trajectory, copy_trajectory, last_assistant_text
+from twinkle.template.contract import append_and_finalize, engine_input_ids
 from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams, StopReason
 from twinkle.template import Template
-from twinkle.template.contract import RolloutState
-from twinkle_agentic.utils.token_utils import _to_plain, encode_appended_turn
+from twinkle_agentic.utils.token_utils import encode_appended_turn
 from .base import API
 
 _FINISH_TO_STOP: dict[str | None, StopReason] = {
@@ -28,10 +27,9 @@ def _normalise_assistant(reply: Any, turn: int) -> dict[str, Any]:
     """Make an API reply safe to render and feed into the next turn."""
     if not isinstance(reply, dict):
         raise TypeError(f"API must return an assistant message dict, got {type(reply).__name__}")
-    message: dict[str, Any] = {
-        "role": "assistant",
-        "content": reply.get("content") or "",
-    }
+    message = copy_trajectory(reply)
+    message["role"] = "assistant"
+    message["content"] = reply.get("content") or ""
     tool_calls = reply.get("tool_calls") or []
     if tool_calls:
         normalised = []
@@ -52,13 +50,10 @@ class APISampler:
 
     Holds the local ``template`` (an API turn's text must be tokenised the way
     the trainer reads it back, not by the endpoint) and the tool schema the
-    endpoint should see (a rollout's ``pif`` no longer carries it after encode).
+    endpoint should see; both live on the complete trajectory.
 
     Also sampler-shaped (:meth:`sample`), so a rollout takes it in place of a sampler.
     """
-
-    #: It reads the conversation off a ``RolloutState``, which a bare encoded feature does not carry.
-    accepts_rollout_state = True
 
     def __init__(
         self,
@@ -89,7 +84,7 @@ class APISampler:
         self.api_kwargs = dict(api_kwargs or {})
 
     def __call__(
-        self, prefix: dict[str, Any] | RolloutState, sampling_params: SamplingParams | None = None, **adapter_kwargs
+        self, prefix: Trajectory, sampling_params: SamplingParams | None = None, **adapter_kwargs
     ) -> SampledSequence:
         """Generate one external turn in the callback's normalized shape.
 
@@ -101,13 +96,14 @@ class APISampler:
             sampling_params = SamplingParams()
         if sampling_params.num_samples != 1:
             raise ValueError(f"APISampler draws one turn per input; got num_samples={sampling_params.num_samples}.")
-        state = prefix if isinstance(prefix, RolloutState) else None
-        feature = state.feature if state is not None else prefix
-        messages = list(state.messages) if state is not None else list(feature.get("messages") or [])
+        feature = copy_trajectory(prefix)
+        messages = feature.get("messages") or []
         if not messages:
             raise ValueError("APISampler needs an encoded prefix carrying its messages.")
-        tools = list(state.tools) if state is not None else feature.get("tools", self.tools)
-        request: Trajectory = {"messages": messages}
+        tools = feature.get("tools", self.tools)
+        if tools is not None:
+            feature['tools'] = copy_trajectory({'tools': tools})['tools']
+        request = copy_trajectory(feature)
         if tools:
             request["tools"] = list(tools)
 
@@ -123,30 +119,24 @@ class APISampler:
         turn = sum(message.get("role") == "assistant" for message in messages) + 1
         reply = _normalise_assistant(reply, turn)
 
+        if "input_ids" not in feature:
+            feature = self.template.encode_prompt(feature, backend="transformers")
         new_tokens = encode_appended_turn(messages, reply, self.template, tools)
-        completion = self.template.append_completion(
-            state or feature, new_tokens, appended_as=self.appended_as, tool_calls=reply.get("tool_calls")
-        )
-        new_input_feature = _to_plain(completion.state.feature)
-        # append_completion reconstructs content by decoding ``new_tokens``;
-        # those include the template's rendered tool-call block. Keep the API's
-        # original content beside its structured calls instead of duplicating it.
-        assistant_message = {key: reply[key] for key in ("role", "content", "tool_calls") if key in reply}
-        if new_input_feature.get("messages"):
-            new_input_feature["messages"][-1] = assistant_message
-        new_state = replace(
-            completion.state,
-            feature=new_input_feature,
-            messages=completion.state.messages[:-1] + (assistant_message,),
-        )
+        new_input_feature = append_and_finalize(
+            feature, new_tokens, scored=self.appended_as == 'demonstration', sampled=False,
+            finalize=self.template.finalize_appended_features)
+        if new_input_feature is None:
+            raise ValueError('appended API turn exceeds max_length under delete truncation strategy')
+        new_input_feature['messages'] = copy_trajectory({'messages': messages + [reply]})['messages']
+        new_input_feature['engine_input_ids'] = engine_input_ids(feature) + new_tokens
+        new_input_feature['reasoning_started'] = self.template._reasoning_started(new_input_feature['input_ids'])
 
         return SampledSequence(
             stop_reason=_FINISH_TO_STOP.get(reply.get("finish_reason"), "stop"),
             tokens=new_tokens,
             logprobs=None,
-            decoded=reply.get("content") or completion.response.content,
+            decoded=last_assistant_text(new_input_feature),
             new_input_feature=new_input_feature,
-            new_state=new_state,
         )
 
     def sample(self, inputs: list[Any], sampling_params: SamplingParams | None = None, **kwargs) -> list[SampleResponse]:

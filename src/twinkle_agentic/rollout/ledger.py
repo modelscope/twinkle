@@ -26,36 +26,19 @@ episode driven from outside appends only what extends the recorded conversation
 re-encoding to make it fit.
 """
 
-import inspect
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
-from twinkle.data_format import Trajectory
+from twinkle.data_format import Trajectory, copy_trajectory
 from twinkle.data_format import last_assistant_text as _traj_last_assistant_text
 from twinkle.data_format import turn_token_spans, validate_trajectory
 from twinkle.data_format.trajectory import _trainable_positions
-from twinkle.data_format.sampling import SampledSequence
+from twinkle.data_format.sampling import SampledSequence, SamplingMask, sampled_token_logprobs
 from twinkle.template.base import Template
-from twinkle.template.contract import RolloutState, coerce_tool_call_arguments
-from twinkle_agentic.utils.token_utils import _to_plain, append_ids
+from twinkle.template.contract import coerce_tool_call_arguments, engine_input_ids
+from twinkle_agentic.utils.token_utils import append_ids
 
-
-def sampled_token_logprobs(tokens: list[int], logprobs) -> list[float]:
-    """Normalize sampler logprobs to one scalar for each sampled token."""
-    if logprobs is None:
-        return []
-    result: list[float] = []
-    for token, position in zip(tokens, logprobs, strict=False):
-        if isinstance(position, (int, float)):
-            result.append(float(position))
-            continue
-        candidates = list(position or [])
-        matched = next((value for token_id, value in candidates if int(token_id) == int(token)), None)
-        if matched is None:
-            raise RuntimeError(f"sampled token {token} is missing from its returned logprobs: {candidates!r}.")
-        result.append(float(matched))
-    return result
 
 
 def last_assistant_text(messages: list[dict] | None) -> str:
@@ -67,7 +50,65 @@ def last_assistant_text(messages: list[dict] | None) -> str:
     return _traj_last_assistant_text({"messages": messages})
 
 
-class TurnLedger:
+class _TrajectoryLedger:
+    """Shared ownership and message operations for token and message accounting."""
+
+    @property
+    def input_feature(self) -> Trajectory:
+        return self._trajectory
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        return copy_trajectory({'messages': self._trajectory.get('messages') or []})['messages']
+
+    @property
+    def tools(self) -> list[dict[str, Any]]:
+        return copy_trajectory({'tools': self._trajectory.get('tools') or []})['tools']
+
+    def replace_last_message(self, message: dict[str, Any]) -> None:
+        if self._trajectory.get("messages"):
+            self._trajectory["messages"][-1] = copy_trajectory(message)
+
+    def clear_tools(self) -> None:
+        self._trajectory["tools"] = []
+
+    def _sampled_trajectory(self, seq: SampledSequence) -> Trajectory:
+        feature = seq.new_input_feature
+        if feature is None or 'messages' not in feature:
+            raise RuntimeError(f"sampler must return a complete trajectory for {self.label}")
+        sampled = copy_trajectory(feature)
+        previous = self.messages
+        messages = sampled.get('messages') or []
+        if (len(messages) != len(previous) + 1 or messages[-1].get('role') != 'assistant'
+                or messages[:-1] != previous):
+            raise RuntimeError(f"sampler must preserve the history and append one assistant message for {self.label}")
+        for key in ('tools', 'user_data'):
+            if (sampled.get(key) or []) != (self._trajectory.get(key) or []):
+                raise RuntimeError(f"sampler changed the recorded {key} for {self.label}")
+        return sampled
+
+    def _continue_messages(self, previous, sampled) -> None:
+        if not previous or previous[-1].get("role") != "assistant":
+            raise RuntimeError(f"continuation without an open assistant turn at {self.label}")
+        incoming = sampled.get("messages") or []
+        if len(incoming) != len(previous) + 1 or incoming[-1].get("role") != "assistant":
+            raise RuntimeError(f"continuation must append one assistant message at {self.label}")
+        last, delta = dict(previous[-1]), incoming[-1]
+        for key in ("content", "reasoning_content"):
+            if key in delta:
+                before, after = last.get(key) or "", delta.get(key) or ""
+                if isinstance(before, list) or isinstance(after, list):
+                    before = before if isinstance(before, list) else ([{"type": "text", "text": before}] if before else [])
+                    after = after if isinstance(after, list) else ([{"type": "text", "text": after}] if after else [])
+                last[key] = before + after
+        if delta.get("tool_calls"):
+            last["tool_calls"] = list(last.get("tool_calls") or []) + list(delta["tool_calls"])
+        last.update({key: value for key, value in delta.items()
+                     if key not in ('role', 'content', 'reasoning_content', 'tool_calls')})
+        sampled["messages"] = previous[:-1] + [last]
+
+
+class TurnLedger(_TrajectoryLedger):
     """Token ids, labels and logprobs for one episode, and nothing else.
 
     Not thread-safe and not meant to be: one ledger belongs to one episode, and
@@ -80,7 +121,7 @@ class TurnLedger:
     is left holding the last state that did fit, so a trajectory that overflowed
     is still complete up to the turn before.
 
-    ``input_feature`` contains model fields only; conversation metadata lives in ``state``.
+    ``input_feature`` is the complete current trajectory.
     """
 
     def __init__(
@@ -101,34 +142,14 @@ class TurnLedger:
         self.label = label
         self.max_tokens = max_tokens
         self.backend = backend
-        self._pif: dict[str, Any] = {}
-        self._state: RolloutState | None = None
+        self._trajectory: Trajectory = {}
         self._logprobs: list[Any] = []
         self._sampling_masks: Any = None
         self._turns = 0
 
     # ---------------------------------------------------------------- reading
 
-    @property
-    def input_feature(self) -> dict[str, Any]:
-        """The encoded model fields for the episode so far."""
-        return self._pif
 
-    @property
-    def state(self) -> RolloutState | None:
-        return self._state
-
-    @property
-    def messages(self) -> list[dict[str, Any]]:
-        if self._state is not None:
-            return list(self._state.messages)
-        return list(self._pif.get("messages") or [])
-
-    @property
-    def tools(self) -> list[dict[str, Any]]:
-        if self._state is not None:
-            return list(self._state.tools)
-        return list(self._pif.get("tools") or [])
 
     @property
     def logprobs(self) -> list[Any]:
@@ -144,7 +165,7 @@ class TurnLedger:
         """Has the episode reached :attr:`max_tokens`? Never true without one."""
         if self.max_tokens is None:
             return False
-        return len(self._pif.get("input_ids") or []) >= self.max_tokens
+        return len(self._trajectory.get("input_ids") or []) >= self.max_tokens
 
     def unfit(self, params: Any) -> bool:
         """Would this turn's completion budget overrun the template's ``max_length``?
@@ -160,7 +181,7 @@ class TurnLedger:
         turn_budget = params.get("max_tokens") if isinstance(params, dict) else getattr(params, "max_tokens", None)
         if max_length is None or turn_budget is None:
             return False
-        return len(self._pif.get("input_ids") or []) + int(turn_budget) > max_length
+        return len(self._trajectory.get("input_ids") or []) + int(turn_budget) > max_length
 
     def capped_turn_params(self, params: Any) -> Any | None:
         """Cap the turn's completion budget to the room left under ``max_length``.
@@ -179,7 +200,7 @@ class TurnLedger:
         turn_budget = params.get("max_tokens") if isinstance(params, dict) else getattr(params, "max_tokens", None)
         if max_length is None or turn_budget is None:
             return None
-        room = int(max_length) - len(self._pif.get("input_ids") or [])
+        room = int(max_length) - len(self._trajectory.get("input_ids") or [])
         if room <= 0:
             return None
         capped = min(int(turn_budget), room)
@@ -200,7 +221,7 @@ class TurnLedger:
     def parse_tool_call(self, decoded: str) -> list[dict[str, Any]]:
         """Structured tool calls, with arguments restored from this episode's tool schemas."""
         calls = self.template.parse_tool_call(decoded)
-        tools = self._state.tools if self._state is not None else self._pif.get("tools") if self._pif else None
+        tools = self._trajectory.get("tools")
         return list(coerce_tool_call_arguments(calls, tools))
 
     def tool_call_errors(self, decoded: str) -> list[str]:
@@ -221,118 +242,78 @@ class TurnLedger:
     # ---------------------------------------------------------------- writing
 
     def open(self, trajectory: Trajectory, *, tools: list[dict[str, Any]] | None = None) -> None:
-        """Encode the opening once, including the resolved tool schemas."""
-        resolved_tools = (
-            list(tools)
-            if tools is not None
-            else (list(trajectory.get("tools") or []) if "tools" in trajectory else None)
-        )
-        encode_input = trajectory if resolved_tools is None else {**trajectory, "tools": resolved_tools}
-        encode_prompt = getattr(self.template, "encode_prompt", None)
-        prompt = None
-        if encode_prompt is not None:
-            parameters = inspect.signature(encode_prompt).parameters.values()
-            accepts_backend = any(
-                parameter.name == "backend" or parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters
-            )
-            kwargs = {"add_generation_prompt": True}
-            if accepts_backend:
-                kwargs["backend"] = self.backend
-            prompt = encode_prompt(encode_input, **kwargs)
-        if prompt is None:
-            self._pif = _to_plain(self.template.encode(encode_input, add_generation_prompt=True))
-            self._pif.setdefault("messages", list(trajectory.get("messages") or []))
-            if resolved_tools is not None:
-                self._pif["tools"] = resolved_tools
-            self._state = None
-        else:
-            self._state = prompt.state
-            self._pif = _to_plain(self._state.feature)
+        """Encode an unencoded opening once, or adopt its existing token history."""
+        feature = copy_trajectory(trajectory)
+        if tools is not None:
+            feature["tools"] = copy_trajectory({"tools": tools})["tools"]
+        if "input_ids" not in feature:
+            feature = self.template.encode_prompt(feature, backend=self.backend, add_generation_prompt=True)
+        engine_input_ids(feature)
+        self.adopt(feature)
         self._logprobs = []
+        self._sampling_masks = None
         self._turns = 0
 
     def record(self, seq: SampledSequence) -> None:
-        """Bank one generation, taking its ids from the sampler.
-
-        ``new_input_feature`` is the prompt plus what was just sampled, already
-        labelled, as the sampler saw it -- the whole reason a multi-turn episode
-        can be trained on. A sampler that does not return one cannot be used for
-        this, and saying so here is better than the alternative: silently
-        re-encoding the reply and training on ids that drift from the sampled
-        ones.
-        """
-        if seq.new_input_feature is None or "input_ids" not in seq.new_input_feature:
-            raise RuntimeError(
-                f"sampler returned a SampledSequence without "
-                f"new_input_feature.input_ids for {self.label}; "
-                f"cannot continue multi-turn."
-            )
-        messages, tools = self.messages, self.tools
-        sampled_feature = _to_plain(dict(seq.new_input_feature))
-        new_state = getattr(seq, "new_state", None)
-        if new_state is not None:
-            self._state = new_state
-        elif self._state is not None:
-            completion = self.template.append_completion(self._state, list(seq.tokens or []))
-            if list(completion.state.feature.get("input_ids") or []) != list(sampled_feature.get("input_ids") or []):
-                raise RuntimeError("sampler new_input_feature disagrees with RolloutState token accounting.")
-            self._state = completion.state
-        self._pif = sampled_feature
-        if len(self.messages) < len(messages) + 1:
-            current_messages = messages + [{'role': 'assistant', 'content': seq.decoded or ''}]
-            self._pif['messages'] = current_messages
-            if self._state is not None:
-                self._state = replace(self._state, messages=tuple(current_messages))
-        if not self.tools and tools:
-            self._pif['tools'] = tools
-            if self._state is not None:
-                self._state = replace(self._state, tools=tuple(tools))
+        """Adopt the sampler's complete trajectory without re-encoding its reply."""
+        self._trajectory = self._sampled_trajectory(seq)
         self._turns += 1
         self._extend_logprobs(seq)
-        # The sampler's per-token sampling support set (sampling replay); banked per turn,
-        # and merge exposes it only for a single-generation episode whose one CSR covers
-        # the whole response -- a multi-turn episode would need the per-turn blocks
-        # concatenated, which no consumer asks for yet.
-        self._sampling_masks = getattr(seq, "sampling_masks", None)
+        self._extend_sampling_masks(seq)
+
+    def _sampled_trajectory(self, seq: SampledSequence) -> Trajectory:
+        sampled = super()._sampled_trajectory(seq)
+        if 'input_ids' not in sampled:
+            raise RuntimeError(f"sampler must return a complete encoded trajectory for {self.label}")
+        for key in ("input_ids", "labels", "completion_mask", "engine_input_ids"):
+            if key in sampled and hasattr(sampled[key], "tolist"):
+                sampled[key] = sampled[key].tolist()
+        expected = list(self._trajectory.get("input_ids", [])) + list(seq.tokens)
+        if list(sampled["input_ids"]) != expected:
+            raise RuntimeError(f"sampler changed the recorded token prefix for {self.label}")
+        if engine_input_ids(sampled) != engine_input_ids(self._trajectory) + list(seq.tokens):
+            raise RuntimeError(f"sampler changed the recorded engine token prefix for {self.label}")
+        for key, fill in (('labels', -100), ('completion_mask', 0)):
+            values = sampled.get(key)
+            if values is None or len(values) != len(expected) or (values and values[-1] != fill):
+                raise RuntimeError(f"sampler returned misaligned {key} for {self.label}")
+            before = self._trajectory.get(key)
+            width = max(len(expected) - len(seq.tokens) - 1, 0)
+            if before is not None and list(values[:width]) != list(before[:width]):
+                raise RuntimeError(f"sampler changed the recorded {key} for {self.label}")
+        return sampled
 
     def record_continuation(self, seq: SampledSequence) -> None:
-        """Bank a continuation of the OPEN assistant turn (chat-protocol continue-on-length).
-
-        The agent re-sent the conversation ending with our truncated reply and asked for more
-        of it: the generation extends that same assistant message instead of opening a new
-        turn. Token accounting is :meth:`record`'s (the sampler's ``new_input_feature`` is the
-        prompt plus everything sampled, labelled); the turn count does not advance, and the
-        decoded continuation is concatenated onto the last assistant content.
-        """
-        if seq.new_input_feature is None or "input_ids" not in seq.new_input_feature:
-            raise RuntimeError(
-                f"sampler returned a SampledSequence without "
-                f"new_input_feature.input_ids for {self.label}; "
-                f"cannot continue multi-turn."
-            )
-        messages = self.messages
-        if not messages or messages[-1].get("role") != "assistant":
-            raise RuntimeError(f"continuation without an open assistant turn at {self.label}")
-        sampled_feature = _to_plain(dict(seq.new_input_feature))
-        new_state = getattr(seq, "new_state", None)
-        if new_state is not None:
-            self._state = new_state
-        elif self._state is not None:
-            completion = self.template.append_completion(self._state, list(seq.tokens or []))
-            if list(completion.state.feature.get("input_ids") or []) != list(sampled_feature.get("input_ids") or []):
-                raise RuntimeError("sampler new_input_feature disagrees with RolloutState token accounting.")
-            self._state = completion.state
-        self._pif = sampled_feature
-        merged = list(messages)
-        last = dict(merged[-1])
-        last["content"] = (last.get("content") or "") + (seq.decoded or "")
-        merged[-1] = last
-        self._pif["messages"] = merged
-        if self._state is not None:
-            self._state = replace(self._state, messages=tuple(merged))
+        """Continue the existing assistant turn while retaining sampled token positions."""
+        previous = self.messages
+        sampled = self._sampled_trajectory(seq)
+        self._continue_messages(previous, sampled)
+        self._trajectory = sampled
         self._extend_logprobs(seq)
-        self._sampling_masks = getattr(seq, "sampling_masks", None)
+        self._extend_sampling_masks(seq)
+
+    def _extend_sampling_masks(self, seq: SampledSequence) -> None:
+        """Keep CSR support sets aligned across sampled turns and continuations."""
+        width = len(_trainable_positions(self._trajectory['input_ids'], self._trajectory.get('labels'),
+                                        self._trajectory.get('completion_mask')))
+        previous = self._sampling_masks
+        previous_width = len(previous.offsets) - 1 if previous is not None else 0
+        mask = seq.sampling_masks
+        if mask is None:
+            if width != previous_width:
+                self._sampling_masks = None
+            return
+        if len(mask.offsets) != len(seq.tokens) + 1:
+            raise RuntimeError(f"sampling masks do not align with the generated tokens for {self.label}")
+        if width != previous_width + len(seq.tokens):
+            self._sampling_masks = None
+            return
+        tokens = list(previous.token_ids) if previous is not None else []
+        offsets = list(previous.offsets) if previous is not None else [0]
+        base = len(tokens)
+        tokens.extend(mask.token_ids)
+        offsets.extend(base + offset for offset in mask.offsets[1:])
+        self._sampling_masks = SamplingMask(token_ids=tokens, offsets=offsets)
 
     def _extend_logprobs(self, seq: SampledSequence) -> None:
         """Append one generation's logprobs -- one per sampled token, or raise.
@@ -352,63 +333,28 @@ class TurnLedger:
         self._logprobs.extend(seq.logprobs)
 
     def observe(self, messages: Sequence[dict[str, Any]]) -> bool:
-        """Append messages the model did not write: tool results, a new question.
-
-        Their tokens are masked out of the loss -- they are the environment's
-        words, and training on them teaches the model to predict its own
-        observations. False means the append did not fit.
-        """
-        tools = list(self._state.tools) if self._state is not None else self._pif.get("tools")
-        render_kwargs = {
-            "gen_prompt_before": False,
-            "gen_prompt_after": True,
-            "tools": tools,
-        }
-        bridge_ids = self.template.render_delta(self.messages, list(messages), **render_kwargs)
-        engine_bridge_ids = self.template.render_delta(
-            self.messages, list(messages), engine=True, backend=self.backend, **render_kwargs
-        )
-        extended = append_ids(self._pif, bridge_ids, self.template, trainable=False)
+        """Append environment messages with separate training and engine bridges."""
+        previous = self.messages
+        kwargs = {"gen_prompt_before": False, "gen_prompt_after": True, "tools": self.tools}
+        bridge = self.template.render_delta(previous, list(messages), **kwargs)
+        engine_bridge = self.template.render_delta(previous, list(messages), engine=True,
+                                                    backend=self.backend, **kwargs)
+        extended = append_ids(self._trajectory, bridge, self.template, trainable=False,
+                              engine_ids=engine_bridge)
         if extended is None:
             return False
-        if self._state is None:
-            extended["messages"] = self.messages + list(messages)
-            if tools:
-                extended["tools"] = list(tools)
-        self._pif = extended
-        if self._state is not None:
-            self._state = replace(
-                self._state,
-                feature=extended,
-                engine_input_ids=self._state.engine_input_ids + tuple(engine_bridge_ids),
-                messages=self._state.messages + tuple(messages),
-                reasoning_started=self.template._reasoning_started(extended["input_ids"]),
-                render_cache=None,
-            )
+        extended["messages"] = previous + copy_trajectory({"messages": list(messages)})["messages"]
+        self._trajectory = extended
         return True
 
-    def replace_last_message(self, message: dict[str, Any]) -> None:
-        if self._state is not None:
-            self._state = replace(self._state, messages=self._state.messages[:-1] + (dict(message),))
-        elif self._pif.get("messages"):
-            self._pif["messages"][-1] = dict(message)
 
-    def clear_tools(self) -> None:
-        if self._state is not None:
-            self._state = replace(self._state, tools=())
-        else:
-            self._pif = {**self._pif, "tools": []}
 
-    def adopt(self, input_feature: dict[str, Any]) -> None:
-        """Take an already-encoded feature as the current state.
-
-        For the one caller that legitimately rebuilds it: an opening rewritten
-        before the first generation, which has to be re-encoded because there is
-        no append that expresses it. Called after a generation instead, this is
-        how a run silently starts training on drifted ids.
-        """
-        self._pif = _to_plain(dict(input_feature))
-        self._state = None
+    def adopt(self, input_feature: Trajectory) -> None:
+        """Adopt an encoded opening; sampled history must only be extended incrementally."""
+        self._trajectory = copy_trajectory(input_feature)
+        for key in ("input_ids", "labels", "completion_mask", "engine_input_ids"):
+            if key in self._trajectory and hasattr(self._trajectory[key], "tolist"):
+                self._trajectory[key] = self._trajectory[key].tolist()
 
     # ---------------------------------------------------------------- closing
 
@@ -426,14 +372,13 @@ class TurnLedger:
         re-derive them from the labels.
         """
         self.audit()
-        out = dict(trajectory)
-        out.update(self._pif)
-        out["messages"] = self.messages or list(trajectory.get("messages") or [])
+        out = {**copy_trajectory(trajectory), **copy_trajectory(self._trajectory)}
+        out["messages"] = self.messages or copy_trajectory({'messages': trajectory.get('messages') or []})['messages']
         out["tools"] = self.tools
-        out["logprobs"] = self._logprobs if self._logprobs else None
-        labels = self._pif.get("labels") or []
-        input_ids = self._pif.get("input_ids") or []
-        completion_mask = self._pif.get("completion_mask")
+        out["logprobs"] = copy_trajectory({'logprobs': self._logprobs})['logprobs'] if self._logprobs else None
+        labels = self._trajectory.get("labels") or []
+        input_ids = self._trajectory.get("input_ids") or []
+        completion_mask = self._trajectory.get("completion_mask")
         positions = _trainable_positions(input_ids, labels, completion_mask)
         if positions and positions[0] == 0:
             # A trainable input-order position 0 means the very first token of the
@@ -452,12 +397,14 @@ class TurnLedger:
             # ``validate_trajectory`` rejects it, while an absent field is the documented signal that
             # this trajectory simply carries no sampling logps.
             out["rollout_logps"] = sampled_token_logprobs(out["response_token_ids"], self._logprobs)
-        if "routed_experts" in self._pif:
+        if "routed_experts" in self._trajectory:
             out["replay_mask"] = (
                 list(completion_mask) if completion_mask is not None else [int(label != -100) for label in labels]
             )
-        if self._turns == 1 and self._sampling_masks is not None:
-            out["sampling_masks"] = self._sampling_masks
+        out.pop('sampling_masks', None)
+        if self._sampling_masks is not None:
+            out["sampling_masks"] = SamplingMask(token_ids=list(self._sampling_masks.token_ids),
+                                                  offsets=list(self._sampling_masks.offsets))
         out.update(fields)
         # The response contract is asserted HERE, at the trajectory's producer: the driver's
         # hand-out merge stays row-level work, and a bad encoding fails this episode's step
@@ -479,8 +426,8 @@ class TurnLedger:
         """
         if not self._logprobs:
             return
-        labels = self._pif.get("labels") or []
-        completion_mask = self._pif.get("completion_mask")
+        labels = self._trajectory.get("labels") or []
+        completion_mask = self._trajectory.get("completion_mask")
         if completion_mask is None:
             expected = sum(1 for label in labels if label != -100)
         elif len(completion_mask) != len(labels):
@@ -497,7 +444,7 @@ class TurnLedger:
             )
 
 
-class MessageLedger:
+class MessageLedger(_TrajectoryLedger):
     """The message-level counterpart of :class:`TurnLedger`: an episode account
     with no tokens in it.
 
@@ -520,9 +467,8 @@ class MessageLedger:
     message it returns (through ``new_input_feature['messages']``), which the loop
     already reads before falling back to text parsing.
 
-    Duck-typed against :class:`TurnLedger`, not subclassed: the two share a call
-    surface, not state -- one holds an encoded feature, the other a message list
-    -- and a common base would be thinner than the disagreement between them.
+    Shares trajectory ownership and message operations with :class:`TurnLedger`;
+    token budgets and logprob accounting remain exclusive to the encoded path.
     """
 
     def __init__(
@@ -543,32 +489,12 @@ class MessageLedger:
         # the loop (it withdraws tool schemas with ``['tools'] = []`` and rewrites
         # the last message). ``messages`` is the very list the writer methods
         # append to, so those annotations stay visible.
-        self._feature: dict[str, Any] = {"messages": [], "tools": []}
+        self._trajectory: dict[str, Any] = {"messages": [], "tools": []}
         self._turns = 0
 
     # ---------------------------------------------------------------- reading
 
-    @property
-    def input_feature(self) -> dict[str, Any]:
-        """The episode so far as a live ``{'messages', 'tools'}`` dict.
 
-        Live rather than a copy because the loop annotates it in place. There are
-        no token arrays in it to protect, which is the one freedom message-level
-        accounting has over :class:`TurnLedger`.
-        """
-        return self._feature
-
-    @property
-    def state(self) -> RolloutState | None:
-        return None
-
-    @property
-    def messages(self) -> list[dict[str, Any]]:
-        return list(self._feature["messages"])
-
-    @property
-    def tools(self) -> list[dict[str, Any]]:
-        return list(self._feature["tools"])
 
     @property
     def logprobs(self) -> list[Any]:
@@ -617,56 +543,41 @@ class MessageLedger:
     # ---------------------------------------------------------------- writing
 
     def open(self, trajectory: Trajectory, *, tools: list[dict[str, Any]] | None = None) -> None:
-        """Take the opening messages as they are -- nothing is encoded."""
-        self._feature = {
-            "messages": list(trajectory.get("messages") or []),
-            "tools": list(tools if tools is not None else (trajectory.get("tools") or [])),
-        }
+        """Own the complete opening without tokenizing it."""
+        self._trajectory = copy_trajectory(trajectory)
+        self._trajectory.setdefault("messages", [])
+        self._trajectory["tools"] = copy_trajectory({"tools": tools if tools is not None else trajectory.get("tools", [])})["tools"]
         self._turns = 0
 
     def record(self, seq: SampledSequence) -> None:
-        """Bank one reply as an assistant message.
-
-        ``new_input_feature`` is optional here, unlike :class:`TurnLedger`. When
-        the backend supplies it as ``{'messages': [...]}`` -- the conversation plus
-        the assistant turn it just produced, carrying any structured ``tool_calls``
-        -- those messages are adopted wholesale, which is how a text-only backend
-        gets tool calls into the episode. Otherwise the reply is appended as a
-        plain assistant message built from ``seq.decoded``.
-        """
-        feature = seq.new_input_feature
-        if isinstance(feature, dict) and feature.get("messages"):
-            self._feature["messages"] = list(feature["messages"])
-            if "tools" in feature:
-                self._feature["tools"] = list(feature["tools"])
+        """Adopt a structured reply, or append a text-only streaming result."""
+        if seq.new_input_feature is not None:
+            self._trajectory = self._sampled_trajectory(seq)
+        elif not seq.tokens:
+            self._trajectory["messages"].append({"role": "assistant", "content": seq.decoded or ""})
         else:
-            self._feature["messages"].append({"role": "assistant", "content": seq.decoded or ""})
+            raise RuntimeError(f"sampler omitted its trajectory for {self.label}")
         self._turns += 1
 
     def record_continuation(self, seq: SampledSequence) -> None:
-        """Extend the open assistant turn with a continuation (no new turn banked)."""
-        feature = seq.new_input_feature
-        if isinstance(feature, dict) and feature.get("messages"):
-            self._feature["messages"] = list(feature["messages"])
-            if "tools" in feature:
-                self._feature["tools"] = list(feature["tools"])
+        """Extend the same assistant message, including structured continuation fields."""
+        previous = self.messages
+        if seq.new_input_feature is not None:
+            sampled = self._sampled_trajectory(seq)
+        elif not seq.tokens:
+            sampled = copy_trajectory(self._trajectory)
+            sampled["messages"] = previous + [{"role": "assistant", "content": seq.decoded or ""}]
         else:
-            msgs = self._feature["messages"]
-            if not msgs or msgs[-1].get("role") != "assistant":
-                raise RuntimeError(f"continuation without an open assistant turn at {self.label}")
-            msgs[-1] = {**msgs[-1], "content": (msgs[-1].get("content") or "") + (seq.decoded or "")}
+            raise RuntimeError(f"sampler omitted its trajectory for {self.label}")
+        self._continue_messages(previous, sampled)
+        self._trajectory = sampled
 
     def observe(self, messages: Sequence[dict[str, Any]]) -> bool:
         """Append messages the model did not write. Always fits: no token budget."""
-        self._feature["messages"].extend(dict(m) for m in messages)
+        self._trajectory["messages"].extend(copy_trajectory({'messages': list(messages)})['messages'])
         return True
 
-    def replace_last_message(self, message: dict[str, Any]) -> None:
-        if self._feature["messages"]:
-            self._feature["messages"][-1] = dict(message)
 
-    def clear_tools(self) -> None:
-        self._feature["tools"] = []
 
     # ---------------------------------------------------------------- closing
 
@@ -677,9 +588,9 @@ class MessageLedger:
         check, and ``input_ids`` / ``labels`` / ``logprobs`` are absent so a
         downstream consumer sees a transcript rather than an encoded feature.
         """
-        out = dict(trajectory)
-        out["messages"] = list(self._feature["messages"])
-        out["tools"] = list(self._feature["tools"])
+        out = {**copy_trajectory(trajectory), **copy_trajectory(self._trajectory)}
+        out["messages"] = self.messages
+        out["tools"] = self.tools
         out.update(fields)
         return out
 

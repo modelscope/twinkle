@@ -2,8 +2,9 @@ import asyncio
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from twinkle.data_format import InputFeature, SamplingParams, Trajectory
-from twinkle.protocol.json_utils import json_safe
+from twinkle.data_format import InputFeature, SamplingParams, Trajectory, copy_trajectory
+from twinkle.protocol.json_utils import wire_trajectory
+from twinkle.protocol.types.data import export_batch
 from twinkle.protocol.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
 from twinkle.protocol.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
                                             SampleResponseModel, SampleResponseModelList, SamplerApplyPatchRequest,
@@ -30,7 +31,7 @@ def _json_safe(obj: Any) -> Any:
     duck-typing (``.tolist()``) so this stays free of a hard torch/numpy import,
     honouring the CPU-only client contract noted above.
     """
-    return json_safe(obj)
+    return wire_trajectory(obj)
 
 
 class vLLMSampler:
@@ -111,16 +112,32 @@ class vLLMSampler:
         """
         if adapter_uri is None:
             adapter_uri = adapter_path if adapter_path is not None else getattr(self, 'adapter_uri', None)
-        response = self._transport.post_model(
-            f'{self.server_url}/sample',
-            build_request(
-                SampleRequest,
-                inputs=_json_safe(inputs),
-                sampling_params=self._sampling_params(sampling_params, num_samples),
-                adapter_name=adapter_name,
-                adapter_uri=adapter_uri,
-                token_only=token_only))
-        return self._await_task(response, SampleResponseModelList).samples
+        originals = [copy_trajectory(item) for item in (inputs if isinstance(inputs, list) else [inputs])]
+        request = build_request(
+            SampleRequest,
+            inputs=_json_safe(originals),
+            sampling_params=self._sampling_params(sampling_params, num_samples),
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            token_only=token_only)
+        wire_inputs = export_batch(request.inputs)
+        response = self._transport.post_model(f'{self.server_url}/sample', request)
+        samples = self._await_task(response, SampleResponseModelList).samples
+        if not token_only:
+            if len(samples) != len(originals):
+                raise RuntimeError('server response count does not match the input batch')
+            for original, wire_input, result in zip(originals, wire_inputs, samples):
+                for sequence in result.sequences:
+                    if sequence.new_input_feature is None:
+                        raise RuntimeError('server omitted a complete trajectory from a normal sample response')
+                    restored = {**copy_trajectory(original), **copy_trajectory(sequence.new_input_feature)}
+                    before, after = original.get('messages') or [], restored.get('messages') or []
+                    # Restore local media objects only when the server retained this exact history.
+                    # Truncated or split messages belong to the server's encoded token sequence.
+                    if before and after[:len(before)] == wire_input.get('messages'):
+                        restored['messages'] = copy_trajectory({'messages': before})['messages'] + after[len(before):]
+                    sequence.new_input_feature = restored
+        return samples
 
     @staticmethod
     def _sampling_params(sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]],

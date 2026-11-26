@@ -1,6 +1,8 @@
 # Template
 
-模板是用于将 Trajectory 转换为 InputFeature 的关键组件。
+模板编码轨迹时保留完整的 dict 载荷。`InputFeature` 是模型输入用途的类型指引，不承担字段删减：messages、tools、user_data 和原始 images/videos/audios 与数值 tensor 一同保留，非模型字段由模型的输入处理阶段筛选。
+
+`encode_prompt` 直接返回携带训练 `input_ids` 与 serving `engine_input_ids` 的完整 dict。`append_completion` 将实际生成的 tokens 追加到两种序列，并返回带结构化 assistant 消息的新轨迹，不重编码已采样历史。
 
 ```python
 class Template:

@@ -29,10 +29,6 @@ def construct_template(template_cls, **kwargs):
         if not separator:
             raise ValueError('A TemplateSpec factory must be a dotted class path.')
         template_cls = getattr(importlib.import_module(module), name)
-    from twinkle.template.contract import TemplateSpec
-
-    if isinstance(template_spec, dict):
-        template_spec = TemplateSpec.from_dict(template_spec)
     factory = getattr(template_cls, 'from_spec', None)
     if factory is None:
         raise TypeError(f'{template_cls!r} does not implement from_spec().')

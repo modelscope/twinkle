@@ -1,6 +1,8 @@
 # Template
 
-The template is a key component for converting Trajectory to InputFeature.
+The template encodes a trajectory while retaining its complete dict payload. `InputFeature` is a model-input type hint, not a field projection: messages, tools, user_data and original images/videos/audios remain alongside numerical tensors. Non-model fields are filtered by the model's input processor.
+
+`encode_prompt` returns the same complete dict with training `input_ids` and serving `engine_input_ids`. `append_completion` appends actual generated tokens to both sequences and returns a new trajectory with a structured assistant message; it does not re-encode the sampled history.
 
 ```python
 class Template:
@@ -58,7 +60,9 @@ Currently, the model-template mapping is simple:
 - Qwen3_5Template class: For Qwen3.5 MLLMs.
 # Template
 
-The template is a key component for converting Trajectory to InputFeature.
+The template encodes a trajectory while retaining its complete dict payload. `InputFeature` is a model-input type hint, not a field projection: messages, tools, user_data and original images/videos/audios remain alongside numerical tensors. Non-model fields are filtered by the model's input processor.
+
+`encode_prompt` returns the same complete dict with training `input_ids` and serving `engine_input_ids`. `append_completion` appends actual generated tokens to both sequences and returns a new trajectory with a structured assistant message; it does not re-encode the sampled history.
 
 ```python
 class Template:

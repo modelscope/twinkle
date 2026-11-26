@@ -29,6 +29,10 @@ class vLLMSampler:
 
 The core method is `sample`, which returns a list of `SampleResponse` objects. Set `SamplingParams(num_samples=N)` to generate multiple sequences per prompt; each response contains `sequences`.
 
+Each normal candidate's `new_input_feature` is the complete trajectory: messages, tools, user_data, original media and numerical encoding fields. `SampledSequence` still carries tokens, logprobs, decoded text, stop_reason, routed_experts and sampling_masks; there is no separate `new_state`. `max_tokens=0` scores the prompt without adding an assistant message.
+
+Over HTTP, the client restores request media and user_data omitted from the response. Explicit `token_only=True` is a transport primitive returning tokens and statistics; `HTTPSampler` uses its local template to append those tokens to the complete trajectory without retokenizing the reply. Server-side DataPlane storage keeps the complete trajectory independently of the HTTP response projection.
+
 ## Available Samplers
 
 Twinkle provides the `vLLMSampler` implementation:

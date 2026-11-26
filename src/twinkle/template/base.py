@@ -7,25 +7,25 @@ from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 import json
 import numpy as np
-from swift.dev.template_contract.encoding import render_delta as render_delta_tokens
-from swift.dev.template_contract.output import _reasoning_is_open, decode_output
+from .contract.encoding import engine_input_ids, render_delta as render_delta_tokens
+from .contract.output import _reasoning_is_open, decode_output
+from twinkle.data_format import copy_trajectory
 
 from twinkle import remote_class
 from twinkle.data_format import InputFeature, Message, Trajectory, user_data_get
 from twinkle.hub import HubOperation
 from twinkle.utils import load_image, to_device
 from .contract import (
-    CompletionEncoding,
     DecodeContext,
     DecodedResponse,
     MediaBundle,
-    PromptEncoding,
-    RolloutState,
+    SHIFTED_FIELDS,
     append_and_finalize,
     feature_has_media,
     shift_values,
     split_reasoning,
 )
+from .contract.encoding import preserve_trajectory, project_sliced_messages
 from .tools import ToolCallRegistry
 from .utils import TokenizeByRound, transfer_to_standard_message
 
@@ -41,7 +41,7 @@ AudioInput = Union[str, np.ndarray, "torch.Tensor"]
 # Fields that are one entry per token and must be sliced with ``input_ids``.
 # ``mm_token_type_ids`` is excluded: it may carry a leading batch dim and is
 # sliced on its last axis instead.
-_SEQUENCE_ALIGNED_FIELDS = ("labels", "completion_mask")
+_SEQUENCE_ALIGNED_FIELDS = ("labels", "completion_mask", "loss_scale", "token_type_ids")
 
 # What an appended turn is to a trainer: the policy's own completion (scored, and
 # a log-prob exists for each of its tokens), someone else's completion offered
@@ -339,10 +339,16 @@ class Template:
         else:
             raise ValueError(f"Unsupported truncation_strategy={strategy!r}.")
         result = dict(feature)
+        result['_kept_token_indices'] = list(range(length))[keep]
         result["input_ids"] = result["input_ids"][keep]
         for key in _SEQUENCE_ALIGNED_FIELDS:
             if key in result:
                 result[key] = result[key][keep]
+        if feature.get('labels') is not None and len(feature['labels']) and feature['labels'][0] == -100:
+            for key, fill in SHIFTED_FIELDS.items():
+                if result.get(key) is not None and len(result[key]):
+                    result[key] = np.array(result[key], copy=True)
+                    result[key][0] = fill
         if "mm_token_type_ids" in result:
             result["mm_token_type_ids"] = result["mm_token_type_ids"][..., keep]
         return InputFeature(**result)
@@ -355,15 +361,7 @@ class Template:
 
     @staticmethod
     def _engine_ids_tuple(input_ids) -> tuple[int, ...]:
-        """``input_ids`` as a tuple of plain python ints, for :attr:`RolloutState.engine_input_ids`.
-
-        ``_encode_messages`` materialises ``input_ids`` as a numpy array, so a plain
-        ``tuple(input_ids)`` yields numpy scalars. ``engine_input_ids`` flows into the serving
-        engines' request payloads (vLLM ``TokensPrompt``), whose msgpack encoder refuses
-        ``numpy.int64`` -- a generation would die at request encoding with "Object of type
-        numpy.int64 is not serializable". Normalising here covers both construction sites
-        (``encode_prompt`` and the plain-feature branch of ``append_completion``).
-        """
+        """Normalize engine IDs to plain integers for request serialization."""
         return tuple(int(token) for token in input_ids)
 
     def _check_max_length(self, input_feature: InputFeature) -> list[InputFeature]:
@@ -385,10 +383,17 @@ class Template:
             for start in range(0, len(input_feature["input_ids"]), self.max_length):
                 end = min(start + self.max_length, len(input_feature["input_ids"]))
                 feat = dict(input_feature)
+                if start != 0 or end != len(input_feature['input_ids']):
+                    feat['_kept_token_indices'] = list(range(start, end))
                 feat["input_ids"] = feat["input_ids"][start:end]
                 for key in _SEQUENCE_ALIGNED_FIELDS:
                     if key in feat:
                         feat[key] = feat[key][start:end]
+                if input_feature.get('labels') is not None and len(input_feature['labels']) and input_feature['labels'][0] == -100:
+                    for key, fill in SHIFTED_FIELDS.items():
+                        if feat.get(key) is not None and len(feat[key]):
+                            feat[key] = np.array(feat[key], copy=True)
+                            feat[key][0] = fill
                 if "mm_token_type_ids" in feat:
                     feat["mm_token_type_ids"] = feat["mm_token_type_ids"][..., start:end]
                 results.append(InputFeature(**feat))
@@ -420,9 +425,9 @@ class Template:
         # not -100: there is no next-token prediction to shift for. Skip the roll for those.
         if len(labels) > 0 and labels[0] != -100:
             return [input_feature]
-        input_feature["labels"] = shift_values(labels, -100)
-        if "completion_mask" in input_feature:
-            input_feature["completion_mask"] = shift_values(input_feature["completion_mask"], 0)
+        for key, fill in SHIFTED_FIELDS.items():
+            if input_feature.get(key) is not None:
+                input_feature[key] = shift_values(input_feature[key], fill)
         return [input_feature]
 
     def _process_mm_messages(self, messages: list, images: list, videos: list, audios: list) -> list:
@@ -858,7 +863,7 @@ class Template:
         return trajectory
 
     def encode(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
-        """Encode a single trajectory into an InputFeature.
+        """Encode an InputFeature while preserving the caller's trajectory fields.
 
         This is a convenience wrapper around :meth:`batch_encode` for encoding
         a single trajectory.
@@ -966,10 +971,35 @@ class Template:
                 # Standard columnar format
                 trajectories = self.map_col_to_row(trajectories)
 
-        # Process List[Trajectory]
-        trajectories = self._invoke_pre_pipeline(trajectories)
-        output = [self._encode_messages(t, add_generation_prompt=add_generation_prompt, **kwargs) for t in trajectories]
-        output = self._run_post_pipeline(output)
+        # Render independent copies while retaining the public conversation and original media.
+        output = []
+        for original in trajectories:
+            source = copy_trajectory(original)
+            rendering = self._invoke_pre_pipeline([copy_trajectory(source)])
+            for rendered in rendering:
+                encoded = self._encode_messages(rendered, add_generation_prompt=add_generation_prompt, **kwargs)
+                original_ids = list(encoded.get('input_ids', ()))
+                for feature in self._run_post_pipeline([encoded]):
+                    result = preserve_trajectory(source, feature)
+                    ids = result.get('input_ids')
+                    if ids is not None:
+                        kept = result.pop('_kept_token_indices', None)
+                        if kept is not None:
+                            def render_prefix(messages):
+                                from copy import copy
+                                row = copy_trajectory(source)
+                                row['messages'] = messages
+                                renderer = copy(self)
+                                renderer.max_length = None
+                                row = renderer._invoke_pre_pipeline([row])[0]
+                                return renderer._encode_messages(row, add_generation_prompt=False, **kwargs)['input_ids']
+                            result['messages'] = project_sliced_messages(
+                                source.get('messages') or [], original_ids, kept,
+                                render_prefix=render_prefix,
+                                decode=lambda values: self.tokenizer.decode(values, skip_special_tokens=True))
+                        result['engine_input_ids'] = list(self._engine_ids_tuple(self._engine_input_ids(ids)))
+                        result['reasoning_started'] = self._reasoning_started(ids)
+                    output.append(result)
 
         if _transfer:
             output = self.map_row_to_col(output)
@@ -1004,80 +1034,42 @@ class Template:
         return output
 
     def encode_prompt(
-        self, sample: Trajectory, *, backend: str = "vllm", add_generation_prompt: bool = True
-    ) -> PromptEncoding:
-        messages = deepcopy(sample.get("messages") or ())
-        tools = deepcopy(sample.get("tools") or ())
-        media = MediaBundle.from_sources(sample)
+        self, sample: Trajectory, *, backend: str = 'vllm', add_generation_prompt: bool = True
+    ) -> Trajectory:
         feature = self.encode(sample, add_generation_prompt=add_generation_prompt)
         if feature is None:
-            # ``truncation_strategy='delete'`` drops over-long rows dataset-side; a single prompt
-            # (rollout generation) has no row to drop, so say so instead of crashing on None below.
-            raise ValueError(
-                'the prompt exceeds max_length and truncation_strategy=\'delete\' cannot encode a '
-                'single prompt; use a truncation strategy that shortens instead of dropping')
-        feature.pop("messages", None)
-        feature.pop("tools", None)
-        engine_ids = self._engine_input_ids(feature["input_ids"])
-        media = media or MediaBundle.from_sources(feature)
-        state = RolloutState(
-            feature=feature,
-            engine_input_ids=self._engine_ids_tuple(engine_ids),
-            messages=tuple(messages),
-            tools=tuple(tools),
-            reasoning_started=self._reasoning_started(feature["input_ids"]),
-            media=media,
-        )
-        return PromptEncoding(state)
+            raise ValueError('the prompt exceeds max_length under truncation_strategy=delete')
+        feature['engine_input_ids'] = list(self._engine_ids_tuple(self._engine_input_ids(feature['input_ids'])))
+        feature['reasoning_started'] = self._reasoning_started(feature['input_ids'])
+        return feature
 
     def append_completion(
-        self,
-        prompt: InputFeature | RolloutState,
-        tokens: list[int],
-        *,
-        appended_as: str = "completion",
+        self, prompt: Trajectory, tokens: list[int], *, appended_as: str = 'completion',
         tool_calls: list[dict[str, Any]] | None = None,
-    ) -> CompletionEncoding:
-        state = prompt if isinstance(prompt, RolloutState) else None
-        if state is None:
-            feature = dict(prompt)
-            messages = tuple(deepcopy(feature.pop("messages", ())))
-            tools = tuple(deepcopy(feature.pop("tools", ())))
-            if feature_has_media(prompt):
-                raise NotImplementedError("multimodal continuation requires RolloutState.")
-            state = RolloutState(
-                feature=feature,
-                engine_input_ids=self._engine_ids_tuple(feature["input_ids"]),
-                messages=messages,
-                tools=tools,
-                reasoning_started=self._reasoning_started(feature["input_ids"]),
-                media=MediaBundle(),
-            )
-        prompt_feature = state.feature
-        feature = self._append_feature(prompt_feature, tokens, appended_as=appended_as, tool_calls=tool_calls)
+    ) -> Trajectory:
+        prefix = copy_trajectory(prompt)
+        ids = engine_input_ids(prefix)
+        media = MediaBundle.from_sources(prefix)
+        if feature_has_media(prefix) and not media:
+            raise ValueError('multimodal continuation requires original media')
+        feature = self._append_feature(prefix, tokens, appended_as=appended_as, tool_calls=tool_calls)
         if feature is None:
-            raise ValueError("appended completion exceeds max_length under delete truncation strategy.")
+            raise ValueError('appended completion exceeds max_length under delete truncation strategy')
         response = self.decode_message(
-            tokens,
-            parse_tool_calls=tool_calls is None,
-            reasoning_started=state.reasoning_started,
-            tools=list(state.tools),
-            structured_calls=tool_calls,
+            tokens, parse_tool_calls=tool_calls is None,
+            reasoning_started=prefix.get('reasoning_started', self._reasoning_started(prefix['input_ids'])),
+            tools=list(prefix.get('tools') or ()), structured_calls=tool_calls,
         )
-        message = Message(role="assistant", content=response.content)
+        message = Message(role='assistant', content=response.content)
         if response.reasoning_content is not None:
-            message["reasoning_content"] = response.reasoning_content
+            message['reasoning_content'] = response.reasoning_content
         if response.tool_calls:
-            message["tool_calls"] = list(response.tool_calls)
-        next_state = RolloutState(
-            feature=feature,
-            engine_input_ids=state.engine_input_ids + tuple(tokens),
-            messages=state.messages + (deepcopy(message),),
-            tools=state.tools,
-            reasoning_started=bool(response.reasoning_started),
-            media=state.media,
-        )
-        return CompletionEncoding(next_state, response)
+            message['tool_calls'] = list(response.tool_calls)
+        feature['messages'] = list(prefix.get('messages') or ()) + [message]
+        feature['tools'] = list(prefix.get('tools') or ())
+        feature['engine_input_ids'] = ids + list(tokens)
+        feature['reasoning_started'] = bool(response.reasoning_started)
+        return feature
 
     def _reasoning_started(self, input_ids) -> bool:
         return _reasoning_is_open(input_ids, self.tokenizer, self.reasoning_open_marker, self.reasoning_close_marker)

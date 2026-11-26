@@ -337,6 +337,7 @@ class SGLangEngine(BaseSamplerEngine):
                               prompt: Union[List[int], str],
                               sampling_params: Union[SamplingParams, Dict[str, Any]],
                               lora_name: Optional[str] = None,
+                              image_data: Optional[Any] = None,
                               **kwargs):
         """Yield ``(delta_text, finish_reason)`` as sglang produces tokens.
 
@@ -357,6 +358,8 @@ class SGLangEngine(BaseSamplerEngine):
             request['input_ids'] = list(prompt)
         if lora_name:
             request['lora_path'] = lora_name
+        if image_data is not None:
+            request['image_data'] = image_data
 
         emitted = 0
         finish_reason = None

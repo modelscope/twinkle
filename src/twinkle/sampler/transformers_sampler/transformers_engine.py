@@ -222,6 +222,7 @@ class TransformersEngine(BaseSamplerEngine):
         prompt: List[int],
         sampling_params: Optional[SamplingParams] = None,
         lora_request: Optional[str] = None,
+        extra_model_inputs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         """Yield ``(delta_text, finish_reason)`` as tokens are produced.
@@ -240,7 +241,7 @@ class TransformersEngine(BaseSamplerEngine):
             streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
             gen_kwargs = self._build_gen_kwargs(params, num_samples=1, logprobs=False)
             gen_kwargs['streamer'] = streamer
-            inputs = self._to_model_inputs([prompt])
+            inputs = self._to_model_inputs([prompt], extra_model_inputs)
             produced: List[int] = []
 
             def _run():

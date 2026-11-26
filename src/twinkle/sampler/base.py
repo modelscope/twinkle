@@ -87,7 +87,7 @@ class Sampler(ABC):
     @abstractmethod
     def sample(
         self,
-        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        inputs: Union[Trajectory, List[Trajectory]],
         sampling_params: Optional[SamplingParams] = None,
         adapter_name: str = '',
         *,
@@ -96,9 +96,9 @@ class Sampler(ABC):
         """Sample responses for given inputs.
 
         Args:
-            inputs: Either InputFeature(s) or Trajectory(s).
-                - InputFeature: Must contain 'input_ids'. For multimodal, include 'images'/'videos'.
-                - Trajectory: Must contain 'messages'. Requires template to be set.
+            inputs: Complete trajectory dict(s), encoded with 'input_ids' or awaiting
+                encoding with 'messages'. Normal sampling requires a template. Encoded
+                multimodal inputs retain 'engine_input_ids' and original media.
             sampling_params: Sampling parameters.
             adapter_name: Optional LoRA adapter name.
             num_samples: Number of completions to generate per input prompt.
@@ -112,7 +112,7 @@ class Sampler(ABC):
 
     def encode(
         self,
-        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        inputs: Union[Trajectory, List[Trajectory]],
         pooling_params: Optional[PoolingParams] = None,
         adapter_name: str = '',
     ) -> List[PoolingResponse]:
@@ -140,7 +140,7 @@ class Sampler(ABC):
 
     @staticmethod
     def _not_encoded(inputs: Any) -> bool:
-        """Check if inputs are not yet encoded (i.e., is Trajectory, not InputFeature).
+        """Check whether a trajectory dict still needs encoding.
 
         Delegates to the single shared predicate so the three backends and the wire
         schema cannot drift apart.
@@ -149,7 +149,7 @@ class Sampler(ABC):
         return not is_encoded(inputs)
 
     def _is_trajectory(self, inputs: Any) -> bool:
-        """Check if inputs are Trajectory type (not encoded)."""
+        """Check whether the first input dict in a batch still needs encoding."""
         if isinstance(inputs, list):
             if not inputs:
                 return False

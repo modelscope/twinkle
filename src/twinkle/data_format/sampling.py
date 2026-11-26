@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Union
 
-from twinkle.data_format import InputFeature
+from .trajectory import Trajectory
 
 StopReason = Literal["length", "stop", "abort", "error"]
 
@@ -236,8 +236,7 @@ class SampledSequence:
     tokens: list[int]
     logprobs: list[list[tuple[int, float]]] | None = None
     decoded: str = None
-    new_input_feature: InputFeature = None
-    new_state: Any | None = None
+    new_input_feature: Trajectory | None = None
     routed_experts: Any | None = None
     sampling_masks: SamplingMask | None = None
 
@@ -376,3 +375,22 @@ class PoolingResponse:
     data: list[float]
     task: PoolingTask = "embed"
     prompt_token_ids: list[int] | None = None
+
+
+def sampled_token_logprobs(tokens: list[int], logprobs) -> list[float]:
+    """Normalize sampler logprobs to one scalar for each sampled token."""
+    if logprobs is None:
+        return []
+    if len(logprobs) != len(tokens):
+        raise RuntimeError('sampled tokens and logprobs must have the same length')
+    result: list[float] = []
+    for token, position in zip(tokens, logprobs):
+        if isinstance(position, (int, float)):
+            result.append(float(position))
+            continue
+        candidates = list(position or [])
+        matched = next((value for token_id, value in candidates if int(token_id) == int(token)), None)
+        if matched is None:
+            raise RuntimeError(f"sampled token {token} is missing from its returned logprobs: {candidates!r}.")
+        result.append(float(matched))
+    return result

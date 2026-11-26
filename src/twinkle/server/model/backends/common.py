@@ -178,7 +178,7 @@ class TwinkleCompatModelBase:
             if not tokens or min(tokens) < 0 or max(tokens) >= len(template.tokenizer):
                 raise ValueError('Continuation tokens must be nonempty and in the configured vocabulary.')
             prompt = template.encode_prompt(row)
-            feature = template.append_completion(prompt.state, tokens).state.feature
+            feature = template.append_completion(prompt, tokens)
             positions = response_positions(feature)
             if [int(feature['labels'][i]) for i in positions] != tokens:
                 raise ValueError('Encoded scoring labels do not match the given continuation.')

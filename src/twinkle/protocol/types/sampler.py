@@ -67,7 +67,7 @@ class SampledSequenceModel(ResponseModel):
     decoded: str | None = Field(None, description='Decoded text of the sampled sequence')
     text: str | None = Field(None, description='Assistant content parsed by the serving template')
     new_input_feature: dict[str, Any] | None = Field(
-        None, description='Updated InputFeature after sampling (input_ids, labels, etc.)')
+        None, description='Complete trajectory after sampling; request media and user_data may be omitted on the wire')
     routed_experts: Ints3 | None = Field(None, description='Expert routing exported by token-only sampling')
     sampling_masks: SamplingMaskModel | None = Field(None, description='Support sets for sampled tokens')
 

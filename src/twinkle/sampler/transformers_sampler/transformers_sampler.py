@@ -38,7 +38,7 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.perf import timed
 from twinkle.sampler import generation
 from twinkle.sampler.base import Sampler
-from twinkle.template.contract import RolloutState
+from twinkle.data_format import copy_trajectory
 
 logger = get_logger()
 
@@ -47,10 +47,6 @@ logger = get_logger()
 class TransformersSampler(Sampler):
     """Sample with ``AutoModelForCausalLM.generate()``."""
 
-    # Declared so a rollout hands this sampler its RolloutState instead of a bare encoded feature:
-    # a multimodal row's pixel tensors can only be carried by the state (encode_all rejects a media
-    # feature without one), and the token account is the same object either way.
-    accepts_rollout_state = True
 
     def __init__(
         self,
@@ -236,7 +232,7 @@ class TransformersSampler(Sampler):
                     strict=strict,
                 )
             params = self._coerce_params(sampling_params)
-            inputs_list = [inputs] if isinstance(inputs, RolloutState) else self._normalize_inputs(inputs)
+            inputs_list = self._normalize_inputs(inputs)
             if not inputs_list:
                 return []
             if adapter_paths is not None:
@@ -257,7 +253,7 @@ class TransformersSampler(Sampler):
                 params = copy(params)
                 params.max_tokens = 1
 
-            encoded, states, failures = generation.encode_all(
+            encoded, failures = generation.encode_all(
                 self.template, inputs_list, logprobs_only=logprobs_only, strict=strict
             )
 
@@ -271,12 +267,11 @@ class TransformersSampler(Sampler):
                 adapter_uri = self._resolve_adapter(path, adapter_name, use_base_model)
                 for chunk in generation.chunks(indices, self.max_batch_size):
                     for index, response in zip(
-                        chunk, self._run_chunk(chunk, encoded, states, params, adapter_uri, strict), strict=False
+                        chunk, self._run_chunk(chunk, encoded, params, adapter_uri, strict), strict=False
                     ):  # noqa: E501
                         results[index] = response
 
-            if not logprobs_only:
-                generation.attach_features(self.template, results, encoded, states)
+            generation.attach_features(self.template, results, encoded, logprobs_only=logprobs_only)
             return [r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)]
 
     def sample_stream(
@@ -295,20 +290,17 @@ class TransformersSampler(Sampler):
                 )
                 return
             params = self._coerce_params(sampling_params)
-            state = inputs if isinstance(inputs, RolloutState) else None
-            if state is not None:
-                feat = state.feature
-            elif self._not_encoded(inputs):
+            feat = copy_trajectory(inputs)
+            if self._not_encoded(feat):
                 if self.template is None:
-                    raise ValueError(f"Template not set for adapter '{adapter_name}'. Pass template= to the sampler.")
-                state = self.template.encode_prompt(inputs, backend="transformers").state
-                feat = state.feature
-            else:
-                feat = inputs
+                    raise ValueError('Template not set; pass template= to the sampler')
+                feat = self.template.encode_prompt(feat, backend='transformers')
             adapter_uri = self._resolve_adapter(adapter_path, adapter_name, use_base_model=False)
-            prompt = generation.prompt_ids(feat, state)
+            prompt = generation.prompt_ids(feat)
+            extra = generation.collate_extra_model_inputs([0], {0: feat}, self.template)
             yield from self._iter_in_loop(
-                self.engine.generate_stream(prompt=prompt, sampling_params=params, lora_request=adapter_uri)
+                self.engine.generate_stream(prompt=prompt, sampling_params=params, lora_request=adapter_uri,
+                                            extra_model_inputs=extra)
             )
 
     # ------------------------------------------------------------------ engine passthrough
@@ -384,7 +376,6 @@ class TransformersSampler(Sampler):
         self,
         chunk: list[int],
         encoded: dict[int, dict[str, Any]],
-        states,
         params: SamplingParams,
         adapter_uri: str | None,
         strict: bool,
@@ -403,4 +394,4 @@ class TransformersSampler(Sampler):
                 )
             )
 
-        return generation.run_chunk(chunk, encoded, states, call_batch, strict=strict)
+        return generation.run_chunk(chunk, encoded, call_batch, template=self.template, strict=strict)
