@@ -438,6 +438,31 @@ async def test_control_deadline_fences_all_participants(stage):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('endpoint', ['twinkle/sample', 'twinkle/sample_stream', 'twinkle/encode', 'tinker/asample'])
+async def test_original_weights_restored_before_ordinary_request(endpoint):
+    pool, driver, _ = setup(minimum=1, maximum=1)
+    ordinary = None
+    try:
+        await pool.request(request(), full_path='checkpoint')
+        ordinary = asyncio.create_task(pool.request(request(endpoint)))
+        await asyncio.sleep(0)
+        assert not ordinary.done()
+        assert [payload['base_path'] for _, payload in driver.calls if 'base_path' in payload] == ['checkpoint']
+
+        driver.finish.set()
+        assert (await ordinary)['status'] == 200
+        await settle_jobs(pool)
+        assert driver.calls[-2][1] == {'base_path': None}
+        assert driver.calls[-1][1]['endpoint'] == endpoint
+        assert not pool._actions
+    finally:
+        driver.finish.set()
+        if ordinary is not None:
+            await asyncio.gather(ordinary, return_exceptions=True)
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_superseded_checkpoint_is_not_needed_to_start_new_replica():
     pool, driver, _ = setup(minimum=1)
     driver.finish.set()

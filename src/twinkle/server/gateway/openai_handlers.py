@@ -13,12 +13,15 @@ import os
 import secrets
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import json
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from twinkle.protocol.headers import (
     H_AUTH,
@@ -38,6 +41,7 @@ import httpx
 import twinkle.protocol.types as types
 from twinkle.server.utils import get_template_for_model
 from .openai_bridge import (
+    InferModelConflictError,
     make_error,
     translate_chat_request,
     translate_completion_request,
@@ -65,6 +69,30 @@ _ROUTE_MOUNT_POLL_INTERVAL = 1.0
 
 def _route_wait_timeout() -> float:
     return float(os.environ.get(_OPENAI_ROUTE_WAIT_ENV, str(_DEFAULT_OPENAI_ROUTE_WAIT_TIMEOUT)))
+
+
+def _can_wait_for_sampler(gateway: GatewayServer, base_model: str, response: Response) -> bool:
+    """A missing route can still mount while its pool controller exists."""
+    import ray
+
+    if not ray.is_initialized():
+        return False
+    try:
+        error = json.loads(response.body)
+    except ValueError:
+        error = None
+    if isinstance(error, dict) and 'error_code' in error:
+        return False
+
+    from twinkle.server.sampler.pool.controller import sampler_controller_name, sampling_pool_id
+
+    namespace = os.environ.get('TWINKLE_STATE_RAY_NAMESPACE', 'twinkle_cluster')
+    pool_id = sampling_pool_id(f"{gateway.route_prefix.rstrip('/')}/sampler/{base_model}")
+    try:
+        ray.get_actor(sampler_controller_name(namespace, pool_id), namespace=namespace)
+    except ValueError:
+        return False
+    return True
 
 
 class SamplerWaitTimeoutError(TimeoutError):
@@ -147,27 +175,22 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
                 translate=lambda data, m: translate_response(data, m, request_id),
             )
 
-        # Streaming: proxy to /twinkle/sample_stream, translate to SSE
-        base_model = await _resolve_base_model(self, model)
-        if base_model is None:
-            return _model_not_found(model)
-        sampler_headers = _sampler_headers(request)
-        await _ensure_template(self, base_model, sampler_headers, request)
         request_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
-        first_chunk = {'is_first': True}
+        is_first = True
 
-        def _chat_chunk(delta_text: str, finish_reason: str | None) -> dict[str, Any]:
-            is_first = first_chunk['is_first']
-            first_chunk['is_first'] = False
-            return translate_stream_chunk(
+        def _chat_chunk(delta_text: str, finish_reason: str | None, response_model: str) -> dict[str, Any]:
+            nonlocal is_first
+            chunk = translate_stream_chunk(
                 delta_text=delta_text,
-                model=model,
+                model=response_model,
                 finish_reason=finish_reason,
                 request_id=request_id,
                 is_first=is_first,
             )
+            is_first = False
+            return chunk
 
-        return _streaming_response(self, request, sample_request, base_model, sampler_headers, _chat_chunk)
+        return await _streaming_response(self, request, sample_request, model, _chat_chunk)
 
     @app.post('/completions')
     async def completions(
@@ -186,20 +209,14 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         except ValueError as e:
             return _bad_request(e)
 
+        request_id = f'cmpl-{uuid.uuid4().hex[:24]}'
         if body.get('stream', False):
-            base_model = await _resolve_base_model(self, model)
-            if base_model is None:
-                return _model_not_found(model)
-            sampler_headers = _sampler_headers(request)
-            await _ensure_template(self, base_model, sampler_headers, request)
-            request_id = f'cmpl-{uuid.uuid4().hex[:24]}'
-            return _streaming_response(
-                self, request, sample_request, base_model, sampler_headers,
-                lambda delta, finish: translate_completion_stream_chunk(
-                    delta_text=delta, model=model, finish_reason=finish, request_id=request_id),
+            return await _streaming_response(
+                self, request, sample_request, model,
+                lambda delta, finish, response_model: translate_completion_stream_chunk(
+                    delta_text=delta, model=response_model, finish_reason=finish, request_id=request_id),
             )
 
-        request_id = f'cmpl-{uuid.uuid4().hex[:24]}'
         return await _proxy_sample(
             self,
             request,
@@ -248,6 +265,8 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         body = await request.json()
         try:
             sample_request, model = translate_infer_request(body)
+        except InferModelConflictError as e:
+            return JSONResponse(status_code=400, content=make_error(message=str(e), param='model'))
         except ValueError as e:
             return _bad_request(e)
         return await _proxy_sample(
@@ -286,38 +305,43 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         })
 
 
-async def _resolve_base_model(gateway: GatewayServer, model: str) -> str | None:
-    """Resolve the base_model for routing given an adapter/model name.
+@dataclass(frozen=True)
+class _ModelRoute:
+    base_model: str
+    response_model: str
+    deployed_adapter: bool = False
 
-    Checks:
-    1. Model metadata in state (adapter → base_model mapping)
-    2. Whether the model name itself is a supported base model
-    """
-    # Check if it's a registered adapter with metadata
-    try:
-        metadata = await gateway.state.get_model_metadata(model)
-        if metadata and metadata.get('base_model'):
-            return metadata['base_model']
-    except Exception:
-        pass
 
-    # Static adapter entries from the deployment's supported_models (name -> base_model):
-    # a swift `--adapters` deployment registers its adapter names here, so requests with
-    # the adapter's name route to the sampler that serves its base model. Registry
-    # rebuilds without the deployment present lose these entries (known limitation).
+async def _resolve_model_route(
+    gateway: GatewayServer, model: str, sample_request: dict[str, Any],
+) -> _ModelRoute | None:
+    """Resolve the sampler, response identity and adapter from explicit bindings."""
+    if model in gateway.supported_model_names:
+        return _ModelRoute(model, model)
+
     for entry in gateway.supported_models:
         if entry.base_model and entry.model_name == model:
-            return entry.base_model
+            return _ModelRoute(entry.base_model, model, deployed_adapter=True)
 
-    # Check if it's directly a supported base model
-    if model in gateway.supported_model_names:
-        return model
+    target = gateway.openai_model_aliases.get(model)
+    if target in gateway.supported_model_names:
+        return _ModelRoute(target, target)
 
-    # Fallback: if there's exactly one supported model, use it
-    if len(gateway.supported_model_names) == 1:
-        return next(iter(gateway.supported_model_names))
-
+    # Training metadata locates the base sampler but has no inference weights.
+    if sample_request.get('adapter_uri'):
+        metadata = await gateway.state.get_model_metadata(model)
+        if metadata and metadata.get('base_model') in gateway.supported_model_names:
+            return _ModelRoute(metadata['base_model'], model)
     return None
+
+
+def _sampler_body(sample_request: dict[str, Any], route: _ModelRoute) -> bytes:
+    body = {**sample_request, 'adapter_name': ''}
+    if route.deployed_adapter or sample_request.get('adapter_uri'):
+        body['adapter_name'] = route.response_model
+    if route.deployed_adapter:
+        body['require_deployed_adapter'] = True
+    return json.dumps(body).encode()
 
 
 def _sampler_headers(request: Request) -> dict[str, str]:
@@ -342,11 +366,18 @@ def _model_not_found(model: str) -> JSONResponse:
     return JSONResponse(
         status_code=404,
         content=make_error(
-            message=f"Model '{model}' not found. Register it as an adapter or use a supported base model.",
+            message=f"Model '{model}' not found. Use a model listed by GET /models or a configured alias.",
             error_type='model_not_found',
             param='model',
+            code='model_not_found',
         ),
     )
+
+
+def _sampler_http_error(model: str, status: int, message: str) -> JSONResponse:
+    if status == 404:
+        return _model_not_found(model)
+    return JSONResponse(status_code=status, content=make_error(message=message, error_type='server_error'))
 
 
 def _deny_without_key(request: Request, api_key: str | None) -> JSONResponse | None:
@@ -396,28 +427,21 @@ async def _proxy_sample(
     of realistic length still completes within one HTTP call instead of coming back as a pending
     envelope that would translate into an empty-but-200 response.
     """
-    base_model = await _resolve_base_model(gateway, model)
-    if base_model is None:
+    route = await _resolve_model_route(gateway, model, sample_request)
+    if route is None:
         return _model_not_found(model)
 
     sampler_headers = _sampler_headers(request)
-    body_bytes = json.dumps(sample_request).encode()
-
-    # The deployment registers the model (so _resolve_base_model succeeds and /models advertises
-    # it) well before the sampler replica mounts its HTTP routes -- that happens only after the
-    # engine finishes loading. A 404 on a resolved model's fixed twinkle/* route therefore means
-    # "route not yet mounted", not a terminal answer: wait it out (bounded) instead of passing
-    # the transient 404 through. This is the same readiness run_deploy's ready_probe enforces
-    # ("one real request succeeds"), applied on the shared body so every non-streaming OpenAI
-    # endpoint gets it at once. _ensure_template rides the same loop: its 404 is the same race,
-    # and it only caches on success, so each retry re-attempts set_template until it sticks.
+    body_bytes = _sampler_body(sample_request, route)
+    # The catalog can advertise a model while its pool is still loading. Only
+    # retry a missing route with a live pool, and re-attempt template setup then.
     route_deadline = time.monotonic() + _route_wait_timeout()
     while True:
-        await _ensure_template(gateway, base_model, sampler_headers, request)
+        await _ensure_template(gateway, route.base_model, sampler_headers, request)
         response = await gateway.proxy.proxy_request(
             request,
             endpoint=endpoint,
-            base_model=base_model,
+            base_model=route.base_model,
             service_type='sampler',
             body_override=body_bytes,
             extra_headers=sampler_headers,
@@ -426,15 +450,11 @@ async def _proxy_sample(
             break
         if await request.is_disconnected():
             break
+        if not await asyncio.to_thread(_can_wait_for_sampler, gateway, route.base_model, response):
+            break
         await asyncio.sleep(_ROUTE_MOUNT_POLL_INTERVAL)
     if response.status_code != 200:
-        return JSONResponse(
-            status_code=response.status_code,
-            content=make_error(
-                message=f'Sampler error: {response.body.decode()[:500]}',
-                error_type='server_error',
-            ),
-        )
+        return _sampler_http_error(model, response.status_code, f'Sampler error: {response.body.decode()[:500]}')
 
     sampler_data = json.loads(response.body)
     try:
@@ -460,7 +480,7 @@ async def _proxy_sample(
     if not payload.get(expected_key):
         return JSONResponse(status_code=502, content=make_error(
             message=f'Sampler completed without returning any {expected_key}', error_type='server_error'))
-    result = translate(payload, model)
+    result = translate(payload, route.response_model)
     resp_headers = {}
     replica_id = response.headers.get('x-twinkle-replica-id')
     if replica_id:
@@ -468,58 +488,74 @@ async def _proxy_sample(
     return JSONResponse(content=result, headers=resp_headers)
 
 
-def _streaming_response(
+async def _streaming_response(
     gateway: GatewayServer,
     request: Request,
     sample_request: dict[str, Any],
-    base_model: str,
-    sampler_headers: dict[str, str],
-    chunk_translator: Callable[[str, str | None], dict[str, Any]],
-) -> StreamingResponse:
-    """Proxy to the sampler's streaming endpoint and translate its NDJSON lines to OpenAI SSE.
-
-    Shared by the chat and completions streaming paths: both read ``{"delta", "finish_reason"}``
-    lines from ``/twinkle/sample_stream`` and differ only in the chunk shape, which
-    ``chunk_translator(delta_text, finish_reason)`` produces (it owns whatever per-stream state,
-    like the chat first-chunk role marker, it needs).
-    """
-
-    async def _sse_generator():
-        try:
-            async for line in gateway.proxy.proxy_request_stream(
-                    request,
-                    endpoint='twinkle/sample_stream',
-                    base_model=base_model,
-                    service_type='sampler',
-                    body_override=json.dumps(sample_request).encode(),
-                    extra_headers=sampler_headers,
-            ):
-                chunk_data = json.loads(line)
-                if isinstance(chunk_data.get('error'), str):
-                    yield f"data: {json.dumps({'error': make_error(
-                        message=chunk_data['error'], error_type='server_error')})}\n\n"
-                    return
-                openai_chunk = chunk_translator(chunk_data.get('delta', ''), chunk_data.get('finish_reason'))
-                yield f'data: {json.dumps(openai_chunk)}\n\n'
-
-            yield 'data: [DONE]\n\n'
-        except httpx.HTTPStatusError as e:
-            error_body = e.response.content.decode()[:500]
-            error_chunk = make_error(
-                message=f'Streaming error: {error_body}',
-                error_type='server_error',
-            )
-            yield f'data: {json.dumps(error_chunk)}\n\n'
-            yield 'data: [DONE]\n\n'
-
-    return StreamingResponse(
-        _sse_generator(),
-        media_type='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
-        },
+    model: str,
+    chunk_translator: Callable[[str, str | None, str], dict[str, Any]],
+) -> Response:
+    route = await _resolve_model_route(gateway, model, sample_request)
+    if route is None:
+        return _model_not_found(model)
+    sampler_headers = _sampler_headers(request)
+    await _ensure_template(gateway, route.base_model, sampler_headers, request)
+    upstream = gateway.proxy.proxy_request_stream(
+        request,
+        endpoint='twinkle/sample_stream',
+        base_model=route.base_model,
+        service_type='sampler',
+        body_override=_sampler_body(sample_request, route),
+        extra_headers=sampler_headers,
     )
+    return _SamplerStreamingResponse(upstream, route.response_model, chunk_translator)
+
+
+class _SamplerStreamingResponse(Response):
+    """Keep the upstream stream open for the downstream response's ASGI lifetime."""
+
+    def __init__(
+        self,
+        upstream: AbstractAsyncContextManager[httpx.Response],
+        model: str,
+        translate: Callable[[str, str | None, str], dict[str, Any]],
+    ):
+        super().__init__(media_type='text/event-stream')
+        self.upstream = upstream
+        self.model = model
+        self.translate = translate
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async with AsyncExitStack() as stack:
+            # Check the upstream status before committing HTTP 200 to the client.
+            try:
+                upstream = await stack.enter_async_context(self.upstream)
+                if upstream.status_code >= 400:
+                    await upstream.aread()
+                    response = _sampler_http_error(
+                        self.model, upstream.status_code, f'Sampler error: {upstream.text[:500]}')
+                else:
+                    response = StreamingResponse(
+                        self._events(upstream.aiter_lines()),
+                        media_type=self.media_type,
+                        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+                    )
+            except httpx.RequestError as error:
+                response = _sampler_http_error(self.model, 502, f'Sampler connection failed: {type(error).__name__}')
+            await response(scope, receive, send)
+
+    async def _events(self, lines: AsyncIterator[str]) -> AsyncIterator[str]:
+        async for line in lines:
+            if not line:
+                continue
+            chunk = json.loads(line)
+            if isinstance(chunk.get('error'), str):
+                error = make_error(message=chunk['error'], error_type='server_error')
+                yield f'data: {json.dumps(error)}\n\n'
+                return
+            event = self.translate(chunk.get('delta', ''), chunk.get('finish_reason'), self.model)
+            yield f'data: {json.dumps(event)}\n\n'
+        yield 'data: [DONE]\n\n'
 
 
 def _register_api_key_gate(app: FastAPI, self_fn: Callable[[], GatewayServer]) -> None:

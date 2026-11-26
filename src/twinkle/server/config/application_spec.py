@@ -182,6 +182,8 @@ class ServerArgs(_ArgsBase):
 
     server_config: ServerStateArgs = Field(default_factory=ServerStateArgs)
     supported_models: list[Any] | None = None
+    openai_model_aliases: dict[str, str] = Field(
+        default_factory=dict, description='Explicit OpenAI request aliases for served base model names.')
     http_options: HttpOptions | None = None
     route_prefix: str | None = None
     api_key: str | None = None
