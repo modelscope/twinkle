@@ -2,7 +2,7 @@
 # code borrowed from https://github.com/jiaweizzhao/GaLore
 import torch
 from twinkle.utils import torch_util
-from .galore_projector import GaLoreProjector
+from .galore_projector import GaLoreOptimizerStateMixin, GaLoreProjector
 
 try:
     from bitsandbytes.optim.optimizer import Optimizer2State
@@ -10,7 +10,7 @@ except ImportError as e:
     Optimizer2State = object
 
 
-class GaLoreAdamW8bit(Optimizer2State):
+class GaLoreAdamW8bit(GaLoreOptimizerStateMixin, Optimizer2State):
     """8-bit AdamW with GaLore low-rank gradient projection.
 
     A param group carrying the `rank`/`update_proj_gap`/`scale`/`proj_type` keys is projected onto a
