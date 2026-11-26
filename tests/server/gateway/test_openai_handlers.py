@@ -13,6 +13,7 @@ import httpx
 import json
 import pytest
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from twinkle.server.gateway.openai_bridge import translate_response
@@ -619,6 +620,64 @@ class TestChatCompletionsStreaming:
         })
         assert response.status_code == 404
         assert response.json()['error']['code'] == 'model_not_found'
+
+class TestInfer:
+
+    @pytest.fixture
+    def infer_gateway(self, mock_gateway):
+        gateway, app = mock_gateway
+        model = next(iter(gateway.supported_model_names))
+        gateway._template_initialized.add(model)
+        gateway.proxy.proxy_request.return_value = JSONResponse({
+            'request_id': 'infer-request',
+            'status': 'completed',
+            'result': {'samples': [
+                {'sequences': [{'tokens': [token], 'stop_reason': 'stop'}]} for token in (11, 22)
+            ]},
+        })
+        return gateway, TestClient(app), model
+
+    @pytest.mark.parametrize('batch_model', [False, True])
+    def test_conflicting_model_names_return_400_before_proxying(self, infer_gateway, batch_model):
+        gateway, client, model = infer_gateway
+        entries = [
+            {'model': model, 'messages': [{'role': 'user', 'content': 'First'}]},
+            {'model': 'another-model', 'messages': [{'role': 'user', 'content': 'Second'}]},
+        ]
+        if batch_model:
+            body = {'request_config': {'model': model}, 'infer_requests': entries[1:]}
+        else:
+            body = entries
+        response = client.post('/infer', json=body)
+
+        assert response.status_code == 400
+        error = response.json()['error']
+        assert error['param'] == 'model'
+        assert 'conflicting model names' in error['message'].lower()
+        gateway.proxy.proxy_request.assert_not_called()
+
+    @pytest.mark.parametrize('mode', ['entries', 'batch', 'both', 'first_entry'])
+    def test_same_model_batch_reaches_one_sampler(self, infer_gateway, mode):
+        gateway, client, model = infer_gateway
+        entries = [
+            {'messages': [{'role': 'user', 'content': 'First'}]},
+            {'messages': [{'role': 'user', 'content': 'Second'}]},
+        ]
+        if mode in ('entries', 'both', 'first_entry'):
+            entries[0]['model'] = model
+        if mode in ('entries', 'both'):
+            entries[1]['model'] = model
+        body = {'request_config': {'model': model}, 'infer_requests': entries} if mode in ('batch', 'both') else entries
+        response = client.post('/infer', json=body)
+
+        assert response.status_code == 200
+        assert [row['sequences'][0]['tokens'] for row in response.json()] == [[11], [22]]
+        gateway.proxy.proxy_request.assert_awaited_once()
+        forwarded = gateway.proxy.proxy_request.call_args.kwargs
+        assert forwarded['base_model'] == model
+        assert forwarded['endpoint'] == 'twinkle/sample'
+        assert len(json.loads(forwarded['body_override'])['inputs']) == 2
+
 
 # ---------- /models tests -------------------------------------------------- #
 

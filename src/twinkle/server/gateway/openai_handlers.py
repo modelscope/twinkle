@@ -41,6 +41,7 @@ import httpx
 import twinkle.protocol.types as types
 from twinkle.server.utils import get_template_for_model
 from .openai_bridge import (
+    InferModelConflictError,
     make_error,
     translate_chat_request,
     translate_completion_request,
@@ -243,6 +244,8 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
         body = await request.json()
         try:
             sample_request, model = translate_infer_request(body)
+        except InferModelConflictError as e:
+            return JSONResponse(status_code=400, content=make_error(message=str(e), param='model'))
         except ValueError as e:
             return _bad_request(e)
         return await _proxy_sample(
