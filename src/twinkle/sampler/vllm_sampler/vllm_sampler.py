@@ -3,7 +3,6 @@ import asyncio
 import atexit
 import numpy as np
 import os
-import threading
 import uuid
 from copy import copy
 from typing import Any, Dict, List, Optional, Type, Union
@@ -20,6 +19,7 @@ from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
 from twinkle.template.contract import MediaBundle, engine_input_ids
+from twinkle.sampler import generation
 from twinkle.sampler.generation import attach_features
 from twinkle.data_format import copy_trajectory
 from twinkle.utils import Platform
@@ -109,17 +109,10 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
         self.device_mesh = device_mesh
         self._init_template(template, template_kwargs)
 
-        # Create a dedicated background event loop for vLLM async operations.
-        # This is necessary because:
-        # 1. vLLM's AsyncLLM requires its async methods to run in the same event loop
-        #    where the engine was created (due to background output_handler task)
-        # 2. Ray workers use uvloop which is already running, so we can't use
-        #    run_until_complete() or asyncio.run() directly
-        # 3. By creating engine in the background thread's event loop, all async
-        #    operations stay in the same loop context
-        self._async_loop = asyncio.new_event_loop()
-        self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='vLLMSampler-EventLoop')
-        self._async_thread.start()
+        # Create the engine in a dedicated background event loop: vLLM's AsyncLLM requires its async
+        # methods to run in the loop where the engine was created (its output_handler task), and
+        # Ray workers already run uvloop, so run_until_complete()/asyncio.run() are unavailable.
+        self._start_async_loop()
 
         # Engine request ids currently mid-generation, so shutdown / replica removal can abort them.
         # Only touched from ``self._async_loop``.
@@ -159,53 +152,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
 
         self._shutdown_called = False
         atexit.register(self.shutdown)
-
-    def _run_event_loop(self):
-        """Run the event loop in background thread."""
-        asyncio.set_event_loop(self._async_loop)
-        self._async_loop.run_forever()
-
-    def _run_in_loop(self, coro):
-        """Run a coroutine in the background event loop and wait for result."""
-        future = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
-        return future.result()
-
-    def _iter_in_loop(self, async_gen_coro):
-        """Iterate an async generator running in the background event loop.
-
-        Counterpart to ``_run_in_loop`` for streaming results: schedules the
-        async generator on ``self._async_loop`` and yields items to the caller
-        via a thread-safe queue.
-        """
-        import queue as stdlib_queue
-        q: stdlib_queue.Queue = stdlib_queue.Queue()
-        _SENTINEL = object()
-
-        async def _drain():
-            try:
-                async for item in async_gen_coro:
-                    q.put(item)
-            except Exception as exc:
-                q.put(exc)
-            finally:
-                try:
-                    await async_gen_coro.aclose()
-                finally:
-                    q.put(_SENTINEL)
-
-        generation = asyncio.run_coroutine_threadsafe(_drain(), self._async_loop)
-        try:
-            while True:
-                item = q.get()
-                if item is _SENTINEL:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                yield item
-        finally:
-            # Queue termination or closing the Python iterator is not evidence
-            # that the engine-loop task has exited. Join before releasing weights.
-            generation.result()
 
     async def _create_engine_async(self, engine_cls, model_id, engine_kwargs):
         """Create engine in async context to ensure output_handler starts correctly."""
@@ -398,15 +344,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
         if not raw_inputs:
             return []
         inputs_list = [copy_trajectory(item) for item in raw_inputs]
-
-        if adapter_paths is not None:
-            if adapter_path is not None:
-                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
-                                 '(one per input), not both.')
-            if len(adapter_paths) != len(inputs_list):
-                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
-                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that '
-                                 'routing keeps them aligned.')
+        generation.check_adapter_arguments(adapter_paths, adapter_path, len(inputs_list))
 
         # Check if inputs are Trajectory (not encoded) - aligned with Model.forward logic
         is_trajectory = 'input_ids' not in inputs_list[0]
@@ -503,14 +441,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
 
         raw_inputs = self._normalize_inputs(inputs)
         inputs_list = [copy_trajectory(item) for item in raw_inputs]
-        if adapter_paths is not None:
-            if adapter_path is not None:
-                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
-                                 '(one per input), not both.')
-            if len(adapter_paths) != len(inputs_list):
-                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
-                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that '
-                                 'routing keeps them aligned.')
+        generation.check_adapter_arguments(adapter_paths, adapter_path, len(inputs_list))
 
         if not inputs_list:
             return []

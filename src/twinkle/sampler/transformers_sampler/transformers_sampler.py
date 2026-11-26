@@ -25,9 +25,7 @@ workers. Nothing is loaded and nothing is synced, because there is only ever one
 """
 
 from __future__ import annotations
-import asyncio
 import atexit
-import threading
 from copy import copy
 from typing import Any, Optional, Union
 
@@ -98,13 +96,8 @@ class TransformersSampler(Sampler):
         self.max_batch_size = engine_kwargs.pop("max_batch_size", 8)
 
         # Mirror the other samplers: a private loop on a background thread, so the public methods stay
-        # synchronous and blocking even when the caller already runs inside an event loop (Ray workers
-        # run uvloop, which forbids asyncio.run).
-        self._async_loop = asyncio.new_event_loop()
-        self._async_thread = threading.Thread(
-            target=self._run_event_loop, daemon=True, name="TransformersSampler-EventLoop"
-        )
-        self._async_thread.start()
+        # synchronous and blocking even when the caller already runs inside an event loop.
+        self._start_async_loop()
 
         if model is not None:
             # Nothing to build: generation happens in the model's workers.
@@ -118,38 +111,6 @@ class TransformersSampler(Sampler):
 
         self._shutdown_called = False
         atexit.register(self.shutdown)
-
-    def _run_event_loop(self):
-        asyncio.set_event_loop(self._async_loop)
-        self._async_loop.run_forever()
-
-    def _run_in_loop(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self._async_loop).result()
-
-    def _iter_in_loop(self, async_gen):
-        """Drain an async generator running on the background loop into a plain iterator."""
-        import queue as stdlib_queue
-
-        q: stdlib_queue.Queue = stdlib_queue.Queue()
-        sentinel = object()
-
-        async def _drain():
-            try:
-                async for item in async_gen:
-                    q.put(item)
-            except Exception as exc:
-                q.put(exc)
-            finally:
-                q.put(sentinel)
-
-        asyncio.run_coroutine_threadsafe(_drain(), self._async_loop)
-        while True:
-            item = q.get()
-            if item is sentinel:
-                break
-            if isinstance(item, Exception):
-                raise item
-            yield item
 
     def apply_patch(self, patch_cls: Patch | type[Patch] | str, **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
@@ -235,18 +196,7 @@ class TransformersSampler(Sampler):
             inputs_list = self._normalize_inputs(inputs)
             if not inputs_list:
                 return []
-            if adapter_paths is not None:
-                if adapter_path is not None:
-                    raise ValueError(
-                        "Pass either adapter_path (one adapter for the whole call) or adapter_paths "
-                        "(one per input), not both."
-                    )
-                if len(adapter_paths) != len(inputs_list):
-                    raise ValueError(
-                        f"adapter_paths has {len(adapter_paths)} entries but there are "
-                        f"{len(inputs_list)} inputs; they must correspond one-to-one so that "
-                        "request routing keeps them aligned."
-                    )
+            generation.check_adapter_arguments(adapter_paths, adapter_path, len(inputs_list))
 
             logprobs_only = params.max_tokens == 0
             if logprobs_only:

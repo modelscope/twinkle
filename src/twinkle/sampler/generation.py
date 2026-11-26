@@ -194,6 +194,21 @@ def group_by_adapter(
     return groups
 
 
+def check_adapter_arguments(adapter_paths: list[str | None] | None, adapter_path: str | None, num_inputs: int) -> None:
+    """The per-call adapter contract every engine sampler checks before encoding: one adapter for the
+    whole call (``adapter_path``) or one per input (``adapter_paths``), never both, and a per-input list
+    that lines up with the inputs so ``group_by_adapter`` keeps request routing aligned."""
+    if adapter_paths is None:
+        return
+    if adapter_path is not None:
+        raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
+                         '(one per input), not both.')
+    if len(adapter_paths) != num_inputs:
+        raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
+                         f'{num_inputs} inputs; they must correspond one-to-one so that '
+                         'routing keeps them aligned.')
+
+
 def chunks(items: list[int], size: int):
     """Yield consecutive sublists of at most ``size`` items."""
     for start in range(0, len(items), size):

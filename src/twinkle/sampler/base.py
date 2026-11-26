@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
+import queue
 import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Future
@@ -192,6 +193,60 @@ class Sampler(ABC):
         """Schedule the coroutine on the engine's background event loop, returning a Future waitable
         from this thread."""
         return asyncio.run_coroutine_threadsafe(coro, self._async_loop)
+
+    def _start_async_loop(self) -> None:
+        """Own a private event loop on a daemon thread, so the engine's async API is drivable with
+        plain blocking calls even when the caller already runs inside an event loop (Ray workers
+        run uvloop, which forbids asyncio.run). Engine samplers call this in ``__init__``; a sampler
+        without an engine never does and has no ``_async_loop``."""
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(
+            target=self._run_event_loop, daemon=True, name=f'{type(self).__name__}-EventLoop'
+        )
+        self._async_thread.start()
+
+    def _run_event_loop(self) -> None:
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_forever()
+
+    def _run_in_loop(self, coro):
+        """Run a coroutine on the background loop and block until it returns."""
+        return asyncio.run_coroutine_threadsafe(coro, self._async_loop).result()
+
+    def _iter_in_loop(self, async_gen):
+        """Drain an async generator on the background loop into a plain iterator.
+
+        Items travel over a thread-safe queue and the generator's exceptions surface at the consumer.
+        Ending the iteration -- normally or by closing it early -- does not return until the loop-side
+        task has really exited, generator finalisation included: no engine work may outlive the caller
+        (the weight-sync paths release weights right after a stream ends).
+        """
+        q = queue.Queue()
+        sentinel = object()
+
+        async def _drain():
+            try:
+                async for item in async_gen:
+                    q.put(item)
+            except Exception as exc:
+                q.put(exc)
+            finally:
+                try:
+                    await async_gen.aclose()
+                finally:
+                    q.put(sentinel)
+
+        drained = asyncio.run_coroutine_threadsafe(_drain(), self._async_loop)
+        try:
+            while True:
+                item = q.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            drained.result()
 
     @staticmethod
     async def _gather_generation_tasks(coroutines):

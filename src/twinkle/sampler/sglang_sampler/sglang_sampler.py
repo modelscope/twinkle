@@ -2,7 +2,6 @@
 import asyncio
 import atexit
 import os
-import threading
 import uuid
 from copy import copy
 from typing import Any, Dict, List, Optional, Type, Union
@@ -20,6 +19,7 @@ from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
 from twinkle.sampler.vllm_sampler.vllm_sampler import SAMPLER_MAX_CONCURRENCY
 from twinkle.template.contract import MediaBundle, engine_input_ids
+from twinkle.sampler import generation
 from twinkle.sampler.generation import attach_features
 from twinkle.data_format import copy_trajectory
 from twinkle.utils import Platform
@@ -79,14 +79,11 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, SGLangDeltaSamplerMixin):
         # keeps per-input adapters from re-registering the same adapter on every request.
         self._registered_loras: Dict[str, str] = {}
 
-        # A dedicated background event loop, for the same reason vLLMSampler has one -- Ray workers run
-        # uvloop, so run_until_complete/asyncio.run are unavailable on the calling thread -- plus one
-        # reason specific to sglang: the engine must be *constructed* on the loop that will drive it, so
-        # that sglang pins its tokenizer_manager handle loop to that loop. See SGLangEngine's class
+        # A dedicated background event loop, for the same reason vLLMSampler has one, plus one reason
+        # specific to sglang: the engine must be *constructed* on the loop that will drive it, so that
+        # sglang pins its tokenizer_manager handle loop to that loop. See SGLangEngine's class
         # docstring for what breaks otherwise.
-        self._async_loop = asyncio.new_event_loop()
-        self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='SGLangSampler-EventLoop')
-        self._async_thread.start()
+        self._start_async_loop()
 
         # Engine request ids currently mid-generation, so shutdown / replica removal can abort them.
         # Only touched from ``self._async_loop``.
@@ -127,16 +124,6 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, SGLangDeltaSamplerMixin):
 
         self._shutdown_called = False
         atexit.register(self.shutdown)
-
-    def _run_event_loop(self):
-        """Run the event loop in background thread."""
-        asyncio.set_event_loop(self._async_loop)
-        self._async_loop.run_forever()
-
-    def _run_in_loop(self, coro):
-        """Run a coroutine in the background event loop and wait for result."""
-        future = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
-        return future.result()
 
     async def _create_engine_async(self, engine_cls, model_id, engine_kwargs):
         """Create the engine on the background loop, which sglang then binds its handle loop to."""
@@ -297,15 +284,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, SGLangDeltaSamplerMixin):
         if not raw_inputs:
             return []
         inputs_list = [copy_trajectory(item) for item in raw_inputs]
-
-        if adapter_paths is not None:
-            if adapter_path is not None:
-                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
-                                 '(one per input), not both.')
-            if len(adapter_paths) != len(inputs_list):
-                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
-                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that '
-                                 'request routing keeps them aligned.')
+        generation.check_adapter_arguments(adapter_paths, adapter_path, len(inputs_list))
 
         is_trajectory = 'input_ids' not in inputs_list[0]
         if token_only and is_trajectory:
@@ -403,14 +382,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, SGLangDeltaSamplerMixin):
             pooling_params = PoolingParams.from_dict(pooling_params)
 
         inputs_list = self._normalize_inputs(inputs)
-        if adapter_paths is not None:
-            if adapter_path is not None:
-                raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
-                                 '(one per input), not both.')
-            if len(adapter_paths) != len(inputs_list):
-                raise ValueError(f'adapter_paths has {len(adapter_paths)} entries but there are '
-                                 f'{len(inputs_list)} inputs; they must correspond one-to-one so that '
-                                 'request routing keeps them aligned.')
+        generation.check_adapter_arguments(adapter_paths, adapter_path, len(inputs_list))
 
         if not inputs_list:
             return []
@@ -517,30 +489,6 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, SGLangDeltaSamplerMixin):
                 lora_name=lora_name,
                 image_data=self._extract_image_data(feat),
             ))
-
-    def _iter_in_loop(self, async_gen):
-        """Drain an async generator running on the background loop into a plain iterator."""
-        import queue as stdlib_queue
-        q: stdlib_queue.Queue = stdlib_queue.Queue()
-        sentinel = object()
-
-        async def _drain():
-            try:
-                async for item in async_gen:
-                    q.put(item)
-            except Exception as exc:
-                q.put(exc)
-            finally:
-                q.put(sentinel)
-
-        asyncio.run_coroutine_threadsafe(_drain(), self._async_loop)
-        while True:
-            item = q.get()
-            if item is sentinel:
-                break
-            if isinstance(item, Exception):
-                raise item
-            yield item
 
     @remote_function(dispatch='all', collect='first')
     @timed
