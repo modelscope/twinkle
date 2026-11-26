@@ -23,7 +23,7 @@ from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_ro
 from twinkle.utils import FullWeightLoadError
 from twinkle.server.task_queue.backend_gate import BackendGate
 from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.exceptions import BackendBusyError, ResourceNotFoundError
+from twinkle.server.exceptions import BackendBusyError, RequestRejectedError, ResourceNotFoundError
 from twinkle.server.task_queue.worker import ComputeWorker
 
 
@@ -219,13 +219,22 @@ async def test_real_routes_overlap_and_keep_request_results(make_service, dialec
     ('/twinkle/sample_stream', SampleRequest),
     ('/twinkle/encode', EncodeRequest),
 ])
-async def test_required_adapter_cannot_fall_back_to_base(make_service, endpoint, request_type):
+@pytest.mark.parametrize('full_checkpoint', [False, True])
+async def test_required_adapter_cannot_fall_back_to_base(
+    make_service, endpoint, request_type, full_checkpoint, tmp_path,
+):
     service = make_service()
     request = Request({'type': 'http', 'headers': [], 'state': {'client_id': 'test'}})
-    body = request_type(inputs=[{'input_ids': [7]}], adapter_name='missing-lora', require_deployed_adapter=True)
-    with pytest.raises(ResourceNotFoundError, match='missing-lora'):
+    adapter_name = 'named-lora'
+    if full_checkpoint:
+        (tmp_path / 'model.safetensors').touch()
+        service.deploy_adapters[adapter_name] = str(tmp_path)
+    body = request_type(inputs=[{'input_ids': [7]}], adapter_name=adapter_name, require_deployed_adapter=True)
+    error = RequestRejectedError if full_checkpoint else ResourceNotFoundError
+    with pytest.raises(error, match=adapter_name):
         await service.endpoints[endpoint](request, body, service)
     assert not service.state.records
+    assert not service.sampler.loads
 
 
 @pytest.mark.asyncio

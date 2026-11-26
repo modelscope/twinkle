@@ -22,6 +22,7 @@ from twinkle.data_format import SamplingParams
 from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.exceptions import RequestRejectedError
+from twinkle.server.lifecycle.sampling_target import resolve_tinker_sampling_target
 from twinkle.server.sampler.submission import existing_sample, sample_submission
 from twinkle.server.sampler.weights import sample_with_weights
 from .runtime import request_execution_scope
@@ -63,16 +64,20 @@ def _register_tinker_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerM
             UntypedAPIFuture wrapping SampleResponse with generated sequences
         """
         token = await self._on_request_start(request)
+        base_model, model_path = await resolve_tinker_sampling_target(
+            self.state,
+            base_model=body.base_model,
+            model_path=body.model_path,
+            sampling_session_id=body.sampling_session_id,
+        )
+        if base_model and base_model != (getattr(self, '_telemetry_base_model', None) or self.model_id):
+            raise RequestRejectedError('Requested base model does not match this sampler.')
         submission = None
         if H_SAMPLE_IDEMPOTENCY_KEY in request.headers or (body.sampling_session_id and body.seq_id is not None):
             submission = sample_submission(request, 'tinker/asample', self._telemetry_base_model, await request.json())
         if submission and await existing_sample(self.state, submission, token) is not None:
             return {'request_id': submission.request_id, 'model_id': None}
 
-        model_path = body.model_path
-        if not model_path and body.sampling_session_id:
-            session = await self.state.get_sampling_session(body.sampling_session_id)
-            model_path = session.get('model_path') if session else None
         training_id = None
         if model_path:
             checkpoint_manager = create_checkpoint_manager(token, client_type='tinker')

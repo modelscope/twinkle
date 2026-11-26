@@ -9,6 +9,7 @@ endpoints.
 from __future__ import annotations
 import asyncio
 import logging
+import os
 import uuid
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -32,7 +33,7 @@ from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError, ResourceNotFoundError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
 from twinkle.server.sampler.submission import existing_sample, sample_submission
-from twinkle.server.sampler.weights import resolve_sampler_weights, sample_with_weights
+from twinkle.server.sampler.weights import is_full_checkpoint, resolve_sampler_weights, sample_with_weights
 from twinkle.server.task_errors import task_error_payload
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
@@ -45,6 +46,8 @@ def _deployed_adapter_uri(service: SamplerManagement, adapter_name: str, require
     uri = service.deploy_adapters.get(adapter_name) if adapter_name else None
     if required and not uri:
         raise ResourceNotFoundError(f"Adapter '{adapter_name}' is not deployed on this sampler.")
+    if uri and (os.path.isabs(uri) or os.path.isdir(uri)) and is_full_checkpoint(uri):
+        raise RequestRejectedError(f"Adapter '{adapter_name}' must point to a LoRA checkpoint.")
     return uri
 
 
@@ -286,7 +289,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                     **extra,
                 )
 
-            responses = await sample_with_weights(self, resolved_uri, generate)
+            responses = await sample_with_weights(
+                self, resolved_uri, generate, full_checkpoint=None if body.adapter_uri else False)
             return types.SampleResponseModelList(samples=_to_sample_response_models(responses)).model_dump()
 
         # Calculate metrics for queue scheduling. The body is wire-validated, so the
@@ -340,13 +344,13 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             # sequence runs as one background future (outside the serial compute queue) and its
             # result is the DataRef. One submit per input (num_samples rides SamplingParams),
             # each handing back a future the handler awaits locally -- no per-status RPC.
-            async def generate():
+            async def generate(lora_path):
                 futures = await self.call_backend(
                     _submit_group, self, inputs, params,
-                    adapter_name=full_adapter_name, adapter_path=adapter_path)
+                    adapter_name=full_adapter_name, adapter_path=lora_path)
                 return await _await_futures(futures)
 
-            responses = await self.sampling_guard.run(generate)
+            responses = await sample_with_weights(self, adapter_path, generate)
             rows, tags = _build_rollout_rows_and_tags(
                 _to_sample_response_models(responses),
                 group_ids=body.group_ids,
@@ -547,7 +551,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                     raise
 
             try:
-                await sample_with_weights(self, resolved_uri, _stream_generation)
+                await sample_with_weights(
+                    self, resolved_uri, _stream_generation, full_checkpoint=None if body.adapter_uri else False)
             except Exception as error:
                 try:
                     await q.put_async(error)

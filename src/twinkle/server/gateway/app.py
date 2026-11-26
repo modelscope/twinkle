@@ -63,6 +63,13 @@ class GatewayServer(LazyCleanupMixin):
         """Registered public names of base samplers."""
         return self._supported_model_names
 
+    def get_openai_model_catalog(self) -> dict[str, Any]:
+        """Read the configured model names for a deployment update via a Serve handle."""
+        return {
+            'models': [model.model_dump(exclude_none=True) for model in self.supported_models],
+            'aliases': dict(self.openai_model_aliases),
+        }
+
     @staticmethod
     def _normalize_server_state_args(server_config: Any) -> dict[str, Any]:
         """Normalize the gateway ``server_config`` into ``get_server_state`` kwargs.

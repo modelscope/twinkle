@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.lifecycle.envelope import error_payload_from_failure
+from twinkle.server.lifecycle.sampling_target import resolve_tinker_sampling_target
 from twinkle.server.middleware.auth import get_token_from_request
 from .use_cases import delete_checkpoint, get_weights_info, list_checkpoints, list_training_runs, poll_future
 from .use_cases import get_training_run as get_training_run_use_case
@@ -233,11 +234,12 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
 
     @app.post('/asample')
     async def asample(request: Request, body: types.SampleRequest, self: GatewayServer = Depends(self_fn)) -> Any:
-        base_model = body.base_model
-        if not base_model and body.sampling_session_id:
-            session = await self.state.get_sampling_session(body.sampling_session_id)
-            if session:
-                base_model = session.get('base_model')
+        base_model, _ = await resolve_tinker_sampling_target(
+            self.state,
+            base_model=body.base_model,
+            model_path=body.model_path,
+            sampling_session_id=body.sampling_session_id,
+        )
         if not base_model:
             raise HTTPException(status_code=400, detail='base_model is required but could not be resolved')
         return await self.proxy.proxy_to_sampler(request, 'asample', base_model)
