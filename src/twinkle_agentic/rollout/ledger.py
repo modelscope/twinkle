@@ -337,6 +337,8 @@ class TurnLedger(_TrajectoryLedger):
         previous = self.messages
         kwargs = {"gen_prompt_before": False, "gen_prompt_after": True, "tools": self.tools}
         bridge = self.template.render_delta(previous, list(messages), **kwargs)
+        if self.unfit({'max_tokens': len(bridge)}):
+            return False
         engine_bridge = self.template.render_delta(previous, list(messages), engine=True,
                                                     backend=self.backend, **kwargs)
         extended = append_ids(self._trajectory, bridge, self.template, trainable=False,

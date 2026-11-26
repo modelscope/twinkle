@@ -34,6 +34,15 @@ from .protocol import (
     TemplateProtocol,
 )
 from .types import (
+    ENGINE,
+    INFER,
+    SCORE,
+    TRAIN,
+    EncodeIntent,
+    EngineBackend,
+    MaxLengthError,
+    check_backend,
+    resolve_intent,
     ConversationSample,
     DecodeContext,
     DecodedResponse,
@@ -48,7 +57,6 @@ from .types import (
     OutputOrderCompletionMask,
     OutputOrderLabels,
     OutputOrderLossScale,
-    PreferencePair,
     PreferenceSample,
     PreparedRow,
     Tool,

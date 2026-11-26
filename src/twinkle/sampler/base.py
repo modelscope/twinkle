@@ -80,9 +80,7 @@ class Sampler(ABC):
             self.template = self._build_template(template, **(template_kwargs or {}))
 
     def _build_template(self, template_cls, **kwargs) -> Template:
-        if 'template_spec' not in kwargs and 'model_id' not in kwargs and getattr(self, 'model_id', None):
-            kwargs['model_id'] = self.model_id
-        return construct_template(template_cls, **kwargs)
+        return construct_template(template_cls, _default_model_id=getattr(self, 'model_id', None), **kwargs)
 
     @abstractmethod
     def sample(

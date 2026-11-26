@@ -3360,9 +3360,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        if 'template_spec' not in kwargs:
-            kwargs['model_id'] = self.tokenizer_id
-        optimizer_config.template = construct_template(template_cls, **kwargs)
+        optimizer_config.template = construct_template(template_cls, _default_model_id=self.tokenizer_id, **kwargs)
 
     @remote_function()
     @timed

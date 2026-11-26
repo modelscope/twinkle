@@ -4,7 +4,7 @@ import re
 from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, cast
 
-from .types import EncodedRow, InputOrderRow, MediaBundle
+from .types import EncodedRow, InputOrderRow, MaxLengthError, MediaBundle
 from twinkle.data_format import Trajectory
 
 SHIFTED_FIELDS: Mapping[str, Any] = MappingProxyType(
@@ -44,14 +44,113 @@ def preserve_trajectory(source: Trajectory, encoded: Mapping[str, Any]) -> Traje
     """Keep raw conversation columns separate from the model's existing numerical fields."""
     from twinkle.data_format import InputFeature, copy_trajectory
 
-    result = {**copy_trajectory(source), **copy_trajectory(encoded)}
+    result = {**source, **encoded}
     previous = set(source.get('_trajectory_columns', ()))
     model_keys = set(InputFeature.__annotations__)
     result['_trajectory_columns'] = sorted((previous | source.keys()) - encoded.keys() - model_keys)
     for key in ('messages', 'tools', 'user_data', 'images', 'videos', 'audios'):
         if key in source:
-            result[key] = copy_trajectory({key: source[key]})[key]
+            result[key] = source[key]
+    return copy_trajectory(result)
+
+
+def check_generation_prompt(sample, add_generation_prompt):
+    messages = sample.get('messages')
+    if not messages:
+        return
+    last = messages[-1]
+    open_turn = last.get('role') not in {'assistant', 'tool_call'} or (
+        last.get('role') == 'assistant' and last.get('content') is None and not last.get('tool_calls'))
+    if add_generation_prompt and not open_turn:
+        raise ValueError(
+            'add_generation_prompt=True but the conversation already ends with an assistant turn; '
+            'drop the trailing response or encode it as a complete conversation.')
+    if not add_generation_prompt and open_turn:
+        raise ValueError(
+            f"add_generation_prompt=False but the conversation ends with a {last.get('role')!r} turn, "
+            'which the encoder would open a generation prompt after.')
+
+
+def model_payload_keys(feature):
+    from twinkle.data_format import InputFeature, Trajectory
+    metadata = set(Trajectory.__annotations__) - set(InputFeature.__annotations__)
+    text = {'input_ids', 'labels', 'loss_scale', 'completion_mask', 'attention_mask', 'attention_mask_2d',
+            'position_ids', 'text_position_ids', 'token_type_ids', 'mm_token_type_ids', 'routed_experts',
+            'replay_mask', 'length', 'lengths', 'channel', 'margin', 'label', 'objects', 'chat_template_kwargs',
+            'template_inputs', 'packed_seq_params', 'cu_seq_lens_q', 'cu_seq_lens_k', 'cu_seqlens_q',
+            'cu_seqlens_kv', 'max_length_q', 'max_length_k', 'system', 'extra_kwargs', 'inputs_embeds',
+            'logprobs', 'stuck_stop', 'tool_stop', 'followups', 'error', 'rollout_infos', 'decoded'}
+    return frozenset(key for key, value in feature.items() if value is not None and key not in metadata
+                     and key not in text and key not in ('images', 'videos', 'audios', 'tools', 'mm_processor_kwargs')
+                     and not key.startswith('_') and key not in feature.get('_trajectory_columns', ()))
+
+
+def normalize_token_fields(row):
+    for key in ('input_ids', 'engine_input_ids', 'labels', 'loss_scale', 'completion_mask',
+                'attention_mask', 'token_type_ids', 'mm_token_type_ids', 'position_ids'):
+        value = row.get(key)
+        if value is not None and hasattr(value, 'ndim') and value.ndim == 1:
+            row[key] = value.tolist()
+        elif key in SHIFTED_FIELDS and value is None:
+            row.pop(key, None)
+    return row
+
+
+def slice_row(row, indices, *, supervised=True):
+    result = dict(row)
+    length = len(row['input_ids'])
+    result['_original_input_ids'] = list(row['input_ids'])
+    result['_kept_token_indices'] = list(indices)
+    for key in ('input_ids', 'labels', 'loss_scale', 'completion_mask', 'token_type_ids', 'mm_token_type_ids'):
+        value = row.get(key)
+        if value is None:
+            continue
+        if _is_torch(value):
+            import torch
+            selected = value.index_select(-1, torch.tensor(indices, dtype=torch.long, device=value.device))
+        elif _is_numpy(value):
+            selected = value[..., indices].copy()
+        else:
+            selected = [value[index] for index in indices]
+            if isinstance(value, tuple):
+                selected = tuple(selected)
+        if supervised and key in SHIFTED_FIELDS and indices:
+            fill = SHIFTED_FIELDS[key]
+            if _is_torch(selected) or _is_numpy(selected):
+                selected[..., 0] = fill
+            else:
+                selected = [fill, *selected[1:]]
+                if isinstance(value, tuple):
+                    selected = tuple(selected)
+        result[key] = selected
+    if len(indices) != length:
+        for key in ('position_ids', 'text_position_ids', 'attention_mask', 'attention_mask_2d'):
+            result.pop(key, None)
+    result['length'] = len(indices)
     return result
+
+
+def truncate_rows(row, max_length, strategy, *, placeholder_tokens=(), multimodal=False, supervised=True):
+    if strategy not in ('raise', 'left', 'right', 'split', 'delete'):
+        raise ValueError(f'Invalid truncation_strategy: {strategy}')
+    ids = row.get('input_ids')
+    if ids is None or max_length is None or len(ids) <= max_length:
+        return [row]
+    length = len(ids)
+    if strategy in ('raise', 'delete'):
+        raise MaxLengthError(f'Current length of row({length}) is larger than the max_length({max_length}).')
+    if strategy == 'split':
+        if multimodal:
+            raise ValueError('multimodal token splitting cannot partition its media payload safely')
+        return [slice_row(row, list(range(start, min(start + max_length, length))), supervised=supervised)
+                for start in range(0, length, max_length)]
+    protected_tokens = set(placeholder_tokens)
+    protected = [index for index, token in enumerate(ids) if int(token) in protected_tokens]
+    protected_set = set(protected)
+    remaining = [index for index in range(length) if index not in protected_set]
+    budget = max(0, max_length - len(protected))
+    selected = remaining[-budget:] if strategy == 'left' and budget else remaining[:budget]
+    return [slice_row(row, sorted(protected + selected), supervised=supervised)]
 
 
 def _is_numpy(value):
@@ -306,18 +405,22 @@ def project_engine_ids(original_ids, engine_ids, kept_indices):
     return result
 
 
-def project_sliced_messages(messages, original_ids, kept_indices, *, render_prefix, decode):
-    """Project retained tokens onto their message spans, keeping intact structured messages."""
+def project_sliced_messages(messages, original_ids, kept_indices, *, render_prefix, decode, span_cache=None):
+    """Project tokens onto structured messages; cache only span offsets across slices of one encoding."""
     if not messages:
         return []
     boundaries = [0]
     for stop in range(1, len(messages)):
-        prefix = list(render_prefix(messages[:stop]))
-        width = 0
-        for left, right in zip(original_ids, prefix):
-            if int(left) != int(right):
-                break
-            width += 1
+        width = span_cache.get(stop) if span_cache is not None else None
+        if width is None:
+            prefix = render_prefix(messages[:stop])
+            width = 0
+            for left, right in zip(original_ids, prefix):
+                if int(left) != int(right):
+                    break
+                width += 1
+            if span_cache is not None:
+                span_cache[stop] = width
         if width < boundaries[-1]:
             raise ValueError('cannot recover message spans from a non-monotonic truncated render')
         boundaries.append(width)

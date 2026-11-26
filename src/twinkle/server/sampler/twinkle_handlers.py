@@ -468,14 +468,18 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     ) -> sampler_types.SamplerSetTemplateResponse:
         """Set the chat template for encoding Trajectory inputs.
 
-        A deployment that pinned its template at construction (``SamplerArgs.template``) ignores this
-        call: the pinned template was chosen deliberately and the gateway's name-based fallback must
-        not clobber it. The response is still success, so a caller that sets templates lazily is
-        unaffected either way.
+        Reapplying a pinned configuration is idempotent; conflicting configurations are rejected.
         """
         if self._template_pinned:
-            logger.debug('set_template ignored: this sampler was configured with a pinned template.')
-            return sampler_types.SamplerSetTemplateResponse()
+            pinned = dict(json_safe(self._startup_template))
+            template_cls = pinned.pop('template_cls')
+            if 'template_spec' not in pinned:
+                pinned.setdefault('model_id', self.model_id)
+            requested = dict(body.init_kwargs)
+            if body.template_cls == template_cls and not body.adapter_name and all(
+                    key in pinned and pinned[key] == value for key, value in requested.items()):
+                return sampler_types.SamplerSetTemplateResponse()
+            raise RequestRejectedError('sampler template is pinned; a different template configuration cannot be applied')
         # Multi-tenant safety: this sampler replica is shared, and set_template mutates a single
         # self.template (it is not keyed per adapter), so one client's call would otherwise change the
         # encoding every other client sees. The guard above is what makes this safe: a deployment pins

@@ -17,7 +17,7 @@ matching :mod:`twinkle.protocol.types.processor`.
 """
 from __future__ import annotations
 
-from pydantic import Field, JsonValue, StrictInt, model_validator
+from pydantic import Field, JsonValue, StrictInt, field_validator, model_validator
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from .base import ResponseModel, StrictRequest, passthrough
@@ -104,6 +104,14 @@ class SamplerSetTemplateRequest(StrictRequest):
     template_cls: str = Field(..., description="Template class name (e.g. 'Template')")
     adapter_name: str = Field('', description='Adapter name to associate the template with')
     init_kwargs: dict[str, JsonValue] = passthrough()
+
+
+    @field_validator('template_cls')
+    @classmethod
+    def registered_template_name(cls, value):
+        if not value.isidentifier():
+            raise ValueError('HTTP template setup requires a registered class name, not a source path')
+        return value
 
 
 class SamplerSetTemplateResponse(ResponseModel):

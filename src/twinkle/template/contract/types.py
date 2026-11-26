@@ -2,13 +2,59 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, NewType, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from typing_extensions import Required, TypedDict
 
-from twinkle.data_format import Trajectory
+from twinkle.data_format import Message, Tool, Trajectory
+EngineBackend = Literal['vllm', 'sglang', 'lmdeploy', 'transformers']
 
-Message = Dict[str, Any]
-Tool = Dict[str, Any]
+
+class MaxLengthError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class EncodeIntent:
+    add_generation_prompt: bool
+    with_labels: bool
+    expand_media: bool
+
+    def __post_init__(self):
+        if self.with_labels and self.add_generation_prompt:
+            raise ValueError(
+                'EncodeIntent(with_labels=True, add_generation_prompt=True) is contradictory: an open '
+                'generation prompt has no response to supervise.')
+        if not self.expand_media and self.with_labels:
+            raise ValueError(
+                'EncodeIntent(expand_media=False, with_labels=True) is contradictory: labels are aligned '
+                'with the expanded sequence the model forward consumes.')
+
+    def render_mode(self, engine: EngineBackend = 'vllm') -> str:
+        check_backend(engine)
+        return 'train' if self.with_labels else 'transformers' if self.expand_media else engine
+
+
+TRAIN = EncodeIntent(False, True, True)
+INFER = EncodeIntent(True, False, True)
+ENGINE = EncodeIntent(True, False, False)
+SCORE = EncodeIntent(False, False, True)
+
+
+def check_backend(backend):
+    if backend not in ('vllm', 'sglang', 'lmdeploy', 'transformers'):
+        raise ValueError(f'Unsupported engine backend: {backend!r}')
+
+
+def resolve_intent(intent, add_generation_prompt):
+    if add_generation_prompt is not None and not isinstance(add_generation_prompt, bool):
+        raise TypeError('add_generation_prompt must be a bool or None')
+    if intent is None:
+        return INFER if add_generation_prompt else TRAIN
+    if not isinstance(intent, EncodeIntent):
+        raise TypeError('intent must be an EncodeIntent')
+    if add_generation_prompt is not None and add_generation_prompt != intent.add_generation_prompt:
+        raise ValueError(f'add_generation_prompt={add_generation_prompt} contradicts {intent}.')
+    return intent
 
 
 class ConversationSample(Trajectory, total=False):
@@ -36,38 +82,10 @@ class KTOSample:
     rejected: Optional[ConversationSample] = None
 
 
-InputOrderLabels = NewType('InputOrderLabels', List[int])
-OutputOrderLabels = NewType('OutputOrderLabels', List[int])
-InputOrderLossScale = NewType('InputOrderLossScale', List[float])
-OutputOrderLossScale = NewType('OutputOrderLossScale', List[float])
-InputOrderCompletionMask = NewType('InputOrderCompletionMask', List[int])
-OutputOrderCompletionMask = NewType('OutputOrderCompletionMask', List[int])
-
-
-class InputOrderRow(Trajectory, total=False):
-    input_ids: Required[List[int]]
-    labels: InputOrderLabels
-    loss_scale: InputOrderLossScale
-    completion_mask: InputOrderCompletionMask
-
-
-class EncodedRow(Trajectory, total=False):
-    input_ids: Required[List[int]]
-    labels: OutputOrderLabels
-    loss_scale: OutputOrderLossScale
-    completion_mask: OutputOrderCompletionMask
-
-
-class PreparedRow(EncodedRow, total=False):
-    position_ids: Required[Any]
-    attention_mask: Any
-
-
-@dataclass(frozen=True)
-class PreferencePair:
-    chosen: EncodedRow
-    rejected: Optional[EncodedRow]
-    margin: Optional[float] = None
+InputOrderLabels = OutputOrderLabels = List[int]
+InputOrderLossScale = OutputOrderLossScale = List[float]
+InputOrderCompletionMask = OutputOrderCompletionMask = List[int]
+InputOrderRow = EncodedRow = PreparedRow = Trajectory
 
 
 @dataclass(frozen=True)

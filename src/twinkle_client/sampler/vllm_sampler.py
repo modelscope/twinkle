@@ -224,8 +224,8 @@ class vLLMSampler:
                                    build_request(UnloadAdapterPathsRequest, adapter_paths=adapter_paths))
 
     @_guarded_operation
-    def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SamplerSetTemplateResponse:
-        """Set the template for encoding trajectories."""
+    def set_template(self, template_cls: Any, adapter_name: str = '', **kwargs) -> SamplerSetTemplateResponse:
+        """Set a Template instance, subclass, or registered name for encoding trajectories."""
         body = build_request(SamplerSetTemplateRequest, template_cls=template_cls, adapter_name=adapter_name, **kwargs)
         response = self._transport.post_model(f'{self.server_url}/set_template', body)
         return SamplerSetTemplateResponse(**response.json())

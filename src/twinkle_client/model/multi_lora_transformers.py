@@ -429,14 +429,8 @@ class MultiLoraTransformersModel:
         """Set the learning rate scheduler."""
         self._submit('set_lr_scheduler', model_types.SetLrSchedulerRequest, None, scheduler_cls=scheduler_cls, **kwargs)
 
-    def set_template(self, template_cls: str, **kwargs) -> None:
-        """Set the template for data processing.
-
-        ``model_id`` is not injected here: the backend always overrides it with its own
-        tokenizer id, so sending it made the request advertise a parameter that had no
-        effect. A caller that passes it explicitly still reaches the template
-        constructor through the passthrough region.
-        """
+    def set_template(self, template_cls: Any, **kwargs) -> None:
+        """Set a Template instance, subclass, or registered name; omitted model_id uses the backend tokenizer."""
         self._submit('set_template', model_types.SetTemplateRequest, None, template_cls=template_cls, **kwargs)
 
     def set_processor(self, processor_cls: str, **kwargs) -> None:

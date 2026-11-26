@@ -144,6 +144,10 @@ def append_ids(
     )
     if result is None:
         return None
-    result["engine_input_ids"] = engine_input_ids(pif) + list(ids if engine_ids is None else engine_ids)
+    engine_prefix = engine_input_ids(pif)
+    if 'engine_input_ids' in pif or (engine_ids is not None and list(engine_ids) != list(ids)):
+        result["engine_input_ids"] = engine_prefix + list(ids if engine_ids is None else engine_ids)
+    else:
+        result.pop('engine_input_ids', None)
     result["reasoning_started"] = template._reasoning_started(result["input_ids"])
     return result

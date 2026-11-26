@@ -9,7 +9,6 @@ from .contract import (
     InputOrderRow,
     KTOSample,
     MediaBundle,
-    PreferencePair,
     PreferenceSample,
     PreparedRow,
 )

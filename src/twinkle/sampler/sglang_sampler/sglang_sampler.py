@@ -12,7 +12,7 @@ import numpy as np
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
 from twinkle.checkpoint_engine.delta.rollout.sglang_mixin import SGLangDeltaSamplerMixin
-from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
+from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampleResponse,
                                  SamplingParams, Trajectory)
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
@@ -20,28 +20,11 @@ from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
 from twinkle.sampler.vllm_sampler.vllm_sampler import SAMPLER_MAX_CONCURRENCY
 from twinkle.template.contract import MediaBundle, engine_input_ids
-from twinkle.template.contract.encoding import validate_sampling_prefix
+from twinkle.sampler.generation import attach_features
 from twinkle.data_format import copy_trajectory
 from twinkle.utils import Platform
 
 logger = get_logger()
-
-
-def _convert_ndarray_to_list(obj: Any) -> Any:
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, np.integer):
-        return int(obj)
-    elif isinstance(obj, np.floating):
-        return float(obj)
-    elif isinstance(obj, np.bool_):
-        return bool(obj)
-    elif isinstance(obj, dict):
-        return {k: _convert_ndarray_to_list(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        converted = [_convert_ndarray_to_list(item) for item in obj]
-        return type(obj)(converted) if isinstance(obj, tuple) else converted
-    return obj
 
 
 @remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
@@ -228,52 +211,8 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, SGLangDeltaSamplerMixin):
             ),
         )
 
-        if not token_only:
-            validate_sampling_prefix(feat, response.prompt_token_ids)
-        sequences = []
-        for seq in response.sequences:
-            if token_only:
-                sampled_seq = SampledSequence(
-                    stop_reason=seq.stop_reason,
-                    tokens=[] if logprobs_only else seq.tokens,
-                    logprobs=None if logprobs_only else seq.logprobs,
-                    routed_experts=seq.routed_experts,
-                    sampling_masks=None if logprobs_only else seq.sampling_masks,
-                )
-            elif logprobs_only:
-                completion = copy_trajectory(feat)
-                completion.pop('routed_experts', None)
-                if seq.routed_experts is not None:
-                    completion['routed_experts'] = seq.routed_experts
-                sampled_seq = SampledSequence(
-                    tokens=[],
-                    stop_reason=seq.stop_reason,
-                    new_input_feature=completion,
-                    routed_experts=seq.routed_experts,
-                )
-            else:
-                if self.template is None:
-                    raise ValueError('normal sampling requires a template; use token_only for engine primitives')
-                completion = (copy_trajectory(feat) if seq.stop_reason == 'error' and not seq.tokens
-                              else self.template.append_completion(feat, seq.tokens))
-                completion.pop('routed_experts', None)
-                if seq.routed_experts is not None:
-                    completion['routed_experts'] = seq.routed_experts
-                sampled_seq = SampledSequence(
-                    stop_reason=seq.stop_reason,
-                    tokens=seq.tokens,
-                    logprobs=seq.logprobs,
-                    decoded=self.template.decode(seq.tokens),
-                    new_input_feature=completion,
-                    routed_experts=seq.routed_experts,
-                    sampling_masks=seq.sampling_masks,
-                )
-            sequences.append(sampled_seq)
-        return SampleResponse(
-            prompt_token_ids=response.prompt_token_ids,
-            sequences=sequences,
-            prompt_logprobs=response.prompt_logprobs,
-            topk_prompt_logprobs=response.topk_prompt_logprobs)
+        attach_features(self.template, [response], {0: feat}, logprobs_only=logprobs_only, token_only=token_only)
+        return response
 
     @remote_function(enable_continous_work=True, sticky_key='session_id')
     @timed

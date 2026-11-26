@@ -1,21 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""The template-facing half of the transformers generation pipeline, shared by both entry points.
+"""Shared template encoding and candidate finalization for samplers and model.generate.
 
-Two callers generate through a :class:`~twinkle.sampler.transformers_sampler.TransformersEngine`:
-
-- :class:`~twinkle.sampler.TransformersSampler`, which loads its own weights from ``model_id``;
-- :meth:`TransformersModel.generate`, a facade that generates on the weights a *training* model already
-  holds, inside that model's own data-parallel workers.
-
-Around the engine's ``batch_sample`` both run the same steps that talk to a
-:class:`~twinkle.template.Template`: encode each ``Trajectory`` into a prompt ``InputFeature``, collate
-the multimodal tensors a batch needs, and stitch the generated tokens back onto the prompt feature.
-Those steps live here so the two callers cannot drift -- which matters because the facade forwards its
-inputs whole and relies on this pipeline matching the sampler's exactly.
-
-What is deliberately *not* here: left-padding, logprobs, ``num_return_sequences`` and decoding. Those
-are the engine's business (see ``transformers_engine``); this module is engine-agnostic and owns only
-the encoding contract with ``Template``.
+Transformers batching stays here; all backends use the same complete-trajectory output contract.
 """
 
 from __future__ import annotations
@@ -26,6 +12,8 @@ import torch
 from twinkle import get_logger
 from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, Trajectory, copy_trajectory, is_encoded
 from twinkle.template.contract import engine_input_ids
+from twinkle.template.contract.encoding import validate_sampling_prefix
+from twinkle.protocol.json_utils import json_safe
 
 logger = get_logger()
 
@@ -45,7 +33,10 @@ def encode_trajectory(template, trajectory, add_generation_prompt: bool = True):
     """Encode a complete prompt while retaining conversation and numerical fields."""
     if template is None:
         raise ValueError('Template not set; call set_template() before encoding a Trajectory')
-    return template.encode_prompt(trajectory, backend='transformers', add_generation_prompt=add_generation_prompt)
+    feature = template.encode_prompt(trajectory, backend='transformers', add_generation_prompt=add_generation_prompt)
+    if not isinstance(feature, dict) or feature.get('input_ids') is None:
+        raise ValueError("encode_prompt must return 'input_ids' in a complete trajectory")
+    return feature
 
 
 def error_response(feat: dict[str, Any]) -> SampleResponse:
@@ -66,10 +57,7 @@ def encode_all(template, inputs_list, *, logprobs_only: bool, strict: bool):
         try:
             feature = copy_trajectory(item)
             if not_encoded(feature):
-                if template is None:
-                    raise ValueError('Template not set; call set_template() before encoding a Trajectory')
-                feature = template.encode_prompt(feature, backend='transformers',
-                                                 add_generation_prompt=not logprobs_only)
+                feature = encode_trajectory(template, feature, add_generation_prompt=not logprobs_only)
             engine_input_ids(feature)
             encoded[index] = feature
         except Exception as exc:
@@ -148,24 +136,33 @@ def collate_extra_model_inputs(chunk: list[int], encoded: dict[int, dict[str, An
     return result
 
 
-def attach_features(template, results, encoded, *, logprobs_only=False):
-    """Attach each complete trajectory, retaining even zero-token generation results."""
+def attach_features(template, results, encoded, *, logprobs_only=False, token_only=False):
+    """Finalize all backends' candidates without mixing token-only and complete-trajectory outputs."""
     for index, response in enumerate(results):
         feat = encoded.get(index)
         if response is None or feat is None:
             continue
+        if not token_only and feat.get('input_ids') is not None:
+            validate_sampling_prefix(feat, response.prompt_token_ids)
         for seq in response.sequences:
+            seq.routed_experts = json_safe(seq.routed_experts)
             if logprobs_only:
                 seq.tokens = []
                 seq.logprobs = None
                 seq.decoded = None
                 seq.sampling_masks = None
+            if token_only:
+                seq.decoded = None
+                seq.new_input_feature = None
+                continue
             if logprobs_only or (seq.stop_reason == 'error' and not seq.tokens):
                 seq.new_input_feature = copy_trajectory(feat)
             else:
                 if template is None:
-                    raise ValueError('normal sampling requires a template')
+                    raise ValueError('normal sampling requires a template; use token_only for engine primitives')
                 seq.new_input_feature = template.append_completion(feat, list(seq.tokens or ()))
+                if seq.decoded is None:
+                    seq.decoded = template.decode(seq.tokens)
             seq.new_input_feature.pop('routed_experts', None)
             if seq.routed_experts is not None:
                 seq.new_input_feature['routed_experts'] = seq.routed_experts

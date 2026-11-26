@@ -207,12 +207,11 @@ class LazyDataset(Dataset):
 
         # Lazy encode
         if self.do_encode:
-            encoded = self.template.encode(item, add_generation_prompt=self.add_generation_prompt, **self.encode_kwargs)
-            # Preserve extra fields not produced by encoding
-            for key in item:
-                if key not in encoded:
-                    encoded[key] = item[key]
-            item = encoded
+            encoded = self.template.batch_encode([item], add_generation_prompt=self.add_generation_prompt,
+                                                  **self.encode_kwargs)
+            if not encoded:
+                return None
+            item = encoded[0]
         elif self.do_check:
             item = self.template.check(item)
 

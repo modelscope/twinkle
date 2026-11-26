@@ -75,6 +75,16 @@ def build_request(model_cls: type[BaseModel], /, **values: Any) -> BaseModel:
     """
     declared = model_cls.model_fields
     regions = fields_with_role(model_cls, FieldRole.Passthrough)
+    if 'template_cls' in declared and 'template_cls' in values and not isinstance(values['template_cls'], str):
+        from twinkle.template.utils import template_request
+        values = dict(values)
+        control = {key: values.pop(key) for key in list(values) if key in declared and key != 'init_kwargs'}
+        explicit = values.pop('init_kwargs', {}) or {}
+        collisions = set(values) & set(explicit)
+        if collisions:
+            raise TwinkleClientValidationError(f'template kwargs were passed twice: {sorted(collisions)}')
+        template_cls, options = template_request(control.pop('template_cls'), {**explicit, **values})
+        values = {**control, 'template_cls': template_cls, 'init_kwargs': options}
 
     body: dict[str, Any] = {}
     routed: dict[str, Any] = {}

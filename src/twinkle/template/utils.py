@@ -14,25 +14,59 @@ logger = get_logger()
 _T = TypeVar('_T')
 
 
-def construct_template(template_cls, **kwargs):
-    template_spec = kwargs.pop('template_spec', None)
-    if template_spec is None:
-        import twinkle.template
-        from twinkle.template.base import Template
-        from twinkle.utils import construct_class
+def construct_template(template_cls, *, _default_model_id=None, **kwargs):
+    import twinkle.template
+    from twinkle.template.base import Template
+    from twinkle.utils import Plugin
 
-        return construct_class(template_cls, Template, twinkle.template, **kwargs)
-    if kwargs:
-        raise TypeError(f'Unexpected TemplateSpec construction arguments: {sorted(kwargs)}')
+    template_spec = kwargs.pop('template_spec', None)
+    if isinstance(template_cls, Template):
+        if template_spec is not None:
+            raise TypeError('an existing template cannot also receive template_spec')
+        return template_cls.replace(**kwargs) if kwargs else template_cls
     if isinstance(template_cls, str):
-        module, separator, name = template_cls.rpartition('.')
-        if not separator:
-            raise ValueError('A TemplateSpec factory must be a dotted class path.')
-        template_cls = getattr(importlib.import_module(module), name)
-    factory = getattr(template_cls, 'from_spec', None)
-    if factory is None:
-        raise TypeError(f'{template_cls!r} does not implement from_spec().')
-    return factory(template_spec)
+        if hasattr(twinkle.template, template_cls):
+            template_cls = getattr(twinkle.template, template_cls)
+        elif template_spec is not None:
+            module, separator, name = template_cls.rpartition('.')
+            if not separator:
+                raise ValueError(f'Template {template_cls!r} is not registered in this worker')
+            template_cls = getattr(importlib.import_module(module), name)
+        elif template_cls.isidentifier():
+            raise ValueError(f'Template {template_cls!r} is not registered in this worker')
+        else:
+            template_cls = Plugin.load_plugin(template_cls, Template)
+    if not isinstance(template_cls, type) or not issubclass(template_cls, Template):
+        raise TypeError('template_cls must be a Template instance, subclass or registered name')
+    if template_spec is not None:
+        if kwargs:
+            raise TypeError(f'Unexpected TemplateSpec construction arguments: {sorted(kwargs)}')
+        factory = getattr(template_cls, 'from_spec', None)
+        if factory is None:
+            raise TypeError(f'{template_cls!r} does not implement from_spec().')
+        return factory(template_spec)
+    if _default_model_id is not None and 'model_id' in inspect.signature(template_cls.__init__).parameters:
+        kwargs.setdefault('model_id', _default_model_id)
+    return template_cls(**kwargs)
+
+
+def template_request(template_cls, kwargs):
+    options = dict(kwargs)
+    if isinstance(template_cls, str):
+        return template_cls, options
+    from twinkle.template.base import Template
+    if isinstance(template_cls, Template):
+        if options:
+            template_cls = template_cls.replace(**options)
+        options = template_cls._constructor_config()
+        template_cls = type(template_cls)
+    if isinstance(template_cls, type):
+        if not issubclass(template_cls, Template):
+            raise TypeError('template_cls must be a Template subclass')
+        template_cls = getattr(template_cls, '_server_template_name', None) or template_cls.__name__
+    if not isinstance(template_cls, str):
+        raise TypeError('template_cls must be a Template instance, subclass or registered name')
+    return template_cls, options
 
 
 def _coerce_ids_to_list(ids: Any) -> List[int]:
@@ -162,11 +196,7 @@ def transfer_to_standard_message(message: Message, image_placeholder, video_plac
     else:
         new_content = [{'type': 'text', 'text': message['content']}]
 
-    return Message(
-        role=message['role'],
-        content=new_content,
-        tool_calls=message.get('tool_calls'),
-        reasoning_content=message.get('reasoning_content'))
+    return {**message, 'content': new_content}
 
 
 def get_inputs_embeds_hf(inputs_embeds, inputs, visual, processor, config):

@@ -128,7 +128,9 @@ class APISampler:
         if new_input_feature is None:
             raise ValueError('appended API turn exceeds max_length under delete truncation strategy')
         new_input_feature['messages'] = copy_trajectory({'messages': messages + [reply]})['messages']
-        new_input_feature['engine_input_ids'] = engine_input_ids(feature) + new_tokens
+        serving_ids = engine_input_ids(feature)
+        if 'engine_input_ids' in feature:
+            new_input_feature['engine_input_ids'] = serving_ids + new_tokens
         new_input_feature['reasoning_started'] = self.template._reasoning_started(new_input_feature['input_ids'])
 
         return SampledSequence(
