@@ -53,6 +53,8 @@ def ensure_ray_cluster(*, namespace: str, address: str | None = None, persistent
 
     if ray.is_initialized():
         return
+    if address in (None, 'auto'):
+        address = os.environ.get('RAY_ADDRESS') or address
     if address == 'local':
         address = None
     if persistent and address is None:
@@ -61,11 +63,25 @@ def ensure_ray_cluster(*, namespace: str, address: str | None = None, persistent
         import subprocess
         import sys
 
+        from ray._private.services import find_bootstrap_address
+
         # A detached deployment needs a head whose lifetime is independent of this driver.
-        try:
-            with socket.create_connection(('127.0.0.1', 6379), timeout=1.0):
-                pass
-        except OSError:
+        # Attach by the head's CONCRETE recorded address (whatever host/port it actually uses,
+        # read from Ray's own session record -- not a hardcoded 6379): ray.init('auto') lets
+        # RAY_ADDRESS=local spawn a driver-owned ephemeral head, and ray.shutdown() at driver
+        # exit would then kill the "detached" deployment. A concrete address is never overridden.
+        def _head_alive(addr: str | None) -> bool:
+            if not addr:
+                return False
+            host, _, port = addr.rpartition(':')
+            try:
+                with socket.create_connection((host, int(port)), timeout=1.0):
+                    return True
+            except (OSError, ValueError):
+                return False
+
+        address = find_bootstrap_address(None)
+        if not _head_alive(address):
             executable = Path(sys.executable).parent / 'ray'
             ray_cli = str(executable) if executable.is_file() else shutil.which('ray')
             if ray_cli is None:
@@ -73,7 +89,9 @@ def ensure_ray_cluster(*, namespace: str, address: str | None = None, persistent
             result = subprocess.run([ray_cli, 'start', '--head'], capture_output=True, text=True)
             if result.returncode:
                 raise RuntimeError(f'Ray head startup failed:\n{result.stdout}\n{result.stderr}')
-        address = 'auto'
+            address = find_bootstrap_address(None)
+            if not _head_alive(address):
+                raise RuntimeError(f'Ray head started but is not reachable at {address!r}.')
     init_kwargs: dict[str, Any] = {
         'namespace': namespace,
         'runtime_env': build_ray_runtime_env(),
@@ -136,7 +154,8 @@ class ServerLauncher:
 
     @staticmethod
     def _update_gateway_models(gateway_name: str, *, add: list | None = None,
-                               remove: list[str] | None = None) -> list[str]:
+                               remove: list[str] | None = None, replace: list | None = None,
+                               aliases: dict[str, str] | None = None) -> list[str]:
         """Persist discovery through Serve reconfiguration while preserving all existing deployment settings.
 
         Returns the names now registered to the given ``add`` entries (newly added or already
@@ -149,11 +168,14 @@ class ServerLauncher:
 
         info, route, config, current = ServerLauncher._gateway_state(gateway_name)
         removed = set(remove or ())
+        current_aliases = config.get('openai_model_aliases',
+                                     info.replica_config.init_kwargs.get('openai_model_aliases') or {})
 
         def model_name(item):
             return item if isinstance(item, str) else item['model_name']
 
-        models = {model_name(item): item for item in current if model_name(item) not in removed}
+        source = current if replace is None else replace
+        models = {model_name(item): item for item in source if model_name(item) not in removed}
         published = []
         for item in add or ():
             name = model_name(item)
@@ -165,9 +187,17 @@ class ServerLauncher:
                 models[name] = item
             published.append(name)
         registry = list(models.values())
-        if registry == current:
+        updated_aliases = ({name: base for name, base in current_aliases.items() if base not in removed}
+                           if replace is None else {})
+        for name, base in (aliases or {}).items():
+            if updated_aliases.setdefault(name, base) != base:
+                raise ValueError(f'OpenAI alias {name!r} is already registered to a different model.')
+        if conflicts := updated_aliases.keys() & models.keys():
+            raise ValueError(f'OpenAI aliases conflict with registered model names: {", ".join(sorted(conflicts))}')
+        if registry == current and updated_aliases == current_aliases:
             return published
         config['supported_models'] = registry
+        config['openai_model_aliases'] = updated_aliases
         deployment = Deployment('GatewayServer', info.deployment_config, info.replica_config,
                                 version=info.version, _internal=True).options(user_config=config)
         serve.run(Application(deployment), name=gateway_name, route_prefix=route)
@@ -188,10 +218,12 @@ class ServerLauncher:
             entries = []
             for base in base_names:
                 matched = [item for item in registry
-                           if item == base or (isinstance(item, dict) and item.get('base_model') == base)]
+                           if item == base or (isinstance(item, dict) and
+                                               (item.get('base_model') or item['model_name']) == base)]
                 entries.extend(matched or [base])
             if entries:
-                self._published_models.update(self._update_gateway_models(app.name, add=entries))
+                aliases = {name: base for name, base in app.args.openai_model_aliases.items() if base in base_names}
+                self._published_models.update(self._update_gateway_models(app.name, add=entries, aliases=aliases))
 
     def _prepare_model_deployment(self, model_name: str) -> None:
         """Share gateway/data-plane applications without replacing a live sampler."""
@@ -233,13 +265,14 @@ class ServerLauncher:
 
         self._init_ray()
         applications = self._application_details()
-        sampler_name = f'sampler-{model_name.replace("/", "_")}'
         gateways = [app for app in self.config.applications if app.import_path == 'server']
         if len(gateways) != 1:
             raise ValueError('Stopping a model requires exactly one gateway configuration.')
         gateway = gateways[0]
-        route = (applications.get(sampler_name) or {}).get('route_prefix')
-        route = route or f'{gateway.route_prefix}/sampler/{model_name}'
+        gateway_route = (applications.get(gateway.name) or {}).get('route_prefix') or gateway.route_prefix
+        route = f"{gateway_route.rstrip('/')}/sampler/{model_name}"
+        sampler_name = next((name for name, details in applications.items() if details.get('route_prefix') == route),
+                            None)
         failures = []
         released = False
         try:
@@ -247,9 +280,9 @@ class ServerLauncher:
         except Exception as exc:
             failures.append(exc)
             logger.exception('Sampler pool cleanup failed for %s', model_name)
-        if sampler_name not in applications and not released and not failures:
+        if sampler_name is None and not released and not failures:
             raise ValueError(f'No deployment found for model {model_name!r}.')
-        if sampler_name in applications:
+        if sampler_name is not None:
             serve.delete(sampler_name)
         remaining = [name for name in self._model_names() if name != model_name]
         if gateway.name in applications:
@@ -285,7 +318,7 @@ class ServerLauncher:
     def _configure_environment(self) -> None:
         if self.config.trust_remote_code is not None:
             os.environ['TWINKLE_TRUST_REMOTE_CODE'] = '1' if self.config.trust_remote_code else '0'
-        if any(app.import_path in ('model', 'sampler') for app in self.config.applications):
+        if any(app.import_path in ('server', 'model', 'sampler') for app in self.config.applications):
             os.environ['TWINKLE_STATE_RAY_NAMESPACE'] = self.ray_namespace
         os.environ.update(self.config.persistence.to_env_vars())
         gateways = [app for app in self.config.applications if app.import_path == 'server']
@@ -300,17 +333,16 @@ class ServerLauncher:
 
     def _configure_telemetry(self) -> None:
         telemetry = self.config.telemetry
-        os.environ['TWINKLE_TELEMETRY_ENABLED'] = str(int(telemetry.enabled))
+        os.environ.update(telemetry.to_env_vars())
         if not telemetry.enabled:
             return
+        from twinkle.server.identity import USER_ID_KEY_ENV, user_id_key
         from twinkle.server.telemetry import init_telemetry
+        if USER_ID_KEY_ENV in os.environ and user_id_key() is None:
+            raise ValueError(f'{USER_ID_KEY_ENV} must be nonempty and distinct from TWINKLE_TOKEN_SALT')
+        if USER_ID_KEY_ENV not in os.environ:
+            logger.warning('Tenant usage and snapshots require %s', USER_ID_KEY_ENV)
         init_telemetry(telemetry)
-        os.environ.update({
-            'TWINKLE_TELEMETRY_DEBUG': str(int(telemetry.debug)),
-            'TWINKLE_TELEMETRY_SERVICE': telemetry.service_name,
-            'TWINKLE_TELEMETRY_ENDPOINT': telemetry.otlp_endpoint,
-            'TWINKLE_TELEMETRY_INTERVAL': str(telemetry.export_interval_ms),
-        })
 
     def _init_ray(self) -> None:
         """Initialize Ray with the resolved namespace (attach-or-local via :func:`ensure_ray_cluster`)."""
@@ -363,14 +395,16 @@ class ServerLauncher:
         return options
 
     def _gateway_arguments(self) -> dict[str, Any]:
-        args = {'http_options': self.config.http_options.model_dump()}
+        args = {
+            'http_options': self.config.http_options.model_dump(),
+            'supported_models': list(
+                dict.fromkeys(
+                    alias for app in self.config.applications
+                    if app.import_path == 'sampler' and (alias := extract_model_alias(app.route_prefix, 'sampler')))),
+        }
         models = self.config.training_config.models
         if models:
             args['training_models'] = [model.name for model in models]
-            args['supported_models'] = list(
-                dict.fromkeys(
-                    alias for app in self.config.applications
-                    if app.import_path == 'sampler' and (alias := extract_model_alias(app.route_prefix, 'sampler'))))
         return args
 
     def _deploy_sampler(self, app: ApplicationSpec) -> None:
@@ -379,15 +413,28 @@ class ServerLauncher:
 
         from twinkle.server.sampler.pool.actor import create_sampler_controller
         from twinkle.server.sampler.pool.router import build_sampler_router
-        controller, options, pool_id = create_sampler_controller(app, self.ray_namespace,
-                                                                 self.config.resources.model_dump(),
-                                                                 build_worker_env_vars())
+        base_model = extract_model_alias(app.route_prefix, 'sampler') or app.name
+        controller, options, pool_id = create_sampler_controller(
+            app, self.ray_namespace, self.config.resources.model_dump(), build_worker_env_vars(),
+            base_model=base_model,
+        )
         self._sampler_controllers.append(controller)
         if app.name not in self._existing_applications:
             self._owned_applications.add(app.name)
         ray.get(controller.initialize.remote())
+        # The sampler router shares the proxy port with the gateway, so it must enforce the same
+        # credential: an explicit SamplerArgs.api_key wins, else inherit the gateway's key so a
+        # deployment authenticated at the gateway cannot be bypassed by dialing the sampler route
+        # directly. (The gateway forwards the caller's Bearer key, so proxied traffic still passes.)
+        api_key = getattr(app.args, 'api_key', None)
+        if api_key is None:
+            api_key = next((getattr(other.args, 'api_key', None) for other in self.config.applications
+                            if other.import_path == 'server'), None)
         serve.run(
-            build_sampler_router(self.ray_namespace, pool_id, options), name=app.name, route_prefix=app.route_prefix)
+            build_sampler_router(self.ray_namespace, pool_id, options, model_id=base_model, api_key=api_key),
+            name=app.name,
+            route_prefix=app.route_prefix,
+        )
 
     def _deploy_application(self, app_spec: ApplicationSpec) -> None:
         """Model declarations go to the training controller; other apps deploy here."""
@@ -399,6 +446,9 @@ class ServerLauncher:
         if app_spec.import_path == 'server' and app_spec.name in self._existing_applications:
             logger.info('Reusing gateway %s with its existing listener, authentication and session settings.',
                         app_spec.name)
+            if len(self.config.applications) == 1 and app_spec.args.supported_models is not None:
+                self._update_gateway_models(app_spec.name, replace=app_spec.args.supported_models,
+                                            aliases=app_spec.args.openai_model_aliases)
             return
         if app_spec.name not in self._existing_applications:
             self._owned_applications.add(app_spec.name)
@@ -406,6 +456,8 @@ class ServerLauncher:
         args = {key: value for key, value in dict(app_spec.args).items() if value is not None}
         if app_spec.import_path == 'server':
             defaults = self._gateway_arguments()
+            if 'supported_models' not in args and defaults['supported_models']:
+                defaults.setdefault('training_models', [])
             for key, value in defaults.items():
                 args.setdefault(key, value)
         deployment = app_spec.deployments[0] if app_spec.deployments else {}
@@ -516,14 +568,14 @@ class ServerLauncher:
     def _shutdown(self, *, raise_errors: bool = True) -> None:
         from functools import partial
 
-        from twinkle.server.telemetry import flush_telemetry_safely
+        from twinkle.server.telemetry import shutdown_telemetry_safely
         actions = [('training controller shutdown', self._stop_training_controller)]
         actions.extend(('sampler controller shutdown', partial(self._stop_sampler_controller, controller))
                        for controller in tuple(self._sampler_controllers))
         if self._serve_started:
             actions.append(('gateway discovery cleanup', self._unpublish_models))
             actions.append(('owned application cleanup', self._delete_owned_applications))
-        actions.append(('telemetry flush', flush_telemetry_safely))
+        actions.append(('telemetry shutdown', shutdown_telemetry_safely))
         self._run_cleanup(actions, raise_errors=raise_errors)
         self._serve_started = bool(self._owned_applications or self._published_models)
 

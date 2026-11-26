@@ -145,11 +145,26 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
             if isinstance(kwargs.get('output_fields'), list):
                 # Field names describe the operation, so DP must deliver them to every rank.
                 kwargs['output_fields'] = tuple(kwargs['output_fields'])
+            decision = kwargs.get('task') == 'decision' and kwargs.get('return_logits')
+            num_records = len(inputs)
+            if decision and not num_records:
+                raise ValueError('Decision forward requires at least one record.')
+            # Keep all data ranks in the forward, even if the tail is smaller than the mesh.
+            if decision:
+                padding = -num_records % self.data_world_size
+                inputs = inputs + [inputs[-1].copy() for _ in range(padding)]
             ret = await self.call_backend(
                 self.model.forward_only,
                 inputs=inputs,
                 adapter_name=resolved_adapter_name,
                 **kwargs)
+            if decision:
+                counts = ret.get('counts')
+                if counts is None or len(counts) != len(inputs):
+                    raise ValueError('Decision forward must return one count per input record.')
+                counts = counts[:num_records]
+                ret = {key: ret[key][:sum(counts)] for key in ('logits', 'option_mask', 'kinds')}
+                ret['counts'] = counts
             return {'result': ret}
 
         return await run_submit(
@@ -399,6 +414,21 @@ def _register_model_twinkle_routes(app: FastAPI, self_fn: Callable[[], ModelMana
             return {'result': ret}
 
         return await run_submit(self, request, body, task_type='get_train_configs', backend_call=_call)
+
+    @app.post('/twinkle/task_head_temperatures', response_model=types.TaskEnvelope)
+    async def task_head_temperatures(
+        request: Request, body: types.TaskHeadTemperaturesRequest, self: ModelManagement = Depends(self_fn)
+    ) -> types.TaskEnvelope:
+
+        async def _call(self, body, adapter_name, token):
+            operation = getattr(self.model, 'task_head_temperatures', None)
+            if operation is None:
+                raise RequestRejectedError('This backend does not expose task-head temperatures.', error_code=422)
+            return await self.call_backend(
+                operation, adapter_name=self.resolve_model_adapter_name(adapter_name),
+                update=None if body.update is None else body.update.model_dump())
+
+        return await run_submit(self, request, body, task_type='task_head_temperatures', backend_call=_call)
 
     @app.post('/twinkle/set_loss', response_model=types.TaskEnvelope)
     async def set_loss(request: Request, body: types.SetLossRequest,

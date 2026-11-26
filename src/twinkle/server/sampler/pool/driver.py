@@ -12,9 +12,11 @@ from twinkle.server.state.models import FutureFailureRecord, RuntimeContext
 
 
 class SamplerDriver:
-    def __init__(self, args: SamplerArgs, namespace: str, pool_id: str, options: dict, budgets: dict):
+    def __init__(self, args: SamplerArgs, namespace: str, pool_id: str, options: dict, budgets: dict,
+                 *, base_model: str | None = None):
         self.args, self.namespace, self.pool_id = args, namespace, pool_id
         self.options = options
+        self.base_model = base_model
         self.budgets = ResourceOptions.model_validate(budgets)
         self.runtime = RayRuntime(
             namespace,
@@ -38,12 +40,14 @@ class SamplerDriver:
             device_type,
             f"sampling_{self.pool_id}_{instance.epoch}",
             instance.identity,
+            node_selector=self.args.node_selector,
         )
         instance.application = allocation.name
         instance.devices = list(allocation.devices)
         options = self.runtime.deployment_options(self.options, allocation.name)
         values = self.args.model_dump(
-            exclude={"min_replicas", "max_replicas", "idle_timeout_s", "target_ongoing_requests", "queue_config"}
+            exclude={"min_replicas", "max_replicas", "idle_timeout_s", "target_ongoing_requests", "queue_config",
+                     "node_selector"}
         )
         values["device_group"].setdefault("name", "sampler")
         values["device_group"].setdefault("ranks", self.args.nproc_per_node)
@@ -51,6 +55,7 @@ class SamplerDriver:
         app = build_sampler_app(
             **values,
             queue_config=self.args.queue_config,
+            telemetry_base_model=self.base_model,
             deploy_options=options,
             sampling_context=RuntimeContext(
                 namespace=self.namespace, registry_name=allocation.name + "-registry", instance_id=instance.identity

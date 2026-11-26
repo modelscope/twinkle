@@ -6,12 +6,12 @@ Builds a single Ray Serve deployment (SamplerManagement) that simultaneously han
 both Tinker (/tinker/asample) and Twinkle (/twinkle/*) sampler endpoints.
 """
 from __future__ import annotations
-
 import asyncio
 import os
+from typing import Any
+
 from fastapi import FastAPI, Request
 from ray import serve
-from typing import Any
 
 from twinkle import DeviceGroup
 from twinkle.server.config.backend_dispatch import BackendSelector
@@ -129,6 +129,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         self.request_runtime = SamplerRuntime(self)
         self.device_group = DeviceGroup(**device_group)
         context = kwargs.pop('sampling_context', None)
+        telemetry_base_model = kwargs.pop('telemetry_base_model', None) or model_id
         if context is not None:
             context = RuntimeContext.model_validate(context)
             from twinkle.infra._ray.ray_helper import RayHelper
@@ -181,6 +182,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         self._init_task_queue(
             queue_config,
             deployment_name='Sampler',
+            telemetry_base_model=telemetry_base_model,
             collect_width=len(actors) if actors else 1,
         )
         # ComputeWorker bounds the client future. Keep collecting the actual
@@ -260,6 +262,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         self.sampling_guard.check_available()
 
     async def _on_request_start(self, request: Request) -> str:
+        request.state.base_model = self._telemetry_base_model
         await self.state.touch_replica_last_seen(self.replica_id)
         await self._ensure_state_cleanup_started()
         return get_token_from_request(request)
@@ -335,6 +338,11 @@ def build_sampler_app(model_id: str,
         attach_replica_id_header=True,
         on_shutdown=lambda servable: servable.shutdown(),
     )
+    # Same public-ingress credential as the pool router: without it the sampler's HTTP routes
+    # accept anonymous generation even when the gateway requires an api_key. Popped (not left in
+    # kwargs) because SamplerManagement's constructor does not take it.
+    from twinkle.server.middleware.auth import install_api_key_gate
+    install_api_key_gate(app, kwargs.pop('api_key', None))
 
     return bind_deployment(
         app,

@@ -18,6 +18,9 @@ class SamplingSessionManager(BaseManager[SamplingSessionRecord]):
 
     # ----- Cleanup -----
 
+    def is_expired(self, record: SamplingSessionRecord, cutoff_time: float, expired_session_ids: set[str]) -> bool:
+        return record.session_id in expired_session_ids or self._parse_timestamp(record.created_at) < cutoff_time
+
     async def cleanup_expired(self, cutoff_time: float, expired_session_ids: list[str]) -> int:
         """Remove sampling sessions that are older than cutoff_time, or whose
         owning session has already been expired.
@@ -36,13 +39,7 @@ class SamplingSessionManager(BaseManager[SamplingSessionRecord]):
         expired_ids = []
 
         for sampling_id, record in all_records.items():
-            # Cascade: owner session was expired
-            if record.session_id and record.session_id in session_set:
-                expired_ids.append(sampling_id)
-                continue
-            # Own age
-            created_at = self._parse_timestamp(record.created_at)
-            if created_at < cutoff_time:
+            if self.is_expired(record, cutoff_time, session_set):
                 expired_ids.append(sampling_id)
 
         for sampling_id in expired_ids:

@@ -64,7 +64,6 @@ class ResourceManager:
                 'ray_address': str(ray.get_runtime_context().gcs_address)
             } for _ in devices]
         manager._publish_addresses()
-        manager._sort_npu_worker_devices()
         return manager
 
     def __init__(self, nproc_per_node: int, ncpu_proc_per_node: int, groups: List[DeviceGroup]):
@@ -357,7 +356,6 @@ class ResourceManager:
 
         self.group_configs = groups
         self._publish_addresses()
-        self._sort_npu_worker_devices()
         logger.info(f"nodes: {[n['NodeID'][:8] for n in self.nodes]}")
         logger.info(f'node_ranks: {self.node_ranks}')
         logger.info(f'node2pg keys: {list(self.node2pg.keys())}')
@@ -377,14 +375,6 @@ class ResourceManager:
                 placement['node_ip'] = addresses[placement['placement_group']]
         for placement in self.rank_placements.values():
             placement['node_ip'] = addresses[placement['placement_group']]
-
-    def _sort_npu_worker_devices(self) -> None:
-        # Ray-selected IDs can be unordered, but Ascend RTS requires ascending visible IDs.
-        # Sort within each worker so its card set and the allocation metadata stay consistent.
-        for group in self.group_configs:
-            if (group.device_type or '').upper() == 'NPU':
-                for worker in self.device_groups[group.name]:
-                    worker['gpu_rank'].sort(key=int)
 
     @staticmethod
     def noset_env():

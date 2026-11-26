@@ -1,12 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Unit tests for twinkle.model.transformers.target_modules (LoRA target expansion)."""
 import re
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 
 from twinkle.model.transformers.target_modules import (
+    expand_modules_to_save,
+    expand_multimodal_lora_target,
     find_all_linears,
     find_embedding,
     find_layers,
@@ -245,3 +248,32 @@ class TestGetMultimodalTargetRegex:
         pattern = get_multimodal_target_regex(_MultiModal(), arch)
         assert re.fullmatch(pattern, 'language.layers.0.mlp.q_proj')
         assert not re.fullmatch(pattern, 'ghost.anything')
+
+
+class TestConfigExpansionWrappers:
+
+    _FREEZE = dict(freeze_llm=False, freeze_vit=True, freeze_aligner=True)
+
+    def test_all_linear_matches_the_direct_regex(self):
+        config = SimpleNamespace(target_modules='all-linear')
+        expand_multimodal_lora_target(_MultiModal(), config, _model_arch(), **self._FREEZE)
+        assert config.target_modules == get_multimodal_target_regex(_MultiModal(), _model_arch(), **self._FREEZE)
+
+    def test_explicit_target_is_left_verbatim(self):
+        config = SimpleNamespace(target_modules=['q_proj'])
+        expand_multimodal_lora_target(_MultiModal(), config, _model_arch(), **self._FREEZE)
+        assert config.target_modules == ['q_proj']
+
+    def test_modules_to_save_expands_both_shorthands(self):
+        model = nn.Module()
+        model.embed = nn.Embedding(4, 2)
+        model.ln = nn.LayerNorm(2)
+        model.rms = _RMSNormLike()
+        config = SimpleNamespace(modules_to_save=['all-embedding', 'all-norm', 'linear'])
+        expand_modules_to_save(model, config)
+        assert set(config.modules_to_save) == {'embed', 'ln', 'rms', 'linear'}
+
+    def test_modules_to_save_without_shorthand_is_untouched(self):
+        config = SimpleNamespace(modules_to_save=['linear'])
+        expand_modules_to_save(nn.Module(), config)
+        assert config.modules_to_save == ['linear']

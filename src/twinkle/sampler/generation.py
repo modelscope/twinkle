@@ -226,6 +226,11 @@ def run_chunk(
         if strict:
             raise
         if len(chunk) == 1:
+            # A single-row chunk (batch_size=1, or a tail chunk of size 1) has nothing to
+            # isolate, but the non-strict contract still holds: drop the bad row with an
+            # error placeholder instead of aborting the whole run. Raising here made
+            # strict=False depend on how the inputs happened to be chunked.
+            logger.warning(f"Input {chunk[0]} dropped, generate failed: {exc}")
             return [error_response(encoded[chunk[0]])]
         logger.warning(f"Batch of {len(chunk)} failed ({exc}); retrying individually to isolate the input")
         out: list[SampleResponse] = []
@@ -234,5 +239,5 @@ def run_chunk(
                 out.append(call_batch([prompts[position]], collate_extra_model_inputs([index], encoded, template))[0])
             except Exception as inner:
                 logger.warning(f"Input dropped, generate failed: {inner}")
-                out.append(error_response(encoded[index]))
+                out.append(error_response(encoded.get(index) or {}))
         return out

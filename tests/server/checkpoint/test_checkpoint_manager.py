@@ -323,6 +323,8 @@ async def test_training_and_sampler_checkpoints_can_be_read_and_deleted_by_other
 @pytest.mark.parametrize('manager', ['tinker', 'twinkle'], indirect=True)
 async def test_load_and_resume_use_public_directory_while_sampler_cache_uses_version(manager):
     uri, public_directory = await manager.save_sampler('run', 'sample', _writer('sampler'))
+    assert manager.sampling_training_id(uri) == 'run'
+    assert manager.sampling_training_id('/mnt/external/checkpoint') is None
     load = manager.resolve_load_path(uri)
     assert Path(load.checkpoint_dir, load.checkpoint_name) == Path(public_directory)
     assert manager.resolve_checkpoint_dir(uri) == public_directory
@@ -331,6 +333,7 @@ async def test_load_and_resume_use_public_directory_while_sampler_cache_uses_ver
     assert physical_directory != Path(public_directory)
 
     other = type(manager)('another-token', type(manager.training_run_manager)('another-token'))
+    assert other.sampling_training_id(uri) is None
     with pytest.raises(ValueError, match='not found or access denied'):
         other.resolve_checkpoint_dir(uri)
 

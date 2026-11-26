@@ -1310,8 +1310,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         own micro-batch scales. Parallel-list kwargs (``ref_logps`` and friends) are sliced by
         ``select_batch`` alongside the inputs, so per-feature alignment survives the split.
         """
-        if get_task_spec(kwargs.get('task', 'causal_lm')).readout:
-            # Readout tasks organize labels / decision meta per RECORD, not per sample: the
+        spec = get_task_spec(kwargs.get('task', 'causal_lm'))
+        if spec.readout and not spec.token_level_labels:
+            # Record-level readouts organize labels / decision meta per RECORD, not per sample: the
             # sample-level split here would desynchronize them from the micro-batch logits.
             # Decision always reads out (its task_forward families included); the seq_cls
             # family only when the model carries an attached head -- its legacy in-model
@@ -3077,6 +3078,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             }
 
         trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
+        from twinkle.model.base import warn_cumulative_metric_state_not_restored
+        warn_cumulative_metric_state_not_restored(optimizer_config, 'transformers')
         result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
@@ -3272,71 +3275,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
     def _expand_multimodal_lora_target(self, config, model, *, freeze_llm: bool, freeze_vit: bool,
                                        freeze_aligner: bool) -> None:
-        """Rewrite a multimodal ``'all-linear'`` LoRA target into the freeze_*-aware regex, in place.
-
-        PEFT expands ``'all-linear'`` to every linear in the model, which on a multimodal model would
-        also adapt the vision tower and the aligner -- but legacy swift targets only the *unfrozen*
-        towers (by default the language model alone), and that partition is what ``freeze_*`` express.
-        The expansion needs the real modules, so it runs here on the worker, not on the driver's PROXY.
-
-        Left untouched (so PEFT's own behaviour stands) when the target is not ``'all-linear'`` -- an
-        explicit user regex or name list is respected verbatim -- or when ``model_arch`` declares no
-        vision tower / aligner, i.e. a plain LLM where ``'all-linear'`` already means the right thing.
-        """
-        target = getattr(config, 'target_modules', None)
-        is_all_linear = target == 'all-linear' or (isinstance(target, (list, tuple, set)) and 'all-linear' in target)
-        if not is_all_linear:
-            return
-        if not (self.model_arch.get('vision_tower') or self.model_arch.get('aligner')):
-            return
-        from twinkle.model.transformers.target_modules import get_multimodal_target_regex
-        # Walk the base model: target prefixes in model_arch are base-relative, and when an adapter is
-        # added to an already-peft model the towers live under the wrapped base, not the PeftModel.
-        base_model = model
-        while isinstance(base_model, PeftModel):
-            base_model = base_model.get_base_model()
-        include_embedding = isinstance(target, (list, tuple, set)) and 'all-embedding' in target
-        config.target_modules = get_multimodal_target_regex(
-            base_model,
+        from twinkle.model.transformers.target_modules import expand_multimodal_lora_target
+        expand_multimodal_lora_target(
+            model,
+            config,
             self.model_arch,
             freeze_llm=freeze_llm,
             freeze_vit=freeze_vit,
-            freeze_aligner=freeze_aligner,
-            include_embedding=include_embedding)
+            freeze_aligner=freeze_aligner)
 
     def _expand_modules_to_save(self, config, model) -> None:
-        """Expand the ``'all-norm'`` / ``'all-embedding'`` shorthands in ``modules_to_save``, in place.
-
-        PEFT keeps ``modules_to_save`` entries as full-precision trainable copies and matches each by
-        ``name.endswith(entry)`` -- a shorthand like ``'all-norm'`` matches no module and is silently
-        ignored (``_set_trainable``, ``strict_module_check=False``), so it has to be resolved to concrete
-        module names here first. The expansion needs the real modules, so it runs on the worker, not the
-        driver's PROXY -- the same reason the ``'all-linear'`` target expansion lives here. Unlike that
-        target expansion, ``modules_to_save`` is NOT tower / freeze filtered: every norm / embedding the
-        shorthand names is saved, regardless of which towers are LoRA-adapted (legacy does the same).
-        """
-        modules_to_save = getattr(config, 'modules_to_save', None)
-        if not modules_to_save:
-            return
-        shorthands = ('all-norm', 'all-embedding')
-        if not any(name in shorthands for name in modules_to_save):
-            return
-        from twinkle.model.transformers.target_modules import find_embedding, find_norm
-        # Walk to the base model: when an adapter is added to an already-peft model the real modules
-        # live under the wrapped base, not the PeftModel.
-        base_model = model
-        while isinstance(base_model, PeftModel):
-            base_model = base_model.get_base_model()
-        expanded = [name for name in modules_to_save if name not in shorthands]
-        for shorthand, finder in (('all-embedding', find_embedding), ('all-norm', find_norm)):
-            if shorthand not in modules_to_save:
-                continue
-            found = finder(base_model)
-            if not found:
-                logger.warning(f'modules_to_save {shorthand!r} matched no module on this model; ignored.')
-            expanded += found
-        # de-dup while preserving order (a shorthand may overlap an explicitly-named module).
-        config.modules_to_save = list(dict.fromkeys(expanded))
+        from twinkle.model.transformers.target_modules import expand_modules_to_save
+        expand_modules_to_save(model, config)
 
     @remote_function()
     @timed
@@ -3513,6 +3463,27 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
     # The weight generator is shared by direct and checkpoint-engine sync.
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def prepare_for_lending(self) -> None:
+        """Merge FSDP adapters before their shards leave the accelerator for device lending."""
+        if not isinstance(self.strategy, NativeFSDPStrategy) or getattr(self, '_lent_merged_model', None) is not None:
+            return
+        self._lazy_wrap_model()
+        model = self.strategy.unwrap_model(self.model)
+        if isinstance(model, PeftModel):
+            # Record ownership before merging so a partially failed merge can be undone
+            # on every rank by the lending controller's rollback.
+            self._lent_merged_model = model
+            model.merge_adapter()
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def restore_after_lending(self) -> None:
+        """Unmerge only after the trainer's shards are back on their original device."""
+        model = getattr(self, '_lent_merged_model', None)
+        if model is not None:
+            model.unmerge_adapter()
+            self._lent_merged_model = None
+
     def _get_weight_generator(
         self,
         adapter_name: str = None,
@@ -3561,19 +3532,24 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 # merge and skip lora weigts(already merged)
                 # trim prefix(base_model.model.) and suffix(.base_layer)
                 def weight_generator():
-                    if isinstance(model, PeftModel):
-                        model.merge_adapter()
-                    names = []
-                    for name, tensor in model.state_dict().items():
-                        if is_lora_key(name) or name in _tied_duplicates:
-                            continue
-                        tensor = _checkpoint_tensor(tensor)
-                        name = normalize_param_name(name, keep_base_layer=False)
-                        names.append(name)
-                        yield name, tensor
-                    print_weight_example(names)
-                    if isinstance(model, PeftModel):
-                        model.unmerge_adapter()
+                    merge_here = isinstance(model, PeftModel) and getattr(self, '_lent_merged_model', None) is not model
+                    try:
+                        if merge_here:
+                            model.merge_adapter()
+                        names = []
+                        for name, tensor in model.state_dict().items():
+                            if is_lora_key(name) or name in _tied_duplicates:
+                                continue
+                            tensor = _checkpoint_tensor(tensor)
+                            name = normalize_param_name(name, keep_base_layer=False)
+                            names.append(name)
+                            yield name, tensor
+                        print_weight_example(names)
+                    finally:
+                        # A borrowed-device publication stays merged on CPU until reclaim.
+                        # Ordinary exports still own their temporary merge/unmerge pair.
+                        if merge_here:
+                            model.unmerge_adapter()
             else:
                 # LoRA-only mode: send only adapter weights.
                 # Use PEFT's get_peft_model_state_dict for clean LoRA extraction

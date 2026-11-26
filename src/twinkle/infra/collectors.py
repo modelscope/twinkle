@@ -61,7 +61,7 @@ def tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) -> Dict[
                     merged.extend(v)
                 else:
                     merged.append(v)
-            if isinstance(merged[0], torch.Tensor):
+            if merged and isinstance(merged[0], torch.Tensor):
                 merged = pad_and_stack_tensors(merged)
             result[key] = merged
 

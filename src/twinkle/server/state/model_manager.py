@@ -9,7 +9,6 @@ consistent view of the cluster's model registry without an extra coordination
 actor in front.
 """
 from __future__ import annotations
-
 import functools
 import time
 
@@ -125,12 +124,13 @@ class ModelManager(BaseManager[ModelRecord]):
         # Update without re-applying quota; cannot reuse add().
         await self._backend.set(self._make_key(model_id), record.model_dump())
 
-    async def get_training_records(self, namespace: str):
+    async def get_training_records(self, namespace: str | None = None, *, model_ids: list[str] | None = None):
         from .training_records import TrainingRecord
-        keys = await self._backend.keys('model::*')
+        keys = (await self._backend.keys('model::*') if model_ids is None
+                else [self._make_key(model_id) for model_id in model_ids])
         return [
             TrainingRecord.model_validate(value) for value in await self._backend.mget(keys) if isinstance(value, dict)
-            and value.get('controller_epoch') and value.get('training_namespace') == namespace
+            and value.get('controller_epoch') and (namespace is None or value.get('training_namespace') == namespace)
         ]
 
     async def touch_replica_last_seen(self, replica_id: str) -> None:

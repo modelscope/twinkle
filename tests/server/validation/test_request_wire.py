@@ -17,7 +17,9 @@ from fastapi.exceptions import RequestValidationError
 
 from twinkle.server.deployment import validation_error_handler
 from twinkle.protocol.types import model as model_types
+from twinkle.protocol.types import SampleRequest
 from twinkle.protocol.types.base import StrictRequest
+from twinkle_client._request_builder import request_json
 
 
 @pytest.fixture(scope='module')
@@ -62,6 +64,16 @@ def test_a_valid_body_reaches_the_handler(client):
     response = _post(client, '/forward', _valid_forward())
     assert response.status_code == 200
     assert response.json() == {'reached_handler': True}
+
+def test_native_sampling_omits_deployed_adapter_requirement_by_default():
+    request = SampleRequest(inputs=[{'input_ids': [1]}])
+    assert 'require_deployed_adapter' not in request_json(request)
+
+
+def test_deployed_adapter_selection_rejects_a_checkpoint_override():
+    with pytest.raises(ValidationError, match='Select either the deployed adapter or an explicit adapter_uri'):
+        SampleRequest(inputs=[{'input_ids': [1]}], adapter_name='served-lora', adapter_uri='twinkle://checkpoint',
+                      require_deployed_adapter=True)
 
 
 def test_an_unknown_top_level_field_is_rejected(client):

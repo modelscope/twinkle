@@ -27,7 +27,10 @@ from twinkle.utils import deep_getattr, get_logger
 
 logger = get_logger()
 
-__all__ = ['get_multimodal_target_regex', 'find_all_linears', 'find_layers', 'find_norm', 'find_embedding']
+__all__ = [
+    'get_multimodal_target_regex', 'find_all_linears', 'find_layers', 'find_norm', 'find_embedding',
+    'expand_multimodal_lora_target', 'expand_modules_to_save'
+]
 
 
 def find_layers(model: nn.Module,
@@ -192,3 +195,73 @@ def get_multimodal_target_regex(model: nn.Module,
             f'multimodal target expansion found no linear layer under the unfrozen towers {modules}; '
             f'the threaded model_arch does not match this model. Check the loader\'s ModelArch.')
     return rf'^({"|".join(res)})$'
+
+
+def _unwrap_peft(model: nn.Module) -> nn.Module:
+    """The base model under any ``PeftModel`` wrappers."""
+    from peft import PeftModel
+    while isinstance(model, PeftModel):
+        model = model.get_base_model()
+    return model
+
+
+def expand_multimodal_lora_target(model: nn.Module,
+                                  config,
+                                  model_arch: Dict[str, Any],
+                                  *,
+                                  freeze_llm: bool,
+                                  freeze_vit: bool,
+                                  freeze_aligner: bool) -> None:
+    """Expand transformers/PEFT ``all-linear``; Megatron has its own mcore expansion."""
+    target = getattr(config, 'target_modules', None)
+    is_all_linear = target == 'all-linear' or (isinstance(target, (list, tuple, set)) and 'all-linear' in target)
+    if not is_all_linear:
+        return
+    if not (model_arch.get('vision_tower') or model_arch.get('aligner')):
+        from peft.tuners.tuners_utils import BaseTunerLayer
+        from transformers.pytorch_utils import Conv1D
+
+        base_model = _unwrap_peft(model)
+        # Preserve PEFT's native expansion unless quantized linears are invisible to it.
+        invisible = any(
+            'linear' in type(module).__name__.lower()
+            and not isinstance(module, (nn.Linear, Conv1D, BaseTunerLayer))
+            and type(module).__name__.lower() not in ('glulinear', 'gemma4clippablelinear')
+            and not any(part in name for part in ('lora_A', 'lora_B', 'base_layer'))
+            for name, module in base_model.named_modules())
+        if invisible:
+            expanded = find_all_linears(base_model, model_arch.get('lm_head'), extra_layers=[nn.Linear, Conv1D])
+            if not expanded:
+                raise ValueError("Dense 'all-linear' expansion found no LoRA-able layer; "
+                                 'pass target_modules explicitly.')
+            config.target_modules = (expanded if isinstance(target, str) else list(
+                dict.fromkeys([name for name in target if name != 'all-linear'] + expanded)))
+        return
+    include_embedding = isinstance(target, (list, tuple, set)) and 'all-embedding' in target
+    config.target_modules = get_multimodal_target_regex(
+        _unwrap_peft(model),
+        model_arch,
+        freeze_llm=freeze_llm,
+        freeze_vit=freeze_vit,
+        freeze_aligner=freeze_aligner,
+        include_embedding=include_embedding)
+
+
+def expand_modules_to_save(model: nn.Module, config) -> None:
+    """Expand transformers/PEFT ``all-norm`` / ``all-embedding``; not used by Megatron."""
+    modules_to_save = getattr(config, 'modules_to_save', None)
+    if not modules_to_save:
+        return
+    shorthands = ('all-norm', 'all-embedding')
+    if not any(name in shorthands for name in modules_to_save):
+        return
+    base_model = _unwrap_peft(model)
+    expanded = [name for name in modules_to_save if name not in shorthands]
+    for shorthand, finder in (('all-embedding', find_embedding), ('all-norm', find_norm)):
+        if shorthand not in modules_to_save:
+            continue
+        found = finder(base_model)
+        if not found:
+            logger.warning(f'modules_to_save {shorthand!r} matched no module on this model; ignored.')
+        expanded += found
+    config.modules_to_save = list(dict.fromkeys(expanded))

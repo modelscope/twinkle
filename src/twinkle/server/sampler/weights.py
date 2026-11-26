@@ -43,9 +43,10 @@ async def resolve_sampler_weights(service, resolved_uri: str | None, *, full_che
     return None
 
 
-async def sample_with_weights(service, resolved_uri: str | None, generate):
+async def sample_with_weights(service, resolved_uri: str | None, generate, *, full_checkpoint: bool | None = None):
     """Keep a full checkpoint's load and generation in the same exclusive job."""
-    full_checkpoint = is_full_checkpoint(resolved_uri)
+    if full_checkpoint is None:
+        full_checkpoint = is_full_checkpoint(resolved_uri)
 
     async def job():
         adapter_path = await resolve_sampler_weights(service, resolved_uri, full_checkpoint=full_checkpoint)
