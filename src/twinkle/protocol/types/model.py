@@ -284,6 +284,13 @@ class SetTemplateRequest(TrainingRequest):
     template_cls: str
     init_kwargs: dict[str, JsonValue] = passthrough()
 
+    @field_validator('template_cls')
+    @classmethod
+    def registered_template_name(cls, value):
+        if not value.isidentifier():
+            raise ValueError('HTTP template setup requires a registered class name, not a source path')
+        return value
+
 
 class SetProcessorRequest(TrainingRequest):
     processor_cls: str

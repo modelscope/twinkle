@@ -66,8 +66,8 @@ class IterablePackingDataset(IterableDataset):
         while True:
             i, data = self._in_queue.get()
             try:
-                encoded_data = self.template.encode(data)
-                data.update(encoded_data)
+                encoded = self.template.batch_encode([data])
+                data = encoded[0] if encoded else None
             except BaseException as exc:
                 # Propagate instead of letting the daemon die with the error swallowed: the parent
                 # blocks on _out_queue.get() forever and the whole run hangs with no error output.

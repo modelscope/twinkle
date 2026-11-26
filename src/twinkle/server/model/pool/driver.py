@@ -31,7 +31,8 @@ class RayInstanceDriver:
         tags = {"backend": spec.backend, "mode": spec.mode, "device_type": spec.device_type}
         try:
             allocation = await self.runtime.pool.allocate(
-                spec.config.num_devices, spec.device_type, instance.controller_epoch, instance.instance_id
+                spec.config.num_devices, spec.device_type, instance.controller_epoch, instance.instance_id,
+                node_selector=spec.config.node_selector,
             )
             status = "success"
             return {
@@ -67,6 +68,7 @@ class RayInstanceDriver:
                 "idle_timeout_s",
                 "adapter_config",
                 "queue_config",
+                "node_selector",
             },
             exclude_none=True,
         )

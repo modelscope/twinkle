@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
-from twinkle.data_format import InputFeature
+from twinkle.data_format import InputFeature, Trajectory
 from twinkle.perf import timed
 from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
@@ -187,7 +187,12 @@ class InputProcessor:
             return inputs
 
     def prepare_inputs(self, inputs: list[InputFeature] | InputFeature, **kwargs) -> list[InputFeature]:
+        metadata_keys = Trajectory.__annotations__.keys() - InputFeature.__annotations__.keys()
+
         def to_tensor(_input):
+            metadata = metadata_keys | set(_input.get('_trajectory_columns', ()))
+            # Project only the model view; the caller retains the complete trajectory.
+            _input = {key: value for key, value in _input.items() if key not in metadata and not key.startswith('_')}
             for key in list(_input.keys()):
                 value = _input[key]
                 # Ray/pyarrow can return numpy or list scalars; normalize to tensors.

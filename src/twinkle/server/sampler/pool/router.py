@@ -10,8 +10,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.deployment import bind_deployment, build_deployment_app
+from twinkle.server.exceptions import RequestRejectedError
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.proxy import ForwardedRequest
+from twinkle.server.lifecycle.sampling_target import resolve_tinker_sampling_target
 from twinkle.server.middleware.auth import get_token_from_request, install_api_key_gate
 from twinkle.server.sampler.submission import existing_sample, sample_submission
 from twinkle.server.sampler.weights import is_full_checkpoint
@@ -51,6 +53,16 @@ class SamplerRouter:
                 data = {}
             if not isinstance(data, dict):
                 data = {}
+            path = data.get("adapter_uri")
+            if endpoint == "tinker/asample":
+                base_model, path = await resolve_tinker_sampling_target(
+                    self.state,
+                    base_model=data.get("base_model"),
+                    model_path=data.get("model_path"),
+                    sampling_session_id=data.get("sampling_session_id"),
+                )
+                if base_model and base_model != self.model_id:
+                    raise RequestRejectedError("Requested base model does not match this sampler.")
             if endpoint in ("twinkle/sample", "tinker/asample"):
                 submission = sample_submission(request, endpoint, self.model_id, data)
                 if submission is not None:
@@ -62,10 +74,6 @@ class SamplerRouter:
                             return JSONResponse(envelope.model_dump(mode="json"))
                         return JSONResponse({"request_id": submission.request_id, "model_id": None})
             # The existing handler remains responsible for its validation/wire errors.
-            path = data.get("adapter_uri") or data.get("model_path")
-            if not path and endpoint == "tinker/asample" and data.get("sampling_session_id"):
-                session = await self.state.get_sampling_session(data["sampling_session_id"])
-                path = session.get("model_path") if session else None
             if path:
                 client_type = "tinker" if endpoint.startswith("tinker/") else "twinkle"
                 _, resolved = create_checkpoint_manager(

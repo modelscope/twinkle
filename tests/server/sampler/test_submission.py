@@ -101,6 +101,7 @@ async def test_tinker_retries_submission_and_polling_with_the_same_sequence(samp
 
     init_tinker_client()
     queue, calls = sampler_queue
+    await queue.state.create_sampling_session({'base_model': 'base'}, sampling_session_id='test-session')
 
     def routes(app, _):
         _register_tinker_sampler_routes(app, lambda: queue)

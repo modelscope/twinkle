@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from twinkle.data_format import Trajectory, user_data_get
-from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingParams
+from twinkle.data_format.sampling import SampledSequence, SampleResponse, SamplingMask, SamplingParams
 from twinkle.infra import remote_class, remote_function
 from twinkle.protocol.types.sampler import SampleResponseModel
 from twinkle.template.base import Template
@@ -238,7 +238,11 @@ def _single_sequence(responses: Any) -> SampledSequence:
         raise RuntimeError(f'SampleResponse contains {len(response.sequences)} sequences; expected exactly one.')
     sequence = response.sequences[0]
     if isinstance(response, SampleResponseModel):
-        return SampledSequence(**sequence.model_dump())
+        payload = {name: getattr(sequence, name) for name in SampledSequence.__dataclass_fields__}
+        if sequence.sampling_masks is not None:
+            payload['sampling_masks'] = SamplingMask(token_ids=list(sequence.sampling_masks.token_ids),
+                                                    offsets=list(sequence.sampling_masks.offsets))
+        return SampledSequence(**payload)
     return sequence
 
 
@@ -1022,17 +1026,17 @@ class MultiTurnRollout:
     def _generate(self, ep: _Episode, ledger, params: SamplingParams) -> SampledSequence:
         """One generation for the episode, from the sampler or the ``response_callback``."""
         if self.response_callback is not None:
-            state = ledger.state if ledger.state is not None else ledger.input_feature
-            seq = self.response_callback(self._view(ep), state, params)
+            seq = self.response_callback(self._view(ep), ledger.input_feature, params)
         else:
-            use_state = ledger.state is not None and getattr(type(self.sampler), 'accepts_rollout_state', False)
-            responses = self.sampler.sample([ledger.state if use_state else ledger.input_feature],
+            responses = self.sampler.sample([ledger.input_feature],
                                             sampling_params=params,
                                             session_id=ep.episode_id,
                                             **self._adapter_kwargs)
             seq = _single_sequence(responses)
         if not isinstance(seq, SampledSequence):
             raise TypeError(f'expected SampledSequence, got {type(seq).__name__}')
+        if seq.stop_reason == 'error' and not seq.tokens:
+            raise APIGenerationError(seq.decoded or 'sampler returned an error without generated tokens')
         return seq
 
     @staticmethod
@@ -1102,7 +1106,7 @@ class MultiTurnRollout:
 
         # A reply cut off at max_tokens is truncated in exactly the sense the flag names;
         # tool calls it happens to contain are not dispatched.
-        if seq.stop_reason == 'length' or ledger.full():
+        if seq.stop_reason in ('length', 'abort', 'error') or ledger.full():
             ep.truncated = True
             return self._finish_tool_episode(ep)
 
@@ -1391,6 +1395,10 @@ class MultiTurnRollout:
             ep.ledger = ledger
             ep.segments += 1
         ep.stop_reason = seq.stop_reason
+        if seq.stop_reason in ('abort', 'error'):
+            ep.truncated = True
+            request.reply.set_exception(APIGenerationError(f'generation terminated with {seq.stop_reason}'))
+            return self._finish(ep, segments=ep.segments)
 
         # Decoded off the sampled ids rather than taken from ``seq.decoded``, which keeps
         # the template's end-of-turn marker -- a marker the agent would write into its files.
@@ -1450,6 +1458,10 @@ class MultiTurnRollout:
             raise EpisodeError(f'episode {ep.episode_id!r}: generation failed: {error}') from error
         ledger.record_continuation(seq)
         ep.stop_reason = seq.stop_reason
+        if seq.stop_reason in ('abort', 'error'):
+            ep.truncated = True
+            request.reply.set_exception(APIGenerationError(f'generation terminated with {seq.stop_reason}'))
+            return self._finish(ep, segments=ep.segments)
         text = ledger.decode_tokens(seq)
         parsed = ledger.parse_tool_call(prev_raw + text)
         message = assistant_message(text, parsed, self.template.clean_tool_call(text) if parsed else text)

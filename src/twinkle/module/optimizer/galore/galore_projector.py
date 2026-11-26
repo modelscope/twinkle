@@ -26,8 +26,6 @@ class GaLoreOptimizerStateMixin:
             state[pid] = entry
         # Rebuild before Optimizer recursively casts dictionaries to the parameter dtype.
         super().load_state_dict({**state_dict, 'state': state}, *args, **kwargs)
-        if not (args[0] if args else kwargs.get('move_to_device', True)):
-            return
         for param, entry in self.state.items():
             projector = entry.get('projector')
             if isinstance(projector, GaLoreProjector) and projector.ortho_matrix is not None:

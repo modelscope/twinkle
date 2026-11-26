@@ -129,6 +129,10 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
         processor_id = body.processor_id
         function_name = body.function
         _kwargs = dict(body.call_kwargs)
+        if function_name == 'set_template' and _kwargs.get('template_spec') is not None:
+            name = _kwargs.get('template_func', _kwargs.get('template_cls'))
+            if not isinstance(name, str) or not name.isidentifier():
+                raise RequestRejectedError('HTTP TemplateSpec setup requires a registered template class name')
         processor_id = processor_id[4:]
         self.assert_resource_exists(processor_id)
         processor = self.resource_dict.get(processor_id)

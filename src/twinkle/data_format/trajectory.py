@@ -18,10 +18,13 @@ class Trajectory(InputFeature, total=False):
     tools: List[Tool]
     # PyArrow-stable encoding: each entry is (key, json.dumps(value)). Use the helpers below.
     user_data: List[Tuple[str, str]]
-    images: Optional[List[Union[str, Any]]]
-    videos: Optional[List[Union[str, Any]]]
-    audios: Optional[List[Union[str, Any]]]
+    # Raw media and sampling metadata are not model tensor inputs.
+    images: Optional[List[Any]]
+    videos: Optional[List[Any]]
+    audios: Optional[List[Any]]
     prompt: Optional[str]
+    engine_input_ids: List[int]
+    reasoning_started: bool
     # Identity: episode_id unique per episode; group_key groups one prompt's generations.
     episode_id: str
     group_key: Any
@@ -63,6 +66,23 @@ RESPONSE_FRAME_FIELDS = frozenset({
     'response_token_ids', 'rollout_logps', 'ref_logps', 'old_logps', 'teacher_logps',
     'advantages', 'returns', 'old_values', 'sampling_masks',
 })
+
+
+def copy_trajectory(trajectory: Mapping[str, Any]) -> Trajectory:
+    """Copy mutable containers while sharing media and tensors across independent candidates."""
+    from .sampling import SamplingMask
+    def copy_value(value):
+        if isinstance(value, SamplingMask):
+            return SamplingMask(token_ids=list(value.token_ids), offsets=list(value.offsets))
+        if isinstance(value, dict):
+            return {key: copy_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [copy_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(copy_value(item) for item in value)
+        return value
+
+    return {key: copy_value(value) for key, value in trajectory.items()}
 
 
 def pack_value(value: Any) -> str:
@@ -160,8 +180,12 @@ def assert_response_frame(trajectory: Trajectory, field: str) -> None:
     if values is None:
         raise ValueError(f'{field} is missing on trajectory {trajectory.get("episode_id")!r}')
     expected = len(trajectory.get('response_token_ids') or ())
-    if len(values) != expected:
-        raise ValueError(f'{field} has {len(values)} entries but trajectory '
+    offsets = None
+    if field == 'sampling_masks':
+        offsets = values.get('offsets') if isinstance(values, Mapping) else getattr(values, 'offsets', None)
+    actual = len(offsets) - 1 if offsets is not None else len(values)
+    if actual != expected:
+        raise ValueError(f'{field} has {actual} entries but trajectory '
                          f'{trajectory.get("episode_id")!r} has {expected} response tokens')
 
 

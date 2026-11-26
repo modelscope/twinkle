@@ -21,6 +21,7 @@ wrong callable -- a silently wrong result rather than an error.
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import asdict, is_dataclass
 from pydantic import BaseModel
 from typing import Any, Mapping
@@ -49,10 +50,8 @@ def to_wire_value(value: Any) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [to_wire_value(item) for item in value]
 
-    from peft import LoraConfig
-
     from twinkle.protocol.serialize import is_dataset_meta, serialize_object
-    if isinstance(value, LoraConfig) or is_dataset_meta(value):
+    if isinstance(value, getattr(sys.modules.get('peft'), 'LoraConfig', ())) or is_dataset_meta(value):
         return serialize_object(value)
     if is_dataclass(value) and not isinstance(value, type):
         return to_wire_value(asdict(value))
@@ -75,6 +74,16 @@ def build_request(model_cls: type[BaseModel], /, **values: Any) -> BaseModel:
     """
     declared = model_cls.model_fields
     regions = fields_with_role(model_cls, FieldRole.Passthrough)
+    if 'template_cls' in declared and 'template_cls' in values and not isinstance(values['template_cls'], str):
+        from twinkle.template.utils import template_request
+        values = dict(values)
+        control = {key: values.pop(key) for key in list(values) if key in declared and key != 'init_kwargs'}
+        explicit = values.pop('init_kwargs', {}) or {}
+        collisions = set(values) & set(explicit)
+        if collisions:
+            raise TwinkleClientValidationError(f'template kwargs were passed twice: {sorted(collisions)}')
+        template_cls, options = template_request(control.pop('template_cls'), {**explicit, **values})
+        values = {**control, 'template_cls': template_cls, 'init_kwargs': options}
 
     body: dict[str, Any] = {}
     routed: dict[str, Any] = {}

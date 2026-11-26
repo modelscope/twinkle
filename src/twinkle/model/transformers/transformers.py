@@ -1562,7 +1562,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         generation_target = self.model if hasattr(self.model, 'generate') else unwrapped_model
         engine = TransformersEngine(self.tokenizer_id, model=generation_target, tokenizer=template.tokenizer)
 
-        encoded, states, failures = generation.encode_all(
+        encoded, failures = generation.encode_all(
             template, inputs_list, logprobs_only=logprobs_only, strict=strict)
         results: List[Optional[SampleResponse]] = [None] * len(inputs_list)
         for index, response in failures.items():
@@ -1574,31 +1574,24 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # responsive and Ray forbids asyncio.run, so there is nothing to gain from batch_sample's
             # loop-and-thread hop (and its lock, which would be bound to the wrong loop).
             return engine.generate_batch(
-                prompts, params, num_samples=params.num_samples, logprobs=params.logprobs is not None,
+                prompts,
+                params,
+                num_samples=params.num_samples,
+                logprobs=params.logprobs is not None,
                 include_prompt_logprobs=params.prompt_logprobs is not None,
                 topk_prompt_logprobs=params.prompt_logprobs or 0,
-                extra_model_inputs=extra or None)
+                extra_model_inputs=extra or None,
+            )
 
         lora_ctx = (unwrapped_model.disable_adapter()
                     if use_base_model and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
         with lora_ctx:
             for chunk in generation.chunks(pending, _GENERATION_MAX_BATCH_SIZE):
                 for index, response in zip(
-                        chunk, generation.run_chunk(chunk, encoded, states, call_batch, strict=strict)):
+                        chunk, generation.run_chunk(chunk, encoded, call_batch, template=template, strict=strict)):
                     results[index] = response
 
-        if not logprobs_only:
-            generation.attach_features(template, results, encoded, states)
-        else:
-            # "Score, do not generate": discard the one token generated to carry the prompt
-            # logprobs, matching the vLLM backend and TransformersSampler.sample.
-            for response in results:
-                if response is None:
-                    continue
-                for seq in response.sequences:
-                    seq.tokens = []
-                    seq.logprobs = None
-                    seq.decoded = None
+        generation.attach_features(template, results, encoded, logprobs_only=logprobs_only)
         return [
             r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
         ]
@@ -3323,9 +3316,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        if 'template_spec' not in kwargs:
-            kwargs['model_id'] = self.tokenizer_id
-        optimizer_config.template = construct_template(template_cls, **kwargs)
+        optimizer_config.template = construct_template(template_cls, _default_model_id=self.tokenizer_id, **kwargs)
 
     @remote_function()
     @timed

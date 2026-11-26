@@ -8,7 +8,7 @@ from .sampling import (PoolingParams, PoolingResponse, SampledSequence, SampleRe
 from .tq_fields import (REQUIRED_MODEL_INPUT_FIELDS, ROLLOUT_TRAIN_FIELDS, TRANSFORMERS_INPUT_FIELDS,
                         columns_to_tq_fields, rows_to_tq_fields)
 from .trajectory import (CONVERSATION_FIELDS, RESPONSE_FRAME_FIELDS, Trajectory, assert_response_frame,
-                         attach_user_data, conversation, ground_truth, last_assistant_text, msg_content_text,
+                         attach_user_data, conversation, copy_trajectory, ground_truth, last_assistant_text, msg_content_text,
                          pack_user_data, pack_value, trainable_runs, turn_token_spans, user_data_get,
                          validate_trajectory)
 

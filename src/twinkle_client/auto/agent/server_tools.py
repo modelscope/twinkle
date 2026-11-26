@@ -268,7 +268,7 @@ class _ServerTools:
                     'log_path':
                     log_path,
                     'hint':
-                    'Check required packages (pip install -e ".[client,server,rl]"; '
+                    'Check required packages (pip install -e ".[client,server]"; '
                     'add the megatron extra for the Megatron backend).',
                 }
             try:
