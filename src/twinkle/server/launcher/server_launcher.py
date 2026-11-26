@@ -53,6 +53,8 @@ def ensure_ray_cluster(*, namespace: str, address: str | None = None, persistent
 
     if ray.is_initialized():
         return
+    if address in (None, 'auto'):
+        address = os.environ.get('RAY_ADDRESS') or address
     if address == 'local':
         address = None
     if persistent and address is None:
@@ -61,11 +63,25 @@ def ensure_ray_cluster(*, namespace: str, address: str | None = None, persistent
         import subprocess
         import sys
 
+        from ray._private.services import find_bootstrap_address
+
         # A detached deployment needs a head whose lifetime is independent of this driver.
-        try:
-            with socket.create_connection(('127.0.0.1', 6379), timeout=1.0):
-                pass
-        except OSError:
+        # Attach by the head's CONCRETE recorded address (whatever host/port it actually uses,
+        # read from Ray's own session record -- not a hardcoded 6379): ray.init('auto') lets
+        # RAY_ADDRESS=local spawn a driver-owned ephemeral head, and ray.shutdown() at driver
+        # exit would then kill the "detached" deployment. A concrete address is never overridden.
+        def _head_alive(addr: str | None) -> bool:
+            if not addr:
+                return False
+            host, _, port = addr.rpartition(':')
+            try:
+                with socket.create_connection((host, int(port)), timeout=1.0):
+                    return True
+            except (OSError, ValueError):
+                return False
+
+        address = find_bootstrap_address(None)
+        if not _head_alive(address):
             executable = Path(sys.executable).parent / 'ray'
             ray_cli = str(executable) if executable.is_file() else shutil.which('ray')
             if ray_cli is None:
@@ -73,7 +89,9 @@ def ensure_ray_cluster(*, namespace: str, address: str | None = None, persistent
             result = subprocess.run([ray_cli, 'start', '--head'], capture_output=True, text=True)
             if result.returncode:
                 raise RuntimeError(f'Ray head startup failed:\n{result.stdout}\n{result.stderr}')
-        address = 'auto'
+            address = find_bootstrap_address(None)
+            if not _head_alive(address):
+                raise RuntimeError(f'Ray head started but is not reachable at {address!r}.')
     init_kwargs: dict[str, Any] = {
         'namespace': namespace,
         'runtime_env': build_ray_runtime_env(),
