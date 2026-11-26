@@ -191,20 +191,14 @@ class SamplingParams:
             gen_kwargs["eos_token_id"] = tokenizer.eos_token_id
 
             if self.stop:
-                if isinstance(self.stop, str):
-                    stop_ids = tokenizer.encode(self.stop, add_special_tokens=False)
-                    if stop_ids:
-                        gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + stop_ids
-                elif isinstance(self.stop, (list, tuple)):
-                    if self.stop and isinstance(self.stop[0], int):
-                        gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + list(self.stop)
-                    else:
-                        all_stop_ids = [tokenizer.eos_token_id]
-                        for s in self.stop:
-                            ids = tokenizer.encode(s, add_special_tokens=False)
-                            if ids:
-                                all_stop_ids.extend(ids)
-                        gen_kwargs["eos_token_id"] = all_stop_ids
+                if not isinstance(self.stop, str) and isinstance(self.stop[0], int):
+                    eos = tokenizer.eos_token_id
+                    eos_ids = [] if eos is None else ([eos] if isinstance(eos, int) else list(eos))
+                    gen_kwargs["eos_token_id"] = eos_ids + list(self.stop)
+                else:
+                    from transformers import StopStringCriteria, StoppingCriteriaList
+                    stops = [self.stop] if isinstance(self.stop, str) else list(self.stop)
+                    gen_kwargs["stopping_criteria"] = StoppingCriteriaList([StopStringCriteria(tokenizer, stops)])
 
         return gen_kwargs
 

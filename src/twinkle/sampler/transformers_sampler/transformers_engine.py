@@ -237,7 +237,8 @@ class TransformersEngine(BaseSamplerEngine):
 
         async with self._generate_lock:
             self._activate_adapter(lora_request)
-            streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+            streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True,
+                                            clean_up_tokenization_spaces=False if params.stop else None)
             gen_kwargs = self._build_gen_kwargs(params, num_samples=1, logprobs=False)
             gen_kwargs['streamer'] = streamer
             inputs = self._to_model_inputs([prompt])
@@ -256,15 +257,29 @@ class TransformersEngine(BaseSamplerEngine):
 
             loop = asyncio.get_running_loop()
             sentinel = object()
+            stops = [params.stop] if isinstance(params.stop, str) else list(params.stop or ())
+            strings = [stop for stop in stops if isinstance(stop, str)]
+            # Hold potential stop prefixes so excluded text is never emitted and then retracted.
+            hold = max((len(stop) - 1 for stop in strings), default=0)
+            pending = ''
+            matched = False
             while True:
                 delta = await loop.run_in_executor(None, lambda: next(streamer, sentinel))
                 if delta is sentinel:
                     break
-                if delta:
-                    yield delta, None
+                if not delta or matched:
+                    continue
+                pending, matched = self._trim_stop_text(pending + delta, params)
+                ready = len(pending) if matched else max(0, len(pending) - hold)
+                if ready:
+                    yield pending[:ready], None
+                    pending = pending[ready:]
             thread.join()
+            if pending:
+                yield pending, None
             new_tokens = produced[0] if produced else 0
-            yield '', ('length' if params.max_tokens and new_tokens >= params.max_tokens else 'stop')
+            reason = 'length' if params.max_tokens and new_tokens >= params.max_tokens else 'stop'
+            yield '', ('stop' if matched else reason)
 
     # ------------------------------------------------------------------ weights / memory
 
@@ -409,12 +424,15 @@ class TransformersEngine(BaseSamplerEngine):
             for offset in range(num_samples):
                 row = index * num_samples + offset
                 tokens = _strip_padding(completions[row], self.tokenizer.pad_token_id)
+                decoded = self.tokenizer.decode(
+                    tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False if params.stop else None)
+                decoded, matched = self._trim_stop_text(decoded, params)
                 seqs.append(
                     SampledSequence(
-                        stop_reason='length' if max_new and len(tokens) >= max_new else 'stop',
+                        stop_reason='length' if max_new and len(tokens) >= max_new and not matched else 'stop',
                         tokens=tokens,
                         logprobs=None if step_logprobs is None else step_logprobs[row][:len(tokens)],
-                        decoded=self.tokenizer.decode(tokens, skip_special_tokens=True),
+                        decoded=decoded,
                     ))
             responses.append(
                 SampleResponse(
@@ -423,6 +441,19 @@ class TransformersEngine(BaseSamplerEngine):
                     prompt_logprobs=None if prompt_logprobs is None else prompt_logprobs[index],
                 ))
         return responses
+
+    @staticmethod
+    def _trim_stop_text(text: str, params: SamplingParams) -> Tuple[str, bool]:
+        """Trim text, not sampled tokens: a stop can start or end inside a token."""
+        stops = [params.stop] if isinstance(params.stop, str) else list(params.stop or ())
+        if not stops or isinstance(stops[0], int):
+            return text, False
+        matches = [(text.find(stop), stop) for stop in stops if stop and text.find(stop) >= 0]
+        if not matches:
+            return text, False
+        start, stop = min(matches, key=lambda match: match[0])
+        end = start + len(stop) if params.include_stop_str_in_output else start
+        return text[:end], True
 
     def _prompt_logprobs(self, inputs: Dict[str, Any], topk: int) -> List[List[Optional[float]]]:
         """Score the prompt itself -- ``generate()`` never does, so this is a second forward pass."""
