@@ -231,7 +231,17 @@ class TransformersEngine(BaseSamplerEngine):
         so the bridge here is a thread + a thread-safe queue drained from the event loop. finish_reason
         is only known once generation ends, hence the final ``('', reason)`` tuple.
         """
-        from transformers import TextIteratorStreamer
+        from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
+
+        class _AbortOnEvent(StoppingCriteria):
+            """Ends ``model.generate`` once ``aborted`` is set; checked between decoding steps."""
+
+            def __init__(self, aborted: threading.Event):
+                super().__init__()
+                self.aborted = aborted
+
+            def __call__(self, input_ids, scores, **kwargs) -> bool:
+                return self.aborted.is_set()
 
         params = sampling_params or SamplingParams()
         self._check_lengths([prompt], params)
@@ -242,6 +252,14 @@ class TransformersEngine(BaseSamplerEngine):
                                             clean_up_tokenization_spaces=False if params.stop else None)
             gen_kwargs = self._build_gen_kwargs(params, num_samples=1, logprobs=False)
             gen_kwargs['streamer'] = streamer
+            # Cooperative stop for an abandoned stream: checked between decoding steps. Appended, not
+            # assigned: ``to_transformers`` already installs a ``StopStringCriteria`` when ``params.stop``
+            # is a string list.
+            aborted = threading.Event()
+            criteria = gen_kwargs.get('stopping_criteria')
+            if criteria is None:
+                criteria = gen_kwargs['stopping_criteria'] = StoppingCriteriaList()
+            criteria.append(_AbortOnEvent(aborted))
             inputs = self._to_model_inputs([prompt], extra_model_inputs)
             produced: List[int] = []
             eos_ids = gen_kwargs.get('eos_token_id')
@@ -251,36 +269,42 @@ class TransformersEngine(BaseSamplerEngine):
                 try:
                     out = self.model.generate(**inputs, **gen_kwargs)
                     sequences = out.sequences if hasattr(out, 'sequences') else out
-                    produced.extend(_strip_padding(sequences[0, inputs['input_ids'].shape[-1] :], eos_ids))
+                    produced.extend(_strip_padding(sequences[0, inputs['input_ids'].shape[-1]:], eos_ids))
                 except Exception as exc:  # surfaced to the consumer via the queue below
                     streamer.on_finalized_text('', stream_end=True)
                     raise exc
 
             thread = threading.Thread(target=_run, daemon=True, name='TransformersEngine-stream')
             thread.start()
-
-            loop = asyncio.get_running_loop()
-            sentinel = object()
-            stops = [params.stop] if isinstance(params.stop, str) else list(params.stop or ())
-            strings = [stop for stop in stops if isinstance(stop, str)]
-            # Hold potential stop prefixes so excluded text is never emitted and then retracted.
-            hold = max((len(stop) - 1 for stop in strings), default=0)
-            pending = ''
-            matched = False
-            while True:
-                delta = await loop.run_in_executor(None, lambda: next(streamer, sentinel))
-                if delta is sentinel:
-                    break
-                if not delta or matched:
-                    continue
-                pending, matched = self._trim_stop_text(pending + delta, params)
-                ready = len(pending) if matched else max(0, len(pending) - hold)
-                if ready:
-                    yield pending[:ready], None
-                    pending = pending[ready:]
-            thread.join()
-            if pending:
-                yield pending, None
+            try:
+                loop = asyncio.get_running_loop()
+                sentinel = object()
+                stops = [params.stop] if isinstance(params.stop, str) else list(params.stop or ())
+                strings = [stop for stop in stops if isinstance(stop, str)]
+                # Hold potential stop prefixes so excluded text is never emitted and then retracted.
+                hold = max((len(stop) - 1 for stop in strings), default=0)
+                pending = ''
+                matched = False
+                while True:
+                    delta = await loop.run_in_executor(None, lambda: next(streamer, sentinel))
+                    if delta is sentinel:
+                        break
+                    if not delta or matched:
+                        continue
+                    pending, matched = self._trim_stop_text(pending + delta, params)
+                    ready = len(pending) if matched else max(0, len(pending) - hold)
+                    if ready:
+                        yield pending[:ready], None
+                        pending = pending[ready:]
+                if pending:
+                    yield pending, None
+            finally:
+                # Whatever ends the stream -- completion, a consumer that closed it early, an error --
+                # ``model.generate`` must have stopped before the lock is released, or the next
+                # generate / weight sync runs concurrently with this one on the same nn.Module.
+                # On completion the criteria is already satisfied and the join is immediate.
+                aborted.set()
+                thread.join()
             max_new = gen_kwargs.get('max_new_tokens')
             yield (
                 '',
