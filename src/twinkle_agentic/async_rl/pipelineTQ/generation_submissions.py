@@ -193,11 +193,7 @@ class GenerationSubmissionMixin:
     def collect_generation(self, submission_id: str):
         self._check_generation_control()
         if not hasattr(self, '_sampler_workers'):
-            from twinkle.infra import _lazy_collect
-            result = self._collect_generation(submission_id)
-            if not getattr(self, '_lazy_collect', _lazy_collect) and callable(result):
-                return result()
-            return result
+            return self._collect_generation(submission_id)
         with self._worker_lock:
             owner = self._generation_owner(submission_id)
             if owner.submitting or owner.collection is not None or owner.cancelling:

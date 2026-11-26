@@ -57,10 +57,21 @@ class _GenerationGate:
 
 
 class Sampler(ABC):
+    # The teardown entries of every sampler: ``close`` composes the subclass ``shutdown``
+    # (below) and releases the owned replicas; ``shutdown`` is the entry drivers call
+    # directly at the end of an infer or eval run.
+    _lifecycle = ('close', 'shutdown')
 
     def __init__(self):
         self.engine = None
         self.template = None
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def close(self) -> None:
+        """Shut down this sampler's engine before its owned replicas are released."""
+        shutdown = getattr(self, 'shutdown', None)
+        if shutdown is not None:
+            shutdown()
 
     def _init_template(self, template: Optional[Union[Template, Type[Template], str]],
                        template_kwargs: Optional[dict] = None) -> None:
@@ -298,9 +309,9 @@ class Sampler(ABC):
         finally:
             ids.discard(request_id)
 
-    async def _abort_all_inflight(self) -> int:
+    async def _abort_requests(self, request_ids) -> int:
         aborted = 0
-        for request_id in list(self.__dict__.get('_inflight_request_ids', ())):
+        for request_id in request_ids:
             try:
                 await self.engine.abort_request(request_id)
                 aborted += 1
@@ -308,12 +319,29 @@ class Sampler(ABC):
                 logger.warning('Failed to abort in-flight request %s: %s', request_id, error)
         return aborted
 
+    async def _abort_all_inflight(self) -> int:
+        return await self._abort_requests(list(self.__dict__.get('_inflight_request_ids', ())))
+
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def abort_all_inflight(self) -> dict:
         """Abort every in-flight generation on this replica (server shutdown)."""
         if not hasattr(self, '_async_loop'):
             return {'aborted': 0}
         return {'aborted': asyncio.run_coroutine_threadsafe(self._abort_all_inflight(), self._async_loop).result()}
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def abort_requests(self, request_ids: List[str]) -> dict:
+        """Abort specific in-flight requests, leaving the replica's other generations running.
+
+        The failed-group sibling cleanup: when one request of a submitted group fails, the group's
+        result is discarded, so its siblings would otherwise burn engine capacity to an end nobody
+        reads. Aborting an already-finished or unknown id is a harmless engine no-op, which is what
+        makes the dispatch='all' fan-out safe (the ids live on one replica only).
+        """
+        if not hasattr(self, '_async_loop'):
+            return {'aborted': 0}
+        return {'aborted': asyncio.run_coroutine_threadsafe(self._abort_requests(request_ids),
+                                                            self._async_loop).result()}
 
     def _drain(self) -> None:
         """Replica removal: abort what is running so those requests are resubmitted elsewhere."""

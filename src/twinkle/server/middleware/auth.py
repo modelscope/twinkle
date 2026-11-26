@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import secrets
 from typing import Any
 
 from fastapi import Request
@@ -8,6 +9,48 @@ from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, H_CLIENT_ID, H_REQU
 from twinkle.server.identity import current_tenant_fingerprint, tenant_fingerprint
 
 _OPENAI_COMPAT_SUFFIXES = ('/chat/completions', '/models')
+
+
+def deny_without_api_key(request: Request, api_key: str | None) -> JSONResponse | None:
+    """A 401 when ``api_key`` is configured and the request lacks a matching Bearer token.
+
+    The deployment-level credential check shared by every public HTTP ingress (gateway and
+    sampler alike): ``verify_request_token`` only extracts the tenant identity -- its
+    ``is_token_valid`` hook accepts every token by design -- so an ingress that must be
+    authenticated installs this gate on top. ``None`` means the operator opted out of auth.
+    Accepts the same two headers the gateway forwards to the sampler (``Twinkle-Authorization``
+    first, then ``Authorization``), and compares in constant time.
+    """
+    if api_key is None:
+        return None
+    header = request.headers.get(H_AUTH_TWINKLE) or request.headers.get(H_AUTH) or ''
+    supplied = header[len('Bearer '):] if header.startswith('Bearer ') else ''
+    if not supplied or not secrets.compare_digest(supplied.encode(), api_key.encode()):
+        return JSONResponse(
+            status_code=401,
+            content={'detail': 'Missing or invalid API key; send "Authorization: Bearer <key>".'},
+        )
+    return None
+
+
+def install_api_key_gate(app, api_key: str | None, *, open_suffixes: tuple[str, ...] = ('/healthz',)) -> None:
+    """Register the Bearer gate as the OUTERMOST middleware of a deployment app.
+
+    Registered after ``build_deployment_app``'s stack so a rejected request short-circuits
+    before identity extraction or any handler runs. ``open_suffixes`` keeps liveness probes
+    reachable without credentials (matched on the path suffix because the app is mounted
+    under a deployment-specific route prefix it does not itself know).
+    """
+    if api_key is None:
+        return
+
+    @app.middleware('http')
+    async def require_api_key(request: Request, call_next):
+        if not any(request.url.path.endswith(suffix) for suffix in open_suffixes):
+            denied = deny_without_api_key(request, api_key)
+            if denied is not None:
+                return denied
+        return await call_next(request)
 
 
 async def verify_request_token(request: Request, call_next):

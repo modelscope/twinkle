@@ -279,7 +279,10 @@ class GRPOMetric(Metric):
         mask: 'torch.Tensor',
         mask_f: 'torch.Tensor',
     ) -> None:
-        smp = align_logps_to_mask(sampler_slice, mask, logps_raw.dtype)
+        # Reconciliation lane: a short sampler row is the very gap this panel reports
+        # (sampler_token_delta), so tolerate it here -- unlike the ratio legs, which fail loud.
+        # Rows are per-token logps: a 1-element row is a one-token response, not a scalar.
+        smp = align_logps_to_mask(sampler_slice, mask, logps_raw.dtype, strict=False, broadcast_scalar=False)
         if smp is None:
             return
         rows = sampler_slice if isinstance(sampler_slice, (list, tuple)) else [sampler_slice]
@@ -290,7 +293,8 @@ class GRPOMetric(Metric):
             except TypeError:
                 lens.append(1)
         self.n_sampler_given += sum(lens)
-        cov = align_logps_to_mask([[1.0] * n for n in lens], mask, logps_raw.dtype)
+        cov = align_logps_to_mask([[1.0] * n for n in lens], mask, logps_raw.dtype,
+                                  strict=False, broadcast_scalar=False)
         if cov is None:
             return
         valid = cov * mask_f

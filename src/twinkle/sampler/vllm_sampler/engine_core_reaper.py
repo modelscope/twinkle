@@ -1,150 +1,115 @@
-"""Ray-independent reaping of vLLM EngineCore subprocesses (defect58 part②).
-
-The vLLM v1 ``AsyncLLM`` spawns its EngineCore as a separate OS process via
-``CoreEngineProcManager`` (vllm/v1/engine/utils.py). That process is NOT inside the ray actor
-lifecycle: when the raylet dies first, ``cluster.sampler.shutdown()`` is a ray RPC that raises
-``ActorDiedError`` and never runs ``VLLMEngine.shutdown()`` (which lives inside the actor), so the
-EngineCore is reparented to init and holds the whole GPU's memory indefinitely. vLLM's own
-``weakref.finalize`` also runs inside the actor and is skipped on SIGKILL. ``ray stop --force``
-cannot reap it either (its process name contains no 'ray').
-
-Fix: the actor records its EngineCore PIDs to a shared file at creation (ray healthy); the driver,
-which captures the ray job id at setup, reaps those PIDs directly at teardown -- bypassing the dead
-actor. The shared anchor is the ray job id (both sides derive it from the runtime context while ray
-is healthy) plus a fixed directory, so no env var (raylet env inheritance is unreliable) and no
-constructor plumbing through the sampler/builder chain is needed.
-
-Safety: this is a best-effort safety net, never a hard dependency. Recording is gated on running as
-a ray actor; reaping identity-verifies each PID (cmdline must still look like an EngineCore) before
-SIGTERM so a reused PID is not killed. Every step isolates exceptions.
-"""
-import glob
-import json
+# Copyright (c) ModelScope Contributors. All rights reserved.
+import contextvars
+import functools
 import os
-import signal
-import tempfile
-
-import logging
-
-logger = logging.getLogger(__name__)
-
-#: Fixed shared directory both the actor (writer) and driver (reader) derive without env/plumbing.
-ENGINE_CORE_PID_DIR = os.path.join(tempfile.gettempdir(), 'twinkle_engine_core_pids')
+import threading
+import weakref
 
 
-def _engine_core_pids(engine):
-    """Best-effort read of the EngineCore subprocess PIDs from a vLLM AsyncLLM (version-guarded).
-
-    vLLM 0.23 path: engine.engine_core (AsyncMPClient) -> .resources (BackgroundResources)
-    -> .engine_manager (CoreEngineProcManager) -> .processes[*].pid. Older/other layouts differ;
-    a missing link yields [] (the reaper is a safety net, not a hard dependency).
-    """
-    pids = []
-    try:
-        core = getattr(engine, 'engine_core', None)
-        resources = getattr(core, 'resources', None)
-        manager = getattr(resources, 'engine_manager', None)
-        processes = getattr(manager, 'processes', None) or []
-        for proc in processes:
-            pid = getattr(proc, 'pid', None)
-            if pid:
-                pids.append(int(pid))
-    except Exception as e:  # noqa: BLE001 - safety net must never break engine creation
-        logger.warning('engine_core_reaper: could not read EngineCore PIDs: %r', e)
-    return pids
+_PARENT_WRITERS = set()
+_OWNER = contextvars.ContextVar('twinkle_engine_core_owner', default=None)
+_INSTALL_LOCK = threading.Lock()
 
 
-def record_engine_core_pids(engine):
-    """Actor side: record this engine's EngineCore PIDs keyed by ray job id + actor name.
-
-    No-op unless running as a ray actor (local in-process engines die with the driver, no orphan).
-    Called right after engine creation while ray is healthy. Never raises.
-    """
-    try:
-        import ray
-        if not ray.is_initialized():
-            return
-        ctx = ray.get_runtime_context()
-        actor_id = ctx.get_actor_id()
-        if not actor_id:  # not an actor (e.g. driver-side local engine)
-            return
-        pids = _engine_core_pids(engine)
-        if not pids:
-            return
-        job_id = str(ctx.get_job_id())
-        actor_name = ctx.get_actor_name() or str(actor_id)
-        os.makedirs(ENGINE_CORE_PID_DIR, exist_ok=True)
-        path = os.path.join(ENGINE_CORE_PID_DIR, f'{job_id}__{actor_name}.json')
-        rec = {
-            'job_id': job_id,
-            'actor_name': actor_name,
-            'actor_pid': os.getpid(),
-            'engine_core_pids': pids,
-            'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
-        }
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(rec, f)
-        logger.info('engine_core_reaper: recorded EngineCore PIDs %s -> %s', pids, path)
-    except Exception as e:  # noqa: BLE001
-        logger.warning('engine_core_reaper: record failed (non-fatal): %r', e)
+def _close_inherited_writers():
+    # Forked children must not keep another process's parent-death pipe alive.
+    for writer in tuple(_PARENT_WRITERS):
+        writer.close()
+    _PARENT_WRITERS.clear()
 
 
-def _proc_cmdline(pid):
-    try:
-        with open(f'/proc/{pid}/cmdline', 'rb') as f:
-            return f.read().replace(b'\x00', b' ').decode('utf-8', 'replace')
-    except OSError:
-        return ''
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_close_inherited_writers)
 
 
-def _looks_like_engine_core(pid):
-    """Identity guard against PID reuse: the live process must still look like a vLLM EngineCore.
-
-    Match the vLLM proc title ``VLLM::EngineCore`` (camelCase ``EngineCore``), NOT the generic
-    lowercase substring ``engine_core`` -- the latter appears in any cmdline that merely imports
-    this module (the driver, a test invocation) and would mis-reap unrelated processes.
-    """
-    cmdline = _proc_cmdline(pid)
-    if not cmdline:
-        return False
-    return ('EngineCore' in cmdline) or ('VLLM::' in cmdline and 'Engine' in cmdline)
+def _close_writers(writers):
+    for writer in writers:
+        _PARENT_WRITERS.discard(writer)
+        writer.close()
 
 
-def reap_engine_core_orphans(job_id):
-    """Driver side: reap this job's recorded EngineCore PIDs directly, bypassing the (dead) actor.
+def _run_with_parent_watch(reader, target, args, kwargs):
+    """Start the parent-death monitor before initializing the engine core."""
+    finished = threading.Event()
 
-    Called in the teardown finally after sampler.shutdown() (which raises ActorDiedError when the
-    raylet died). Identity-verifies each PID before SIGTERM; isolates per-PID and per-file errors so
-    one failure cannot block the rest. Never raises. Returns the list of PIDs signalled.
-    """
-    signalled = []
-    if not job_id:
-        return signalled
-    try:
-        paths = glob.glob(os.path.join(ENGINE_CORE_PID_DIR, f'{job_id}__*.json'))
-    except Exception:  # noqa: BLE001
-        return signalled
-    for path in paths:
+    def monitor():
         try:
-            with open(path, encoding='utf-8') as f:
-                rec = json.load(f)
-            for pid in rec.get('engine_core_pids', []):
-                try:
-                    pid = int(pid)
-                    if not _looks_like_engine_core(pid):
-                        continue  # gone, or PID reused by an unrelated process -- do not kill
-                    os.kill(pid, signal.SIGTERM)
-                    signalled.append(pid)
-                    logger.info('engine_core_reaper: reaped orphan EngineCore pid=%d (job=%s)', pid, job_id)
-                except ProcessLookupError:
-                    pass  # already dead
-                except Exception as e:  # noqa: BLE001
-                    logger.warning('engine_core_reaper: kill pid=%s failed (non-fatal): %r', pid, e)
-        except Exception as e:  # noqa: BLE001
-            logger.warning('engine_core_reaper: read %s failed (non-fatal): %r', path, e)
-        finally:
+            reader.recv()
+        except (EOFError, OSError):
+            if not finished.is_set():
+                os._exit(1)
+
+    threading.Thread(target=monitor, daemon=True, name='engine-parent-watch').start()
+    try:
+        return target(*args, **kwargs)
+    finally:
+        finished.set()
+        reader.close()
+
+
+class _OwnedProcessContext:
+    """Add a one-way lifetime pipe to processes created by one engine manager."""
+
+    def __init__(self, context, pipes):
+        self.context = context
+        self.pipes = pipes
+
+    def __getattr__(self, name):
+        return getattr(self.context, name)
+
+    def Process(self, *, target, args=(), kwargs=None, **options):
+        reader, writer = self.context.Pipe(duplex=False)
+        _PARENT_WRITERS.add(writer)
+        self.pipes.append((reader, writer))
+        return self.context.Process(
+            target=_run_with_parent_watch, args=(reader, target, args, kwargs or {}), **options)
+
+
+def install_engine_core_parent_watch():
+    """Guard vLLM-owned EngineCore processes without modifying installed package files."""
+    from vllm.v1.engine import utils
+
+    with _INSTALL_LOCK:
+        manager = utils.CoreEngineProcManager
+        if getattr(manager, '_twinkle_parent_watch', False):
+            return
+        get_context = utils.get_mp_context
+        initialize = manager.__init__
+        shutdown = manager.shutdown
+
+        @functools.wraps(get_context)
+        def owned_context():
+            context = get_context()
+            pipes = _OWNER.get()
+            return context if pipes is None else _OwnedProcessContext(context, pipes)
+
+        @functools.wraps(initialize)
+        def initialize_owned(self, *args, **kwargs):
+            pipes = []
+            token = _OWNER.set(pipes)
             try:
-                os.replace(path, path + '.reaped')  # mark consumed; keep for post-mortem (no rm)
-            except OSError:
-                pass
-    return signalled
+                initialize(self, *args, **kwargs)
+            except BaseException:
+                _close_writers([writer for _, writer in pipes])
+                raise
+            else:
+                self._twinkle_parent_pipe_finalizer = weakref.finalize(
+                    self, _close_writers, [writer for _, writer in pipes])
+            finally:
+                _OWNER.reset(token)
+                for reader, _ in pipes:
+                    reader.close()
+
+        @functools.wraps(shutdown)
+        def shutdown_owned(self, *args, **kwargs):
+            try:
+                return shutdown(self, *args, **kwargs)
+            finally:
+                finalizer = getattr(self, '_twinkle_parent_pipe_finalizer', None)
+                if finalizer is not None:
+                    finalizer()
+
+        utils.get_mp_context = owned_context
+        manager.__init__ = initialize_owned
+        manager.shutdown = shutdown_owned
+        manager._twinkle_parent_watch = True

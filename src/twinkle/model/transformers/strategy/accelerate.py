@@ -656,7 +656,8 @@ class AccelerateStrategy(TransformerStrategyBase):
             )
             probe = os.environ.get('TWINKLE_OPT_LOAD_PROBE')
             if probe:
-                self._probe_loaded_optimizer_state(model, inner_optimizer, input_path, probe)
+                self._probe_loaded_optimizer_state(model, inner_optimizer, input_path, probe,
+                                                   param_name_mapping=param_name_mapping)
             return
 
         # weights_only=True: optimizer state is tensors + plain containers (verified), so a
@@ -665,7 +666,8 @@ class AccelerateStrategy(TransformerStrategyBase):
         remap_optimizer_state_names(optim_state, param_name_mapping or {})
         optimizer.load_state_dict(optim_state)
 
-    def _probe_loaded_optimizer_state(self, model, optimizer, checkpoint_path, path) -> None:
+    def _probe_loaded_optimizer_state(self, model, optimizer, checkpoint_path, path,
+                                      param_name_mapping=None) -> None:
         """Compare the moments in the live optimizer against the ones the checkpoint holds.
 
         Both sides must be reduced to the same granularity before any number means anything: the
@@ -680,20 +682,23 @@ class AccelerateStrategy(TransformerStrategyBase):
         from torch.distributed.tensor import DTensor, distribute_tensor
 
         saved = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        # Reduce the checkpoint through the SAME name mapping the load path applies, or every
+        # renamed parameter misses and the probe reports a vacuous all-clear.
+        remap_optimizer_state_names(saved, param_name_mapping or {})
         saved_state = saved.get('state') or {}
         state = getattr(optimizer, 'state', {})
         rank = self.accelerator.process_index
         detail = {}
         worst = {'name': None, 'key': None, 'diff': 0.0}
         checked = 0
-        watched = ('model.language_model.embed_tokens.weight', 'lm_head.weight',
-                   'model.language_model.norm.weight', 'model.visual.patch_embed.proj.weight')
+        # Model-agnostic: the watched set is probe configuration, not a hard-coded model's names.
+        watched = tuple(n for n in os.environ.get('TWINKLE_OPT_LOAD_PROBE_WATCH', '').split(',') if n)
         for name, param in model.named_parameters():
-            live, saved = state.get(param), saved_state.get(name)
-            if live is None or saved is None:
+            live, saved_row = state.get(param), saved_state.get(name)
+            if live is None or saved_row is None:
                 continue
             for key in ('step', 'exp_avg', 'exp_avg_sq'):
-                live_value, saved_value = live.get(key), saved.get(key)
+                live_value, saved_value = live.get(key), saved_row.get(key)
                 if live_value is None or saved_value is None:
                     continue
                 if isinstance(live_value, DTensor):

@@ -62,6 +62,38 @@ logger = logging.getLogger(__name__)
 _OPENAI_SAMPLE_TIMEOUT_ENV = 'TWINKLE_OPENAI_SAMPLE_TIMEOUT'
 _DEFAULT_OPENAI_SAMPLE_TIMEOUT = 1800.0
 
+_OPENAI_ROUTE_WAIT_ENV = 'TWINKLE_OPENAI_ROUTE_WAIT_TIMEOUT'
+_DEFAULT_OPENAI_ROUTE_WAIT_TIMEOUT = 300.0
+_ROUTE_MOUNT_POLL_INTERVAL = 1.0
+
+
+def _route_wait_timeout() -> float:
+    return float(os.environ.get(_OPENAI_ROUTE_WAIT_ENV, str(_DEFAULT_OPENAI_ROUTE_WAIT_TIMEOUT)))
+
+
+def _can_wait_for_sampler(gateway: GatewayServer, base_model: str, response: Response) -> bool:
+    """A missing route can still mount while its pool controller exists."""
+    import ray
+
+    if not ray.is_initialized():
+        return False
+    try:
+        error = json.loads(response.body)
+    except ValueError:
+        error = None
+    if isinstance(error, dict) and 'error_code' in error:
+        return False
+
+    from twinkle.server.sampler.pool.controller import sampler_controller_name, sampling_pool_id
+
+    namespace = os.environ.get('TWINKLE_STATE_RAY_NAMESPACE', 'twinkle_cluster')
+    pool_id = sampling_pool_id(f"{gateway.route_prefix.rstrip('/')}/sampler/{base_model}")
+    try:
+        ray.get_actor(sampler_controller_name(namespace, pool_id), namespace=namespace)
+    except ValueError:
+        return False
+    return True
+
 
 class SamplerWaitTimeoutError(TimeoutError):
     """The sampler task did not reach a terminal state inside the gateway's budget."""
@@ -400,16 +432,27 @@ async def _proxy_sample(
         return _model_not_found(model)
 
     sampler_headers = _sampler_headers(request)
-    await _ensure_template(gateway, route.base_model, sampler_headers, request)
-
-    response = await gateway.proxy.proxy_request(
-        request,
-        endpoint=endpoint,
-        base_model=route.base_model,
-        service_type='sampler',
-        body_override=_sampler_body(sample_request, route),
-        extra_headers=sampler_headers,
-    )
+    body_bytes = _sampler_body(sample_request, route)
+    # The catalog can advertise a model while its pool is still loading. Only
+    # retry a missing route with a live pool, and re-attempt template setup then.
+    route_deadline = time.monotonic() + _route_wait_timeout()
+    while True:
+        await _ensure_template(gateway, route.base_model, sampler_headers, request)
+        response = await gateway.proxy.proxy_request(
+            request,
+            endpoint=endpoint,
+            base_model=route.base_model,
+            service_type='sampler',
+            body_override=body_bytes,
+            extra_headers=sampler_headers,
+        )
+        if response.status_code != 404 or time.monotonic() >= route_deadline:
+            break
+        if await request.is_disconnected():
+            break
+        if not await asyncio.to_thread(_can_wait_for_sampler, gateway, route.base_model, response):
+            break
+        await asyncio.sleep(_ROUTE_MOUNT_POLL_INTERVAL)
     if response.status_code != 200:
         return _sampler_http_error(model, response.status_code, f'Sampler error: {response.body.decode()[:500]}')
 

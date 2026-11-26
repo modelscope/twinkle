@@ -6,6 +6,7 @@ The decision is made per call, so unfreezing the tower restores autograd by itse
 """
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Mapping
 from functools import wraps
 from types import MethodType
@@ -27,11 +28,17 @@ def _needs_input_grad(value) -> bool:
     return not isinstance(value, (type(None), bool, int, float, str, torch.dtype, torch.device))
 
 
-def patch_frozen_module(module: nn.Module) -> None:
-    """Run ``module.forward`` without autograd while nothing in it or in its inputs needs a gradient."""
+def patch_frozen_module(module: nn.Module, amp_dtype: torch.dtype | None = None) -> None:
+    """Run ``module.forward`` without autograd while nothing in it or in its inputs needs a gradient.
+
+    ``amp_dtype`` (the training mixed-precision dtype) runs the tower under autocast: a frozen tower
+    kept in fp32 still drives flash-attention kernels that reject fp32, so the attention must see
+    bf16/fp16. ``None`` (no mixed precision) leaves the dtype untouched.
+    """
     if hasattr(module, _ORIGINAL_FORWARD_ATTR):
         return
     setattr(module, _ORIGINAL_FORWARD_ATTR, module.forward)
+    use_amp = amp_dtype in (torch.bfloat16, torch.float16)
 
     @wraps(module.forward)
     def frozen_forward(self, *args, **kwargs):
@@ -39,7 +46,9 @@ def patch_frozen_module(module: nn.Module) -> None:
         if requires_grad:
             requires_grad = any(parameter.requires_grad for parameter in self.parameters()) or _needs_input_grad(
                 (args, kwargs))
-        with torch.set_grad_enabled(requires_grad):
+        amp_ctx = (torch.autocast(device_type=next(self.parameters()).device.type, dtype=amp_dtype)
+                   if use_amp else contextlib.nullcontext())
+        with torch.set_grad_enabled(requires_grad), amp_ctx:
             return getattr(self, _ORIGINAL_FORWARD_ATTR)(*args, **kwargs)
 
     module.forward = MethodType(frozen_forward, module)

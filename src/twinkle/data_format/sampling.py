@@ -95,8 +95,11 @@ class SamplingParams:
         if self.seed is not None:
             kwargs["seed"] = self.seed
 
-        if self.top_k > 0:
-            kwargs["top_k"] = self.top_k
+        # Always carried, including -1 ("disabled"): omitting it would let the engine's
+        # default sampling params -- which vLLM may seed from the model's
+        # generation_config.json (e.g. gemma's top_k=50) -- silently keep filtering even
+        # though the request asked for no top-k cut. An explicit caller override wins.
+        kwargs.setdefault("top_k", self.top_k)
 
         if self.repetition_penalty != 1.0:
             kwargs["repetition_penalty"] = self.repetition_penalty
@@ -144,8 +147,9 @@ class SamplingParams:
         if self.seed is not None:
             params["sampling_seed"] = self.seed
 
-        if self.top_k > 0:
-            params["top_k"] = self.top_k
+        # -1 means "all tokens" to sglang; carry it explicitly so a model-declared
+        # default top_k cannot survive a request that disabled top-k (see to_vllm).
+        params.setdefault("top_k", self.top_k)
 
         if self.repetition_penalty != 1.0:
             params["repetition_penalty"] = self.repetition_penalty
@@ -180,8 +184,11 @@ class SamplingParams:
         if self.seed is not None:
             torch.manual_seed(self.seed)
 
-        if self.top_k > 0:
-            gen_kwargs["top_k"] = self.top_k
+        # HF spells "disabled" as 0. Carry it explicitly: omitting top_k would let
+        # model.generation_config's own top_k (loaded from the checkpoint's
+        # generation_config.json, e.g. gemma's 50) keep filtering a request that asked
+        # for no top-k cut.
+        gen_kwargs["top_k"] = self.top_k if self.top_k > 0 else 0
 
         if self.repetition_penalty != 1.0:
             gen_kwargs["repetition_penalty"] = self.repetition_penalty
@@ -191,26 +198,27 @@ class SamplingParams:
             gen_kwargs["eos_token_id"] = tokenizer.eos_token_id
 
             if self.stop:
-                if isinstance(self.stop, str):
-                    stop_ids = tokenizer.encode(self.stop, add_special_tokens=False)
-                    if stop_ids:
-                        gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + stop_ids
-                elif isinstance(self.stop, (list, tuple)):
-                    if self.stop and isinstance(self.stop[0], int):
-                        gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + list(self.stop)
-                    else:
-                        all_stop_ids = [tokenizer.eos_token_id]
-                        for s in self.stop:
-                            ids = tokenizer.encode(s, add_special_tokens=False)
-                            if ids:
-                                all_stop_ids.extend(ids)
-                        gen_kwargs["eos_token_id"] = all_stop_ids
+                if not isinstance(self.stop, str) and isinstance(self.stop[0], int):
+                    eos = tokenizer.eos_token_id
+                    eos_ids = [] if eos is None else ([eos] if isinstance(eos, int) else list(eos))
+                    gen_kwargs["eos_token_id"] = eos_ids + list(self.stop)
+                else:
+                    from transformers import StopStringCriteria, StoppingCriteriaList
+                    stops = [self.stop] if isinstance(self.stop, str) else list(self.stop)
+                    gen_kwargs["stopping_criteria"] = StoppingCriteriaList([StopStringCriteria(tokenizer, stops)])
 
         return gen_kwargs
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SamplingParams":
-        """Create SamplingParams from a dict."""
+        """Create SamplingParams from a dict.
+
+        The caller's dict is never mutated: the max_new_tokens -> max_tokens rename
+        happens on a copy, so a config dict reused across requests (or shared with
+        other consumers that still read max_new_tokens) keeps its original keys.
+        Keys that are not fields are ignored.
+        """
+        d = dict(d)
         if "max_new_tokens" in d and "max_tokens" not in d:
             d["max_tokens"] = d.pop("max_new_tokens")
 
@@ -336,8 +344,13 @@ class PoolingParams:
             if self.dimensions <= 0:
                 raise ValueError(f"dimensions must be > 0, got {self.dimensions}")
 
-    def to_vllm(self, **kwargs):
-        """Convert to vLLM's ``PoolingParams``, keeping only the fields the installed version takes."""
+    def to_vllm(self, *, task: str | None = None, **kwargs):
+        """Convert to vLLM's ``PoolingParams``, keeping only the fields the installed version takes.
+
+        ``task`` overrides the request task for the backend call (e.g. the vLLM backend maps a
+        ``classify`` request onto ``token_classify`` for a reward architecture whose pooler only
+        supports that task); the caller-facing :class:`PoolingResponse` keeps the original task.
+        """
         import inspect
 
         from vllm.pooling_params import PoolingParams as VLLMPoolingParams
@@ -345,7 +358,7 @@ class PoolingParams:
         params = dict(kwargs)
         signature = inspect.signature(VLLMPoolingParams).parameters
         if "task" in signature:
-            params["task"] = self.task
+            params["task"] = task if task is not None else self.task
         if self.use_activation:
             if "use_activation" in signature:
                 params["use_activation"] = True

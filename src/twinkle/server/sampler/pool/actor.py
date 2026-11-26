@@ -88,12 +88,9 @@ def stop_sampler_controller(namespace, route_prefix, *, timeout_s=60):
     except ray.exceptions.ActorDiedError:
         pass  # already dead; the kill below is then just name bookkeeping
     except ray.exceptions.GetTimeoutError:
-        # shutdown stuck (the case where cleanup matters most): kill anyway so
-        # --stop converges -- aborting here would leave BOTH the controller and
-        # the router app behind. A half-done shutdown may leave engine
-        # deployments / placement groups alive; say so loudly for manual check.
-        logger.warning(f'sampler controller {name!r} shutdown timed out after {timeout_s}s; '
-                       'killing it anyway -- engine deployments / placement groups may survive, '
-                       'check `ray list actors` / serve status if devices stay occupied.')
+        # Keep the owner alive: a timeout does not prove its devices or deployments were released.
+        logger.warning('Sampler controller %r shutdown timed out after %ss; its owner is retained for retry.',
+                       name, timeout_s)
+        raise
     ray.kill(controller, no_restart=True)
     return True

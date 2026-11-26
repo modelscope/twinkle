@@ -53,6 +53,7 @@ from twinkle.server.telemetry.tracing import create_tracing_middleware
 
 logger = logging.getLogger(__name__)
 
+
 # Type aliases for the per-builder customization points.
 RegisterRoutes = Callable[[FastAPI, Callable[[], Any]], None]
 OnShutdown = Callable[[Any], Awaitable[None]]

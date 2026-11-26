@@ -731,7 +731,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 from .vision_keepalive import VisionKeepAlive
 
                 base_model = self.model.get_base_model() if isinstance(self.model, PeftModel) else self.model
-                self._vision_keepalive = VisionKeepAlive(base_model, self.model, self.model_arch['aligner'])
+                # Text-only checkpoints (e.g. JEV-9B qwen3_5_text) can carry a multimodal model_arch
+                # declaration yet have no visual tower; only keep alive aligners that actually exist
+                # so the wrap does not raise on get_submodule('visual').
+                aligners = []
+                for path in self.model_arch['aligner']:
+                    try:
+                        base_model.get_submodule(path)
+                    except AttributeError:
+                        continue
+                    aligners.append(path)
+                if aligners:
+                    self._vision_keepalive = VisionKeepAlive(base_model, self.model, aligners)
 
             if optimizer_groups:
                 result = self.strategy.wrap_model(self.model, *(group.optimizer for group in optimizer_groups))
@@ -861,8 +872,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         after the forward to gather recorded indices (RECORD) and clear global state.
         """
         from .moe.router_replay import RouterReplay
-        if not getattr(self, '_router_replay_enabled', False) or action is None:
+        if action is None:
             return RouterReplay(action=None)
+        if not getattr(self, '_router_replay_enabled', False):
+            raise ValueError('Routing replay was requested, but the model was built with enable_router_replay=False. '
+                             'Set enable_router_replay=True when constructing the model '
+                             '(in the model application args for a remote deployment).')
         self._maybe_apply_router_replay()
         return RouterReplay(
             action=action,
@@ -1007,6 +1022,32 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if not derives:
             return inputs
         return {k: v for k, v in inputs.items() if k != 'position_ids'}
+
+    def _compute_precision_autocast(self):
+        """Run a full-parameter fp32 actor's forward in the mixed-precision compute dtype.
+
+        RL's trainable actors pin float32 parameter storage (master weights) while compute follows
+        ``mixed_precision``. A LoRA policy (``PeftModel``) already gets bf16 compute from the strategy's
+        autocast / FSDP cast, so it must be left untouched (adding autocast would upcast its softmax /
+        layernorm to fp32 and drift the curve). PPO's FULL-PARAMETER critic, however, reaches the
+        eval/forward_only path (``model.eval()`` + ``no_grad``) without that cast and runs fp32 into
+        flash_attention_2 (fp16/bf16 only), which raises. Gate on full-parameter fp32 storage so only that
+        broken case gets the autocast; LoRA policies and already-bf16 models are untouched.
+        """
+        amp_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(self.mixed_precision)
+        if amp_dtype is None:
+            return contextlib.nullcontext()
+        param = next(self.model.parameters(), None)
+        if param is None or param.dtype != torch.float32:
+            return contextlib.nullcontext()
+        base = self.strategy.unwrap_model(self.model)
+        if isinstance(base, PeftModel):
+            return contextlib.nullcontext()
+        if not getattr(self, '_precision_autocast_logged', False):
+            self._precision_autocast_logged = True
+            logger.info('compute_precision_autocast: full-param fp32 storage -> %s compute (strategy=%s, mixed_precision=%s)',
+                        amp_dtype, type(self.strategy).__name__, self.mixed_precision)
+        return torch.autocast(device_type=param.device.type, dtype=amp_dtype)
 
     def _forward_with_task_readout(self, unwrapped_model, task, inputs, adapter_name=None):
         """Model call for tasks whose registry row carries a readout kind (``TaskSpec.readout``).
@@ -1159,7 +1200,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # processes every forward with the wrong template.
         with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), \
                 _resolve_mm_graph_context(unwrapped_model, optimizer_config.template), \
-                self._mm_forward_context(optimizer_config):
+                self._mm_forward_context(optimizer_config), self._compute_precision_autocast():
             with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                 # Without gradient checkpointing use_cache stays True, and Transformers skips
                 # detecting padding-free packed sequences whenever a KV cache exists.
@@ -1269,8 +1310,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         own micro-batch scales. Parallel-list kwargs (``ref_logps`` and friends) are sliced by
         ``select_batch`` alongside the inputs, so per-feature alignment survives the split.
         """
-        if get_task_spec(kwargs.get('task', 'causal_lm')).readout:
-            # Readout tasks organize labels / decision meta per RECORD, not per sample: the
+        spec = get_task_spec(kwargs.get('task', 'causal_lm'))
+        if spec.readout and not spec.token_level_labels:
+            # Record-level readouts organize labels / decision meta per RECORD, not per sample: the
             # sample-level split here would desynchronize them from the micro-batch logits.
             # Decision always reads out (its task_forward families included); the seq_cls
             # family only when the model carries an attached head -- its legacy in-model
@@ -1384,7 +1426,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # See ``forward``: the per-group multimodal hook needs to know which group this call
             # selected, and the forward-only path resolves it from ``adapter_name`` just the same.
             with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), \
-                    lora_ctx, self._mm_forward_context(optimizer_config):
+                    lora_ctx, self._mm_forward_context(optimizer_config), self._compute_precision_autocast():
                 with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                     # In eval mode use_cache defaults to True, and Transformers skips detecting
                     # padding-free packed sequences whenever a KV cache exists.
@@ -1533,6 +1575,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # loop-and-thread hop (and its lock, which would be bound to the wrong loop).
             return engine.generate_batch(
                 prompts, params, num_samples=params.num_samples, logprobs=params.logprobs is not None,
+                include_prompt_logprobs=params.prompt_logprobs is not None,
+                topk_prompt_logprobs=params.prompt_logprobs or 0,
                 extra_model_inputs=extra or None)
 
         lora_ctx = (unwrapped_model.disable_adapter()
@@ -1545,6 +1589,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         if not logprobs_only:
             generation.attach_features(template, results, encoded, states)
+        else:
+            # "Score, do not generate": discard the one token generated to carry the prompt
+            # logprobs, matching the vLLM backend and TransformersSampler.sample.
+            for response in results:
+                if response is None:
+                    continue
+                for seq in response.sequences:
+                    seq.tokens = []
+                    seq.logprobs = None
+                    seq.decoded = None
         return [
             r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
         ]
@@ -1645,8 +1699,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         router_replay_mode = kwargs.pop('router_replay_mode', None)
         rr = None
-        if router_replay_mode is not None:
+        if router_replay_mode not in (None, 'disabled'):
             from .moe.router_replay import RouterReplay, RouterReplayAction
+            RouterReplay.resolve_router_replay_mode(router_replay_mode)
             rr = self._router_replay(RouterReplayAction.REPLAY_BACKWARD)
 
         with no_sync_ctx:
@@ -3030,6 +3085,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             }
 
         trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
+        from twinkle.model.base import warn_cumulative_metric_state_not_restored
+        warn_cumulative_metric_state_not_restored(optimizer_config, 'transformers')
         result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
@@ -3156,6 +3213,29 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _task_head_is_master(self) -> bool:
         return Platform.is_master()
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def save_scoring_head_sidecar(self, checkpoint_dir: str, save_weights: bool = True) -> bool:
+        """Persist the attached decision scoring head beside a checkpoint, worker-side.
+
+        The decision_checkpoint callback binds the driver's Ray proxy, which has no
+        ``_modules`` tree (the head lives on the workers), so head discovery and
+        ``head.save_pretrained`` must run here rather than on the stub. Only the master
+        rank writes the sidecar, matching the checkpoint save's ``Platform.is_master``
+        guard; the single-head decision readout is replicated, not a LoRA target.
+        """
+        if not self._task_head_is_master():
+            return False
+        host = self._task_head_host()
+        head = None
+        for name, module in host.named_modules():
+            if name in ('scoring_head', 'task_head') or name.endswith(('.scoring_head', '.task_head')):
+                head = module
+                break
+        if head is None:
+            return False
+        head.save_pretrained(checkpoint_dir, save_weights=save_weights)
+        return True
+
     def _add_task_head(self, adapter_name: str, task, task_head_loader=None, num_labels=None) -> None:
         """Build one task head worker-side and register it per adapter.
 
@@ -3194,10 +3274,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         base_model = model
         while isinstance(base_model, PeftModel):
             base_model = base_model.get_base_model()
+        amp_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(self.mixed_precision)
         for prefix in prefixes:
             tower = deep_getattr(base_model, prefix)
             if isinstance(tower, torch.nn.Module) and not any(p.requires_grad for p in tower.parameters()):
-                patch_frozen_module(tower)
+                patch_frozen_module(tower, amp_dtype=amp_dtype)
 
     def _expand_multimodal_lora_target(self, config, model, *, freeze_llm: bool, freeze_vit: bool,
                                        freeze_aligner: bool) -> None:

@@ -71,7 +71,7 @@ class DeltaWorkerMetadata(TypedDict):
 
 class DeltaReceiverPlacement(TypedDict):
     rank: int
-    node_id: str
+    node_ip: str
     device_uuid: str
     cuda_visible_device: NotRequired[str]
     zmq_handle: str

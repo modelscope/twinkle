@@ -16,7 +16,8 @@ from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.model.megatron import MegatronModel, MultiLoraMegatronModel
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
-                                                  collect_forward_backward_results, to_cpu_safe_output)
+                                                  collect_forward_backward_results, decision_forward_output,
+                                                  to_cpu_safe_output)
 from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.utils.nccl_safe import nccl_safe_megatron
 
@@ -58,7 +59,10 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward_only(inputs=input_features, adapter_name=adapter_name, **kwargs)
-        results = self._tinker_build_output(inputs, outputs, return_full_logprobs=True)
+        # Tinker contract: one logprob per input token. Return the unpadded slice;
+        # the DPO reference round-trip stays intact because the server re-pads
+        # ragged client-supplied ref_logps in extract_rl_features_for_loss.
+        results = self._tinker_build_output(inputs, outputs)
         return [results, 0.0]
 
     @remote_function(dispatch='all')
@@ -120,16 +124,20 @@ class _MegatronTinkerCompatMixin(TwinkleCompatModelBase):
     @nccl_safe_megatron
     def forward_only(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward-only for twinkle-native clients (InputFeature/Trajectory I/O)."""
-        output = super().forward_only(inputs=inputs, **kwargs)
-        return to_cpu_safe_output(output)
+        if kwargs.get('task') == 'decision' and kwargs.get('return_logits'):
+            # The schedule calls our forward_backward wrapper, which serializes the readout.
+            return super().forward_only(inputs=inputs, **kwargs)
+        return to_cpu_safe_output(super().forward_only(inputs=inputs, **kwargs))
 
     @remote_function(dispatch='slice_dp', collect='tensor_dict', sync=True)
     @nccl_safe_megatron
     def forward_backward(self, *, inputs: InputFeature | list[InputFeature] | Trajectory | list[Trajectory], **kwargs):
         """Forward+backward for twinkle-native clients (InputFeature/Trajectory I/O)."""
         self._normalize_ref_outputs(kwargs)
-        output = super().forward_backward(inputs=inputs, **kwargs)
-        return to_cpu_safe_output(output)
+        if kwargs.get('forward_only') and kwargs.get('task') == 'decision' and kwargs.get('return_logits'):
+            output = super().forward_backward(inputs=inputs, **kwargs)
+            return decision_forward_output(output) if self._task_head_carries_on_this_rank() else {}
+        return to_cpu_safe_output(super().forward_backward(inputs=inputs, **kwargs))
 
     @remote_function(collect='first', lazy_collect=False, sync=True, timeout=4)
     def ping(self) -> bool:

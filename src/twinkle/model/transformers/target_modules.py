@@ -218,6 +218,24 @@ def expand_multimodal_lora_target(model: nn.Module,
     if not is_all_linear:
         return
     if not (model_arch.get('vision_tower') or model_arch.get('aligner')):
+        from peft.tuners.tuners_utils import BaseTunerLayer
+        from transformers.pytorch_utils import Conv1D
+
+        base_model = _unwrap_peft(model)
+        # Preserve PEFT's native expansion unless quantized linears are invisible to it.
+        invisible = any(
+            'linear' in type(module).__name__.lower()
+            and not isinstance(module, (nn.Linear, Conv1D, BaseTunerLayer))
+            and type(module).__name__.lower() not in ('glulinear', 'gemma4clippablelinear')
+            and not any(part in name for part in ('lora_A', 'lora_B', 'base_layer'))
+            for name, module in base_model.named_modules())
+        if invisible:
+            expanded = find_all_linears(base_model, model_arch.get('lm_head'), extra_layers=[nn.Linear, Conv1D])
+            if not expanded:
+                raise ValueError("Dense 'all-linear' expansion found no LoRA-able layer; "
+                                 'pass target_modules explicitly.')
+            config.target_modules = (expanded if isinstance(target, str) else list(
+                dict.fromkeys([name for name in target if name != 'all-linear'] + expanded)))
         return
     include_embedding = isinstance(target, (list, tuple, set)) and 'all-embedding' in target
     config.target_modules = get_multimodal_target_regex(

@@ -21,6 +21,24 @@ _FINISH_REASONS: Dict[str, StopReason] = {
 }
 
 
+def _sglang_engine_arg_names() -> Optional[set]:
+    """Engine argument names the installed sglang accepts, or None when it cannot be probed.
+
+    Shared by the engine's warn-and-drop filter (twinkle-injected keys) and the sampler's
+    fail-loud guard (user-set keys), so both lanes judge against one source of truth.
+    """
+    try:
+        from sglang.srt.server_args import ServerArgs
+    except Exception:
+        return None
+    accepted = set(getattr(ServerArgs, '__annotations__', {}) or {})
+    try:
+        accepted |= set(inspect.signature(ServerArgs).parameters)
+    except (TypeError, ValueError):
+        pass
+    return accepted or None
+
+
 class SGLangEngine(BaseSamplerEngine):
     """Token-level inference on sglang's offline engine.
 
@@ -102,20 +120,12 @@ class SGLangEngine(BaseSamplerEngine):
         0.5.x, which spells expert parallelism ``ep_size`` -- and ``Engine`` accepts ``**kwargs``
         only to reject unknown names at startup. A caller therefore cannot forward a config block
         wholesale: one retired knob, even left at its default, stops the engine before it starts.
-        Dropping is reported by name rather than silent, so a knob the caller did set on purpose is
-        still visible; the four arguments this class passes explicitly are its own business and are
-        never filtered here.
+        This warn-and-drop lane is for twinkle's own injected/defaulted keys only; keys the USER
+        set are validated fail-loud by SGLangSampler before the merge (same contract as vLLM's
+        engine_kwargs guard), so a purpose-set knob is never silently discarded here.
         """
-        try:
-            from sglang.srt.server_args import ServerArgs
-        except Exception:
-            return dict(engine_kwargs)
-        accepted = set(getattr(ServerArgs, '__annotations__', {}) or {})
-        try:
-            accepted |= set(inspect.signature(ServerArgs).parameters)
-        except (TypeError, ValueError):
-            pass
-        if not accepted:
+        accepted = _sglang_engine_arg_names()
+        if accepted is None:
             return dict(engine_kwargs)
         unknown = sorted(key for key in engine_kwargs if key not in accepted)
         if unknown:

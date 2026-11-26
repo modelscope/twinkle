@@ -74,6 +74,30 @@ class TestCollateExtraModelInputs:
         # The narrower row is LEFT-padded to the batch width (engine builds left-padded ids).
         assert torch.equal(stacked[1], torch.tensor([0., 0., 5., 6.]))
 
+    def test_per_token_companion_with_leading_batch_dim_is_squeezed(self):
+        # Qwen3_5Template emits mm_token_type_ids as [1, L]; stacking must yield [B, L],
+        # not [B, 1, L] (HF generate's per-step update cats a 2-D extension).
+        encoded = {
+            0: {'input_ids': [1], 'mm_token_type_ids': torch.tensor([[0, 0, 0]])},
+            1: {'input_ids': [2], 'mm_token_type_ids': torch.tensor([[0, 0]])},
+        }
+        collated = collate_extra_model_inputs([0, 1], encoded)
+        assert collated['mm_token_type_ids'].shape == (2, 3)
+        assert torch.equal(collated['mm_token_type_ids'][1], torch.tensor([0, 0, 0]))
+
+    def test_mrope_position_ids_batch_on_dim_one_with_left_pad(self):
+        # M-RoPE position_ids are [sections, 1, L] per row: batch on dim 1, left-pad on L.
+        encoded = {
+            0: {'input_ids': [1, 2], 'position_ids': torch.arange(6).reshape(3, 1, 2)},
+            1: {'input_ids': [3], 'position_ids': torch.arange(3).reshape(3, 1, 1)},
+        }
+        collated = collate_extra_model_inputs([0, 1], encoded)
+        pos = collated['position_ids']
+        assert pos.shape == (3, 2, 2)
+        assert torch.equal(pos[:, 0, :], torch.arange(6).reshape(3, 2))
+        assert torch.equal(pos[:, 1, 0], torch.zeros(3, dtype=pos.dtype))  # left pad
+        assert torch.equal(pos[:, 1, 1], torch.arange(3))
+
 
 class TestAttachFeatures:
 
@@ -147,12 +171,24 @@ class TestRunChunk:
         with pytest.raises(RuntimeError, match='boom'):
             run_chunk([0, 1], {0: {'input_ids': [1]}, 1: {'input_ids': [2]}}, {0: None, 1: None}, call_batch)
 
-    def test_single_item_failure_raises_even_when_not_strict(self):
+    def test_single_item_failure_drops_when_not_strict(self):
+        # The non-strict contract ("one bad row cannot discard a long run") must not depend
+        # on how inputs are chunked: a row alone in a chunk (batch_size=1 or a tail of 1)
+        # gets the same error placeholder as a row isolated from a bigger batch.
+        def call_batch(prompts, extra):
+            raise RuntimeError('boom')
+
+        results = run_chunk([0], {0: {'input_ids': [1]}}, {0: None}, call_batch, strict=False)
+        assert results[0].sequences[0].stop_reason == 'error'
+        assert results[0].sequences[0].tokens == []
+        assert results[0].prompt_token_ids == [1]
+
+    def test_single_item_failure_still_raises_when_strict(self):
         def call_batch(prompts, extra):
             raise RuntimeError('boom')
 
         with pytest.raises(RuntimeError, match='boom'):
-            run_chunk([0], {0: {'input_ids': [1]}}, {0: None}, call_batch, strict=False)
+            run_chunk([0], {0: {'input_ids': [1]}}, {0: None}, call_batch, strict=True)
 
     def test_non_strict_failure_isolates_the_bad_input(self):
         encoded = {0: {'input_ids': [1]}, 1: {'input_ids': [2]}, 2: {'input_ids': [3]}}

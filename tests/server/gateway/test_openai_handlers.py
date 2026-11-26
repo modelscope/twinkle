@@ -117,6 +117,41 @@ class TestChatCompletions:
         assert data['choices'][0]['finish_reason'] == 'stop'
         assert 'usage' in data
 
+    @pytest.mark.parametrize('adapter_missing', [False, True])
+    def test_only_missing_routes_wait_for_a_starting_pool(self, mock_gateway, monkeypatch, adapter_missing):
+        import ray
+
+        from twinkle.protocol.types import SupportedModel
+        from twinkle.server.gateway import openai_handlers
+        from twinkle.server.sampler.pool.controller import sampler_controller_name, sampling_pool_id
+
+        gateway, app = mock_gateway
+        base = next(iter(gateway.supported_model_names))
+        gateway.route_prefix = '/v1'
+        gateway._template_initialized.add(base)
+        gateway.supported_models.append(SupportedModel(model_name='adapter', base_model=base))
+        get_actor = MagicMock(return_value=object())
+        monkeypatch.setattr(ray, 'is_initialized', lambda: True)
+        monkeypatch.setattr(ray, 'get_actor', get_actor)
+        monkeypatch.setenv('TWINKLE_STATE_RAY_NAMESPACE', 'test')
+        monkeypatch.setattr(openai_handlers, '_ROUTE_MOUNT_POLL_INTERVAL', 0)
+
+        missing = JSONResponse({'error_code': 404} if adapter_missing else {'detail': 'Not Found'}, status_code=404)
+        gateway.proxy.proxy_request.side_effect = [missing, self._make_sample_response()]
+        response = TestClient(app).post('/chat/completions', json={
+            'model': 'adapter', 'messages': [{'role': 'user', 'content': 'Hello'}],
+        })
+        if adapter_missing:
+            assert response.status_code == 404
+            get_actor.assert_not_called()
+            gateway.proxy.proxy_request.assert_awaited_once()
+        else:
+            assert response.status_code == 200
+            assert response.json()['model'] == 'adapter'
+            get_actor.assert_called_once_with(
+                sampler_controller_name('test', sampling_pool_id(f'/v1/sampler/{base}')), namespace='test')
+            assert gateway.proxy.proxy_request.await_count == 2
+
     def test_missing_model_returns_400(self, mock_gateway):
         _, app = mock_gateway
         client = TestClient(app)
@@ -697,3 +732,22 @@ class TestListModels:
         with pytest.raises(ValueError, match='conflict with registered model names: model-a'):
             gateway_app.GatewayServer(
                 supported_models=['model-a', 'model-b'], openai_model_aliases={'model-a': 'model-b'})
+
+    def test_reconfigure_keeps_adapters_and_updates_aliases(self, monkeypatch):
+        from twinkle.server.gateway import app as gateway_app
+
+        monkeypatch.setattr(gateway_app, 'get_server_state', MagicMock())
+        gateway = gateway_app.GatewayServer(
+            supported_models=['model-a', 'model-b'], openai_model_aliases={'alias-a': 'model-a'})
+        gateway._template_initialized.update(['model-a', 'model-b'])
+        adapter = {'model_name': 'adapter-b', 'base_model': 'model-b'}
+        gateway.reconfigure({
+            'supported_models': ['model-b', adapter],
+            'openai_model_aliases': {'alias-b': 'model-b'},
+        })
+        assert gateway.supported_model_names == {'model-b'}
+        assert gateway._template_initialized == {'model-b'}
+        assert gateway.get_openai_model_catalog() == {
+            'models': [{'model_name': 'model-b'}, adapter],
+            'aliases': {'alias-b': 'model-b'},
+        }
