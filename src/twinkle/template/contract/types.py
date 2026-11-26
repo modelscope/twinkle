@@ -82,10 +82,8 @@ class KTOSample:
     rejected: Optional[ConversationSample] = None
 
 
-InputOrderLabels = OutputOrderLabels = List[int]
-InputOrderLossScale = OutputOrderLossScale = List[float]
-InputOrderCompletionMask = OutputOrderCompletionMask = List[int]
-InputOrderRow = EncodedRow = PreparedRow = Trajectory
+#: One row before (``InputOrderRow``) and after (``EncodedRow``) the labels shift; both are trajectories.
+InputOrderRow = EncodedRow = Trajectory
 
 
 @dataclass(frozen=True)

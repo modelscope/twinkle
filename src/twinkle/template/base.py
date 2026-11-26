@@ -91,6 +91,9 @@ class Template:
     placeholder_tokens = ()
     task_type = 'causal_lm'
     default_enable_thinking = False
+    # Class-level defaults keep ``object.__new__``-built templates (tests, fingerprints) readable.
+    _explicit_enable_thinking = False
+    preserve_thinking = None
     _server_template_name = None
 
     def __init__(
@@ -1097,8 +1100,13 @@ class Template:
             )
         if kwargs:
             raise TypeError(f'Unsupported decode_message kwargs: {sorted(kwargs)}')
+        return self._decode_message(token_ids, context, structured_calls)
+
+    def _decode_message(self, token_ids: list[int], context: DecodeContext, structured_calls) -> DecodedResponse:
+        """Decode under a prepared context; subclasses override this to swap the decoder."""
         decoded = self.decode(token_ids, skip_special_tokens=False)
-        reasoning_started = self.enable_thinking if context.reasoning_started is None else context.reasoning_started
+        thinking = self.enable_thinking if self._explicit_enable_thinking else self.default_enable_thinking
+        reasoning_started = thinking if context.reasoning_started is None else context.reasoning_started
         return decode_output(
             decoded,
             thinking_marks=(self.reasoning_open_marker, self.reasoning_close_marker),

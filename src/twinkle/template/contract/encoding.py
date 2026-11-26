@@ -284,10 +284,6 @@ def append_and_finalize(
     return result
 
 
-def splice(row: EncodedRow, tokens: Sequence[int], *, scored: bool, sampled: bool) -> EncodedRow:
-    return refresh(append_input_order(row, tokens, scored=scored, sampled=sampled))
-
-
 def refresh(row: InputOrderRow) -> EncodedRow:
     result: Dict[str, Any] = dict(row)
     input_ids = result.get("input_ids")

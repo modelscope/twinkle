@@ -10,7 +10,6 @@ from .contract import (
     KTOSample,
     MediaBundle,
     PreferenceSample,
-    PreparedRow,
 )
 
 _LAZY_EXPORTS = {

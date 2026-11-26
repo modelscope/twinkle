@@ -45,9 +45,6 @@ class SampleRequest(StrictRequest):
     token_only: bool = Field(
         False, description='Return sampled tokens/logprobs only; encoded inputs are engine ids, media alongside'
     )
-    project_request_fields: bool = Field(
-        False, description='Opt into request-field/history projection restored by the materialized sampler client'
-    )
 
     @model_validator(mode='after')
     def _validate_adapter_selection(self) -> SampleRequest:

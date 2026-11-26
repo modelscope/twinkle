@@ -455,14 +455,17 @@ class TransformersEngine(BaseSamplerEngine):
                 decoded = self.tokenizer.decode(
                     tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False if params.stop else None)
                 decoded, matched = self._trim_stop_text(decoded, params)
+                stop_reason = (
+                    'length'
+                    if max_new and len(tokens) >= max_new and not matched
+                    and (not tokens or tokens[-1] not in eos_ids)
+                    else 'stop'
+                )
+                if matched and not params.include_stop_str_in_output:
+                    tokens = self._trim_stop_tokens(tokens, decoded)
                 seqs.append(
                     SampledSequence(
-                        stop_reason=(
-                            'length'
-                            if max_new and len(tokens) >= max_new and not matched
-                            and (not tokens or tokens[-1] not in eos_ids)
-                            else 'stop'
-                        ),
+                        stop_reason=stop_reason,
                         tokens=tokens,
                         logprobs=None if step_logprobs is None else step_logprobs[row][:len(tokens)],
                         decoded=decoded,
@@ -489,6 +492,23 @@ class TransformersEngine(BaseSamplerEngine):
         start, stop = min(matches, key=lambda match: match[0])
         end = start + len(stop) if params.include_stop_str_in_output else start
         return text[:end], True
+
+    def _trim_stop_tokens(self, tokens: List[int], text: str) -> List[int]:
+        """The token prefix that stays inside a trimmed stop ``text`` (the same rule as the vLLM engine:
+        the sampled ``tokens`` never carry the stop string when it is excluded from the output).
+        ``generate()`` runs on to the EOS after a stop string appears, so the tail can be long; the
+        decoded prefix grows monotonically with the token count, hence the binary search."""
+        def decoded(count: int) -> str:
+            return self.tokenizer.decode(tokens[:count], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+        low, high = 0, len(tokens)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if text.startswith(decoded(mid)):
+                low = mid
+            else:
+                high = mid - 1
+        return tokens[:low]
 
     def _prompt_logprobs(self, inputs: Dict[str, Any], topk: int):
         with torch.inference_mode():

@@ -127,8 +127,7 @@ class vLLMSampler:
             sampling_params=self._sampling_params(sampling_params, num_samples),
             adapter_name=adapter_name,
             adapter_uri=adapter_uri,
-            token_only=token_only,
-            project_request_fields=not token_only)
+            token_only=token_only)
         if getattr(self, '_sample_idempotency', False):
             key = uuid.uuid4().hex if idempotency_key is None else idempotency_key
             headers = {H_SAMPLE_IDEMPOTENCY_KEY: key}
@@ -148,18 +147,12 @@ class vLLMSampler:
                 for sequence in result.sequences:
                     if sequence.new_input_feature is None:
                         raise RuntimeError('server omitted a complete trajectory from a normal sample response')
-                    feature = copy_trajectory(sequence.new_input_feature)
-                    omitted = feature.pop('_request_fields')
-                    if not isinstance(omitted, list) or any(not isinstance(key, str) or key not in original for key in omitted):
-                        raise RuntimeError('server referenced fields absent from the sampling request')
-                    count = feature.pop('_request_message_count', None)
-                    restored = {**copy_trajectory({key: original[key] for key in omitted}), **feature}
-                    if count is not None:
-                        before = original.get('messages') or []
-                        if type(count) is not int or count != len(before) or not isinstance(restored.get('messages'), list):
-                            raise RuntimeError('server returned an invalid sampling history projection')
-                        restored['messages'] = copy_trajectory({'messages': before})['messages'] + restored['messages']
-                    sequence.new_input_feature = restored
+                    # The server never echoes the request's media / user_data back; restore them here.
+                    sequence.new_input_feature = {
+                        **copy_trajectory({key: original[key] for key in ('images', 'videos', 'audios', 'user_data')
+                                          if key in original}),
+                        **copy_trajectory(sequence.new_input_feature),
+                    }
         return samples
 
     @staticmethod

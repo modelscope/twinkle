@@ -414,6 +414,18 @@ class ServerLauncher:
         from twinkle.server.sampler.pool.actor import create_sampler_controller
         from twinkle.server.sampler.pool.router import build_sampler_router
         base_model = extract_model_alias(app.route_prefix, 'sampler') or app.name
+        # The sampler router and every replica app share the proxy port with the gateway, so all of
+        # them enforce the same credential: an explicit SamplerArgs.api_key wins, else inherit the
+        # gateway's key so a deployment authenticated at the gateway cannot be bypassed by dialing the
+        # sampler route directly. (The gateway forwards the caller's Bearer key, so proxied traffic
+        # still passes.) Written into the args BEFORE the controller serializes them: the pool driver
+        # builds each replica app from that dump and installs the same gate on it.
+        if app.args.api_key is None:
+            app.args.api_key = next(
+                (getattr(other.args, 'api_key', None) for other in self.config.applications
+                 if other.import_path == 'server'),
+                None,
+            )
         controller, options, pool_id = create_sampler_controller(
             app, self.ray_namespace, self.config.resources.model_dump(), build_worker_env_vars(),
             base_model=base_model,
@@ -422,16 +434,9 @@ class ServerLauncher:
         if app.name not in self._existing_applications:
             self._owned_applications.add(app.name)
         ray.get(controller.initialize.remote())
-        # The sampler router shares the proxy port with the gateway, so it must enforce the same
-        # credential: an explicit SamplerArgs.api_key wins, else inherit the gateway's key so a
-        # deployment authenticated at the gateway cannot be bypassed by dialing the sampler route
-        # directly. (The gateway forwards the caller's Bearer key, so proxied traffic still passes.)
-        api_key = getattr(app.args, 'api_key', None)
-        if api_key is None:
-            api_key = next((getattr(other.args, 'api_key', None) for other in self.config.applications
-                            if other.import_path == 'server'), None)
         serve.run(
-            build_sampler_router(self.ray_namespace, pool_id, options, model_id=base_model, api_key=api_key),
+            build_sampler_router(
+                self.ray_namespace, pool_id, options, model_id=base_model, api_key=app.args.api_key),
             name=app.name,
             route_prefix=app.route_prefix,
         )

@@ -30,7 +30,6 @@ from twinkle.data_format.sampling import sampled_token_logprobs
 from twinkle.protocol.json_utils import json_safe, wire_trajectory
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
-from twinkle.protocol.types.data import export_batch
 from twinkle.server.checkpoint import create_checkpoint_manager
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError, ResourceNotFoundError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
@@ -90,26 +89,12 @@ def _json_safe_value(value):
     return _DROP
 
 
-def _serialize_input_feature(feature: dict, original: dict, *, project_request_fields: bool = False) -> dict:
-    if not project_request_fields:
-        return _json_safe_value(
-            json_safe(
-                {key: value for key, value in feature.items() if key not in ('images', 'videos', 'audios', 'user_data')}
-            )
-        )
-    omitted = [key for key in ('images', 'videos', 'audios', 'user_data') if key in original and key in feature]
-    safe = _json_safe_value(json_safe({key: value for key, value in feature.items() if key not in omitted}))
-    for key in list(safe):
-        if key != 'messages' and key in original and safe[key] == original[key]:
-            omitted.append(key)
-            safe.pop(key)
-    before = original.get('messages') or []
-    messages = safe.get('messages')
-    if before and messages is not None and messages[: len(before)] == before:
-        safe['messages'] = messages[len(before) :]
-        safe['_request_message_count'] = len(before)
-    safe['_request_fields'] = omitted
-    return safe
+def _serialize_input_feature(feature: dict) -> dict:
+    """A returned trajectory without the media and ``user_data`` the request already carries: the
+    client restores them from its own copy, so the heavy payload never travels back."""
+    return _json_safe_value(
+        json_safe({key: value for key, value in feature.items() if key not in ('images', 'videos', 'audios', 'user_data')})
+    )
 
 
 def _build_rollout_rows_and_tags(
@@ -152,12 +137,10 @@ def _build_rollout_rows_and_tags(
     return rows, tags
 
 
-def _to_sample_response_models(
-    responses, inputs, *, project_request_fields: bool = False
-) -> List[types.SampleResponseModel]:
+def _to_sample_response_models(responses) -> List[types.SampleResponseModel]:
     """Convert internal sampler responses to the HTTP response schema."""
     sample_models = []
-    for response, original in zip(responses, inputs, strict=True):
+    for response in responses:
         sequences = [
             types.SampledSequenceModel(
                 stop_reason=sequence.stop_reason,
@@ -168,9 +151,7 @@ def _to_sample_response_models(
                 if sequence.new_input_feature is not None
                 else None,
                 new_input_feature=(
-                    _serialize_input_feature(
-                        sequence.new_input_feature, original, project_request_fields=project_request_fields
-                    )
+                    _serialize_input_feature(sequence.new_input_feature)
                     if sequence.new_input_feature is not None
                     else None
                 ),
@@ -365,9 +346,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             responses = await sample_with_weights(
                 self, resolved_uri, generate, full_checkpoint=None if body.adapter_uri else False)
             return types.SampleResponseModelList(
-                samples=_to_sample_response_models(
-                    responses, export_batch(body.inputs), project_request_fields=body.project_request_fields
-                )
+                samples=_to_sample_response_models(responses)
             ).model_dump()
 
         # Calculate metrics for queue scheduling. The body is wire-validated, so the

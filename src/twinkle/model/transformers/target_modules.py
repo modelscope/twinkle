@@ -32,6 +32,10 @@ __all__ = [
     'expand_multimodal_lora_target', 'expand_modules_to_save'
 ]
 
+#: Linear-like classes that are not ``nn.Linear`` / ``Conv1D``: LoRA targets all the same, so neither
+#: the all-linear search nor PEFT's own all-linear expansion may treat them as "invisible" linears.
+GLU_LINEAR_CLS = ('glulinear', 'gemma4clippablelinear')  # phi4-mm, gemma4
+
 
 def find_layers(model: nn.Module,
                 cond: Callable[[str, nn.Module], bool],
@@ -94,10 +98,7 @@ def find_all_linears(model: nn.Module,
     # 'score' / 'classifier': sequence-classification head; 'v_head': reward-model head. The lora_* /
     # base_layer entries keep an already-adapted model from being targeted through its own wrappers.
     ignore_layers = [lm_head_name, 'score', 'v_head', 'classifier', 'lora_A', 'lora_B', 'base_layer']
-    ignore_linear_cls = [
-        'glulinear',  # phi4-mm
-        'gemma4clippablelinear',  # gemma4
-    ]
+    ignore_linear_cls = list(GLU_LINEAR_CLS)
 
     def _cond(name: str, module: nn.Module) -> bool:
         module_name = module.__class__.__name__.lower()
@@ -226,7 +227,7 @@ def expand_multimodal_lora_target(model: nn.Module,
         invisible = any(
             'linear' in type(module).__name__.lower()
             and not isinstance(module, (nn.Linear, Conv1D, BaseTunerLayer))
-            and type(module).__name__.lower() not in ('glulinear', 'gemma4clippablelinear')
+            and type(module).__name__.lower() not in GLU_LINEAR_CLS
             and not any(part in name for part in ('lora_A', 'lora_B', 'base_layer'))
             for name, module in base_model.named_modules())
         if invisible:

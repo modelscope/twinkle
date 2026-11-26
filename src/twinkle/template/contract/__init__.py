@@ -10,7 +10,6 @@ from .encoding import (
     render_delta,
     shift,
     shift_values,
-    splice,
     unshift,
     unshift_values,
 )
@@ -47,18 +46,11 @@ from .types import (
     DecodeContext,
     DecodedResponse,
     EncodedRow,
-    InputOrderCompletionMask,
-    InputOrderLabels,
-    InputOrderLossScale,
     InputOrderRow,
     KTOSample,
     MediaBundle,
     Message,
-    OutputOrderCompletionMask,
-    OutputOrderLabels,
-    OutputOrderLossScale,
     PreferenceSample,
-    PreparedRow,
     Tool,
 )
 
