@@ -79,6 +79,7 @@ class SamplerArgs(_ArgsBase):
     #: so direct sampler calls cannot bypass the gateway's auth boundary.
     api_key: str | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
+    node_selector: dict[str, str] = Field(default_factory=dict)
     data_plane_url: str | None = None
     template: dict[str, Any] | None = None
     #:
