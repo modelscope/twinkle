@@ -6,7 +6,7 @@ FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:
 # driver shim and pip cuDNN ahead of apt cuDNN.
 ENV LD_LIBRARY_PATH="/usr/local/cuda-13.0/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/cuda/compat:/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 
-ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
 
 WORKDIR /twinkle
 COPY pyproject.toml setup.cfg README.md LICENSE ./
@@ -15,7 +15,9 @@ COPY src/ ./src/
 # Resolve the pinned Swift revision and Twinkle together. Keep the base image's
 # CUDA wheels and let vLLM enforce the matching TileLang and TVM FFI versions.
 # TE 2.19 makes the tensor handle pool configurable for the 35B LoRA trainer.
-RUN pip install --no-cache-dir --no-build-isolation \
+RUN --mount=type=cache,id=twinkle-cu130-py312-pip,target=/var/cache/twinkle-pip \
+    pip install --index-url "$PIP_INDEX_URL" --cache-dir /var/cache/twinkle-pip \
+    --no-build-isolation --retries 5 --timeout 30 \
     --only-binary=torch,vllm,ray,megatron-core,mcore-bridge,sentence-transformers,transformer-engine-cu13 \
     "torch==2.14.0" "vllm==0.33.0" \
     "ray[serve]==2.55.1" "megatron-core==0.20.0" "mcore-bridge==1.7.0" \

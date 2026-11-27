@@ -111,8 +111,9 @@ installs the checkout's source and packages its cookbook startup scripts.
 Check out the target branch or tag before building a release image.
 The image installs the Swift revision used in the Twinkle client guide to
 provide the shared template contract.
-The build uses PyPI by default. Set `--build-arg PIP_INDEX_URL=<index-url>`
-to use a different package index.
+The build uses the Tsinghua HTTPS PyPI mirror by default. Set
+`--build-arg PIP_INDEX_URL=https://pypi.org/simple` to use PyPI directly.
+Repeated builds on the same builder reuse the pip download and wheel cache.
 
 The provisioned **Twinkle / Twinkle Server Overview** dashboard shows:
 

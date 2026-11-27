@@ -6,13 +6,17 @@ cd -- "$script_dir/../../../../.."
 revision=$(git rev-parse HEAD)
 registry=${REGISTRY:-openmind-registry.cn-hangzhou.cr.aliyuncs.com}
 image="$registry/openmind/modelscope:twinkle-h20-group-${revision:0:12}"
+build_args=()
+if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+    build_args+=(--build-arg "PIP_INDEX_URL=$PIP_INDEX_URL")
+fi
 
 sudo -v
 sudo docker login "$registry"
 printf 'Building %s from Git commit %s\n' "$image" "$revision"
 git archive "$revision" -- .dockerignore Dockerfile pyproject.toml setup.cfg README.md LICENSE src cookbook | \
     sudo env DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --progress=plain \
-    --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}" \
+    "${build_args[@]}" \
     --label "org.opencontainers.image.revision=$revision" -t "$image" -
 
 sudo docker run --rm -i --platform linux/amd64 --entrypoint python "$image" - <<'PYTHON'
