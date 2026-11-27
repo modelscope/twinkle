@@ -46,7 +46,7 @@ bash "$build_script" observability 20261125-1
 在 Linux 构建机用部署分支打包 GPU 镜像。脚本实时打印构建日志和实际依赖版本，仅在版本匹配、Swift 契约可加载且依赖检查没有新增冲突后推送。
 
 ```bash
-git switch server-runtime-deployment && git pull --ff-only && bash cookbook/client/server/megatron/deployment/build-and-push-gpu-image.sh
+git fetch origin server-runtime-deployment:refs/remotes/origin/server-runtime-deployment && git checkout server-runtime-deployment && git pull --ff-only origin server-runtime-deployment && bash cookbook/client/server/megatron/deployment/build-and-push-gpu-image.sh
 ```
 
 1. 为同一个应用创建 GPU Runtime 版本，使用脚本打印的镜像。运行命令填 `exec /usr/local/bin/twinkle-runtime spectrum-group`，平台端口填 `9000`，探针填 `/healthz`。只将此探针交给平台。把 Serve `8000`、Ray 和 OTLP 留在授权的内网。

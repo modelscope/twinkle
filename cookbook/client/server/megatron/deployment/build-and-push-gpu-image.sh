@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd -- "$script_dir/../../../../.."
 if [[ -n $(git status --porcelain) ]]; then
     printf 'Build from a clean deployment checkout.\n' >&2
     exit 2
