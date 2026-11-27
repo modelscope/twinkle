@@ -8,7 +8,7 @@ import numpy as np
 from peft import LoraConfig
 from transformers import AutoTokenizer
 
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 TEXTS = [

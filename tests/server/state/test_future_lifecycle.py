@@ -14,8 +14,8 @@ from unittest import mock
 import pytest
 
 from tests.server.state.fake_backend import FakeBackend
-from twinkle.server.state.future_manager import FutureManager
-from twinkle.server.state.models import FutureFailureRecord
+from twinkle_server.state.future_manager import FutureManager
+from twinkle_server.state.models import FutureFailureRecord
 
 
 @pytest.fixture
@@ -72,7 +72,7 @@ async def test_non_terminal_past_absolute_deadline_is_failed(manager):
 @pytest.mark.asyncio
 async def test_record_without_deadline_uses_expiration_timeout(manager):
     await _store(manager, 'without-deadline', 'running', replica_id=None)
-    with mock.patch('twinkle.server.state.future_manager.time.time', return_value=time.time() + 301):
+    with mock.patch('twinkle_server.state.future_manager.time.time', return_value=time.time() + 301):
         await manager.cleanup_expired(cutoff_time=time.time() + 10, alive_replica_ids=set())
     rec = await manager.get('without-deadline')
     assert rec is not None and rec.status == 'failed'
@@ -91,7 +91,7 @@ async def test_terminal_expired_is_deleted(manager):
 @pytest.mark.asyncio
 async def test_terminal_to_terminal_different_is_refused_and_warns(manager):
     await _store(manager, 'r5', 'failed', replica_id='replica-A')
-    with mock.patch('twinkle.server.state.future_manager.logger') as log:
+    with mock.patch('twinkle_server.state.future_manager.logger') as log:
         await manager.store_status('r5', 'completed', model_id='m1')
     rec = await manager.get('r5')
     assert rec.status == 'failed'  # not overwritten
@@ -101,7 +101,7 @@ async def test_terminal_to_terminal_different_is_refused_and_warns(manager):
 @pytest.mark.asyncio
 async def test_terminal_to_terminal_same_is_dropped_without_warning(manager):
     await _store(manager, 'r6', 'completed', replica_id='replica-A')
-    with mock.patch('twinkle.server.state.future_manager.logger') as log:
+    with mock.patch('twinkle_server.state.future_manager.logger') as log:
         await manager.store_status('r6', 'completed', model_id='m1')
     rec = await manager.get('r6')
     assert rec.status == 'completed'
@@ -136,7 +136,7 @@ async def test_stored_timestamps_align_with_wall_clock_regardless_of_host_tz(man
 
 @pytest.mark.asyncio
 async def test_claim_seq_dedups_then_release_readmits():
-    from twinkle.server.state.server_state import ServerState
+    from twinkle_server.state.server_state import ServerState
     state = ServerState(backend=FakeBackend())
     # First claim of a (session, seq_id) is unseen -> None, caller proceeds to enqueue.
     assert await state.claim_seq('seq::s1::1', 'reqA', ttl=60) is None
@@ -151,7 +151,7 @@ async def test_claim_seq_dedups_then_release_readmits():
 
 @pytest.mark.asyncio
 async def test_cancel_drops_pending_but_never_running():
-    from twinkle.server.state.server_state import ServerState
+    from twinkle_server.state.server_state import ServerState
     state = ServerState(backend=FakeBackend())
     # pending -> cancel drops it to a terminal domain failure.
     await state.store_future_status('rp', 'pending', 'm1')
@@ -169,7 +169,7 @@ async def test_cancel_drops_pending_but_never_running():
 
 
 def test_cancelled_record_maps_to_error_envelope():
-    from twinkle.server.lifecycle.envelope import envelope_from_record
+    from twinkle_server.lifecycle.envelope import envelope_from_record
     rec = {
         'status': 'cancelled',
         'failure': {
@@ -219,8 +219,8 @@ async def test_concurrent_starters_only_one_obtains_execution(manager):
 
 @pytest.mark.asyncio
 async def test_future_owner_outlives_admission_retention_until_result_cleanup(monkeypatch):
-    from twinkle.server.exceptions import ResourceNotFoundError
-    from twinkle.server.state import ServerState
+    from twinkle_server.exceptions import ResourceNotFoundError
+    from twinkle_server.state import ServerState
     state = ServerState(backend=FakeBackend(), expiration_timeout=10)
     await state.store_future_status('owned', 'pending', 'training_test', owner_token='owner')
     await state.store_future_status('owned', 'completed', 'training_test', result={'value': 42})
@@ -237,8 +237,8 @@ async def test_future_owner_outlives_admission_retention_until_result_cleanup(mo
 
 @pytest.mark.asyncio
 async def test_future_owner_is_immutable_and_not_part_of_wire_envelope():
-    from twinkle.server.state import ServerState
-    from twinkle.server.lifecycle.envelope import envelope_from_record
+    from twinkle_server.state import ServerState
+    from twinkle_server.lifecycle.envelope import envelope_from_record
     state = ServerState(backend=FakeBackend())
     await state.store_future_status('owned', 'pending', None, owner_token='secret-owner')
     await state.store_future_status('owned', 'completed', None, result=42, owner_token='replacement')

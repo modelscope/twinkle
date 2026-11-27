@@ -7,14 +7,14 @@ import time
 from datetime import datetime, timezone
 from unittest import mock
 
-from twinkle.server.exceptions import ResourceQuotaExceededError
-from twinkle.server.state import ServerState
-from twinkle.server.state.backend.memory_backend import RayActorBackend
-from twinkle.server.state.future_manager import FutureManager
-from twinkle.server.state.model_manager import ModelManager
-from twinkle.server.state.models import FutureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
-from twinkle.server.state.sampling_manager import SamplingSessionManager
-from twinkle.server.state.session_manager import SessionManager
+from twinkle_server.exceptions import ResourceQuotaExceededError
+from twinkle_server.state import ServerState
+from twinkle_server.state.backend.memory_backend import RayActorBackend
+from twinkle_server.state.future_manager import FutureManager
+from twinkle_server.state.model_manager import ModelManager
+from twinkle_server.state.models import FutureRecord, ModelRecord, SamplingSessionRecord, SessionRecord
+from twinkle_server.state.sampling_manager import SamplingSessionManager
+from twinkle_server.state.session_manager import SessionManager
 from .fake_backend import FakeBackend
 
 # ============================================================
@@ -342,9 +342,9 @@ class TestProcessorQuota:
     @pytest.mark.asyncio
     async def test_expired_worker_lease_is_reclaimed(self):
         state = ServerState(backend=FakeBackend())
-        with mock.patch('twinkle.server.state.server_state.time.time', return_value=100.0):
+        with mock.patch('twinkle_server.state.server_state.time.time', return_value=100.0):
             await state.reserve_processor_quota('token', 'dead', 's1', limit=1, lease_seconds=10.0)
-        with mock.patch('twinkle.server.state.server_state.time.time', return_value=111.0):
+        with mock.patch('twinkle_server.state.server_state.time.time', return_value=111.0):
             assert await state.renew_processor_quota('token', 'dead', lease_seconds=10.0) is False
             await state.reserve_processor_quota('token', 'replacement', 's2', limit=1, lease_seconds=10.0)
 
@@ -542,8 +542,8 @@ def test_state_initializes_without_or_with_a_partial_environment_policy(monkeypa
     import uuid
 
     from tests.server.state.fake_backend import FakeBackend
-    from twinkle.server.config.env_propagation import SERVER_STATE_ENV_KEYS
-    from twinkle.server.state.server_state import get_server_state
+    from twinkle_server.config.env_propagation import SERVER_STATE_ENV_KEYS
+    from twinkle_server.state.server_state import get_server_state
 
     for key in SERVER_STATE_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)

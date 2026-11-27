@@ -11,9 +11,9 @@ import time
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from twinkle.server.deployment import twinkle_server_error_handler
-from twinkle.server.exceptions import TwinkleServerError
-from twinkle.server.gateway.twinkle_handlers import _register_gateway_twinkle_routes
+from twinkle_server.deployment import twinkle_server_error_handler
+from twinkle_server.exceptions import TwinkleServerError
+from twinkle_server.gateway.twinkle_handlers import _register_gateway_twinkle_routes
 
 
 class _State:

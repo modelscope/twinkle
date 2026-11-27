@@ -4,15 +4,15 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.config.training import TrainingConfig
-from twinkle.server.resources.allocation import CapacityUnavailableError
-from twinkle.server.state import ServerState
-from twinkle.server.state.backend.memory_backend import RayActorBackend
-from twinkle.server.state.training_records import CreateTraining
-from twinkle.server.task_queue import TaskQueueMixin
-from twinkle.server.model.pool.controller import TrainingController
-from twinkle.server.model.runtime import TrainingRuntime
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.config.training import TrainingConfig
+from twinkle_server.resources.allocation import CapacityUnavailableError
+from twinkle_server.state import ServerState
+from twinkle_server.state.backend.memory_backend import RayActorBackend
+from twinkle_server.state.training_records import CreateTraining
+from twinkle_server.task_queue import TaskQueueMixin
+from twinkle_server.model.pool.controller import TrainingController
+from twinkle_server.model.runtime import TrainingRuntime
 
 
 class Clock:
@@ -150,7 +150,7 @@ class RuntimeQueue(TrainingRuntime, TaskQueueMixin):
 
     def __init__(self, controller, state, instance):
         self.state, self.replica_id = state, instance.instance_id
-        from twinkle.server.state.training_records import TrainingRuntimeContext
+        from twinkle_server.state.training_records import TrainingRuntimeContext
         self.training_context = TrainingRuntimeContext(
             instance_id=instance.instance_id,
             epoch=controller.epoch,

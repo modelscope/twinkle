@@ -26,7 +26,7 @@ def _reset_canonical_state_actor():
 
 def test_named_save_and_cached_overwrite():
     from transformers import AutoTokenizer
-    from twinkle import init_tinker_client
+    from twinkle_client import init_tinker_client
 
     init_tinker_client()
     from tinker import ServiceClient, types

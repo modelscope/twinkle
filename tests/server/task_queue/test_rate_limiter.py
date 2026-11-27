@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle.server.task_queue.rate_limiter import RateLimiter
+from twinkle_server.task_queue.rate_limiter import RateLimiter
 
 
 class _RecordingGauge:

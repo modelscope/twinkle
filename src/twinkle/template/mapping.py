@@ -1,0 +1,57 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""
+Model-to-template selection shared by local, client and server callers.
+
+Provides centralized template selection logic for different model types,
+making it easy to maintain and extend template configurations.
+"""
+
+# Template mapping for different model families
+# Key: model name pattern to match, Value: template name
+# Qwen3.6 / Qwen3.8 share Qwen3.5's architecture (``Qwen3_5ForConditionalGeneration``,
+# ``model_type: qwen3_5``) and therefore its template. Qwen3.8 differs from Qwen3.6
+# only in chat_template semantics (``reasoning_effort``, ``preserve_thinking`` default),
+# which the jinja template itself handles.
+MODEL_TEMPLATE_MAPPING = {
+    'Qwen3.5': 'Qwen3_5Template',
+    'Qwen3.6': 'Qwen3_5Template',
+    'Qwen3.8': 'Qwen3_5Template',
+    # DeepSeek-V4 uses its own chat markup, so it maps to DeepseekV4Template rather than the default.
+    # Substring match is case-sensitive, so cover the org-prefixed and bare spellings callers use.
+    'DeepSeek-V4': 'DeepseekV4Template',
+    'deepseek-v4': 'DeepseekV4Template',
+    'Deepseek-V4': 'DeepseekV4Template',
+    # Add more model-template mappings here as needed
+    # 'ModelName': 'TemplateName',
+}
+
+# Default template for models not in the mapping
+DEFAULT_TEMPLATE = 'Template'
+
+
+def get_template_for_model(model_name: str) -> str:
+    """
+    Get the appropriate template name for a given model.
+
+    This function determines which template to use based on the model name.
+    It checks if the model name matches any known patterns and returns the
+    corresponding template, or falls back to the default template.
+
+    Args:
+        model_name: The name or identifier of the model (e.g., 'Qwen3.5-4B')
+
+    Returns:
+        The template name to use (e.g., 'Qwen3_5Template' or 'Template')
+
+    Examples:
+        >>> get_template_for_model('Qwen3.5-4B')
+        'Qwen3_5Template'
+        >>> get_template_for_model('Qwen2-7B')
+        'Template'
+        >>> get_template_for_model('llama-3-8b')
+        'Template'
+    """
+    for pattern, template in MODEL_TEMPLATE_MAPPING.items():
+        if pattern in model_name:
+            return template
+    return DEFAULT_TEMPLATE

@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from twinkle.data_format import InputFeature, Trajectory
-from twinkle.server.lifecycle.submit import to_backend_inputs
+from twinkle_server.lifecycle.submit import to_backend_inputs
 
 
 @pytest.mark.parametrize('single', [False, True])

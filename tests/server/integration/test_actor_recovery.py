@@ -9,8 +9,8 @@ from __future__ import annotations
 import pytest
 from fastapi import FastAPI
 
-from twinkle.server.model.app import ModelManagement
-from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
+from twinkle_server.model.app import ModelManagement
+from twinkle_server.model.twinkle_handlers import _register_model_twinkle_routes
 
 
 class _MockModel:

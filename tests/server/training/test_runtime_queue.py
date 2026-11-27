@@ -7,10 +7,10 @@ from tests.server.training.helpers import RPC, RuntimeQueue, settle
 
 import pytest
 
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.task_queue import TaskQueueMixin
-from twinkle.server.model.runtime import TrainingRuntime
-from twinkle.server.lifecycle.submit import submit_training_task
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.task_queue import TaskQueueMixin
+from twinkle_server.model.runtime import TrainingRuntime
+from twinkle_server.lifecycle.submit import submit_training_task
 from tests.server.training.helpers import create, setup
 
 
@@ -79,7 +79,7 @@ async def test_cancelled_queued_operation_releases_ticket_without_business_renew
     import time
     # Freeze wall time as well as the injected business clock; RPC latency is not activity.
     now = time.time()
-    monkeypatch.setattr('twinkle.server.task_queue.worker.time.time', lambda: now)
+    monkeypatch.setattr('twinkle_server.task_queue.worker.time.time', lambda: now)
     controller, state, runtime, clock = await setup()
     identity = await create(controller, state, 1)
     instance = controller.instances[controller.trainings[identity].instance_id]
@@ -307,7 +307,7 @@ async def test_execution_facts_expire_without_future_status_guessing(monkeypatch
             await asyncio.sleep(0.01)
         outcome = worker.get_task_outcome(ref['request_id'])
         assert outcome['executed']
-        monkeypatch.setattr('twinkle.server.task_queue.worker.time.time',
+        monkeypatch.setattr('twinkle_server.task_queue.worker.time.time',
                             lambda: outcome['finished_at'] + worker._config.absolute_future_ttl(1) + 1)
         assert (await queue.verify_operation(ref['request_id']))['state'] == 'missing'
         assert not worker._task_outcomes

@@ -16,15 +16,15 @@ from tinker import types as tinker_types
 
 from twinkle.data_format import SampledSequence, SampleResponse
 from twinkle.protocol.types import EncodeRequest, SampleRequest
-from twinkle.server.sampler.app import SamplerManagement
-from twinkle.server.sampler.concurrency import SamplerConcurrency
-from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
-from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
+from twinkle_server.sampler.app import SamplerManagement
+from twinkle_server.sampler.concurrency import SamplerConcurrency
+from twinkle_server.sampler.tinker_handlers import _register_tinker_sampler_routes
+from twinkle_server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
 from twinkle.utils import FullWeightLoadError
-from twinkle.server.task_queue.backend_gate import BackendGate
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.exceptions import BackendBusyError, RequestRejectedError, ResourceNotFoundError
-from twinkle.server.task_queue.worker import ComputeWorker
+from twinkle_server.task_queue.backend_gate import BackendGate
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.exceptions import BackendBusyError, RequestRejectedError, ResourceNotFoundError
+from twinkle_server.task_queue.worker import ComputeWorker
 
 
 async def _until(predicate):
@@ -178,7 +178,7 @@ async def make_service():
 
 @pytest.mark.asyncio
 async def test_standalone_checkpoint_load_waits_for_ordinary_sampling(make_service, tmp_path):
-    from twinkle.server.sampler.weights import resolve_sampler_weights
+    from twinkle_server.sampler.weights import resolve_sampler_weights
     checkpoint = tmp_path / '2'
     checkpoint.mkdir()
     (checkpoint / 'model.safetensors').touch()
@@ -461,7 +461,7 @@ async def test_partial_checkpoint_failure_quarantines_changed_weights(make_servi
 
 @pytest.mark.asyncio
 async def test_timeout_keeps_job_capacity_and_does_not_overwrite_failed_future(make_service):
-    from twinkle.server.exceptions import ResourceExhaustedError
+    from twinkle_server.exceptions import ResourceExhaustedError
     service = make_service(timeout=0.05, limit=1)
     service.sampler.release.clear()
     ref = await service.submit('tinker')

@@ -8,7 +8,7 @@ import pytest
 redis = pytest.importorskip('redis')
 ConnectionError = redis.exceptions.ConnectionError
 
-from twinkle.server.state.backend.redis_backend import RedisBackend
+from twinkle_server.state.backend.redis_backend import RedisBackend
 from tests.server.integration.on_demand_training.managed_redis import ManagedRedis
 
 

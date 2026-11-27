@@ -6,6 +6,9 @@
 !LICENSE
 !src/
 !src/**
+!twinkle_cs/
+!twinkle_cs/server/
+!twinkle_cs/server/**
 !cookbook/
 !cookbook/**
 **/.env
@@ -13,3 +16,5 @@
 **/__pycache__
 **/*.egg-info
 **/.DS_Store
+**/build/
+**/dist/

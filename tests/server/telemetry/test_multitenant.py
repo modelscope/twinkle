@@ -13,19 +13,19 @@ import pytest
 from fastapi import FastAPI, Request
 
 from tests.server.state.fake_backend import FakeBackend
-from twinkle.server.checkpoint import paths
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.exceptions import BackendBusyError
-from twinkle.server.identity import USER_ID_KEY_ENV, current_tenant_fingerprint, tenant_fingerprint
-from twinkle.server.lifecycle.submit import submit_training_task
-from twinkle.server.middleware.auth import get_token_from_request, verify_request_token
-from twinkle.server.processor.twinkle_handlers import _register_processor_routes
-from twinkle.server.state.server_state import ServerState
-from twinkle.server.task_queue.mixin import TaskQueueMixin
-from twinkle.server.config.telemetry import TelemetryConfig
-from twinkle.server.telemetry import metrics, resource_metrics
-from twinkle.server.telemetry.http_middleware import create_metrics_middleware
-from twinkle.server.telemetry.tracing import create_tracing_middleware
+from twinkle_server.checkpoint import paths
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.exceptions import BackendBusyError
+from twinkle_server.identity import USER_ID_KEY_ENV, current_tenant_fingerprint, tenant_fingerprint
+from twinkle_server.lifecycle.submit import submit_training_task
+from twinkle_server.middleware.auth import get_token_from_request, verify_request_token
+from twinkle_server.processor.twinkle_handlers import _register_processor_routes
+from twinkle_server.state.server_state import ServerState
+from twinkle_server.task_queue.mixin import TaskQueueMixin
+from twinkle_server.config.telemetry import TelemetryConfig
+from twinkle_server.telemetry import metrics, resource_metrics
+from twinkle_server.telemetry.http_middleware import create_metrics_middleware
+from twinkle_server.telemetry.tracing import create_tracing_middleware
 from twinkle.utils.logger import get_logger
 
 TOKEN = 'synthetic-credential-测试'
@@ -307,7 +307,7 @@ async def test_http_failure_status_and_anonymous_attribution(monkeypatch, in_mem
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
     from twinkle.protocol.headers import H_CLIENT_ID
-    from twinkle.server import deployment
+    from twinkle_server import deployment
 
     reader = InMemoryMetricReader()
     meter_provider = MeterProvider(metric_readers=[reader])
@@ -356,9 +356,9 @@ async def test_http_failure_status_and_anonymous_attribution(monkeypatch, in_mem
 
 @pytest.mark.asyncio
 async def test_proxy_client_span_connects_two_server_spans(in_memory_span_exporter, monkeypatch):
-    from twinkle.server.deployment import twinkle_server_error_handler
-    from twinkle.server.exceptions import RateLimitExceededError, TwinkleServerError
-    from twinkle.server.lifecycle.proxy import ServiceProxy
+    from twinkle_server.deployment import twinkle_server_error_handler
+    from twinkle_server.exceptions import RateLimitExceededError, TwinkleServerError
+    from twinkle_server.lifecycle.proxy import ServiceProxy
 
     in_memory_span_exporter.clear()
     requests_total = SimpleNamespace(add=Mock())
@@ -409,8 +409,8 @@ async def test_proxy_client_span_connects_two_server_spans(in_memory_span_export
 async def test_sampler_router_propagates_new_trace_context(in_memory_span_exporter):
     from starlette.requests import Request as ASGIRequest
 
-    from twinkle.server.sampler.pool.router import SamplerRouter
-    from twinkle.server.telemetry.tracing import traced_operation
+    from twinkle_server.sampler.pool.router import SamplerRouter
+    from twinkle_server.telemetry.tracing import traced_operation
 
     in_memory_span_exporter.clear()
     forwarded = AsyncMock(return_value={'status': 429, 'body': b'{}', 'headers': []})

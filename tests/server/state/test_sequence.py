@@ -6,10 +6,10 @@ import uuid
 import pytest
 import pytest_asyncio
 
-from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.state import ServerState
-from twinkle.server.state.backend.memory_backend import RayActorBackend
-from twinkle.server.state.backend.redis_backend import RedisBackend
+from twinkle_server.exceptions import RequestRejectedError
+from twinkle_server.state import ServerState
+from twinkle_server.state.backend.memory_backend import RayActorBackend
+from twinkle_server.state.backend.redis_backend import RedisBackend
 
 
 @pytest_asyncio.fixture(params=['memory', 'redis'])
@@ -32,7 +32,7 @@ async def state(request):
 async def test_expired_retry_receipts_cannot_execute_old_sequences_again(state, monkeypatch):
     backend = state._backend
     now = time.time()
-    monkeypatch.setattr('twinkle.server.state.server_state.time.time', lambda: now)
+    monkeypatch.setattr('twinkle_server.state.server_state.time.time', lambda: now)
     assert await state.claim_training_seq('training', 'native::session::step', 1, 'first', 10) is None
     assert await state.claim_training_seq('training', 'native::session::step', 1, 'retry', 10) == 'first'
     now += 11

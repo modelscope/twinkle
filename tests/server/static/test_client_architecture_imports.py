@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-_ROOT = Path(__file__).parents[3] / 'src'
+_ROOT = Path(__file__).parents[3]
 _ALLOWED_SERVER_IMPORTS = (
     'twinkle.protocol.types',
     'twinkle.protocol.headers',
@@ -25,16 +25,16 @@ def _imports(path: Path):
 
 def test_client_does_not_import_server():
     offenders = []
-    for path in (_ROOT / 'twinkle_client').rglob('*.py'):
+    for path in (_ROOT / 'twinkle_cs/client/src/twinkle_client').rglob('*.py'):
         for module in _imports(path):
-            if module == 'twinkle.server' or module.startswith('twinkle.server.'):
+            if module == 'twinkle_server' or module.startswith('twinkle_server.'):
                 offenders.append(f'{path.relative_to(_ROOT)} -> {module}')
     assert offenders == []
 
 
 def test_server_only_imports_shared_client_contracts():
     offenders = []
-    for path in (_ROOT / 'twinkle' / 'server').rglob('*.py'):
+    for path in (_ROOT / 'twinkle_cs/server/src/twinkle_server').rglob('*.py'):
         for module in _imports(path):
             if module == 'twinkle_client' or module.startswith('twinkle_client.'):
                 if not any(module == allowed or module.startswith(f'{allowed}.')

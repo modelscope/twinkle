@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from twinkle.server.lifecycle.submit import run_submit
+from twinkle_server.lifecycle.submit import run_submit
 from twinkle.protocol.types.model import ForwardBackwardTaskRequest
 
 

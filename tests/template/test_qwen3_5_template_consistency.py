@@ -36,7 +36,7 @@ import numpy as np
 
 import twinkle
 from twinkle.data_format import Message, Trajectory
-from twinkle.server.utils.template_utils import DEFAULT_TEMPLATE, get_template_for_model
+from twinkle.template.mapping import DEFAULT_TEMPLATE, get_template_for_model
 
 twinkle.initialize(mode='local')
 

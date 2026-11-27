@@ -5,16 +5,16 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from twinkle.server.lifecycle.envelope import envelope_from_record
+from twinkle_server.lifecycle.envelope import envelope_from_record
 
 
 def test_wire_maps_cover_exactly_the_canonical_reason_codes():
     """The Twinkle and Tinker failure maps must both stay in lockstep with the
     canonical reason-code set, so a newly added domain reason cannot silently
     fall back to 500 on one protocol face."""
-    from twinkle.server.gateway.tinker_handlers import _tinker_error_from_failure
-    from twinkle.server.lifecycle.envelope import error_payload_from_failure
-    from twinkle.server.task_errors import FailureResponse
+    from twinkle_server.gateway.tinker_handlers import _tinker_error_from_failure
+    from twinkle_server.lifecycle.envelope import error_payload_from_failure
+    from twinkle_server.task_errors import FailureResponse
 
     for reason in FailureResponse.reasons():
         policy = FailureResponse.for_reason(reason)

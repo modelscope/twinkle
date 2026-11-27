@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from twinkle.server.resources.allocation import DevicePool
+from twinkle_server.resources.allocation import DevicePool
 
 
 @pytest.mark.parametrize('node_selector', [None, {'twinkle-node': 'a'}])

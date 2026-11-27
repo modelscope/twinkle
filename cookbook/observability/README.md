@@ -125,7 +125,7 @@ The provisioned **Twinkle / Twinkle Server Overview** dashboard shows:
 
 For traces, switch the datasource picker in **Explore** to Tempo and search by
 service or span name. Twinkle spans are namespaced under
-`twinkle.server.<component>` (Gateway / Model / Sampler / Processor).
+`twinkle_server.<component>` (Gateway / Model / Sampler / Processor).
 
 ## Metric naming reference
 

@@ -12,8 +12,8 @@ from starlette.requests import Request
 
 from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import request, setup
-from twinkle.server.config.training import TrainingConfig
-from twinkle.server.model.pool.router import TrainingRouter
+from twinkle_server.config.training import TrainingConfig
+from twinkle_server.model.pool.router import TrainingRouter
 
 
 async def _setup_full_instance():
@@ -82,7 +82,7 @@ async def test_concurrent_handler_creates_have_exactly_one_winner():
     router.controller = SimpleNamespace(create=SimpleNamespace(remote=AsyncMock(side_effect=controller.create)))
 
     async def create_remote(payload):
-        from twinkle.server.state.training_records import CreateTraining
+        from twinkle_server.state.training_records import CreateTraining
         return await controller.create(CreateTraining.model_validate(payload))
     router.controller.create.remote.side_effect = create_remote
     try:

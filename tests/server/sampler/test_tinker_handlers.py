@@ -5,9 +5,9 @@ from starlette.requests import Request
 from tinker import types
 
 from twinkle.data_format import SampledSequence, SampleResponse
-from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
-from twinkle.server.sampler.concurrency import SamplerConcurrency
+from twinkle_server.exceptions import RequestRejectedError
+from twinkle_server.sampler.tinker_handlers import _register_tinker_sampler_routes
+from twinkle_server.sampler.concurrency import SamplerConcurrency
 
 
 class _DummyState:
