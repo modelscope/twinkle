@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source "$(dirname -- "${BASH_SOURCE[0]}")/twinkle-runtime-common.sh"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/twinkle-runtime-common.sh"
+megatron_examples="$script_dir/megatron"
+if [[ ! -d "$megatron_examples" ]]; then
+    megatron_examples=/twinkle/cookbook/client/server/megatron
+fi
 export FLA_TILELANG="${FLA_TILELANG:-0}"
 
 start_worker() {
@@ -90,7 +95,7 @@ case "$role" in
         mkdir -p -- "$TWINKLE_DEFAULT_SAVE_DIR" "$MODELSCOPE_CACHE"
         export RAY_ADDRESS="$MASTER_ADDRESS:6379"
         export TWINKLE_EXPECTED_RAY_NODES="${TWINKLE_EXPECTED_RAY_NODES:-3}" TWINKLE_EXPECTED_GPUS_PER_NODE=8
-        export TWINKLE_SERVER_CONFIG="${TWINKLE_SERVER_CONFIG:-/twinkle/cookbook/client/server/megatron/server_config_h20_smoke.yaml}"
+        export TWINKLE_SERVER_CONFIG="${TWINKLE_SERVER_CONFIG:-$megatron_examples/server_config_h20_smoke.yaml}"
         case "$TWINKLE_EXPECTED_RAY_NODES" in
             2|3) ;;
             *) printf 'spectrum-group requires two or three nodes.\n' >&2; exit 2 ;;
@@ -106,7 +111,7 @@ case "$role" in
             exit 2
         fi
         options=(--node-ip-address="$RANK_IP" "--labels=twinkle-node=$node" --disable-usage-stats)
-        health_script=/twinkle/cookbook/client/server/megatron/deployment/spectrum_health.py
+        health_script="$megatron_examples/deployment/spectrum_health.py"
         start_service python "$health_script"
         if [[ "$node" == a ]]; then
             start_head --port=6379 --include-dashboard=false "${options[@]}"
@@ -129,7 +134,7 @@ case "$role" in
         if [ "$node" = a ]; then
             export RAY_ADDRESS="$NODE_IP:6379"
             export TWINKLE_EXPECTED_RAY_NODES=3 TWINKLE_EXPECTED_GPUS_PER_NODE=8
-            export TWINKLE_SERVER_CONFIG="${TWINKLE_SERVER_CONFIG:-/twinkle/cookbook/client/server/megatron/server_config_h20_3x8.yaml}"
+            export TWINKLE_SERVER_CONFIG="${TWINKLE_SERVER_CONFIG:-$megatron_examples/server_config_h20_3x8.yaml}"
             start_head --port=6379 --dashboard-host=127.0.0.1 "${options[@]}" "$@"
         else
             start_worker "${options[@]}" "$@"

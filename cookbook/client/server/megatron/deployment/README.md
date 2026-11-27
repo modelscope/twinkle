@@ -53,3 +53,11 @@ git fetch origin server-runtime-deployment:refs/remotes/origin/server-runtime-de
 2. 创建一个成组部署，基数选 3，组数填 1。扩展配置开启 `{"cache_volume":{"enabled":true,"scope":"application"}}`。[GPU 私有配置模板](gpu-group.runtime.env.example) 中的变量可以填到部署环境变量，也可以放在应用卷的 `runtime-config/twinkle-gpu.env`。Redis URL 和 Grafana 必须指向同一个 Redis 和 key prefix，Grafana 使用独立的快照只读账户。验双机时同时把基数和 `TWINKLE_EXPECTED_RAY_NODES` 改为 2。
 3. 先核对平台给的 Rank、Ray 的 24 张卡和三个节点的任务落点，再通过 Head 的 `/readyz` 检查业务路由。默认 [4B 验收配置](../server_config_h20_smoke.yaml) 把 Megatron 放 A、vLLM 放 B，C 参与 Ray 组网。使用 [3×8 正式模型配置](../server_config_h20_3x8.yaml) 时显式设置 `TWINKLE_SERVER_CONFIG`，单独验收各模型。
 4. 运行客户端训练并对账。训练活跃时查 Grafana 的 **Current trainings**，打开对应 trace 的 `task_queue.execute`，通过 **Allocated GPU utilization** 或 **Allocated GPU memory** 查实际分配的卡。在同一次训练中保存训练和采样 checkpoint，让 B 从共享卷读取采样权重。上传 ModelScope 时只使用获准的私有仓库。
+
+### 复用镜像验证纯代码改动
+
+先核对已运行镜像的包版本满足目标提交的依赖。容器能访问 GitHub 时，保留原镜像，创建新的 Runtime 版本，给每个 Rank 使用下面同一条命令。将 `REVIEWED_COMMIT` 替换为验收过的完整 Git SHA。每个 Rank 将源码放在同一绝对路径，Ray worker 才能沿用 Head 传播的 `PYTHONPATH`。运行日志会打印提交号。依赖改变时使用上面的镜像构建脚本。
+
+```bash
+exec bash -c 'set -eu; code="/tmp/twinkle-source/$1"; mkdir -p "$code"; cd "$code"; git init -q; timeout 90 git fetch -q --depth=1 https://github.com/modelscope/twinkle.git "$1"; git checkout -q --detach FETCH_HEAD; test "$(git rev-parse HEAD)" = "$1"; printf "Twinkle source %s\n" "$1"; export PYTHONPATH="$code/src${PYTHONPATH:+:$PYTHONPATH}"; exec bash cookbook/client/server/twinkle-runtime.sh spectrum-group' twinkle REVIEWED_COMMIT
+```
