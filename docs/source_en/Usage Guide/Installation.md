@@ -26,7 +26,7 @@ Install a matching `ms-swift` when you use Swift templates or model loaders.
 You can also use our pre-built Docker image:
 
 ```text
-modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.3.0
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-1.0.0.dev
 ```
 
 ## Client Installation

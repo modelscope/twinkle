@@ -19,11 +19,24 @@ python -m build twinkle_cs/server
 
 The shared `twinkle.protocol` belongs to kit. Client and server never install one
 another. Their CLI entry points and package resources belong to their own wheels.
-The initial Python versions are `0.4.0.dev0`; each distribution can be versioned
-independently within its declared kit compatibility range.
 
-Release tags `v<version>` (kit), `twinkle-client-v<version>` and
-`twinkle-server-v<version>` publish the corresponding Python distribution.
+## Versioning and releases
+
+No distribution carries a version of its own: the repository-root `VERSION` file is the single
+source for every distribution in this repository, Python or otherwise.
+
+- `pyproject.toml` (twinkle-kit) reads `VERSION` directly (`[tool.setuptools.dynamic]`).
+- `client/` and `server/` cannot reference the repository root from their `pyproject.toml`
+  (setuptools refuses files outside the project directory), so their `setup.py` copies `VERSION`
+  next to itself before calling `setup()`, and `MANIFEST.in` ships that copy inside the sdist so
+  the wheel stays rebuildable from the sdist alone. The copies are git-ignored.
+- At runtime `twinkle.__version__`, `twinkle_client.__version__` and `twinkle_server.__version__`
+  read the installed package metadata; a source checkout falls back to the `VERSION` file.
+
+Pushing a single `v<VERSION>` tag publishes twinkle-kit, twinkle-client and twinkle-server
+together with that version (`.github/workflows/publish.yaml`, which fails if the tag and
+`VERSION` disagree). A future non-Python distribution reads the same `VERSION` file and joins the
+same workflow.
 
 The Tinker request encoder is now
 `twinkle_client.utils.tinker_datum.input_feature_to_datum`; client examples do not

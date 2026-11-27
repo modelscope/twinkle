@@ -1,11 +1,13 @@
 name: release
 
+# One tag publishes every distribution in this repository with the same version: the tag must be
+# `v<VERSION>` where VERSION is the repository-root VERSION file (twinkle-kit reads it directly,
+# twinkle-client / twinkle-server copy it next to themselves in their setup.py).
+
 on:
   push:
     tags:
       - 'v**'
-      - 'twinkle-client-v**'
-      - 'twinkle-server-v**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-publish
@@ -14,25 +16,25 @@ concurrency:
 jobs:
   build-n-publish:
     runs-on: ubuntu-22.04
-    #if: startsWith(github.event.ref, 'refs/tags')
     steps:
-      - uses: actions/checkout@v2
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v2
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install build
-        run: pip install build
-      - name: Build twinkle-kit
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: python -m build --outdir dist
-      - name: Build twinkle-client
-        if: startsWith(github.ref, 'refs/tags/twinkle-client-v')
-        run: python -m build twinkle_cs/client --outdir dist
-      - name: Build twinkle-server
-        if: startsWith(github.ref, 'refs/tags/twinkle-server-v')
-        run: python -m build twinkle_cs/server --outdir dist
-      - name: Publish package to PyPI
+        run: pip install build twine
+      - name: Check the tag against VERSION
         run: |
-          pip install twine
-          twine upload dist/* --skip-existing -u __token__ -p ${{ secrets.PYPI_API_TOKEN }}
+          VERSION="$(cat VERSION)"
+          if [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match v${VERSION} (VERSION file)"; exit 1
+          fi
+      - name: Build twinkle-kit, twinkle-client and twinkle-server
+        run: |
+          python -m build --outdir dist
+          python -m build twinkle_cs/client --outdir dist
+          python -m build twinkle_cs/server --outdir dist
+          python -m twine check dist/*
+          ls dist/*
+      - name: Publish packages to PyPI
+        run: twine upload dist/* --skip-existing -u __token__ -p ${{ secrets.PYPI_API_TOKEN }}
