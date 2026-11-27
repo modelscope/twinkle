@@ -57,25 +57,6 @@ def construct_template(template_cls, *, _default_model_id=None, **kwargs):
     return template_cls(**kwargs)
 
 
-def template_request(template_cls, kwargs):
-    options = dict(kwargs)
-    if isinstance(template_cls, str):
-        return template_cls, options
-    from twinkle.template.base import Template
-    if isinstance(template_cls, Template):
-        if options:
-            template_cls = template_cls.replace(**options)
-        options = template_cls._constructor_config()
-        template_cls = type(template_cls)
-    if isinstance(template_cls, type):
-        if not issubclass(template_cls, Template):
-            raise TypeError('template_cls must be a Template subclass')
-        template_cls = getattr(template_cls, '_server_template_name', None) or template_cls.__name__
-    if not isinstance(template_cls, str):
-        raise TypeError('template_cls must be a Template instance, subclass or registered name')
-    return template_cls, options
-
-
 def _coerce_ids_to_list(ids: Any) -> List[int]:
     import torch
     if isinstance(ids, torch.Tensor):

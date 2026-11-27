@@ -21,9 +21,7 @@ class Dataset(RemoteComponent):
         self._bind_remote('dataset', 'Dataset', dataset_meta=dataset_meta, transport=transport, **kwargs)
 
     def set_template(self, template_func: Union[Template, Type[Template], str], **kwargs):
-        from twinkle.template.utils import template_request
-        name, options = template_request(template_func, kwargs)
-        return self._call('set_template', template_func=name, **options)
+        return self._call('set_template', template_func=template_func, **kwargs)
 
     def encode(self, add_generation_prompt: bool = False, timeout: Optional[int] = 600, **kwargs):
         return self._call('encode', timeout, add_generation_prompt=add_generation_prompt, **kwargs)

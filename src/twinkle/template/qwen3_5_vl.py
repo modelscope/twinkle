@@ -156,12 +156,6 @@ class Qwen3_5Template(Template):
                            if (value := getattr(self.config, name, None)) is not None)
         return media + boundaries
 
-    def _constructor_config(self):
-        image = {f'image_{key}': value for key, value in self._image_kwargs.items()}
-        video = {(f'video_{key}' if key in ('min_pixels', 'max_pixels', 'total_pixels', 'min_frames', 'max_frames')
-                  else key): value for key, value in self._video_kwargs.items()}
-        return {**super()._constructor_config(), **image, **video}
-
     @property
     def tool_call_stop(self) -> str | None:
         # Qwen writes Hermes markup, which closes every call, so stopping here

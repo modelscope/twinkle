@@ -94,7 +94,6 @@ class Template:
     # Class-level defaults keep ``object.__new__``-built templates (tests, fingerprints) readable.
     _explicit_enable_thinking = False
     preserve_thinking = None
-    _server_template_name = None
 
     def __init__(
         self,
@@ -165,13 +164,6 @@ class Template:
         self.padding_side = padding_side
         self.media_types = frozenset(media_types) if media_types is not None else self._infer_media_types()
 
-    def _constructor_config(self):
-        return {**getattr(self, '_processor_kwargs', {}), 'model_id': self.model_id,
-                'max_length': self.max_length, 'truncation_strategy': self.truncation_strategy,
-                'use_chat_template': self.use_chat_template, 'default_system': self.default_system,
-                'enable_thinking': self.enable_thinking if self._explicit_enable_thinking else None,
-                'preserve_thinking': self.preserve_thinking, 'padding_side': self.padding_side,
-                'media_types': sorted(self.media_types)}
 
     def parse_tool_call(self, decoded: str) -> list[dict[str, Any]]:
         """Parse tool calls from the assistant's decoded output.

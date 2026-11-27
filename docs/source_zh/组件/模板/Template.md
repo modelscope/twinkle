@@ -58,7 +58,7 @@ class Template:
 
 list 批次返回平铺 list，列存批次返回等长列。单条 encode 在 split 下可以返回多条轨迹；encode_prompt 拒绝多条结果。left/right 保留受保护媒体 token，并同步切片序列字段；不能安全切分的多模态和配对样本拒绝 split。追加不能截断已记录 token。decode 不带 context 返回文本，带 context 返回共享的 DecodedResponse。
 
-组件的 set_template 接受模板实例、子类或注册名称。HTTP 只传注册名称和构造配置，swift 复用现有 TemplateSpec。远程使用前通过现有 swift worker 启动 hook 注册 SwiftTemplate；名称未注册时明确报错，不回退到原生模板。
+进程内组件的 set_template 接受模板实例、子类或注册名称。远程 client 只传注册名称和构造配置（swift 复用现有 TemplateSpec），类和实例不跨 HTTP 传递。远程使用前通过现有 swift worker 启动 hook 注册 SwiftTemplate；名称未注册时明确报错，不回退到原生模板。
 
 > Template 不支持使用函数来代替，因为其内部要支持的功能较多。如果需要编写新的 Template，请继承 `Template` 类。
 > 一般来说，纯文本模型使用 Template 基类就足够了，在基类中我们使用了 tokenizer.apply_chat_template 来编码模型，对一般的纯文本模型是通用的。

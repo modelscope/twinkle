@@ -58,7 +58,7 @@ class Template:
 
 List batches return a flat list; columnar batches return equally sized columns. Single encode can return a list under split; encode_prompt rejects split results. Left/right retain protected media tokens and slice their sequence companions together. Multimodal and paired samples reject split. Append never truncates recorded tokens. Without a decode context, decode returns text; with one, it returns the shared DecodedResponse.
 
-Components accept template instances, subclasses, or registered names through set_template. HTTP sends only a registered name and construction settings, using the existing TemplateSpec for swift. Register SwiftTemplate through the existing swift worker startup hook before remote use; an unregistered name raises an error instead of falling back.
+In-process components accept template instances, subclasses, or registered names through set_template. A remote client sends only a registered name and construction settings (the existing TemplateSpec for swift); classes and instances are not sent over HTTP. Register SwiftTemplate through the existing swift worker startup hook before remote use; an unregistered name raises an error instead of falling back.
 
 > Template does not support using functions as replacements because it needs to support many functions internally. If you need to write a new Template, please inherit the `Template` class.
 > Generally speaking, using the Template base class is sufficient for pure text models. In the base class, we use tokenizer.apply_chat_template to encode the model, which is universal for general pure text models.
