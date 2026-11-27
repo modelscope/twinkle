@@ -49,7 +49,7 @@ bash "$build_script" observability 20261125-1
 git fetch origin server-runtime-deployment:refs/remotes/origin/server-runtime-deployment && git checkout server-runtime-deployment && git pull --ff-only origin server-runtime-deployment && bash cookbook/client/server/megatron/deployment/build-and-push-gpu-image.sh
 ```
 
-GPU 镜像用清华 HTTPS PyPI 镜像下载依赖。同一构建机上的 BuildKit 会复用已下载的包和构建出来的 wheel。已有构建环境需要指定源时，给脚本设置 `PIP_INDEX_URL`。基础镜像中的 Ray 满足 Twinkle 要求时直接复用。三台 GPU 使用同一个镜像，Ray Client 诊断环境使用脚本打印的 Ray 版本。
+GPU 镜像用阿里云公网 HTTPS PyPI 镜像下载依赖。同一构建机上的 BuildKit 会复用已下载的包和构建出来的 wheel。构建环境需要切换源时，给脚本设置 `PIP_INDEX_URL`。基础镜像中的 Ray 满足 Twinkle 要求时直接复用。三台 GPU 使用同一个镜像，Ray Client 诊断环境使用脚本打印的 Ray 版本。
 
 1. 为同一个应用创建 GPU Runtime 版本，使用脚本打印的镜像。运行命令填 `exec /usr/local/bin/twinkle-runtime spectrum-group`，平台端口填 `9000`，探针填 `/healthz`。只将此探针交给平台。把 Serve `8000`、Ray 和 OTLP 留在授权的内网。
 2. 创建一个成组部署，基数选 3，组数填 1。扩展配置开启 `{"cache_volume":{"enabled":true,"scope":"application"}}`。[GPU 私有配置模板](gpu-group.runtime.env.example) 中的变量可以填到部署环境变量，也可以放在应用卷的 `runtime-config/twinkle-gpu.env`。Redis URL 和 Grafana 必须指向同一个 Redis 和 key prefix，Grafana 使用独立的快照只读账户。验双机时同时把基数和 `TWINKLE_EXPECTED_RAY_NODES` 改为 2。
