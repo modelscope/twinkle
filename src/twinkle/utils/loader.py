@@ -17,12 +17,13 @@ T = TypeVar("T")
 #: rather than a re-import, and two different plugins never collide on a shared module name.
 _LOADED_MODULES: dict[str, ModuleType] = {}
 
-#: Env var carrying a ``module:attr`` worker-startup hook the driver registers. A Ray worker inherits it
-#: through its ``runtime_env`` (``os.environ.copy()``), and :func:`run_worker_setup_hook` resolves and calls
-#: it once per worker process -- BEFORE any actor argument is deserialised. The indirection (a dotted path
-#: in the environment, resolved lazily) keeps twinkle agnostic of whoever registers the hook: swift points
-#: it at its own plugin reloader so an ``--external_plugins`` file the driver imported is re-imported --
-#: and its ``@register`` side effects re-run -- in every worker.
+#: Env var carrying one or more ``module:attr`` worker-startup hooks the driver registers (comma-separated, run in
+#: order). A Ray worker inherits it through its ``runtime_env`` (``os.environ.copy()``), and
+#: :func:`run_worker_setup_hook` resolves and calls each once per worker process -- BEFORE any actor
+#: argument is deserialised. The indirection (dotted paths in the environment, resolved lazily) keeps twinkle
+#: agnostic of whoever registers the hooks: swift points it at its plugin reloader AND its server-side
+#: namespace export, so both an ``--external_plugins`` file the driver imported and ``SwiftTemplate`` /
+#: ``DevInputProcessor`` are available in every worker.
 WORKER_SETUP_HOOK_ENV = "TWINKLE_WORKER_SETUP_HOOK"
 
 #: The import path Ray needs to reach :func:`run_worker_setup_hook`. A string rather than the
@@ -32,19 +33,19 @@ WORKER_SETUP_HOOK = f"{__name__}.run_worker_setup_hook"
 
 
 def run_worker_setup_hook() -> None:
-    """Ray ``worker_process_setup_hook``: invoke the driver-registered setup hook, if any.
+    """Ray ``worker_process_setup_hook``: invoke the driver-registered setup hooks, if any.
 
     Runs once per worker process at startup, before tasks/actor arguments are handled. A plugin module the
     driver loaded rides into worker arguments by reference (cloudpickle), so it must be importable here
-    first; re-importing it also re-runs its registration side effects. The target is read from
-    ``WORKER_SETUP_HOOK_ENV`` (which the worker inherited through its runtime_env), so twinkle never needs
-    to know the downstream framework that registered it. A no-op when nothing is registered.
+    first; re-importing it also re-runs its registration side effects. The targets are read from
+    ``WORKER_SETUP_HOOK_ENV`` (which the worker inherited through its runtime_env) as a comma-separated
+    list of ``module:attr`` paths, so several frameworks (or several hooks of one) can each register
+    without knowing about the others. A no-op when nothing is registered.
     """
-    target = os.environ.get(WORKER_SETUP_HOOK_ENV)
-    if not target:
-        return
-    module_name, _, attr = target.partition(":")
-    getattr(importlib.import_module(module_name), attr)()
+    for target in os.environ.get(WORKER_SETUP_HOOK_ENV, '').split(','):
+        module_name, _, attr = target.strip().partition(":")
+        if module_name:
+            getattr(importlib.import_module(module_name), attr)()
 
 
 def _unique_module_name(path: Path) -> str:
