@@ -172,7 +172,7 @@ class MockSampler:
 
     def sample_stream_to_queue(self, queue, inputs, sampling_params=None, adapter_name="", adapter_path=None):
         """Push streaming deltas to a cross-process Ray queue."""
-        from twinkle.sampler.streaming import stream_to_queue
+        from twinkle.utils.streaming import stream_to_queue
 
         stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
 

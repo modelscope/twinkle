@@ -602,7 +602,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
         from ray.util.queue import Queue
 
-        from twinkle.sampler.streaming import STREAM_SENTINEL
+        from twinkle.utils.streaming import STREAM_SENTINEL
 
         request_id = f'req_{uuid.uuid4().hex}'
         actors = self.sampler._actors
