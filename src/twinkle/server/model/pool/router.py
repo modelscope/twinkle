@@ -42,6 +42,7 @@ NATIVE_REQUESTS = {
     "clip_grad_norm": native.ClipGradNormRequest,
     "clip_grad_and_step": native.ClipGradAndStepRequest,
     "get_train_configs": native.AdapterRequest,
+    "task_head_temperatures": native.TaskHeadTemperaturesRequest,
     "set_loss": native.SetLossRequest,
     "set_optimizer": native.SetOptimizerRequest,
     "set_lr_scheduler": native.SetLrSchedulerRequest,

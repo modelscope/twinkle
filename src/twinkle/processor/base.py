@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import math
 import sys
 from copy import copy
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
-from twinkle.data_format import InputFeature
+from twinkle.data_format import InputFeature, Trajectory
 from twinkle.perf import timed
 from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
@@ -49,7 +50,6 @@ class PackedSeqParams:
     cp_scatter_cache: object = None
 
 
-@remote_class()
 def _record_collated(inputs, padding_side: str) -> None:
     """Save the batch AFTER collation when ``TWINKLE_COLLATED_PROBE`` names a directory.
 
@@ -88,6 +88,7 @@ def _record_collated(inputs, padding_side: str) -> None:
                os.path.join(root, f'collated.{os.getpid()}.{index:05d}.pt'))
 
 
+@remote_class()
 class InputProcessor:
     padding_map = {
         "input_ids": 0,
@@ -142,15 +143,26 @@ class InputProcessor:
         "mm_token_type_ids",
         "second_per_grid_ts",
     } | VLM_CONCAT_FIELDS)
+    # Token columns ``pad_cp`` right-pads to the sequence alignment. Pad values come from
+    # ``padding_map`` (labels -100, loss_scale 0, position_ids -1 keeps the pad inside the last
+    # cu_seqlens segment -- all loss-neutral).
+    _SEQ_ALIGN_FIELDS = (
+        "input_ids", "position_ids", "attention_mask", "labels", "completion_mask", "loss_scale", "mm_token_type_ids",
+    )
 
     def __init__(
         self,
         device_mesh: DeviceMesh | None = None,
         padding_free: bool = False,
         framework: Literal["transformers", "megatron"] = "transformers",
+        seq_align_to: int | None = None,
         **kwargs,
     ):
         self.device_mesh = device_mesh
+        #: Kernel alignment every sequence's token count must reach (megatron fp8/fp4 GEMMs: 16
+        #: delayed/tensorwise, 32 mxfp8, 128 blockwise); ``pad_cp`` combines it with CP / SP. None
+        #: or 1 disables it.
+        self.seq_align_to = int(seq_align_to) if seq_align_to and seq_align_to > 1 else None
         # right is always used in training, and is fit for megatron
         self.padding_side = kwargs.get("padding_side", "right")
         self.padding_free = padding_free
@@ -187,7 +199,12 @@ class InputProcessor:
             return inputs
 
     def prepare_inputs(self, inputs: list[InputFeature] | InputFeature, **kwargs) -> list[InputFeature]:
+        metadata_keys = Trajectory.__annotations__.keys() - InputFeature.__annotations__.keys()
+
         def to_tensor(_input):
+            metadata = metadata_keys | set(_input.get('_trajectory_columns', ()))
+            # Project only the model view; the caller retains the complete trajectory.
+            _input = {key: value for key, value in _input.items() if key not in metadata and not key.startswith('_')}
             for key in list(_input.keys()):
                 value = _input[key]
                 # Ray/pyarrow can return numpy or list scalars; normalize to tensors.
@@ -417,118 +434,97 @@ class InputProcessor:
         return pooled, is_packed
 
     def pad_cp(self, inputs: list[InputFeature], **kwargs) -> list[InputFeature]:
-        if self.device_mesh is None:
+        """Right-pad every token column so each sequence's length divides ``_seq_pad_divisor``.
+
+        For CP > 1 Megatron's RoPE needs seq_len % (2 * cp) == 0 and the zigzag cut in ``split_cp``
+        must stay legal, so a packed row is padded per cu_seqlens segment; with sequence parallel the
+        whole row is padded to the TP size; with fp8/fp4 (``seq_align_to``) the kernels need the token
+        count to reach their alignment, on a single process too. Runs before ``add_extra_padding_free_args``
+        derives cu_seqlens, so the packed params describe the padded layout.
+        Padded tokens carry labels -100 / loss_scale 0 and contribute no loss.
+        """
+        if self.framework != "megatron":
             return inputs
-        if self.framework == "transformers":
+        divisor = self._seq_pad_divisor()
+        if divisor <= 1:
             return inputs
+        return [self._pad_row_to_seq_align(row, divisor) for row in inputs]
 
-        def _pad_cp(_input: InputFeature) -> InputFeature:
-            # Pad sequence for parallel compatibility
-            # 1. For CP > 1: Megatron's RoPE requires seq_len % (2 * cp_size) == 0
-            # 2. For sequence_parallel with TP > 1: seq_len must be divisible by TP size
-            cp_size = self.device_mesh.cp_world_size
-            tp_size = self.device_mesh.tp_world_size
-            position_ids = _input.get("position_ids")
+    def _seq_pad_divisor(self) -> int:
+        """What every sequence's token count must divide: the kernel alignment combined with the CP
+        zigzag split (2 * cp) or, without CP, the sequence-parallel TP shard."""
+        mesh = self.device_mesh
+        cp_size = mesh.cp_world_size if mesh is not None else 1
+        tp_size = mesh.tp_world_size if mesh is not None else 1
+        divisor = self.seq_align_to or 1
+        if cp_size > 1:
+            divisor = math.lcm(divisor, 2 * cp_size)
+        elif mesh is not None and mesh.sequence_parallel and tp_size > 1:
+            divisor = math.lcm(divisor, tp_size)
+        return divisor
 
-            def pad_cp_inputs(input_tensor: torch.Tensor, padding_value: int) -> torch.Tensor:
-                if input_tensor is None:
-                    return input_tensor
+    def _seq_align_segments(self, row: InputFeature, seq_len: int) -> list[tuple]:
+        """(start, end) token segments of a row: the cu_seqlens segments under CP, else the whole row."""
+        cp_size = self.device_mesh.cp_world_size if self.device_mesh is not None else 1
+        position_ids = row.get("position_ids")
+        if cp_size <= 1 or position_ids is None:
+            return [(0, seq_len)]
+        pos = position_ids[:1] if position_ids.dim() >= 2 and position_ids.shape[0] > 1 else position_ids
+        pos_f = pos.flatten()
+        indices = torch.arange(pos_f.shape[0], device=pos_f.device, dtype=torch.int32)
+        cu_seqlens = torch.cat([indices[pos_f == 0], torch.tensor(pos_f.shape, device=pos_f.device, dtype=torch.int32)])
+        bounds = cu_seqlens.tolist()
+        return list(zip(bounds[:-1], bounds[1:]))
 
-                seq_len = input_tensor.shape[-1]
+    @staticmethod
+    def _pad_token_column(value: torch.Tensor, segments: list[tuple], divisor: int, pad_value) -> torch.Tensor:
+        pieces = []
+        changed = False
+        for start, end in segments:
+            piece = value[..., start:end]
+            length = end - start
+            if length % divisor != 0:
+                pad_len = divisor - length % divisor
+                piece = torch.nn.functional.pad(piece, (0, pad_len), value=pad_value)
+                changed = True
+            pieces.append(piece)
+        if not changed:
+            return value
+        return torch.cat(pieces, dim=-1) if len(pieces) > 1 else pieces[0]
 
-                # Calculate required divisor based on parallelism settings
-                if cp_size > 1:
-                    divisor = 2 * cp_size
-                elif self.device_mesh.sequence_parallel and tp_size > 1:
-                    divisor = tp_size
-                else:
-                    divisor = 1
+    @staticmethod
+    def _pad_4d_mask_to_seq_align(value: torch.Tensor, segments: list[tuple], divisor: int, pad_value) -> torch.Tensor:
+        # The dense [B, 1, S, S] mask pads on BOTH the query and the key axis. The packed path never
+        # carries a 4D mask -- the collator drops it -- so the per-segment cu_seqlens slicing cannot
+        # apply; fail loudly on that invariant, same as split_cp does.
+        if len(segments) > 1:
+            raise ValueError('a 4D attention_mask cannot ride the packed CP padding; '
+                             'the collator should have dropped it for the packed batch.')
+        length = segments[0][1] - segments[0][0]
+        if length % divisor != 0:
+            pad_len = divisor - length % divisor
+            value = torch.nn.functional.pad(value, (0, pad_len, 0, pad_len), value=pad_value)
+        return value
 
-                if divisor > 1 and seq_len % divisor != 0:
-                    pad_len = divisor - (seq_len % divisor)
-                    input_tensor = torch.nn.functional.pad(input_tensor, (0, pad_len), value=padding_value)
-                return input_tensor
-
-            if cp_size > 1:
-                pos_for_cu = position_ids[:1] if position_ids.dim() >= 2 and position_ids.shape[0] > 1 else position_ids
-                position_ids_f = pos_for_cu.flatten()
-                indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
-                cu_seqlens = torch.cat(
-                    [
-                        indices_q[position_ids_f == 0],
-                        torch.tensor(position_ids_f.shape, device=position_ids_f.device, dtype=torch.int32),
-                    ]
-                )
-
-                for key in [
-                    "input_ids",
-                    "position_ids",
-                    "attention_mask",
-                    "labels",
-                    "completion_mask",
-                    "loss_scale",
-                    "mm_token_type_ids",
-                ]:
-                    value = _input.get(key)
-                    if value is None:
-                        continue
-                    if key == "attention_mask" and isinstance(value, torch.Tensor) and value.dim() == 4:
-                        # The dense [B, 1, S, S] mask pads on BOTH the query and the key
-                        # axis (the generic helper only pads the last one). The packed
-                        # path never carries a 4D mask -- the collator drops it -- so the
-                        # per-segment cu_seqlens slicing cannot apply; fail loudly on
-                        # that invariant, same as split_cp does.
-                        if cp_size > 1 and cu_seqlens.shape[0] > 2:
-                            raise ValueError(
-                                'a 4D attention_mask cannot ride the packed CP padding; '
-                                'the collator should have dropped it for the packed batch.')
-                        divisor = (2 * cp_size if cp_size > 1
-                                   else (tp_size if self.device_mesh.sequence_parallel and tp_size > 1 else 1))
-                        seq_len = value.shape[-1]
-                        if divisor > 1 and seq_len % divisor != 0:
-                            pad_len = divisor - (seq_len % divisor)
-                            value = torch.nn.functional.pad(
-                                value, (0, pad_len, 0, pad_len),
-                                value=self.padding_map.get(key, 0))
-                        _input[key] = value
-                        continue
-                    result = []
-                    for i in range(cu_seqlens.shape[0]):
-                        if i == cu_seqlens.shape[0] - 1:
-                            break
-                        _value_slice = value[..., cu_seqlens[i] : cu_seqlens[i + 1]]
-                        result.append(pad_cp_inputs(_value_slice, padding_value=self.padding_map.get(key, 0)))
-                    value = torch.cat(result, dim=-1)
-                    _input[key] = value
-            elif self.device_mesh.sequence_parallel and tp_size > 1:
-                # Sequence parallel without CP still requires seq_len % TP == 0
-                for key in [
-                    "input_ids",
-                    "position_ids",
-                    "attention_mask",
-                    "labels",
-                    "completion_mask",
-                    "loss_scale",
-                    "mm_token_type_ids",
-                ]:
-                    value = _input.get(key)
-                    if value is None:
-                        continue
-                    if key == "attention_mask" and isinstance(value, torch.Tensor) and value.dim() == 4:
-                        # Both sequence axes of the dense mask must reach the TP divisor;
-                        # the generic helper only pads the key axis.
-                        seq_len = value.shape[-1]
-                        if seq_len % tp_size != 0:
-                            pad_len = tp_size - (seq_len % tp_size)
-                            value = torch.nn.functional.pad(
-                                value, (0, pad_len, 0, pad_len),
-                                value=self.padding_map.get(key, 0))
-                        _input[key] = value
-                        continue
-                    _input[key] = pad_cp_inputs(value, padding_value=self.padding_map.get(key, 0))
-            return _input
-
-        return [_pad_cp(_inp) for _inp in inputs]
+    def _pad_row_to_seq_align(self, row: InputFeature, divisor: int) -> InputFeature:
+        ref = row.get("input_ids")
+        if ref is None:
+            ref = row.get("position_ids")
+        if ref is None or not torch.is_tensor(ref):
+            return row
+        seq_len = ref.shape[-1]
+        segments = self._seq_align_segments(row, seq_len)
+        for key in self._SEQ_ALIGN_FIELDS:
+            value = row.get(key)
+            # Scalar labels (seq_cls/embedding) and media payloads are not token columns.
+            if value is None or not torch.is_tensor(value) or value.shape[-1] != seq_len:
+                continue
+            pad_value = self.padding_map.get(key, 0)
+            if key == "attention_mask" and value.dim() == 4:
+                row[key] = self._pad_4d_mask_to_seq_align(value, segments, divisor, pad_value)
+            else:
+                row[key] = self._pad_token_column(value, segments, divisor, pad_value)
+        return row
 
     def split_cp(self, inputs: list[dict[str, Any]], **kwargs) -> list[dict[str, Any]]:
         if self.device_mesh is None:

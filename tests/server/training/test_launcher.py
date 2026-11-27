@@ -55,7 +55,9 @@ def test_unresponsive_controller_does_not_block_other_cleanup():
         ray.get(entered, timeout=10)
         assert finished.wait(2), 'Controller shutdown exceeded its budget and blocked the next owner'
         assert cleaned == [True]
-        assert len(errors) == 1 and isinstance(errors[0].__cause__, ray.exceptions.GetTimeoutError)
+        assert len(errors) == 1 and isinstance(errors[0], ExceptionGroup)
+        timeout, = errors[0].exceptions
+        assert isinstance(timeout, ray.exceptions.GetTimeoutError)
         assert launcher._training_controller is controller
         ray.get(controller.unblock.remote(), timeout=5)
         launcher._stop_training_controller()
@@ -107,10 +109,10 @@ def test_cleanup_attempts_all_owners_and_reports_the_original_failure():
     def healthy():
         calls.append('healthy')
 
-    with pytest.raises(RuntimeError, match='cleanup is incomplete') as caught:
+    with pytest.raises(ExceptionGroup, match='cleanup is incomplete') as caught:
         ServerLauncher._run_cleanup([('first', failed), ('second', healthy)], raise_errors=True)
     assert calls == ['failed', 'healthy']
-    assert caught.value.__cause__ is error
+    assert caught.value.exceptions == (error,)
 
 
 def test_startup_rollback_preserves_startup_error_and_cleans_all_owners(monkeypatch):
@@ -167,11 +169,12 @@ def test_start_serve_reuses_existing_instance_without_restart(monkeypatch):
     client = Mock(return_value=object())
     start, shutdown = Mock(), Mock()
     monkeypatch.setattr('ray.serve.context._get_global_client', client)
+    monkeypatch.setattr(launcher, '_application_details', lambda: {})
     monkeypatch.setattr('ray.serve.start', start)
     monkeypatch.setattr('ray.serve.shutdown', shutdown)
     launcher._start_serve()
     launcher._start_serve()
-    client.assert_called_once_with()
+    client.assert_called_once_with(raise_if_no_controller_running=False)
     start.assert_not_called()
     shutdown.assert_not_called()
     assert launcher._serve_started
@@ -179,7 +182,7 @@ def test_start_serve_reuses_existing_instance_without_restart(monkeypatch):
 
 def test_start_serve_starts_missing_instance_with_configured_listener(monkeypatch):
     launcher = ServerLauncher(ServerConfig(proxy_location='HeadOnly'))
-    client = Mock(side_effect=RuntimeError('Serve is not running'))
+    client = Mock(return_value=None)
     start, shutdown = Mock(), Mock()
     monkeypatch.setattr('ray.serve.context._get_global_client', client)
     monkeypatch.setattr('ray.serve.start', start)
@@ -199,5 +202,6 @@ def test_launch_server_forwards_blocking_policy(monkeypatch, blocking):
     factory = Mock(return_value=launcher)
     monkeypatch.setattr('twinkle.server.launcher.server_launcher.ServerLauncher', factory)
     launch_server(config=config, blocking=blocking)
-    factory.assert_called_once_with(config=config, ray_namespace=config.ray_namespace)
-    launcher.launch.assert_called_once_with(blocking=blocking)
+    factory.assert_called_once_with(config=config, ray_namespace=config.ray_namespace,
+                                    ray_address='auto', persistent_cluster=False)
+    launcher.launch.assert_called_once_with(blocking=blocking, model_name=None)

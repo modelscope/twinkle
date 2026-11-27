@@ -2,6 +2,7 @@
 """The vLLM stream iterator owns its engine task until actual completion."""
 import ast
 import asyncio
+import queue
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,10 +10,10 @@ from types import SimpleNamespace
 
 def test_stream_iterator_close_joins_the_real_engine_loop_task():
     # Execute the repository method without constructing a GPU-backed vLLM engine.
-    path = Path('src/twinkle/sampler/vllm_sampler/vllm_sampler.py')
+    path = Path('src/twinkle/sampler/base.py')
     tree = ast.parse(path.read_text())
     method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == '_iter_in_loop')
-    namespace = {'asyncio': asyncio}
+    namespace = {'asyncio': asyncio, 'queue': queue}
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), 'exec'), namespace)
     loop = asyncio.new_event_loop()
     running, finalizing, release, closed = [threading.Event() for _ in range(4)]

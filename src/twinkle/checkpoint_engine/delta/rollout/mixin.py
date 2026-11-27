@@ -1,30 +1,24 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Rollout-side lifecycle for the delta checkpoint engine.
 
-CUDA: Ray receiver actors (:mod:`.cuda_receiver`) colocated with each vLLM worker feed it over IPC. Ascend NPU:
+CUDA: receiver components (:mod:`.cuda_receiver`) sharing each vLLM worker's device feed it over IPC. Ascend NPU:
 no receiver actors; the vLLM workers join the trainer's HCCL group themselves (:mod:`.hccl_receiver`) and the
 sampler only drives vLLM's lifecycle RPCs.
 """
 from __future__ import annotations
 
 import asyncio
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from twinkle import Platform, remote_function
+from twinkle import DeviceGroup, Platform, get_logger, remote_function
 from ..config import (DeltaReceiverPlacement, DeltaSyncConfig, DeltaTransportEndpoint,
                      DeltaWorkerCapabilities, DeltaWorkerMetadata)
 from .cuda_receiver import CudaDeltaReceiver
 
 
-def _spawn_receiver(node_id: str, env_vars: dict[str, str], args: tuple) -> Any:
-    """One zero-resource receiver actor pinned to ``node_id``, next to the device it feeds."""
-    import ray
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-    return ray.remote(num_cpus=0, num_gpus=0)(CudaDeltaReceiver).options(
-        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False),
-        runtime_env={'env_vars': dict(env_vars)},
-    ).remote(*args)
+logger = get_logger()
 
 
 class VLLMDeltaSamplerMixin:
@@ -133,9 +127,7 @@ class VLLMDeltaSamplerMixin:
         ranks = {(item['node_ip'], item['device_uuid']): rank for rank, item in enumerate(workers, start=1)}
         if not metadata or any(item not in workers for item in metadata):
             raise ValueError('local vLLM workers are missing from the delta topology')
-        import ray
-        nodes = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes() if node['Alive']}
-        return [dict(rank=ranks[item['node_ip'], item['device_uuid']], node_id=nodes[item['node_ip']],
+        return [dict(rank=ranks[item['node_ip'], item['device_uuid']], node_ip=item['node_ip'],
                      device_uuid=item['device_uuid'],
                      cuda_visible_device=item.get('cuda_visible_device', item['device_uuid']),
                      zmq_handle=item['zmq_handle'])
@@ -150,22 +142,38 @@ class VLLMDeltaSamplerMixin:
             return
         metadata = self._run_in_loop(self._delta_rpc('delta_receiver_metadata'))
         placements = self._delta_receiver_placements(metadata, endpoint)
-        # One zero-resource receiver per rollout device, pinned to its node with the device's
-        # CUDA context; the handle is driven below with plain .method.remote() calls.
-        self._delta_receivers = [
-            _spawn_receiver(
-                placement['node_id'],
-                {'CUDA_VISIBLE_DEVICES': placement.get('cuda_visible_device', placement['device_uuid']),
-                 'RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES': '1'},
-                (self._delta_config, endpoint, placement))
-            for placement in placements]
-        import ray
-        ray.get([receiver.ready.remote() for receiver in self._delta_receivers],
-                timeout=self._delta_config.timeout_seconds)
+        if getattr(self, '_delta_receivers', None):
+            raise RuntimeError('Close the previous delta receivers before initializing another transport.')
+        self._delta_receivers = []
+        try:
+            for placement in placements:
+                group = DeviceGroup(
+                    name=f'delta_receiver_{placement["rank"]}', ranks=1, device_type='GPU', shared=True,
+                    node_addresses=[placement['node_ip']],
+                    visible_devices=[placement.get('cuda_visible_device', placement['device_uuid'])])
+                receiver = CudaDeltaReceiver(
+                    self._delta_config, endpoint, placement, remote_group=group,
+                    instance_id=uuid.uuid4().hex, call_timeout=self._delta_config.timeout_seconds)
+                self._delta_receivers.append(receiver)
+            # Construct every participant before readiness waits on the common rendezvous,
+            # then submit every readiness wait CONCURRENTLY: a receiver's ready() blocks
+            # inside the group's broadcast barrier until the remaining receivers reach it,
+            # so a serial submit would deadlock on the members whose ready() is never
+            # submitted behind the first blocking call.
+            with ThreadPoolExecutor(max_workers=len(self._delta_receivers)) as pool:
+                futures = [pool.submit(receiver.ready) for receiver in self._delta_receivers]
+                for future in futures:
+                    future.result()
+        except BaseException:
+            try:
+                self._close_delta_receivers()
+            except BaseException:
+                logger.exception('Delta receiver initialization rollback is incomplete.')
+            raise
         self._delta_weight_transfer_initialized = False
 
     async def _next_delta_flush(self) -> dict[str, bool] | None:
-        flags = await asyncio.gather(*(receiver.next_flush.remote() for receiver in self._delta_receivers))
+        flags = await asyncio.gather(*(asyncio.to_thread(receiver.next_flush) for receiver in self._delta_receivers))
         if any(flag != flags[0] for flag in flags):
             raise ValueError('delta checkpoint receivers disagree about stream completion')
         return flags[0]
@@ -173,7 +181,7 @@ class VLLMDeltaSamplerMixin:
     async def _send_delta_flush(self) -> None:
         receivers = asyncio.create_task(self._delta_rpc('update_twinkle_delta_weights'))
         try:
-            await asyncio.gather(*(receiver.send_flush.remote() for receiver in self._delta_receivers))
+            await asyncio.gather(*(asyncio.to_thread(receiver.send_flush) for receiver in self._delta_receivers))
             await receivers
         finally:
             if not receivers.done():
@@ -252,11 +260,22 @@ class VLLMDeltaSamplerMixin:
                 self._delta_weight_transfer_initialized = False
                 self._delta_endpoint = None
             return
-        import ray
-        receivers = getattr(self, '_delta_receivers', [])
-        try:
-            ray.get([receiver.close.remote() for receiver in receivers], timeout=self._delta_config.timeout_seconds)
-        finally:
-            for receiver in receivers:
-                ray.kill(receiver, no_restart=True)
-            self._delta_receivers = []
+        self._close_delta_receivers()
+
+    def _close_delta_receivers(self) -> None:
+        """Close every independent participant and retain unsuccessful handles for cleanup retry."""
+        receivers = list(getattr(self, '_delta_receivers', ()))
+        if not receivers:
+            return
+        failures = []
+        with ThreadPoolExecutor(max_workers=len(receivers)) as pool:
+            futures = [(receiver, pool.submit(receiver.close)) for receiver in receivers]
+            for receiver, future in futures:
+                try:
+                    future.result()
+                except BaseException as error:
+                    failures.append(error)
+                else:
+                    self._delta_receivers.remove(receiver)
+        if failures:
+            raise BaseExceptionGroup('Delta receiver cleanup is incomplete', failures)

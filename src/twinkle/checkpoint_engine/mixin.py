@@ -24,6 +24,16 @@ class CheckpointEngineMixin:
     # Per-channel HMAC keys, delivered by the manager over the (trusted) Ray control path.
     _checkpoint_engine_auth_keys = None
 
+    @remote_function(dispatch='all', collect='first', lazy_collect=True)
+    def checkpoint_transfer_capabilities(self) -> dict:
+        """Domain facts only: the device this role runs on, and whether it supports direct
+        in-process weight streaming. Where the answer EXECUTES is infra's channel -- with
+        lazy collect the call answers with the plain dict only when it ran in the caller's
+        process, and with a pending handle otherwise; the manager reads that shape for the
+        co-execution gate, so no process or actor identity ever enters the declaration.
+        """
+        return {'direct_stream': True, 'device_type': Platform.get_platform().__name__}
+
     def _select_checkpoint_engine(self, backend: str, channel: str, auth_key: str = '') -> None:
         if not isinstance(channel, str) or not channel:
             raise ValueError(f'checkpoint channel must be a non-empty string, got {channel!r}.')

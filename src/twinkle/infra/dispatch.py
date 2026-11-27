@@ -18,6 +18,11 @@ from .worker_mixin import mount_worker_mixin
 logger = get_logger()
 
 T1 = TypeVar('T1', bound=object)
+_PROCESS_OWNER = uuid.uuid4().hex
+
+
+def _owner_identity():
+    return os.getpid(), sys.modules[__name__]._PROCESS_OWNER
 
 
 def _infra():
@@ -68,6 +73,8 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'first', 'las
     Returns:
         The collected results.
     """
+    if callable(method):
+        return method(result, device_mesh=device_mesh)
     if not result:
         return result
 
@@ -118,111 +125,67 @@ def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'first', 'las
     elif method == 'dp_flatten':
         from .collectors import dp_flatten
         return dp_flatten(result, device_mesh=device_mesh)
-    elif isinstance(method, Callable):
-        # Callable
-        return method(result, device_mesh=device_mesh)
     else:
         raise ValueError(f'Unsupported collect method: {method}')
 
 
 def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh], args, kwargs):
+    if not workers:
+        return []
     if execute == 'first':
         return [(workers[0], args, kwargs)]
-    elif dispatch == 'all':
+    if dispatch == 'all':
         return [(worker, args, kwargs) for worker in workers]
-    elif dispatch == 'slice':
-        # split arg to workers evenly
+    length = len(workers)
+    if callable(dispatch):
         result = []
-        length = len(workers)
-
-        def dispatch_func(arg, n):
-            if isinstance(arg, list):
-                # only list
-                _args = []
-                k, m = divmod(len(arg), n)
-                for i in range(n):
-                    _args.append(arg[i * k + min(i, m):(i + 1) * k + min(i + 1, m)])
-                return _args
-            else:
-                return [arg] * n
-
-        args = [dispatch_func(arg, length) for arg in args]
-        kwargs = {k: dispatch_func(v, length) for k, v in kwargs.items()}
-        for i in range(length):
-            sliced_args = tuple(arg[i] for arg in args)
-            sliced_kwargs = {k: v[i] for k, v in kwargs.items()}
-            result.append((workers[i], sliced_args, sliced_kwargs))
-
+        for index, worker in enumerate(workers):
+            sliced_args, sliced_kwargs = dispatch(length, index, args, kwargs, device_mesh=device_mesh)
+            result.append((worker, sliced_args, sliced_kwargs))
         return result
-    elif dispatch == 'slice_dp':
-        assert device_mesh is not None
-        # split by dp. each worker in one ep will receive the same argument
-        result = []
-        # if device_mesh is not None:
-        # TODO this may occurs error when remote calls remote
-        # Comment this because remote_class supports `first``
-        # assert device_mesh.world_size == len(workers)
-        length = len(workers)
-        # Map actor index to global_rank: with gpus_per_worker>1, consecutive
-        # global ranks belong to the same actor (TP peers).
-        _mesh_world = device_mesh.world_size if device_mesh is not None else length
-        _rank_stride = max(1, _mesh_world // length)
-        if _rank_stride * length != _mesh_world:
-            raise ValueError(
-                f'slice_dp dispatch needs the {length} workers to tile the device mesh exactly '
-                f'(world_size {_mesh_world}): uneven tiling leaves data ranks unserved, and their '
-                'outputs silently drop out of the collect step.')
-
-        def dispatch_func(arg, n):
-            import torch
-            if isinstance(arg, list) or isinstance(arg, torch.Tensor):
-                _args = []
-                for i in range(n):
-                    _args.append(arg[device_mesh.get_slice(
-                        len(arg), device_mesh.get_data_rank_from_global_rank(i * _rank_stride))])
-                return _args
-            elif isinstance(arg, dict):
-                _args = [{} for _ in range(n)]
-                for key in arg.keys():
-                    value = arg[key]
-                    for i, v in enumerate(dispatch_func(value, n)):
-                        _args[i][key] = v
-                return _args
-            else:
-                return [arg] * n
-
-        args = [dispatch_func(arg, length) for arg in args]
-        kwargs = {k: dispatch_func(v, length) for k, v in kwargs.items()}
-
-        for i in range(length):
-            sliced_args = tuple(arg[i] for arg in args)
-            sliced_kwargs = {k: v[i] for k, v in kwargs.items()}
-            result.append((workers[i], sliced_args, sliced_kwargs))
-
-        # Raise early if some ranks got data and others didn't (causes hangs).
-        def _check_uniform(slices):
-            lens = [len(s) if s is not None and isinstance(s, (list, tuple)) else 0 for s in slices]
-            return not lens or all(length > 0 for length in lens) or all(length == 0 for length in lens)
-
-        for arg in args:
-            if not _check_uniform(arg):
-                raise ValueError(f'Batch too small for {length} workers, some ranks have no data. '
-                                 f'Please increase batch size to at least {length}.')
-        for v in kwargs.values():
-            if not _check_uniform(v):
-                raise ValueError(f'Batch too small for {length} workers, some ranks have no data. '
-                                 f'Please increase batch size to at least {length}.')
-
-        return result
-    elif isinstance(dispatch, Callable):
-        length = len(workers)
-        result = []
-        for i in range(length):
-            sliced_args, sliced_kwargs = dispatch(length, i, args, kwargs, device_mesh=device_mesh)
-            result.append((workers[i], sliced_args, sliced_kwargs))
-        return result
-    else:
+    if dispatch not in ('slice', 'slice_dp'):
         raise ValueError(f'Unsupported dispatch method: {dispatch}')
+
+    from ._ray.ray_helper import LazyCollect, RayHelper
+    if dispatch == 'slice_dp':
+        if device_mesh is None:
+            raise ValueError('slice_dp dispatch requires a device_mesh.')
+        stride = max(1, device_mesh.world_size // length)
+        if stride * length != device_mesh.world_size:
+            raise ValueError(f'{length} workers cannot tile mesh world_size={device_mesh.world_size}.')
+
+    def slices(size):
+        if dispatch == 'slice_dp':
+            return [device_mesh.get_slice(size, device_mesh.get_data_rank_from_global_rank(index * stride))
+                    for index in range(length)]
+        count, remainder = divmod(size, length)
+        return [slice(index * count + min(index, remainder),
+                      (index + 1) * count + min(index + 1, remainder)) for index in range(length)]
+
+    def split(value):
+        import torch
+        if RayHelper._is_handle(value):
+            value = (value if isinstance(value, LazyCollect)
+                     else LazyCollect([value], 'none', _collect_func, device_mesh))
+            kind, structure = value._project('structure').result()
+            if kind == 'sequence' or (dispatch == 'slice_dp' and kind == 'tensor'):
+                return [value[part] for part in slices(structure)]
+            if kind == 'mapping' and dispatch == 'slice_dp':
+                value = {key: value[key] for key in structure}
+            else:
+                return [value] * length
+        if isinstance(value, list) or (dispatch == 'slice_dp' and isinstance(value, torch.Tensor) and value.dim() > 0):
+            return [value[part] for part in slices(len(value))]
+        if dispatch == 'slice_dp' and isinstance(value, dict):
+            columns = {key: split(item) for key, item in value.items()}
+            return [{key: column[index] for key, column in columns.items()} for index in range(length)]
+        return [value] * length
+
+    arg_parts = [split(value) for value in args]
+    kwarg_parts = {key: split(value) for key, value in kwargs.items()}
+    return [(worker, tuple(parts[index] for parts in arg_parts),
+             {key: parts[index] for key, parts in kwarg_parts.items()})
+            for index, worker in enumerate(workers)]
 
 
 def _get_device_mesh_param_name(init_method) -> str:
@@ -244,21 +207,6 @@ def _get_device_mesh_param(args, kwargs):
         if isinstance(arg, DeviceMesh):
             return arg
     return None
-
-
-def _prepare_lazy_collect(args, kwargs):
-    # if a worker received an actor handle,
-    # lazy collect should be false to prevent any outer function receives an object ref
-    if not os.environ.get('WORKER_NAME'):
-        # If this is a driver
-        return args, kwargs
-    else:
-        # If this is a worker, collect now
-        for arg in list(args) + list(kwargs.values()):
-            if hasattr(arg, '_actors'):
-                # This arg is an handler, and this is a worker env, so do not do lazy collect
-                arg._lazy_collect = False
-        return args, kwargs
 
 
 def _is_pool_class(cls) -> bool:
@@ -286,6 +234,8 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
             call may override it with a ``max_concurrency=`` keyword, read here and
             never passed to the component (like ``remote_group``); in local mode it
             sizes the thread pool that runs the continuous lazy methods.
+            ``call_timeout=`` on construction bounds calls without a method-level timeout.
+            ``remote_group`` accepts a named group or a shared DeviceGroup view of initialized devices.
     """
 
     def decorator(cls):
@@ -305,6 +255,20 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
         # Get device mesh parameter name
         device_mesh_name = _get_device_mesh_param_name(cls.__init__)
         init_method = cls.__init__
+        # Lifecycle methods are DECLARED by the component: the class-level ``_lifecycle``
+        # names this class's teardown entries -- the default protocol releases the class's
+        # owned workers on ``close``, families with a real second entry (samplers, envs)
+        # declare ``('close', 'shutdown')``. Infra never guesses from method names or
+        # signatures: a declared ``close`` without a class body keeps the release-only
+        # implementation, and re-decorating composes -- an already-wrapped method unwraps
+        # to its component body first, so a business teardown is composed with, not
+        # replaced by, the ownership release.
+        lifecycle_methods = {}
+        for name in getattr(cls, '_lifecycle', ('close',)):
+            method = getattr(cls, name, None)
+            if getattr(method, '_twinkle_owned_close', False):
+                method = method._component_close
+            lifecycle_methods[name] = method
 
         def new_init(self, *args, **kwargs):
             _caller = _capture_caller()
@@ -314,7 +278,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
             try:
                 _infra()._maybe_load_worker_notifier()
                 _new_init_body(self, _caller, *args, **kwargs)
-            except Exception as _e:
+            except BaseException as _e:
+                try:
+                    _release_workers(self)
+                except BaseException:
+                    logger.exception('Component-construction rollback is incomplete.')
                 _tag_exc(_e, _caller)
                 notify_exception(_infra()._notifier, _ctx, _e, _infra()._name)
                 raise
@@ -330,6 +298,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
         def _new_init_body(self, _caller, *args, **kwargs):
             infra = _infra()
             concurrency = kwargs.pop('max_concurrency', None) or max_concurrency
+            self._ray_get_timeout = kwargs.pop('call_timeout', None)
             if infra._mode == 'local':
                 # remote_group names the ray device group (the ray branch below
                 # consumes then pops it). Local mode never dispatches, so it is
@@ -398,8 +367,10 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                     if infra._device_group and remote_group:
                         # usually this happens in driver because worker does not has a valid _device_group
                         # this is used to print the device_group info, so pass the worker is ok
-                        device_group = [dg for dg in infra._device_group if dg.name == remote_group][0]
-                        device_group._device_mesh[self.__class__.__name__] = device_mesh
+                        group_name = remote_group if isinstance(remote_group, str) else remote_group.name
+                        device_group = next((dg for dg in infra._device_group if dg.name == group_name), None)
+                        if device_group is not None:
+                            device_group._device_mesh[self.__class__.__name__] = device_mesh
 
                 # ``__iter_origin__`` (set once, below) is the user-declared iterator: without it,
                 # a second instantiation of the same class would read the stash off our own
@@ -408,7 +379,12 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                 iter_stash = getattr(iter_origin, '_stash', None)
 
                 # This will solve the iterator cannot be passed through ray.
-                def __iter__(_self):
+                # ``_dispatch_context`` is absorbed here because these rebuilt bodies are the
+                # actor-side methods Ray captures at create_workers() time -- BEFORE the
+                # remote_function re-decoration below pins the signature. The dispatch path puts
+                # ``_dispatch_context`` on the wire (see _call_replicas), so the actor method must
+                # declare it or Ray's signature validator refuses the call.
+                def __iter__(_self, _dispatch_context=None):
                     if os.environ.get('WORKER_NAME'):
                         # This is a worker, iter keeps in the class, pass nothing to driver
                         _iter = _self.__iter_origin__()
@@ -418,7 +394,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         # This is executed in driver
                         return _self.__iter_origin__()
 
-                def __next__(_self):
+                def __next__(_self, _dispatch_context=None):
                     # Use _self._iter to get the next data
                     # Only one driver can use this at one time
                     try:
@@ -443,18 +419,26 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         # pop the device_mesh
                         args = [arg for arg in args if not isinstance(arg, DeviceMesh)]
                         kwargs = {key: value for key, value in kwargs.items() if not isinstance(value, DeviceMesh)}
-                        # if any handler is passed to other component, lazy collect should be false
-                        # for example, dataset pass to the dataloader
-                    args, kwargs = _prepare_lazy_collect(args, kwargs)
                     kwargs.pop('remote_group', None)  # component does not need this
                     self._max_concurrency = concurrency
                     init_method(self, *args, **kwargs)
                 else:
                     if hasattr(cls, '__iter__'):
-                        _dispatch = self.__iter__._dispatch
-                        _execute = self.__iter__._execute
-                        _collect = self.__iter__._collect
-                        _lazy = self.__iter__._lazy_collect
+                        # Read the iterator's dispatch contract off the ORIGINAL user-declared
+                        # ``__iter__`` (``iter_origin``), never off ``self.__iter__``: on a SECOND
+                        # instantiation of the same class ``self.__iter__`` is already the round-1
+                        # re-wrapper below (``collect='none'``, ``lazy_collect=None``), so reading it
+                        # would silently drop the user's ``collect``/``lazy_collect`` and make every
+                        # later round's ``__next__`` fall back to the global ``infra._lazy_collect``
+                        # (True under ray) -- handing the trainer an unmaterialised LazyCollect batch
+                        # instead of the plain (rows, facts) it declared (G35 item7 round-2 crash:
+                        # 'LazyCollect' object has no attribute 'values'). ``iter_origin`` is the
+                        # pre-wrap method on the first instantiation and the preserved original on
+                        # every later one, so the contract is stable across rounds.
+                        _dispatch = iter_origin._dispatch
+                        _execute = iter_origin._execute
+                        _collect = iter_origin._collect
+                        _lazy = iter_origin._lazy_collect
                         import ray
                         # The user's original iterator is recorded ONCE: a later instantiation of
                         # the same class must not overwrite it with our own wrapper, whose body
@@ -483,9 +467,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         instance_id=instance_id,
                         extra_torch_kwargs=infra._extra_torch_kwargs,
                         max_concurrency=concurrency,
+                        creation_timeout=self._ray_get_timeout,
                         *args,
                         **kwargs_for_workers)
                     self._actors = _actors
+                    self._actor_owner = _owner_identity()
                     self._max_concurrency = concurrency
                     if pool_class:
                         _register_pool(self, cls, remote_group, execute, instance_id, args, kwargs_for_workers,
@@ -508,10 +494,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
 
         def perf_on(self, *, profiler_spec=None):
             from twinkle.perf import Perf
-            strategy = getattr(self, 'strategy', None)
-            model = getattr(self, 'model', None)
-            target = strategy.unwrap_model(model) if (strategy is not None and model is not None) else None
-            self._profiler = Perf.enable_process(model=target, profiler_spec=profiler_spec)
+            self._profiler = Perf.enable_process(profiler_spec=profiler_spec)
 
         def perf_step(self):
             from twinkle.perf import Perf
@@ -526,38 +509,56 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
             Perf.disable_process(getattr(self, '_profiler', None))
             self._profiler = None
 
-        def close(self):
-            """Terminate THIS handle's remote workers: the constructor's counterpart.
+        def _owned_workers(self):
+            owner = _owner_identity()
+            actors = list(self.__dict__.get('_actors', ())) if self.__dict__.get('_actor_owner') == owner else []
+            if self.__dict__.get('_pool_actor_owner') == owner:
+                actors.extend(actor for actor in self.__dict__.get('_owned_pool_actors', ()) if actor not in actors)
+            return actors
 
-            Driver-side, idempotent, best-effort (never raises). Without it a
-            dropped handle leaves its named workers behind, and the next
-            construction at the same call site dies with 'actor already taken'.
-            Pool handles also deregister their replicas so the registry keeps
-            no stale ACTIVE entries. Local mode holds no workers: a no-op."""
-            actors = getattr(self, '_actors', None)
-            if not actors:
-                return
-            import ray
+        def _release_workers(self):
             from ._ray import RayHelper
-            for actor in actors:
-                try:
-                    ray.kill(actor, no_restart=True)
-                except Exception:  # noqa
-                    pass
+            actors = _owned_workers(self)
             try:
-                RayHelper._created_actors[:] = [a for a in RayHelper._created_actors
-                                                if a not in actors]
-            except Exception:  # noqa
-                pass
-            if RayHelper._registry is not None:
-                try:
-                    from .continuous_work import worker_id_of
+                RayHelper.release_workers(actors)
+            finally:
+                for field, owner_field in (('_actors', '_actor_owner'), ('_owned_pool_actors', '_pool_actor_owner')):
+                    if self.__dict__.get(owner_field) == _owner_identity():
+                        self.__dict__[field][:] = [actor for actor in self.__dict__[field]
+                                                  if actor in RayHelper._created_actors]
 
-                    ray.get(RayHelper._registry.remove_actors.remote(
-                        [worker_id_of(actor) for actor in actors]))
-                except Exception:  # noqa
-                    pass
-            self._actors = []
+        def owned_lifecycle(method):
+            def close(self, *args, **kwargs):
+                """Run component teardown and release only replicas owned by this process."""
+                if '_actors' not in self.__dict__:
+                    return method(self, *args, **kwargs) if method is not None else None
+                actors = _owned_workers(self)
+                if not actors:
+                    _release_workers(self)
+                    return
+                try:
+                    if method is not None:
+                        import copy
+                        handle = copy.copy(self)
+                        handle._actors = actors
+                        handle._pool_key = None
+                        result = method(handle, *args, **kwargs)
+                        from ._ray.ray_helper import LazyCollect
+                        if isinstance(result, (Future, LazyCollect)):
+                            return result.result()
+                        return result
+                finally:
+                    primary_error = sys.exc_info()[0]
+                    try:
+                        _release_workers(self)
+                    except BaseException:
+                        if primary_error is None:
+                            raise
+                        logger.exception('Worker cleanup failed while preserving the component teardown error.')
+
+            close._twinkle_owned_close = True
+            close._component_close = method
+            return close
 
         if not hasattr(cls, 'perf_on'):
             cls.perf_on = remote_function(dispatch='all', execute=execute, collect='none',
@@ -570,11 +571,17 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
         if not hasattr(cls, 'perf_off'):
             cls.perf_off = remote_function(dispatch='all', execute=execute, collect='none',
                                            lazy_collect=False)(perf_off)
-        # close must NOT go through remote_function: it kills the driver-side
-        # handle's own workers, so it runs HERE, on the handle, not on a worker.
-        if not hasattr(cls, 'close'):
-            cls.close = close
+        for name, method in lifecycle_methods.items():
+            if method is None and name != 'close':
+                continue
+            if method is not None and not hasattr(method, '_dispatch'):
+                method = remote_function(dispatch='all', execute=execute, collect='none', lazy_collect=False)(method)
+            setattr(cls, name, owned_lifecycle(method))
 
+        def _twinkle_ready(self):
+            return None
+
+        cls._twinkle_ready = _twinkle_ready
         cls.__init__ = new_init
         return cls
 
@@ -663,7 +670,7 @@ def _stash_channels(result: Any, channels: Union[bool, Sequence[Union[int, str]]
     raise TypeError(f'stash requires a tuple or dict return value, got {type(result).__name__}')
 
 
-def _record_return_probe(func_name: str, kwargs: dict) -> None:
+def _record_return_probe(func_name: str, call_id=None) -> None:
     """Append one record when a worker method finishes its whole return path, stash included.
 
     A probe inside the method body cannot tell "the body returned" from "the caller's reference
@@ -681,7 +688,8 @@ def _record_return_probe(func_name: str, kwargs: dict) -> None:
     path = os.path.join(root, f'dispatch.{os.getpid()}.jsonl')
     with open(path, 'a', encoding='utf-8') as handle:
         handle.write(json.dumps({'t': time.monotonic(), 'event': 'worker_returned',
-                                 'func': func_name, 'episode_id': kwargs.get('episode_id')}) + '\n')
+                                 'func': func_name, 'call_id': call_id or uuid.uuid4().hex,
+                                 'instance': os.environ.get('WORKER_NAME')}) + '\n')
 
 
 def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callable] = 'slice',
@@ -773,30 +781,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         def _run_here(self, args, kwargs, dispatch_context):
             """The method body in this process: a Ray worker, or a component built without a remote group."""
             from ._ray import RayHelper
-            device_mesh = getattr(self, 'device_mesh', None)
             if RayHelper.has_ref(args, kwargs):
-                args, kwargs = RayHelper.do_get_and_collect(args, kwargs)
-                if dispatch_context is None:
-                    world_size = Platform.get_world_size()
-                    rank = Platform.get_rank()
-                    workers = _get_workers([None] * world_size, execute)
-                    local_dispatch = dispatch
-                    local_mesh = device_mesh
-                    # 'first' and 'peer' hand this process a one-entry subset (its own slot);
-                    # indexing it by the GLOBAL rank reads past it. 'all' keeps every rank, so
-                    # the rank itself is the entry index.
-                    entry = rank if execute == 'all' else 0
-                else:
-                    # The caller sent the refs to every worker unsliced; slice here, now that the
-                    # structure is visible.
-                    world_size, rank, pool = dispatch_context
-                    workers = [None] * world_size
-                    local_dispatch = 'slice' if pool and dispatch == 'slice_dp' else dispatch
-                    local_mesh = None if pool else device_mesh
-                    # The caller numbered the entries of the worker list it dispatched to, and
-                    # this rank's index is its position in that same list.
-                    entry = rank
-                _, args, kwargs = _dispatch_args(workers, local_dispatch, execute, local_mesh, args, kwargs)[entry]
+                resolve_timeout = timeout if timeout is not None else getattr(self, '_ray_get_timeout', None)
+                args, kwargs = RayHelper.do_get_and_collect(args, kwargs, timeout=resolve_timeout)
             if enable_continous_work and getattr(self, '_twinkle_draining', False):
                 raise WorkerDraining(f'{func.__name__}: this replica is leaving its pool.')
             try:
@@ -817,7 +804,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                 # ``__iter__`` is exempt: it hands back the generator, not a batch, and the stash
                 # declared on it is applied per yielded value by the ``__next__`` wrapper.
                 result = _stash_channels(result, stash)
-            _record_return_probe(func.__name__, kwargs)
+            _record_return_probe(func.__name__, dispatch_context)
             return result
 
         def _call_replicas(self, args, kwargs):
@@ -830,8 +817,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                 assert not sync, (f'{func.__name__}: enable_continous_work cannot be used with sync=True, '
                                   'which exists for collectives that must run in lock step.')
                 call = _ContinuousCall(_pool_view(self), func.__name__, args, kwargs, _cw_batch_len(args, kwargs),
-                                       _resolve_sticky_key(sticky_key, func, args, kwargs),
-                                       RayHelper.has_ref(args, kwargs))
+                                       _resolve_sticky_key(sticky_key, func, args, kwargs))
                 future = call.start()
                 if lazy_collect is True:
                     return future
@@ -868,13 +854,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             # Replicas of a pool are independent engines: a data-parallel slice is a plain slice.
             _dispatch = 'slice' if pool and dispatch == 'slice_dp' else dispatch
             _mesh = None if pool else getattr(self, 'device_mesh', None)
-            if RayHelper.has_ref(args, kwargs):
-                # If has any object-ref, dispatch in worker, because we don't know the structure in the ref.
-                # for example, dataloader returns any data list.
-                _workers_and_args = [(worker, args, dict(kwargs, _dispatch_context=(len(workers), index, pool)))
-                                     for index, worker in enumerate(workers)]
-            else:
-                _workers_and_args = _dispatch_args(workers, _dispatch, execute, _mesh, args, kwargs)
+            call_id = uuid.uuid4().hex
+            _workers_and_args = [
+                (worker, shard_args, dict(shard_kwargs, _dispatch_context=call_id))
+                for worker, shard_args, shard_kwargs in _dispatch_args(workers, _dispatch, execute, _mesh, args, kwargs)]
             # offload_blocking: call the awaitable companion so the blocking body runs in a worker
             # thread instead of monopolizing the actor's default event loop (defect88).
             _method_name = (_WORKER_ASYNC_PREFIX + func.__name__) if offload_blocking else func.__name__
@@ -905,15 +888,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                         raise StopIteration()
                 result_func._futures = [_res[0] for _res in result]
 
-            _local_lazy_collect = infra._lazy_collect
-            if lazy_collect is not None:
-                # Maybe this function returns a small object
-                _local_lazy_collect = lazy_collect
-            if hasattr(self, '_lazy_collect'):
-                # _lazy_collect in class has the highest priority
-                # This is the unique case that an object ref contains another
-                # And this is user independent, only decided by the code.
-                _local_lazy_collect = self._lazy_collect
+            _local_lazy_collect = infra._lazy_collect if lazy_collect is None else lazy_collect
             if _local_lazy_collect:
                 return result_func
             return result_func()
@@ -974,7 +949,14 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         # what lets the ref-carrying dispatch path put it on the wire. The body's own parameters are
         # kept in the pin rather than replaced with a var-args form, so ``inspect.signature`` stays
         # honest for anyone reading the component.
-        _params = list(inspect.signature(func).parameters.values())
+        # Ray reads ``inspect.signature(inspect.unwrap(method))`` and unwrap descends the WHOLE
+        # ``__wrapped__`` chain to the innermost body. An intermediate decorator (``@timed`` under
+        # ``@remote_function``, e.g. CheckpointEngineMixin.send_weights_to_vllm) inserts a
+        # ``__wrapped__`` layer: a pin on ``func`` (the timed wrapper) is bypassed because unwrap
+        # lands on the undecorated body, whose signature lacks ``_dispatch_context`` and Ray refuses
+        # the dispatch kwarg. Pin the innermost body that unwrap actually lands on.
+        _body = inspect.unwrap(func)
+        _params = list(inspect.signature(_body).parameters.values())
         if not any(_p.name == '_dispatch_context' for _p in _params):
             _context = inspect.Parameter('_dispatch_context', inspect.Parameter.KEYWORD_ONLY,
                                          default=None)
@@ -982,7 +964,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             _at = next((_i for _i, _p in enumerate(_params)
                         if _p.kind is inspect.Parameter.VAR_KEYWORD), len(_params))
             _params.insert(_at, _context)
-        func.__signature__ = inspect.Signature(parameters=_params)
+        _body.__signature__ = inspect.Signature(parameters=_params)
 
         # ``self`` must be declared here: Ray extracts an actor method's signature with
         # ``extract_signature(func, ignore_first=True)``, which drops the first parameter on the

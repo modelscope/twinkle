@@ -72,6 +72,12 @@ class SamplerArgs(_ArgsBase):
     device_mesh: dict[str, Any]
     sampler_type: Literal['mock', 'vllm', 'vllm_async', 'sglang', 'sglang_async', 'torch']
     engine_args: dict[str, Any] | None = None
+    #:
+    #: Bearer credential required on the sampler's own public routes (the router mounted at
+    #: ``{route_prefix}/sampler/{name}``). ``None`` leaves them unauthenticated, matching a
+    #: gateway deployed without ``ServerArgs.api_key``; set it to the SAME key as the gateway
+    #: so direct sampler calls cannot bypass the gateway's auth boundary.
+    api_key: str | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     node_selector: dict[str, str] = Field(default_factory=dict)
     data_plane_url: str | None = None
@@ -177,6 +183,8 @@ class ServerArgs(_ArgsBase):
 
     server_config: ServerStateArgs = Field(default_factory=ServerStateArgs)
     supported_models: list[Any] | None = None
+    openai_model_aliases: dict[str, str] = Field(
+        default_factory=dict, description='Explicit OpenAI request aliases for served base model names.')
     http_options: HttpOptions | None = None
     route_prefix: str | None = None
     api_key: str | None = None

@@ -148,7 +148,7 @@ class MuonClip(Optimizer):
                 state = self.state[p]
                 state['step'] = state.get('step', 0) + 1
 
-                if apply_muon and p.ndim >= 2:
+                if apply_muon and p.ndim == 2:
                     update = self._muon_update(p, state, group)
                 else:
                     update = self._adamw_update(p, state, group)

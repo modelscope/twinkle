@@ -343,6 +343,11 @@ def build_sampler_app(model_id: str,
         attach_replica_id_header=True,
         on_shutdown=lambda servable: servable.shutdown(),
     )
+    # Same public-ingress credential as the pool router: without it the sampler's HTTP routes
+    # accept anonymous generation even when the gateway requires an api_key. Popped (not left in
+    # kwargs) because SamplerManagement's constructor does not take it.
+    from twinkle.server.middleware.auth import install_api_key_gate
+    install_api_key_gate(app, kwargs.pop('api_key', None))
 
     return bind_deployment(
         app,

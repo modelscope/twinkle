@@ -65,6 +65,10 @@ class TrainingArguments(BaseModel):
     task_type: Literal["causal_lm", "embedding", "seq_cls", "reranker", "value", "decision"] | None = None
     num_labels: int | None = Field(default=None, gt=0, strict=True)
     language_model_only: bool | None = Field(default=None, strict=True)
+    # MoE routing replay (R3): build the served model replay-enabled so it can replay
+    # sampler-exported routed_experts. Forwarded verbatim to the model ctor (transformers/
+    # megatron kwargs.pop('enable_router_replay')); the sampler must export routed_experts.
+    enable_router_replay: bool = Field(default=False, strict=True)
 
     @field_validator("template")
     @classmethod

@@ -18,6 +18,7 @@ from twinkle.processor.trajectory import response_positions
 from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 from twinkle.server.validation.tinker_loss import validate_tinker_loss
 from twinkle.template import Template
+from twinkle.utils import torch_util
 
 
 def collect_forward_backward_results(results, device_mesh: DeviceMesh):
@@ -92,6 +93,23 @@ def to_cpu_safe_output(obj: Any) -> Any:
     return obj
 
 
+def decision_forward_output(output) -> dict:
+    """Preserve the option axes and serialize only the decision readout."""
+    keys = ('logits', 'option_mask', 'kinds', 'counts')
+    if any(not isinstance(output.get(key), torch.Tensor) for key in keys):
+        raise ValueError('Decision forward requires option logits, mask, kinds and record counts.')
+    logits, mask, kinds, counts = (torch_util.to_local_tensor(output[key]).detach().cpu() for key in keys)
+    if (logits.ndim != 2 or mask.shape != logits.shape or mask.dtype != torch.bool
+            or kinds.shape != logits.shape[:1] or kinds.dtype != torch.long or counts.ndim != 1
+            or counts.dtype != torch.long or (counts < 0).any() or counts.sum().item() != len(logits)
+            or not mask.any(dim=1).all()):
+        raise ValueError('Invalid decision forward shapes, option mask, kinds or record counts.')
+    if not logits[mask].isfinite().all():
+        raise ValueError('Decision forward returned non-finite logits for real options.')
+    return dict(logits=logits.masked_fill(~mask, 0).tolist(), option_mask=mask.tolist(),
+                kinds=kinds.tolist(), counts=counts.tolist())
+
+
 def clean_metrics(metrics: dict) -> dict:
 
     def _to_float(v):
@@ -129,7 +147,12 @@ def clean_metrics(metrics: dict) -> dict:
 
 
 class TwinkleCompatModelBase:
-    """Base class containing common logic for Twinkle compatibility wrappers."""
+    """Base class containing common logic for Twinkle compatibility wrappers.
+
+    The task-head temperature read/write (``task_head_temperatures``) lives on
+    :class:`~twinkle.model.base.TrainableModel` -- this mixin's backends inherit it,
+    which is what lets local, ray and the server endpoint share ONE implementation.
+    """
 
     @staticmethod
     def _normalize_ref_outputs(kwargs: dict) -> None:
@@ -178,7 +201,7 @@ class TwinkleCompatModelBase:
             if not tokens or min(tokens) < 0 or max(tokens) >= len(template.tokenizer):
                 raise ValueError('Continuation tokens must be nonempty and in the configured vocabulary.')
             prompt = template.encode_prompt(row)
-            feature = template.append_completion(prompt.state, tokens).state.feature
+            feature = template.append_completion(prompt, tokens)
             positions = response_positions(feature)
             if [int(feature['labels'][i]) for i in positions] != tokens:
                 raise ValueError('Encoded scoring labels do not match the given continuation.')
@@ -397,11 +420,13 @@ class TwinkleCompatModelBase:
                             return_full_logprobs: bool = False) -> list[dict]:
         """Convert raw logits to the expected output format with logprobs and elementwise_loss.
 
-        When return_full_logprobs is True (forward_only / reference pass), logprobs is returned
-        at the full TP/CP-padded sequence length so that when the client sends it back as
-        ref_logps in the DPO forward_backward step the shape already matches the padded labels.
-        When return_full_logprobs is False (default, forward_backward pass), logprobs is
-        truncated to the original unpadded sequence length.
+        By default (both the tinker forward and forward_backward passes) logprobs is
+        truncated to the original unpadded sequence length, so it stays aligned 1:1 with
+        the datum's input/target tokens as the Tinker protocol requires. The DPO reference
+        round-trip does not need pre-padded logprobs: the server re-pads ragged
+        client-supplied ref_logps in extract_rl_features_for_loss.
+        return_full_logprobs=True is an internal utility that retains the full TP/CP-padded
+        slice; it is not used by the public tinker endpoints.
         elementwise_loss is always computed on the original (unpadded) length because the
         per-datum weights tensor has that length.
         """

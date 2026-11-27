@@ -39,7 +39,7 @@ add to the debt rather than pay it down.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from pydantic import BeforeValidator, Field, StrictInt, model_validator
+from pydantic import BeforeValidator, Field, StrictBool, StrictInt, model_validator
 from typing import Annotated, Any, List, Literal, Optional, Union
 
 from twinkle.data_format.encoding import ENCODED_INPUT_KEYS
@@ -105,7 +105,22 @@ class WireMessage(DataModel):
     audios: MediaList | None = None
 
 
-class WireInputFeature(DataModel):
+class _WireConversation(DataModel):
+    """Conversation fields shared by raw and encoded trajectories."""
+
+    messages: list[WireMessage] | None = None
+    tools: list[dict[str, Any]] | None = None
+    user_data: list[tuple[str, str]] | None = None
+    images: MediaList | None = None
+    videos: MediaList | None = None
+    audios: MediaList | None = None
+    prompt: str | None = None
+    engine_input_ids: list[StrictInt] | None = None
+    reasoning_started: StrictBool | None = None
+    mm_processor_kwargs: dict[str, Any] | None = None
+
+
+class WireInputFeature(_WireConversation):
     """An already-encoded entry: token ids (or embeddings) plus aligned tensors."""
 
     input_ids: Ints1to2 | None = None
@@ -129,12 +144,6 @@ class WireInputFeature(DataModel):
     feature_attention_mask: Numbers1to4 | None = None
     grid_thws: Numbers1to4 | None = None
 
-    # The media an encoded multimodal prompt runs with (``input_ids`` are then the engine's ids):
-    # a multi-turn client uploads them again with every turn, the server keeps no episode.
-    images: MediaList | None = None
-    videos: MediaList | None = None
-    audios: MediaList | None = None
-
     @model_validator(mode='after')
     def require_encoded_key(self) -> WireInputFeature:
         """At least one of the encoded-input keys must be present.
@@ -148,17 +157,16 @@ class WireInputFeature(DataModel):
         return self
 
 
-class WireTrajectory(DataModel):
-    """A not-yet-encoded entry: messages the server template will encode."""
+class WireTrajectory(_WireConversation):
+    """A raw conversation awaiting template encoding."""
 
     messages: list[WireMessage]
-    images: MediaList | None = None
-    videos: MediaList | None = None
-    audios: MediaList | None = None
-    tools: list[dict[str, Any]] | None = None
-    # ``List[Tuple[str, str]]`` on the wire: the PyArrow-stable encoding of the
-    # user-data pairs attached by ``twinkle.data_format.attach_user_data``.
-    user_data: list[tuple[str, str]] | None = None
+
+    @model_validator(mode='after')
+    def require_unencoded(self) -> WireTrajectory:
+        if any(getattr(self, key, None) is not None for key in ENCODED_INPUT_KEYS):
+            raise ValueError('an encoded trajectory must use the encoded batch branch')
+        return self
 
 
 # A batch is homogeneous: every entry is encoded, or none is. Expressed as a union of
@@ -202,6 +210,10 @@ CORE_INPUT_KEYS: frozenset[str] = frozenset({
     'audios',
     'tools',
     'user_data',
+    'prompt',
+    'engine_input_ids',
+    'reasoning_started',
+    'mm_processor_kwargs',
 }) | VLM_TENSOR_FIELDS
 
 

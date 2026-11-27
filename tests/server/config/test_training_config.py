@@ -234,15 +234,20 @@ def test_separate_model_applications_select_lora_and_full():
     assert ServerConfig.model_validate(config.to_yaml_dict()).training_config == config.training_config
 
 
-def test_launcher_keeps_training_and_sampling_capabilities_separate(monkeypatch):
+@pytest.mark.parametrize('with_training', [False, True])
+def test_launcher_keeps_training_and_sampling_capabilities_separate(monkeypatch, with_training):
     from ray import serve
     from twinkle.server.launcher.server_launcher import ServerLauncher
-    config = ServerConfig(applications=[model_application(), {
+    applications = [{
         'name': 'gateway', 'import_path': 'server', 'route_prefix': '/api/v1',
+        'args': {'openai_model_aliases': {'default': 'teacher'}},
     }, {
         'name': 'sampler', 'import_path': 'sampler', 'route_prefix': '/api/v1/sampler/teacher',
         'args': {'model_id': 'teacher', 'device_group': {}, 'device_mesh': {}, 'sampler_type': 'mock'},
-    }])
+    }]
+    if with_training:
+        applications.append(model_application())
+    config = ServerConfig(applications=applications)
     captured = {}
     def builder(**kwargs):
         captured.update(kwargs)
@@ -250,9 +255,10 @@ def test_launcher_keeps_training_and_sampling_capabilities_separate(monkeypatch)
     launcher = ServerLauncher(config)
     monkeypatch.setattr(launcher, '_resolve_builder', lambda path: builder)
     monkeypatch.setattr(serve, 'run', lambda *args, **kwargs: None)
-    launcher._deploy_application(config.applications[1])
-    assert captured['training_models'] == ['Qwen/small']
+    launcher._deploy_application(config.applications[0])
+    assert captured['training_models'] == (['Qwen/small'] if with_training else [])
     assert captured['supported_models'] == ['teacher']
+    assert captured['openai_model_aliases'] == {'default': 'teacher'}
 
 
 def configured_application():

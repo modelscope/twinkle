@@ -8,10 +8,10 @@ from torch.optim import Optimizer
 from transformers.utils.versions import require_version
 from typing import Callable, Iterable, Tuple
 
-from .galore_projector import GaLoreProjector
+from .galore_projector import GaLoreOptimizerStateMixin, GaLoreProjector
 
 
-class GaLoreAdamW(Optimizer):
+class GaLoreAdamW(GaLoreOptimizerStateMixin, Optimizer):
     """
     Implements Adam algorithm with weight decay fix as introduced in [Decoupled Weight Decay
     Regularization](https://arxiv.org/abs/1711.05101), with GaLore low-rank gradient projection.

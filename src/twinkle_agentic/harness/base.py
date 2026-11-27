@@ -52,6 +52,11 @@ class CliAgent(ABC):
 
     protocol: Literal['chat', 'responses'] = 'chat'
     timeout: float = 1800.0
+    #: Whether the agent strips each stored message's boundary whitespace at send time
+    #: (ms-agent's ``_format_input_message`` mutates ``content.strip()``), which changes
+    #: the merged view it holds of a continued turn. The rollout folds a split turn with
+    #: the same rule, so the recognition and the agent agree on ONE merged view.
+    merge_strips: bool = False
 
     def task(self, trajectory: Trajectory) -> str:
         """The text handed to the agent; defaults to :func:`default_task_text`."""

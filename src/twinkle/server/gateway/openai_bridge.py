@@ -98,7 +98,6 @@ def translate_chat_request(body: dict[str, Any]) -> tuple[dict[str, Any], str]:
     sample_request = {
         'inputs': trajectory,
         'sampling_params': sampling_params or None,
-        'adapter_name': model,
     }
 
     adapter_uri = body.get('adapter_uri')
@@ -256,7 +255,6 @@ def translate_completion_request(body: dict[str, Any]) -> tuple[dict[str, Any], 
     sample_request = {
         'inputs': inputs,
         'sampling_params': sampling_params or None,
-        'adapter_name': model,
     }
 
     adapter_uri = body.get('adapter_uri')
@@ -372,7 +370,6 @@ def translate_embedding_request(body: dict[str, Any]) -> tuple[dict[str, Any], s
     encode_request = {
         'inputs': inputs,
         'pooling_params': pooling_params,
-        'adapter_name': model,
     }
     return encode_request, model
 
@@ -397,19 +394,23 @@ def translate_embedding_response(encode_data: dict[str, Any], model: str) -> dic
     }
 
 
+class InferModelConflictError(ValueError):
+    """An infer batch explicitly names more than one model."""
+
+
 def translate_infer_request(body: Any) -> tuple[dict[str, Any], str]:
     """Translate a rollout ``/infer`` body to a batched SampleRequest dict.
 
     Accepts either a bare list of infer requests or ``{'infer_requests': [...], 'request_config': {...}}``.
-    Each entry contributes one ``Trajectory`` (its ``messages``); ``request_config`` supplies the shared
-    sampling knobs. Logprobs are forced on: rollout recomputes importance ratios against the served
-    per-token logprobs, so a request that forgot to ask for them would still need them.
+    All supplied model names must match. Each entry contributes one ``Trajectory`` (its ``messages``).
+    ``request_config`` supplies the shared sampling parameters. Logprobs are always enabled because rollout
+    uses them to recompute importance ratios.
 
     Returns:
         ``(sample_request_dict, model)`` where model is the resolved model name.
 
     Raises:
-        ValueError: If no infer requests are present or an entry lacks ``messages``.
+        ValueError: If requests, messages or model names are missing, invalid or inconsistent.
     """
     if isinstance(body, list):
         infer_requests, request_config = body, {}
@@ -422,6 +423,10 @@ def translate_infer_request(body: Any) -> tuple[dict[str, Any], str]:
     if not infer_requests:
         raise ValueError('infer_requests')
 
+    model = request_config.get('model')
+    if model is not None and (not isinstance(model, str) or not model):
+        raise ValueError('model')
+
     inputs = []
     for item in infer_requests:
         messages = item.get('messages') if isinstance(item, dict) else None
@@ -429,9 +434,16 @@ def translate_infer_request(body: Any) -> tuple[dict[str, Any], str]:
             raise ValueError('messages')
         inputs.append({'messages': messages})
 
-    model = request_config.get('model') or next(
-        (item.get('model') for item in infer_requests if isinstance(item, dict) and item.get('model')), None)
-    if not model or not isinstance(model, str):
+        item_model = item.get('model')
+        if item_model is None:
+            continue
+        if not isinstance(item_model, str) or not item_model:
+            raise ValueError('model')
+        if model is not None and item_model != model:
+            raise InferModelConflictError('Conflicting model names in /infer batch. Use one model name per batch.')
+        model = item_model
+
+    if model is None:
         raise ValueError('model')
 
     sampling_params = _extract_sampling_params(request_config)
@@ -445,7 +457,6 @@ def translate_infer_request(body: Any) -> tuple[dict[str, Any], str]:
     sample_request = {
         'inputs': inputs,
         'sampling_params': sampling_params,
-        'adapter_name': model,
     }
     return sample_request, model
 

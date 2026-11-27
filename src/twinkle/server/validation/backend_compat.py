@@ -37,9 +37,12 @@ class BackendCapability(StrEnum):
     """An endpoint that not every backend implements.
 
     Only the gradient-path splits belong here. Megatron fuses forward and backward, so
-    it raises ``NotImplementedError('Megatron only supports forward_backward and
-    forward_only')`` for each of these three; naming them makes that a 501 with the
+    ``forward`` and ``backward`` raise ``NotImplementedError('Megatron only supports
+    forward_backward and forward_only')``; naming them makes that a 501 with the
     alternative endpoints in the message instead of a 500 carrying a backend traceback.
+    ``calculate_loss`` is deliberately NOT listed: both backends implement it (Megatron
+    reports the loss its fused forward already recorded), so the wire must accept what
+    the local method face accepts.
     """
 
     Forward = 'forward'
@@ -50,7 +53,7 @@ class BackendCapability(StrEnum):
 # Capabilities a backend does NOT provide. Absent backends support everything; ``mock``
 # is deliberately absent because it is a test double that accepts every call.
 _UNSUPPORTED: dict[str, frozenset[str]] = {
-    'megatron': frozenset({BackendCapability.Forward, BackendCapability.Backward, BackendCapability.CalculateLoss}),
+    'megatron': frozenset({BackendCapability.Forward, BackendCapability.Backward}),
 }
 
 _ALTERNATIVES = 'use `forward_backward` (training) or `forward_only` (inference) instead'

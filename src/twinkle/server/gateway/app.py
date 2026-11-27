@@ -39,29 +39,48 @@ class GatewayServer(LazyCleanupMixin):
         self.state = get_server_state(**state_kwargs)
         self.route_prefix = kwargs.get('route_prefix', '/api/v1')
         self.http_options = http_options or {}
-        self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
-        self.supported_models = self._normalize_models(supported_models)
         self.training_models = self._normalize_models(kwargs.get('training_models', supported_models))
         self._training_model_names = frozenset(m.model_name for m in self.training_models)
-        self._supported_model_names = frozenset(m.model_name for m in self.supported_models)
+        self.supported_models: list[types.SupportedModel] = []
+        self.openai_model_aliases: dict[str, str] = {}
+        self._template_initialized: set[str] = set()
+        self.reconfigure({
+            'supported_models': supported_models,
+            'openai_model_aliases': kwargs.get('openai_model_aliases') or {},
+        })
+        self.proxy = ServiceProxy(http_options=http_options, route_prefix=self.route_prefix)
         # OpenAI-compat surface knobs: ``api_key`` gates every inference route with a Bearer check
         # (None = unauthenticated), ``owned_by`` is the ``owned_by`` field of ``/models`` entries.
         self.api_key = kwargs.get('api_key')
         self.owned_by = kwargs.get('owned_by') or 'twinkle'
         self._modelscope_config_lock = asyncio.Lock()
         self._state_cleanup_started = False
-        # Per-instance, not module-level: a process-global set never got cleared
-        # across replica rebuilds and made the OpenAI template tests non-isolatable.
-        self._template_initialized: set[str] = set()
+
+    def reconfigure(self, config: dict | None) -> None:
+        """Apply the persisted discovery snapshot to every replica without replacing training/session state."""
+        if not config:
+            return
+        models = self._normalize_models(config.get('supported_models', self.supported_models))
+        aliases = config.get('openai_model_aliases', self.openai_model_aliases)
+        conflicts = aliases.keys() & {model.model_name for model in models}
+        if conflicts:
+            raise ValueError(f'OpenAI aliases conflict with registered model names: {", ".join(sorted(conflicts))}')
+        self.supported_models = models
+        self.openai_model_aliases = dict(aliases)
+        self._supported_model_names = frozenset(model.model_name for model in models if not model.base_model)
+        self._template_initialized.intersection_update(self._supported_model_names)
 
     @property
     def supported_model_names(self) -> frozenset[str]:
-        """Base-model names this gateway accepts.
-
-        Public because ``openai_handlers._resolve_base_model`` reads it; it used to
-        reach into ``gateway._supported_model_names`` directly.
-        """
+        """Registered public names of base samplers."""
         return self._supported_model_names
+
+    def get_openai_model_catalog(self) -> dict[str, Any]:
+        """Read the configured model names for a deployment update via a Serve handle."""
+        return {
+            'models': [model.model_dump(exclude_none=True) for model in self.supported_models],
+            'aliases': dict(self.openai_model_aliases),
+        }
 
     @staticmethod
     def _normalize_server_state_args(server_config: Any) -> dict[str, Any]:

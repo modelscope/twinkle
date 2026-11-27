@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/twinkle-runtime-common.sh"
+export FLA_TILELANG="${FLA_TILELANG:-0}"
 
 start_worker() {
     : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray head address (host:port)}"
@@ -61,7 +62,10 @@ fi
 
 case "$role" in
     spectrum-group)
-        load_config "${1:-/dashscope/caches/application/runtime-config/twinkle-gpu.env}"
+        config="${1:-/dashscope/caches/application/runtime-config/twinkle-gpu.env}"
+        if [[ -f "$config" || $# -gt 0 ]]; then
+            load_config "$config"
+        fi
         : "${RANK_ID:?Spectrum must supply the rank}"
         : "${RANK_IP:?Spectrum must supply the private node IP}"
         : "${MASTER_ADDRESS:?Spectrum must supply the private head address}"
@@ -70,7 +74,7 @@ case "$role" in
         : "${TWINKLE_REDIS_KEY_PREFIX:?Use the same prefix in the Grafana Runtime}"
         : "${TWINKLE_OTLP_ENDPOINT:?Set the private OTLP endpoint}"
         : "${TWINKLE_TELEMETRY_USER_ID_KEY:?Set the telemetry fingerprint key}"
-        : "${TWINKLE_GATEWAY_API_KEY:?Set the validation client's Bearer token}"
+        : "${TWINKLE_GATEWAY_API_KEY:?Set the validation client Bearer token}"
         shared_mount="${TWINKLE_SHARED_MOUNT:-/dashscope/caches/application}"
         if ! mountpoint -q -- "$shared_mount"; then
             printf 'Shared checkpoint volume is not mounted: %s\n' "$shared_mount" >&2
@@ -82,7 +86,7 @@ case "$role" in
         esac
         export TWINKLE_DEFAULT_SAVE_DIR="$TWINKLE_RUNTIME_DIR/checkpoints"
         export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-$shared_mount/.cache}"
-        export CUDA_DEVICE_ORDER=PCI_BUS_ID FLA_TILELANG="${FLA_TILELANG:-0}"
+        export CUDA_DEVICE_ORDER=PCI_BUS_ID
         mkdir -p -- "$TWINKLE_DEFAULT_SAVE_DIR" "$MODELSCOPE_CACHE"
         export RAY_ADDRESS="$MASTER_ADDRESS:6379"
         export TWINKLE_EXPECTED_RAY_NODES="${TWINKLE_EXPECTED_RAY_NODES:-3}" TWINKLE_EXPECTED_GPUS_PER_NODE=8

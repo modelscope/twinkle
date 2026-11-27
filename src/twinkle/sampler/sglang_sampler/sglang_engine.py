@@ -21,6 +21,24 @@ _FINISH_REASONS: Dict[str, StopReason] = {
 }
 
 
+def _sglang_engine_arg_names() -> Optional[set]:
+    """Engine argument names the installed sglang accepts, or None when it cannot be probed.
+
+    Shared by the engine's warn-and-drop filter (twinkle-injected keys) and the sampler's
+    fail-loud guard (user-set keys), so both lanes judge against one source of truth.
+    """
+    try:
+        from sglang.srt.server_args import ServerArgs
+    except Exception:
+        return None
+    accepted = set(getattr(ServerArgs, '__annotations__', {}) or {})
+    try:
+        accepted |= set(inspect.signature(ServerArgs).parameters)
+    except (TypeError, ValueError):
+        pass
+    return accepted or None
+
+
 class SGLangEngine(BaseSamplerEngine):
     """Token-level inference on sglang's offline engine.
 
@@ -102,20 +120,12 @@ class SGLangEngine(BaseSamplerEngine):
         0.5.x, which spells expert parallelism ``ep_size`` -- and ``Engine`` accepts ``**kwargs``
         only to reject unknown names at startup. A caller therefore cannot forward a config block
         wholesale: one retired knob, even left at its default, stops the engine before it starts.
-        Dropping is reported by name rather than silent, so a knob the caller did set on purpose is
-        still visible; the four arguments this class passes explicitly are its own business and are
-        never filtered here.
+        This warn-and-drop lane is for twinkle's own injected/defaulted keys only; keys the USER
+        set are validated fail-loud by SGLangSampler before the merge (same contract as vLLM's
+        engine_kwargs guard), so a purpose-set knob is never silently discarded here.
         """
-        try:
-            from sglang.srt.server_args import ServerArgs
-        except Exception:
-            return dict(engine_kwargs)
-        accepted = set(getattr(ServerArgs, '__annotations__', {}) or {})
-        try:
-            accepted |= set(inspect.signature(ServerArgs).parameters)
-        except (TypeError, ValueError):
-            pass
-        if not accepted:
+        accepted = _sglang_engine_arg_names()
+        if accepted is None:
             return dict(engine_kwargs)
         unknown = sorted(key for key in engine_kwargs if key not in accepted)
         if unknown:
@@ -201,14 +211,12 @@ class SGLangEngine(BaseSamplerEngine):
         else:
             request['input_ids'] = list(prompt)
 
-        if logprobs_k or prompt_logprobs_k:
-            request['return_logprob'] = True
-            top_k = max(logprobs_k, prompt_logprobs_k)
-            if top_k > 1:
-                request['top_logprobs_num'] = top_k
-            # -1 keeps sglang on the generated tokens only; 0 makes it score the prompt as well, which
-            # is the more expensive path and only worth asking for when prompt logprobs were requested.
-            request['logprob_start_len'] = 0 if prompt_logprobs_k else -1
+        # SGLang exposes actual sampled IDs through output_token_logprobs, even when callers omit logprobs.
+        request['return_logprob'] = True
+        top_k = max(logprobs_k, prompt_logprobs_k)
+        if top_k > 0:
+            request['top_logprobs_num'] = top_k
+        request['logprob_start_len'] = 0 if sampling_params.prompt_logprobs is not None else -1
         if image_data is not None:
             request['image_data'] = image_data
         if lora_name:
@@ -228,17 +236,18 @@ class SGLangEngine(BaseSamplerEngine):
         sequences = []
         for output in outputs:
             meta = output.get('meta_info') or {}
-            tokens = self._output_token_ids(meta, output, await self.get_tokenizer())
+            tokens = self._output_token_ids(meta, output)
             sequences.append(
                 SampledSequence(
                     stop_reason=self._map_finish_reason(meta.get('finish_reason')),
                     tokens=tokens,
-                    logprobs=self._sequence_logprobs(meta, tokens, logprobs_k),
-                ))
+                    logprobs=self._sequence_logprobs(meta, tokens, sampling_params.logprobs),
+                )
+            )
 
         # Prompt logprobs describe the shared prompt, so they are the same on every sample.
         first_meta = (outputs[0].get('meta_info') or {}) if outputs else {}
-        prompt_logprobs, topk_prompt_logprobs = self._prompt_logprobs(first_meta, prompt_logprobs_k)
+        prompt_logprobs, topk_prompt_logprobs = self._prompt_logprobs(first_meta, sampling_params.prompt_logprobs)
         return SampleResponse(
             sequences=sequences,
             prompt_token_ids=list(prompt_token_ids),
@@ -327,6 +336,7 @@ class SGLangEngine(BaseSamplerEngine):
                               prompt: Union[List[int], str],
                               sampling_params: Union[SamplingParams, Dict[str, Any]],
                               lora_name: Optional[str] = None,
+                              image_data: Optional[Any] = None,
                               **kwargs):
         """Yield ``(delta_text, finish_reason)`` as sglang produces tokens.
 
@@ -347,6 +357,8 @@ class SGLangEngine(BaseSamplerEngine):
             request['input_ids'] = list(prompt)
         if lora_name:
             request['lora_path'] = lora_name
+        if image_data is not None:
+            request['image_data'] = image_data
 
         emitted = 0
         finish_reason = None
@@ -374,36 +386,35 @@ class SGLangEngine(BaseSamplerEngine):
         return _FINISH_REASONS.get(str(reason), 'error')
 
     @staticmethod
-    def _output_token_ids(meta: Dict[str, Any], output: Dict[str, Any], tokenizer) -> List[int]:
-        """The generated token ids.
-
-        sglang returns text, and the ids only as a side effect of asking for logprobs, so without
-        logprobs they have to be recovered by tokenising the completion.
-        """
+    def _output_token_ids(meta: Dict[str, Any], output: Dict[str, Any]) -> List[int]:
         token_logprobs = meta.get('output_token_logprobs')
-        if token_logprobs:
-            return [int(entry[1]) for entry in token_logprobs]
-        text = output.get('text') or ''
-        return tokenizer.encode(text, add_special_tokens=False) if text else []
+        if token_logprobs is None:
+            if output.get('text'):
+                raise RuntimeError('SGLang omitted the requested sampled token IDs')
+            return []
+        return [int(entry[1]) for entry in token_logprobs]
 
     @classmethod
-    def _sequence_logprobs(cls, meta: Dict[str, Any], tokens: List[int],
-                           logprobs_k: int) -> Optional[List[List[Tuple[int, float]]]]:
-        """Per-position logprobs for the generated tokens, as ``[(token_id, logprob), ...]`` per position.
-
-        Two shapes, matching what was asked for: the sampled token alone when ``logprobs == 1``, and
-        sglang's top-k list otherwise -- the same distinction :class:`VLLMEngine` makes.
-        """
-        if not logprobs_k:
+    def _sequence_logprobs(
+        cls, meta: Dict[str, Any], tokens: List[int], logprobs_k: int | None
+    ) -> List[List[Tuple[int, float]]] | None:
+        """Return each sampled token first, followed by its requested alternatives."""
+        if logprobs_k is None:
             return None
-        if logprobs_k > 1:
-            top_logprobs = meta.get('output_top_logprobs')
-            if top_logprobs:
-                return [cls._to_token_logprobs(position)[:logprobs_k] for position in top_logprobs]
         token_logprobs = meta.get('output_token_logprobs')
         if not token_logprobs:
             return None
-        return [[entry] for entry in cls._to_token_logprobs(token_logprobs)]
+        sampled = cls._to_token_logprobs(token_logprobs)
+        if len(sampled) != len(tokens) or any(entry[0] != token for entry, token in zip(sampled, tokens, strict=False)):
+            raise RuntimeError('SGLang sampled logprobs must align with the generated tokens')
+        result = [[entry] for entry in sampled]
+        top_logprobs = meta.get('output_top_logprobs')
+        if logprobs_k > 1 and top_logprobs:
+            for entries, position in zip(result, top_logprobs, strict=True):
+                entries.extend(
+                    entry for entry in cls._to_token_logprobs(position)[:logprobs_k] if entry[0] != entries[0][0]
+                )
+        return result
 
     @classmethod
     def _prompt_logprobs(cls, meta: Dict[str, Any], prompt_logprobs_k: int):
@@ -412,7 +423,7 @@ class SGLangEngine(BaseSamplerEngine):
         The first prompt token has no logprob -- nothing preceded it -- and sglang reports that as
         ``None``, which is passed through rather than filled in.
         """
-        if not prompt_logprobs_k:
+        if prompt_logprobs_k is None:
             return None, None
         token_logprobs = meta.get('input_token_logprobs')
         if not token_logprobs:

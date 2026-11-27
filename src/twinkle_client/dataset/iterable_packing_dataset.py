@@ -33,7 +33,9 @@ class IterablePackingDataset(TorchIterableDataset, RemoteComponent):
         )
 
     def set_template(self, template_cls: Union[Type[Template], str, Template], **kwargs):
-        return self._call('set_template', template_cls=template_cls, **kwargs)
+        from twinkle.template.utils import template_request
+        name, options = template_request(template_cls, kwargs)
+        return self._call('set_template', template_cls=name, **options)
 
     def pack_dataset(self):
         return self._call('pack_dataset')

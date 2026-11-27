@@ -22,7 +22,7 @@ class TestTranslateChatRequest:
         }
         req, model = translate_chat_request(body)
         assert model == 'lora-abc'
-        assert req['adapter_name'] == 'lora-abc'
+        assert 'adapter_name' not in req
         assert req['inputs'] == {'messages': [{'role': 'user', 'content': 'Hello'}]}
         assert req['sampling_params'] is None
 

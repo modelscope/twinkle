@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 _CONTROL_ENDPOINTS = frozenset(
     {"twinkle/set_template", "twinkle/add_adapter_to_sampler", "twinkle/apply_patch", "twinkle/unload_adapter_paths"}
 )
+_SAMPLING_ENDPOINTS = frozenset(
+    {"twinkle/sample", "twinkle/sample_stream", "twinkle/sample_to_data_plane", "twinkle/encode", "tinker/asample"}
+)
 
 
 def sampler_controller_name(namespace, pool_id):
@@ -180,6 +183,10 @@ class SamplerController:
                     break
                 if self._action_key(previous) == key:
                     del self._actions[index]
+        if ("base_path" in action and action["base_path"] is None
+                and not any(previous.get("endpoint") == "twinkle/apply_patch" for previous in self._actions)):
+            # Fresh replicas already start with the original weights.
+            return
         self._actions.append(deepcopy(action))
 
     async def _release(self, instance, ticket):
@@ -216,7 +223,7 @@ class SamplerController:
                 async def broadcast():
                     response = None
                     for replica in replicas:
-                        if full_path is not None:
+                        if payload is None:
                             await self.driver.load_weights(replica, full_path)
                         else:
                             response = await self._invoke_finished(replica, payload)
@@ -233,7 +240,7 @@ class SamplerController:
                     # its RPC is pending. Such an ACK must not commit pool state.
                     if any(replica.state != "READY" for replica in replicas):
                         raise ResourceExhaustedError("Sampler changed state during control update")
-                    if full_path is not None:
+                    if payload is None:
                         self._base_path = full_path
                         self._remember({"base_path": full_path})
                     elif payload["endpoint"] != "twinkle/unload_adapter_paths":
@@ -261,6 +268,7 @@ class SamplerController:
                 "body": b'{"status":"ok"}',
             }
         control = endpoint in _CONTROL_ENDPOINTS
+        selects_weights = endpoint in _SAMPLING_ENDPOINTS
         if submission is not None and submission.request_id in self._sample_replies:
             fingerprint, reply_ready = self._sample_replies[submission.request_id]
             if fingerprint != submission.fingerprint:
@@ -286,7 +294,8 @@ class SamplerController:
                 if control:
                     reply_ready.set_result(await self._mutate(payload=payload))
                     return
-                if full_path is not None and full_path != self._base_path:
+                if selects_weights and full_path != self._base_path:
+                    # A missing checkpoint selects the sampler's original base weights.
                     await self._mutate(full_path=full_path)
                 # This background operation survives cancellation of the forwarding RPC.
                 parent = extract_context(Headers(raw=payload["headers"]))
@@ -309,13 +318,23 @@ class SamplerController:
                 if instance is not None and ticket is not None:
                     await self._release(instance, ticket)
 
+        async def read_if_weights_match():
+            # Check the weights while holding the same guard that all writers use.
+            if selects_weights and full_path != self._base_path:
+                return False
+            await operation()
+            return True
+
         async def guarded():
             try:
-                await self._guard.run(
-                    operation,
-                    exclusive=control or full_path is not None,
-                    queue_timeout=self.args.queue_config.queue_timeout,
-                )
+                timeout = self.args.queue_config.queue_timeout
+                if control or full_path is not None:
+                    await self._guard.run(operation, exclusive=True, queue_timeout=timeout)
+                else:
+                    deadline = asyncio.get_running_loop().time() + timeout
+                    if not await self._guard.run(read_if_weights_match, queue_timeout=timeout):
+                        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+                        await self._guard.run(operation, exclusive=True, queue_timeout=remaining)
             except BaseException as error:
                 if not reply_ready.done():
                     reply_ready.set_exception(error)

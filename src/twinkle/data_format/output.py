@@ -15,6 +15,27 @@ OutputType = Union[np.ndarray, 'torch.Tensor', List[Any], float]
 # per-sample Python numeric lists aligned with response_token_ids; 'sequence' fields keep
 # full-input tensors; 'row' fields keep per-sample task outputs (pooling/decision/seq_cls).
 FIELD_FRAMES = ('response', 'sequence', 'row')
+MODEL_OUTPUT_META_FIELDS = frozenset({
+    'field_frames', 'episode_ids', 'response_token_ids', 'tokenizer_fingerprint',
+    'model_id', 'parameter_version', 'loss', 'num_tokens', 'aux_loss', 'channel_loss',
+})
+
+
+def select_model_output(value: Any, indices: List[int], batch_size: int) -> Any:
+    """Select row-aligned channels and identities while preserving field-level metadata."""
+    scalar_fields = MODEL_OUTPUT_META_FIELDS - {'episode_ids', 'response_token_ids'}
+
+    def select(item):
+        if isinstance(item, (list, tuple)) and len(item) == batch_size:
+            selected = [item[index] for index in indices]
+            return tuple(selected) if isinstance(item, tuple) else selected
+        if hasattr(item, 'shape') and len(item.shape) and item.shape[0] == batch_size:
+            return item[indices]
+        return item
+
+    if isinstance(value, dict):
+        return {key: item if key in scalar_fields else select(item) for key, item in value.items()}
+    return select(value)
 
 
 class ModelOutput(TypedDict, total=False):

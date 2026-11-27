@@ -19,7 +19,8 @@ from twinkle.data_format import InputFeature, Trajectory
 from twinkle.model import MultiLoraTransformersModel, SpectralHybridTransformersModel
 from twinkle.model.transformers import TransformersModel
 from twinkle.server.model.backends.common import (TwinkleCompatModelBase, clean_metrics,
-                                                  collect_forward_backward_results, to_cpu_safe_output)
+                                                  collect_forward_backward_results, decision_forward_output,
+                                                  to_cpu_safe_output)
 from twinkle.server.model.tinker_datum import datum_to_input_feature, extract_rl_features_for_loss
 
 
@@ -41,7 +42,10 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
         template = self.get_template(adapter_name)
         input_features = datum_to_input_feature(inputs, template)
         outputs = super().forward_only(inputs=input_features, adapter_name=adapter_name, **kwargs)
-        results = self._tinker_build_output(inputs, outputs, return_full_logprobs=True)
+        # Tinker contract: one logprob per input token. Return the unpadded slice;
+        # the DPO reference round-trip stays intact because the server re-pads
+        # ragged client-supplied ref_logps in extract_rl_features_for_loss.
+        results = self._tinker_build_output(inputs, outputs)
         return [results, 0.0]
 
     @remote_function(dispatch='slice_dp', collect=collect_forward_backward_results)
@@ -101,7 +105,10 @@ class _TransformersTinkerCompatMixin(TwinkleCompatModelBase):
                      distillation_topk: int | None = None, **kwargs):
         """Forward-only for native clients, with optional compact distillation output."""
         if distillation_topk is None:
-            return to_cpu_safe_output(super().forward_only(inputs=inputs, **kwargs))
+            output = super().forward_only(inputs=inputs, **kwargs)
+            if kwargs.get('task') == 'decision' and kwargs.get('return_logits'):
+                return decision_forward_output(output)
+            return to_cpu_safe_output(output)
         if self.device_mesh is not None and (self.device_mesh.tp_world_size > 1 or self.device_mesh.cp_world_size > 1):
             raise ValueError('Top-K distillation scoring requires TP=CP=1.')
         adapter_name = kwargs.get('adapter_name')

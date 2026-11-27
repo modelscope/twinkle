@@ -65,6 +65,24 @@ def test_tinker_build_output_handles_tensor_rows_from_transformers_backend():
     assert [item['elementwise_loss'].to_torch().tolist() for item in result] == [[-0.0, -1.0, -2.0], [-4.0, -5.0]]
 
 
+def test_tinker_build_output_trims_batch_padded_logps_to_datum_lengths():
+    # Regression (G19/C3-SV06): the public tinker forward pass must return one logprob
+    # per input token. The transformers backend pads a ragged batch to the max length
+    # ([B, T] tensor); the default build path must trim each row back to its datum length
+    # so logprobs stays aligned with target_tokens/weights (tinker SDK contract).
+    inputs = [_datum(17), _datum(17), _datum(16), _datum(15)]
+    outputs = {'logps': torch.arange(4 * 17, dtype=torch.float32).view(4, 17)}
+
+    result = TwinkleCompatModelBase()._tinker_build_output(inputs, outputs)
+
+    assert [item['logprobs'].to_torch().shape[0] for item in result] == [17, 17, 16, 15]
+    assert [item['elementwise_loss'].to_torch().shape[0] for item in result] == [17, 17, 16, 15]
+    # row i keeps the first seq_len_i entries of the padded row
+    for i, seq_len in enumerate([17, 17, 16, 15]):
+        expected = torch.arange(i * 17, i * 17 + seq_len, dtype=torch.float32)
+        torch.testing.assert_close(result[i]['logprobs'].to_torch(), expected)
+
+
 def test_tinker_build_output_handles_ragged_microbatch_logps_from_megatron_backend():
     inputs = [_datum(66), _datum(65), _datum(64), _datum(63)]
     outputs = {

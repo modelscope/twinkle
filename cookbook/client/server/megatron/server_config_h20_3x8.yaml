@@ -26,7 +26,7 @@ http_options:
 persistence:
   mode: redis
   redis_url: "${oc.env:TWINKLE_REDIS_URL}"
-  key_prefix: "twinkle:h20:"
+  key_prefix: "${oc.env:TWINKLE_REDIS_KEY_PREFIX,'twinkle:h20:'}"
 
 # Per-token soft budget in bytes. Persistent saves report a warning from 90%.
 checkpoint_storage_budget_bytes: 300000000000
