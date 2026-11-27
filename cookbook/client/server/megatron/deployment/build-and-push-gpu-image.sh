@@ -29,6 +29,7 @@ expected = {
     'ray': '2.55.1',
     'megatron-core': '0.20.0',
     'mcore-bridge': '1.7.0',
+    'sentence-transformers': '6.3.0',
 }
 for name in (*expected, 'twinkle', 'ms-swift', 'transformers', 'peft', 'tilelang', 'apache-tvm-ffi'):
     version = metadata.version(name)
@@ -42,7 +43,9 @@ commit = 'e1ac89d24f47cb8fd73a7245dd79df0959aec284'
 if origin.get('url') != f'https://codeload.github.com/modelscope/ms-swift/tar.gz/{commit}':
     raise SystemExit('The installed Swift revision does not match the runtime pin.')
 print(f'ms-swift revision {commit}', flush=True)
+from sentence_transformers import SentenceTransformer  # noqa: F401
 from swift.dev import template_contract  # noqa: F401
+from swift.dev.model.multi_lora_sentence_transformer_model import MultiLoraSentenceTransformerModel  # noqa: F401
 
 check = subprocess.run(
     [sys.executable, '-m', 'pip', 'check'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True

@@ -15,9 +15,10 @@ COPY src/ ./src/
 # Resolve the pinned Swift revision and Twinkle together. Keep the base image's
 # CUDA wheels and let vLLM enforce the matching TileLang and TVM FFI versions.
 RUN pip install --no-cache-dir --no-build-isolation \
-    --only-binary=torch,vllm,ray,megatron-core,mcore-bridge \
+    --only-binary=torch,vllm,ray,megatron-core,mcore-bridge,sentence-transformers \
     "torch==2.14.0" "vllm==0.33.0" \
     "ray[serve]==2.55.1" "megatron-core==0.20.0" "mcore-bridge==1.7.0" \
+    "sentence-transformers==6.3.0" \
     "ms-swift[megatron] @ https://codeload.github.com/modelscope/ms-swift/tar.gz/e1ac89d24f47cb8fd73a7245dd79df0959aec284" \
     -e ".[server]"
 COPY cookbook/ ./cookbook/
