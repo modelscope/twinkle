@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from twinkle.server.task_errors import build_error_payload, task_error_payload
+from twinkle_server.task_errors import build_error_payload, task_error_payload
 from twinkle.protocol.types.errors import ErrorCategory, ErrorPayload
 
 

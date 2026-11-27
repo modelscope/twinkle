@@ -10,11 +10,11 @@ ray_port="${RAY_PORT:-6379}"
 ray_address="${RAY_ADDRESS:-127.0.0.1:${ray_port}}"
 
 if ! command -v ray >/dev/null 2>&1; then
-  echo "ray is not installed; run: pip install -e '.[server,rl]'" >&2
+  echo "ray is not installed; from the Twinkle repository root run: pip install -e . -e ./twinkle_cs/server" >&2
   exit 1
 fi
 if ! command -v twinkle-server >/dev/null 2>&1; then
-  echo "twinkle-server is not installed; run: pip install -e '.[server,rl]'" >&2
+  echo "twinkle-server is not installed; from the Twinkle repository root run: pip install -e . -e ./twinkle_cs/server" >&2
   exit 1
 fi
 

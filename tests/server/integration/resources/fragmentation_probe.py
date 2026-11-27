@@ -8,8 +8,8 @@ import uuid
 from ray.cluster_utils import Cluster
 from ray.util.placement_group import placement_group, placement_group_table, remove_placement_group
 
-from twinkle.server.config.training import TrainingConfig
-from twinkle.server.resources.allocation import CapacityUnavailableError, DevicePool
+from twinkle_server.config.training import TrainingConfig
+from twinkle_server.resources.allocation import CapacityUnavailableError, DevicePool
 
 
 async def main():

@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from twinkle.server.telemetry import metrics
-from twinkle.server.model.pool.controller import TrainingController
-from twinkle.server.telemetry.metrics import TrainingInstanceMetrics
+from twinkle_server.telemetry import metrics
+from twinkle_server.model.pool.controller import TrainingController
+from twinkle_server.telemetry.metrics import TrainingInstanceMetrics
 
 _ALLOWED_ATTRIBUTES = {'backend', 'mode', 'state', 'status', 'reason', 'device_type', 'resident'}
 
@@ -163,7 +163,7 @@ async def test_repeated_failed_cleanup_is_one_quarantine_transition():
 
 @pytest.mark.parametrize('phase', ['worker_death', 'pg_removal'])
 def test_quarantine_classification_uses_typed_phase(phase):
-    from twinkle.server.exceptions import ResourceReleaseError
+    from twinkle_server.exceptions import ResourceReleaseError
     assert TrainingInstanceMetrics.quarantine_reason(ResourceReleaseError('unconfirmed', phase=phase)) == phase
     assert TrainingInstanceMetrics.quarantine_reason(RuntimeError('user text: worker death')) == 'other'
 
@@ -200,7 +200,7 @@ async def test_startup_and_shutdown_histograms_follow_real_attempts(fail_start):
 async def test_sweep_instruments_one_iteration_and_its_outcome(monkeypatch, failed):
     import asyncio
     from unittest.mock import AsyncMock, MagicMock
-    from twinkle.server.model.pool.actor import TrainingControllerActor
+    from twinkle_server.model.pool.actor import TrainingControllerActor
 
     async def stop_after_iteration(delay):
         raise asyncio.CancelledError
@@ -208,7 +208,7 @@ async def test_sweep_instruments_one_iteration_and_its_outcome(monkeypatch, fail
     actor = SimpleNamespace(core=SimpleNamespace(sweep=AsyncMock(
         side_effect=RuntimeError('state unavailable') if failed else None)),
         config=SimpleNamespace(sweep_interval_s=5), _metrics=MagicMock())
-    monkeypatch.setattr('twinkle.server.model.pool.actor.asyncio.sleep', stop_after_iteration)
+    monkeypatch.setattr('twinkle_server.model.pool.actor.asyncio.sleep', stop_after_iteration)
     with pytest.raises(asyncio.CancelledError):
         await TrainingControllerActor.__ray_metadata__.modified_class._sweep(actor)
     tags = {'status': 'error' if failed else 'success'}
@@ -221,9 +221,9 @@ async def test_sweep_instruments_one_iteration_and_its_outcome(monkeypatch, fail
 @pytest.mark.parametrize('failed', [False, True])
 async def test_driver_records_allocation_attempts(failed):
     from unittest.mock import AsyncMock, MagicMock
-    from twinkle.server.config.training import TrainingConfig
-    from twinkle.server.resources.allocation import DeviceAllocation
-    from twinkle.server.model.pool.driver import RayInstanceDriver
+    from twinkle_server.config.training import TrainingConfig
+    from twinkle_server.resources.allocation import DeviceAllocation
+    from twinkle_server.model.pool.driver import RayInstanceDriver
 
     config = TrainingConfig(models=[{'name': 'tiny', 'model_id': 'tiny', 'backend': 'mock',
         'device_type': 'cpu', 'mode': 'full', 'config': {'num_devices': 1, 'device_mesh': {'device_type': 'cpu'}}}])

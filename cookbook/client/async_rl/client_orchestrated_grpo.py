@@ -7,7 +7,8 @@ import uuid
 import dotenv
 from peft import LoraConfig
 
-from twinkle import get_logger, init_twinkle_client
+from twinkle import get_logger
+from twinkle_client import init_twinkle_client
 from twinkle.advantage import GRPOAdvantage
 from twinkle.data_format import SamplingParams
 from twinkle.dataloader import DataLoader

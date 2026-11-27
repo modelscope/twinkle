@@ -44,7 +44,7 @@ def test_protocol_exports_match_committed_snapshot() -> None:
 
 def test_sampler_patch_request_has_no_training_handle() -> None:
     from twinkle.protocol.types import ApplyPatchRequest, SamplerApplyPatchRequest
-    from twinkle.server.lifecycle.submit import backend_kwargs
+    from twinkle_server.lifecycle.submit import backend_kwargs
     from twinkle_client._request_builder import build_request
 
     request = build_request(SamplerApplyPatchRequest, patch_cls='ExamplePatch', enabled=True)

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 from redis.exceptions import ConnectionError
 
-from twinkle.server.state.backend.redis_backend import RedisBackend
+from twinkle_server.state.backend.redis_backend import RedisBackend
 
 
 @pytest.mark.asyncio
@@ -24,7 +24,7 @@ async def test_stale_read_retries_without_blocking_another_reader(monkeypatch):
         return '"' + key + '"'
 
     backend._client.get = read
-    monkeypatch.setattr('twinkle.server.state.backend.redis_backend.asyncio.sleep', AsyncMock())
+    monkeypatch.setattr('twinkle_server.state.backend.redis_backend.asyncio.sleep', AsyncMock())
     try:
         first = asyncio.create_task(backend.get('stale'))
         await entered.wait()

@@ -7,14 +7,14 @@ import asyncio
 
 import pytest
 
-from twinkle.server.config.training import TrainingConfig
-from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
-from twinkle.server.state import ServerState
-from twinkle.server.state.backend.memory_backend import RayActorBackend
-from twinkle.server.model.pool.controller import TrainingController
-from twinkle.server.exceptions import TrainingExpiredError
-from twinkle.server.resources.allocation import CapacityUnavailableError
-from twinkle.server.state.training_records import CreateTraining
+from twinkle_server.config.training import TrainingConfig
+from twinkle_server.exceptions import RequestRejectedError, ResourceNotFoundError
+from twinkle_server.state import ServerState
+from twinkle_server.state.backend.memory_backend import RayActorBackend
+from twinkle_server.model.pool.controller import TrainingController
+from twinkle_server.exceptions import TrainingExpiredError
+from twinkle_server.resources.allocation import CapacityUnavailableError
+from twinkle_server.state.training_records import CreateTraining
 
 
 @pytest.mark.asyncio
@@ -324,7 +324,7 @@ async def test_full_and_lora_isolation_and_device_reuse():
 @pytest.mark.asyncio
 async def test_capacity_failure_is_terminal_and_does_not_hold_quota(monkeypatch):
     rejections = []
-    monkeypatch.setattr('twinkle.server.model.pool.controller.record_admission_rejection',
+    monkeypatch.setattr('twinkle_server.model.pool.controller.record_admission_rejection',
                         lambda reason, **_: rejections.append(reason))
     controller, state, runtime, _ = await setup(devices=2)
     await create(controller, state, 1, mode='full')
@@ -356,7 +356,7 @@ async def test_create_idempotency_and_changed_payload_conflict():
 @pytest.mark.asyncio
 async def test_pending_creates_count_toward_quota(monkeypatch):
     rejections = []
-    monkeypatch.setattr('twinkle.server.model.pool.controller.record_admission_rejection',
+    monkeypatch.setattr('twinkle_server.model.pool.controller.record_admission_rejection',
                         lambda reason, **_: rejections.append(reason))
     controller, state, runtime, _ = await setup(quota=1)
     runtime.start_gate.clear()
@@ -499,7 +499,7 @@ async def test_cancelled_create_never_initializes_user_and_keeps_receipt():
 
 @pytest.mark.asyncio
 async def test_unconfirmed_worker_shutdown_holds_devices_and_quota_until_retry():
-    from twinkle.server.state.models import FutureFailureRecord
+    from twinkle_server.state.models import FutureFailureRecord
     controller, state, runtime, _ = await setup(devices=2)
     identity = await create(controller, state, 1, mode='full')
     instance = controller.instances[controller.trainings[identity].instance_id]
@@ -740,7 +740,7 @@ async def test_create_requires_its_own_atomic_start_ack(fault, monkeypatch):
 @pytest.mark.asyncio
 async def test_quarantined_resident_counts_towards_maximum_until_death_confirmed():
     from tests.server.state.fake_backend import FakeBackend
-    from twinkle.server.state.models import FutureFailureRecord
+    from twinkle_server.state.models import FutureFailureRecord
     controller, _, runtime, _ = await setup(backend=FakeBackend(), min_replicas=1, max_replicas=1)
     old = next(iter(controller.instances.values()))
     runtime.fail_shutdown = True
@@ -789,7 +789,7 @@ async def test_last_lora_release_does_not_report_unconfirmed_device_release():
 @pytest.mark.asyncio
 async def test_two_device_lora_capacity_shares_two_instances_and_releases_them():
     from tests.server.state.fake_backend import FakeBackend
-    from twinkle.server.config import ServerConfig
+    from twinkle_server.config import ServerConfig
     controller, state, runtime, _ = await setup(backend=FakeBackend(), devices=4, quota=3)
     controller.config = ServerConfig.from_yaml('cookbook/client/server/megatron/server_config.yaml').training_config
     name = controller.config.models[0].name

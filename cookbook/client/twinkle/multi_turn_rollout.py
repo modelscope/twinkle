@@ -4,7 +4,7 @@
 From the repo root, run python -m cookbook.client.twinkle.multi_turn_rollout.
 """
 
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 from twinkle.advantage import GRPOAdvantage
 from twinkle_client.resources import RolloutResources
 

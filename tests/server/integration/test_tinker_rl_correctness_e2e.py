@@ -42,7 +42,7 @@ def _reset_canonical_state_actor():
 def live_clients():
     from transformers import AutoTokenizer
 
-    from twinkle import init_tinker_client
+    from twinkle_client import init_tinker_client
 
     init_tinker_client()
     from tinker import ServiceClient, types

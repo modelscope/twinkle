@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-_SERVER = Path(__file__).resolve().parents[3] / 'src' / 'twinkle' / 'server'
+_SERVER = Path(__file__).resolve().parents[3] / 'twinkle_cs' / 'server' / 'src' / 'twinkle_server'
 _TWINKLE_HANDLERS = (
     _SERVER / 'gateway' / 'twinkle_handlers.py',
     _SERVER / 'model' / 'twinkle_handlers.py',

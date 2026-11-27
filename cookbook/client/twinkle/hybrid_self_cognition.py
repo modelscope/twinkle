@@ -8,7 +8,8 @@ import os
 import dotenv
 from peft import LoraConfig
 
-from twinkle import get_logger, init_twinkle_client
+from twinkle import get_logger
+from twinkle_client import init_twinkle_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle_client.model import MultiLoraTransformersModel

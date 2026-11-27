@@ -21,12 +21,12 @@ import pytest
 import pytest_asyncio
 import uuid
 
-from twinkle.server.config.persistence import PersistenceConfig
-from twinkle.server.state import ServerState
-from twinkle.server.state.backend.factory import create_backend
-from twinkle.server.state.backend.redis_backend import RedisBackend
-from twinkle.server.state.training_records import TrainingRecord
-from twinkle.server.identity import USER_ID_KEY_ENV, current_tenant_fingerprint, tenant_fingerprint
+from twinkle_server.config.persistence import PersistenceConfig
+from twinkle_server.state import ServerState
+from twinkle_server.state.backend.factory import create_backend
+from twinkle_server.state.backend.redis_backend import RedisBackend
+from twinkle_server.state.training_records import TrainingRecord
+from twinkle_server.identity import USER_ID_KEY_ENV, current_tenant_fingerprint, tenant_fingerprint
 
 REDIS_URL = os.environ.get('TWINKLE_TEST_REDIS_URL', 'redis://localhost:6379/0')
 

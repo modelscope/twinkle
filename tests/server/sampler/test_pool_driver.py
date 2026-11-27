@@ -6,11 +6,11 @@ from types import SimpleNamespace
 import pytest
 
 from tests.server.state.fake_backend import FakeBackend
-from twinkle.server.sampler.concurrency import SamplerConcurrency
-from twinkle.server.sampler.pool import driver as driver_module
-from twinkle.server.sampler.runtime import SamplerRuntime, SamplingOperation
-from twinkle.server.state.future_manager import FutureManager
-from twinkle.server.task_queue.types import ExecutionScope
+from twinkle_server.sampler.concurrency import SamplerConcurrency
+from twinkle_server.sampler.pool import driver as driver_module
+from twinkle_server.sampler.runtime import SamplerRuntime, SamplingOperation
+from twinkle_server.state.future_manager import FutureManager
+from twinkle_server.task_queue.types import ExecutionScope
 
 
 @pytest.fixture(scope='session', autouse=True)

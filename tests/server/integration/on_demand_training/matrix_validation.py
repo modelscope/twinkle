@@ -20,8 +20,8 @@ _ROOT = Path(__file__).resolve().parents[4]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from twinkle.server.config import ServerConfig
-from twinkle.server.launcher.server_launcher import ServerLauncher
+from twinkle_server.config import ServerConfig
+from twinkle_server.launcher.server_launcher import ServerLauncher
 
 
 def validate_controller_restart(base_url, controller, model_name):

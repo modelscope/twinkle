@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from twinkle.server.sampler.backends.streaming import STREAM_SENTINEL, stream_to_queue
+from twinkle.utils.streaming import STREAM_SENTINEL, stream_to_queue
 
 
 @pytest.mark.parametrize('disconnect', [False, True])

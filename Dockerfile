@@ -12,6 +12,8 @@ WORKDIR /twinkle
 COPY pyproject.toml setup.cfg README.md LICENSE ./
 COPY src/ ./src/
 
+COPY twinkle_cs/server/ ./twinkle_cs/server/
+
 # Resolve the pinned Swift revision and Twinkle together. Keep the base image's
 # CUDA wheels and let vLLM enforce the matching TileLang and TVM FFI versions.
 RUN pip install --no-cache-dir --no-build-isolation \
@@ -19,7 +21,7 @@ RUN pip install --no-cache-dir --no-build-isolation \
     "torch==2.14.0" "vllm==0.33.0" \
     "ray[serve]==2.55.1" "megatron-core==0.20.0" "mcore-bridge==1.7.0" \
     "ms-swift[megatron] @ https://codeload.github.com/modelscope/ms-swift/tar.gz/e1ac89d24f47cb8fd73a7245dd79df0959aec284" \
-    -e ".[server]"
+    -e . -e ./twinkle_cs/server
 COPY cookbook/ ./cookbook/
 COPY cookbook/client/server/twinkle-runtime.sh /usr/local/bin/twinkle-runtime
 COPY cookbook/client/server/twinkle-runtime-common.sh /usr/local/bin/

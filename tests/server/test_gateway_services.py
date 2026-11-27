@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from twinkle.server.exceptions import ResourceNotFoundError
-from twinkle.server.gateway import use_cases as services
+from twinkle_server.exceptions import ResourceNotFoundError
+from twinkle_server.gateway import use_cases as services
 
 
 class _State:
@@ -64,7 +64,7 @@ def _parity_client(monkeypatch, canonical_record):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
-    from twinkle.server.gateway import tinker_handlers, twinkle_handlers
+    from twinkle_server.gateway import tinker_handlers, twinkle_handlers
 
     async def _fixed_poll(_state, _request_id, **_kwargs):
         return services.FuturePollResult(record=canonical_record, timed_out=False)

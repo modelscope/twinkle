@@ -7,7 +7,7 @@ to be consumed unchanged by the ``server-request-lifecycle`` spec's equivalent
 check -- there must be exactly one physical copy, not one per spec.
 
 Each entry is ``(module_relpath, function_name)`` where ``module_relpath`` is
-relative to ``src/twinkle/server`` and ``function_name`` is the innermost enclosing
+relative to ``twinkle_cs/server/src/twinkle_server`` and ``function_name`` is the innermost enclosing
 function of the exempted call.
 
 The allowed exemptions are:
@@ -28,7 +28,7 @@ The allowed exemptions are:
 """
 from __future__ import annotations
 
-# (module_relpath under src/twinkle/server, innermost enclosing function name)
+# (module_relpath under twinkle_cs/server/src/twinkle_server, innermost enclosing function name)
 BACKEND_CALL_EXEMPTIONS: frozenset[tuple[str, str]] = frozenset({
     ('sampler/twinkle_handlers.py', '_submit_group'),
     ('sampler/twinkle_handlers.py', '_stream_queue'),

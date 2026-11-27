@@ -14,7 +14,7 @@ from collections.abc import Callable
 from fnmatch import fnmatch
 from typing import Any
 
-from twinkle.server.state.backend.base import StateBackend
+from twinkle_server.state.backend.base import StateBackend
 
 
 class FakeBackend(StateBackend):

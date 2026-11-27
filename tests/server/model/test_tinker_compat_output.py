@@ -3,9 +3,9 @@ import torch
 from tinker import types
 from unittest.mock import Mock
 
-from twinkle.server.model.tinker_datum import extract_rl_features_for_loss
-from twinkle.server.model.backends.common import TwinkleCompatModelBase
-from twinkle.server.exceptions import RequestRejectedError
+from twinkle_server.model.tinker_datum import extract_rl_features_for_loss
+from twinkle_server.model.backends.common import TwinkleCompatModelBase
+from twinkle_server.exceptions import RequestRejectedError
 
 
 def _datum(seq_len: int, *, ref_logps=None, old_logps=None, advantages=None):

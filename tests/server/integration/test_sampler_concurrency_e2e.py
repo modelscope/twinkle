@@ -32,7 +32,7 @@ def _report(**values):
 def clients():
     from transformers import AutoTokenizer
 
-    from twinkle import init_tinker_client, init_twinkle_client
+    from twinkle_client import init_tinker_client, init_twinkle_client
     init_tinker_client()
     from tinker import ServiceClient
     model_id = os.environ['TWINKLE_TEST_MODEL_ID']

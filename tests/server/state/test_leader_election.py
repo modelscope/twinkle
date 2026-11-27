@@ -16,10 +16,10 @@ from unittest.mock import AsyncMock
 
 from tests.server.state.fake_backend import FakeBackend
 
-from twinkle.server.state import ServerState
-from twinkle.server.state.backend.memory_backend import RayActorBackend
-from twinkle.server.state.cleanup_coordinator import LEADER_KEY, LEASE_RENEW, ResourceCleanupCoordinator
-from twinkle.server.telemetry import metrics
+from twinkle_server.state import ServerState
+from twinkle_server.state.backend.memory_backend import RayActorBackend
+from twinkle_server.state.cleanup_coordinator import LEADER_KEY, LEASE_RENEW, ResourceCleanupCoordinator
+from twinkle_server.telemetry import metrics
 
 
 @pytest.fixture
@@ -236,7 +236,7 @@ async def test_failed_cleanup_start_can_retry():
 
 @pytest.mark.asyncio
 async def test_lazy_cleanup_retries_after_failed_start():
-    from twinkle.server.deployment import LazyCleanupMixin
+    from twinkle_server.deployment import LazyCleanupMixin
     client = LazyCleanupMixin()
     client.state = SimpleNamespace(start_cleanup_task=AsyncMock(side_effect=[RuntimeError('offline'), True]))
     await client._ensure_state_cleanup_started()

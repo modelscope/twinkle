@@ -4,14 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from twinkle.server.checkpoint import create_checkpoint_manager
-from twinkle.server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
-from twinkle.server.checkpoint.twinkle import TwinkleCheckpointManager
+from twinkle_server.checkpoint import create_checkpoint_manager
+from twinkle_server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
+from twinkle_server.checkpoint.twinkle import TwinkleCheckpointManager
 
 
 @pytest.fixture
 def manager(request, monkeypatch, tmp_path):
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     manager = create_checkpoint_manager('test-token', client_type=getattr(request, 'param', 'twinkle'))
     manager.training_run_manager._write_info('run', {'base_model': 'test-model', 'is_lora': True})
     return manager
@@ -85,7 +85,7 @@ async def test_same_model_saves_are_serialized(manager):
 
 @pytest.mark.asyncio
 async def test_cancelling_lock_waiter_does_not_block_following_saves(manager, monkeypatch):
-    import twinkle.server.checkpoint.checkpoint_manager as module
+    import twinkle_server.checkpoint.checkpoint_manager as module
     started, finish, waiting_for_lock = asyncio.Event(), asyncio.Event(), asyncio.Event()
     acquire = module.acquire_lock
 
@@ -140,7 +140,7 @@ async def test_legacy_latest_and_alias_remain_readable(manager):
 @pytest.mark.parametrize('failure', ['backend', 'write', 'flush', 'replace'])
 @pytest.mark.asyncio
 async def test_save_failure_preserves_run_and_checkpoint(manager, monkeypatch, name, failure):
-    import twinkle.server.checkpoint.training_run_manager as run_module
+    import twinkle_server.checkpoint.training_run_manager as run_module
     runs = manager.training_run_manager
     old_uri, directory = await manager.save_sampler('run', name, _writer('first'))
     info_path = runs.get_model_dir('run') / runs.train_run_info_filename
@@ -392,7 +392,7 @@ async def test_reusing_live_alias_name_does_not_delete_latest_weights(manager):
 
 @pytest.mark.asyncio
 async def test_sampler_update_does_not_rewrite_existing_save_dir_pointer(monkeypatch, tmp_path):
-    import twinkle.server.checkpoint.training_run_manager as run_module
+    import twinkle_server.checkpoint.training_run_manager as run_module
     monkeypatch.setattr(run_module, 'TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path / 'default'))
     runs = TinkerTrainingRunManager('test-token')
     (tmp_path / 'external').mkdir()
@@ -417,7 +417,7 @@ async def test_sampler_update_does_not_rewrite_existing_save_dir_pointer(monkeyp
 @pytest.mark.asyncio
 async def test_reserved_sampler_name_is_rejected_before_backend_or_file_io(manager):
     from unittest.mock import AsyncMock
-    from twinkle.server.exceptions import RequestRejectedError
+    from twinkle_server.exceptions import RequestRejectedError
     save = AsyncMock()
     with pytest.raises(RequestRejectedError, match='reserved'):
         await manager.save_sampler('run', 'latest', save)

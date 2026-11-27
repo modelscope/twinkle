@@ -16,9 +16,9 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from twinkle.data_format import InputFeature, SamplingParams
-from twinkle.server.exceptions import ConfigError
-from twinkle.server.sampler.app import SAMPLER_SELECTOR, _construct_sampler_backend
-from twinkle.server.sampler.backends.mock_sampler import MockSampler
+from twinkle_server.exceptions import ConfigError
+from twinkle_server.sampler.app import SAMPLER_SELECTOR, _construct_sampler_backend
+from twinkle_server.sampler.backends.mock_sampler import MockSampler
 
 _SAMPLER_TYPES = tuple(SAMPLER_SELECTOR.builders)
 
@@ -115,7 +115,7 @@ def test_mock_dispatch_returns_mock_sampler() -> None:
 
 
 def test_explicit_async_vllm_uses_non_blocking_sampler(monkeypatch) -> None:
-    from twinkle.server.sampler.backends import vllm_async as module
+    from twinkle_server.sampler.backends import vllm_async as module
 
     captured = {}
 
@@ -223,8 +223,8 @@ def test_set_template_does_not_resolve_model_assets():
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
-    from twinkle.server.sampler.concurrency import SamplerConcurrency
-    from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
+    from twinkle_server.sampler.concurrency import SamplerConcurrency
+    from twinkle_server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
 
     async def call_backend(fn, *args, **kwargs):
         return fn(*args, **kwargs)

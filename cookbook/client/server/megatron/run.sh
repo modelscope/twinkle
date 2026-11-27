@@ -446,16 +446,16 @@ cleanup_existing_runtime() {
     SERVER_PID=""
 
     print_info "停止已有的 Twinkle Server..."
-    pkill -f "twinkle.server" 2>/dev/null || true
+    pkill -f "twinkle_server" 2>/dev/null || true
 
     print_info "停止已有的 vLLM 进程..."
     pkill -if "vLLM" 2>/dev/null || true
 
     sleep 2
 
-    if pgrep -f "twinkle.server" > /dev/null 2>&1; then
+    if pgrep -f "twinkle_server" > /dev/null 2>&1; then
         print_warning "Twinkle Server 未退出，强制终止..."
-        pkill -9 -f "twinkle.server" 2>/dev/null || true
+        pkill -9 -f "twinkle_server" 2>/dev/null || true
     fi
     if pgrep -if "vLLM" > /dev/null 2>&1; then
         print_warning "vLLM 进程未退出，强制终止..."

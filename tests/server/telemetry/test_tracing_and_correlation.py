@@ -16,10 +16,10 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from twinkle.server.config.telemetry import TelemetryConfig
-from twinkle.server.telemetry import correlation
-from twinkle.server.telemetry.correlation import set_correlation_attrs
-from twinkle.server.telemetry.tracing import _NoopSpan, traced_operation
+from twinkle_server.config.telemetry import TelemetryConfig
+from twinkle_server.telemetry import correlation
+from twinkle_server.telemetry.correlation import set_correlation_attrs
+from twinkle_server.telemetry.tracing import _NoopSpan, traced_operation
 
 # ---------- attachment of present-only values ------------------------------ #
 
@@ -66,7 +66,7 @@ def test_noop_span_safe() -> None:
 def test_noop_yields_same_result_as_active() -> None:
     """When OTEL is absent, ``traced_operation`` runs the body and returns the
     body's result identically to when OTEL is active."""
-    with mock.patch('twinkle.server.telemetry.tracing._OTEL_AVAILABLE', False):
+    with mock.patch('twinkle_server.telemetry.tracing._OTEL_AVAILABLE', False):
         with traced_operation('op') as span:
             assert isinstance(span, _NoopSpan)
             result = sum(range(5))
@@ -75,7 +75,7 @@ def test_noop_yields_same_result_as_active() -> None:
 
 def test_noop_propagates_exceptions() -> None:
     """NoOp path still re-raises the original exception unchanged."""
-    with mock.patch('twinkle.server.telemetry.tracing._OTEL_AVAILABLE', False):
+    with mock.patch('twinkle_server.telemetry.tracing._OTEL_AVAILABLE', False):
         with pytest.raises(RuntimeError, match='boom'):
             with traced_operation('op'):
                 raise RuntimeError('boom')
@@ -95,7 +95,7 @@ def _otel_available() -> bool:
 def test_span_lifecycle(in_memory_span_exporter) -> None:
     """When OTEL is present, a span is started before and ended after the block."""
     in_memory_span_exporter.clear()
-    with mock.patch('twinkle.server.telemetry.tracing._OTEL_AVAILABLE', True):
+    with mock.patch('twinkle_server.telemetry.tracing._OTEL_AVAILABLE', True):
         with traced_operation('op.under.test', attrs={correlation.SESSION_ID: 's1'}):
             pass
 
@@ -108,7 +108,7 @@ def test_span_lifecycle(in_memory_span_exporter) -> None:
 def test_exception_recorded_and_reraised(in_memory_span_exporter) -> None:
     """Exception inside the block is recorded on the span and re-raised."""
     in_memory_span_exporter.clear()
-    with mock.patch('twinkle.server.telemetry.tracing._OTEL_AVAILABLE', True):
+    with mock.patch('twinkle_server.telemetry.tracing._OTEL_AVAILABLE', True):
         with pytest.raises(ValueError, match='boom'):
             with traced_operation('op.exc'):
                 raise ValueError('boom')
@@ -128,7 +128,7 @@ def test_exception_recorded_and_reraised(in_memory_span_exporter) -> None:
 
 @pytest.fixture
 def resource_meter(monkeypatch):
-    from twinkle.server.telemetry import resource_metrics
+    from twinkle_server.telemetry import resource_metrics
 
     meter = mock.Mock()
     monkeypatch.setattr(resource_metrics, 'get_meter', lambda _: meter)
@@ -136,7 +136,7 @@ def resource_meter(monkeypatch):
 
 
 def test_resource_metrics_collector_does_not_raise_without_pynvml(resource_meter) -> None:
-    from twinkle.server.telemetry import resource_metrics
+    from twinkle_server.telemetry import resource_metrics
 
     with mock.patch.object(resource_metrics, '_PYNVML_AVAILABLE', False):
         collector = resource_metrics.ResourceMetricsCollector(TelemetryConfig())
@@ -146,7 +146,7 @@ def test_resource_metrics_collector_does_not_raise_without_pynvml(resource_meter
 
 
 def test_resource_metrics_collector_registers_named_gauges_when_psutil_present(resource_meter) -> None:
-    from twinkle.server.telemetry import resource_metrics
+    from twinkle_server.telemetry import resource_metrics
 
     if not resource_metrics._PSUTIL_AVAILABLE:
         pytest.skip('psutil not installed in test env')
@@ -161,7 +161,7 @@ def test_resource_metrics_collector_registers_named_gauges_when_psutil_present(r
 
 
 def test_resource_metrics_collector_idempotent(resource_meter) -> None:
-    from twinkle.server.telemetry import resource_metrics
+    from twinkle_server.telemetry import resource_metrics
 
     collector = resource_metrics.ResourceMetricsCollector(TelemetryConfig())
     collector.maybe_start()
@@ -171,7 +171,7 @@ def test_resource_metrics_collector_idempotent(resource_meter) -> None:
 
 
 def test_worker_init_registers_resources_only_with_telemetry(monkeypatch) -> None:
-    from twinkle.server.telemetry import resource_metrics, worker_init
+    from twinkle_server.telemetry import resource_metrics, worker_init
 
     monkeypatch.setattr(worker_init, '_node_metrics', None)
     monkeypatch.delenv('TWINKLE_TELEMETRY_ENABLED', raising=False)
@@ -207,9 +207,9 @@ def test_pipeline_exports_once_and_keeps_early_gauge_callbacks(monkeypatch) -> N
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
     from opentelemetry.util._once import Once
 
-    from twinkle.server.task_queue.worker import logger as task_logger
-    from twinkle.server.telemetry import provider
-    from twinkle.server.telemetry.metrics import MetricsRegistry
+    from twinkle_server.task_queue.worker import logger as task_logger
+    from twinkle_server.telemetry import provider
+    from twinkle_server.telemetry.metrics import MetricsRegistry
 
     for module, name in ((trace, 'TRACER'), (metrics._internal, 'METER'), (logs, 'LOGGER')):
         monkeypatch.setattr(module, f'_{name}_PROVIDER_SET_ONCE', Once())
@@ -304,7 +304,7 @@ def test_inbound_traceparent_continues_trace() -> None:
     from fastapi.testclient import TestClient
     from opentelemetry import trace as otel_trace
 
-    from twinkle.server.telemetry.tracing import create_tracing_middleware
+    from twinkle_server.telemetry.tracing import create_tracing_middleware
 
     app = FastAPI()
     app.middleware('http')(create_tracing_middleware('Model'))
@@ -338,7 +338,7 @@ def test_inbound_without_traceparent_starts_new_trace() -> None:
     from fastapi.testclient import TestClient
     from opentelemetry import trace as otel_trace
 
-    from twinkle.server.telemetry.tracing import create_tracing_middleware
+    from twinkle_server.telemetry.tracing import create_tracing_middleware
 
     app = FastAPI()
     app.middleware('http')(create_tracing_middleware('Gateway'))

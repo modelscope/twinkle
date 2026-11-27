@@ -37,19 +37,26 @@ Twinkle✨ 是一个轻量级的客户端-服务端训练框架，采用模块�
 
 ## 安装
 
-### 使用包安装：
-
-```shell
-pip install 'twinkle-kit'
-```
+| 你要做的事 | 安装方式 |
+| --- | --- |
+| 在本地 GPU 上训练、推理 | `pip install twinkle-kit` |
+| 用 Python SDK 连接远程服务 | 见下方源码安装 |
+| 自己部署 HTTP 服务 | 见下方源码安装 |
 
 ### 从源码安装：
 
 ```shell
 git clone https://github.com/modelscope/twinkle.git
 cd twinkle
-pip install -e .
+pip install -e .                                                        # 本地训练和推理
+pip install -e . -e ./twinkle_cs/client                                 # Python SDK，提供 twinkle-auto
+pip install -e . -e ./twinkle_cs/server                                 # HTTP 服务端，提供 twinkle-server
+pip install -e '.[test]' -e ./twinkle_cs/client -e ./twinkle_cs/server  # 同时开发三个包
 ```
+
+使用 Swift 的模板或模型加载器时，另外安装匹配版本的 `ms-swift`。
+
+
 
 ### 使用docker镜像：
 
@@ -241,11 +248,11 @@ if __name__ == '__main__':
 import os
 from tqdm import tqdm
 from tinker import types
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.model.tinker_datum import input_feature_to_datum
+from twinkle_client.utils.tinker_datum import input_feature_to_datum
 
 base_model = 'ms://Qwen/Qwen3.8-27B'
 base_url='your-base-url'

@@ -15,7 +15,7 @@ repos:
       - id: end-of-file-fixer
         exclude: ^(client_tools/|tests/)
       - id: requirements-txt-fixer
-        exclude: ^(client_tools/|src/twinkle_client/|tests/)
+        exclude: ^(client_tools/|twinkle_cs/client/src/twinkle_client/|tests/)
       - id: check-merge-conflict
         exclude: ^(client_tools/|tests/)
       - id: mixed-line-ending

@@ -10,9 +10,9 @@ from ray import serve
 from ray.util import list_named_actors
 from ray.util.placement_group import placement_group_table
 
-from twinkle.server.config.application_spec import SamplerArgs
-from twinkle.server.sampler.pool.controller import SamplerController
-from twinkle.server.sampler.pool.driver import SamplerDriver
+from twinkle_server.config.application_spec import SamplerArgs
+from twinkle_server.sampler.pool.controller import SamplerController
+from twinkle_server.sampler.pool.driver import SamplerDriver
 
 
 async def run(namespace):
@@ -63,7 +63,7 @@ async def run(namespace):
         responses = await asyncio.gather(*calls)
         assert all(response['status'] == 200 for response in responses), responses
         await pool.lifecycle.join()
-        from twinkle.server.state import get_server_state
+        from twinkle_server.state import get_server_state
         state = get_server_state()
         for response in responses:
             record = await state.get_future(json.loads(response['body'])['request_id'])

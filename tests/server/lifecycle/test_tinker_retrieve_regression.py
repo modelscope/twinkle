@@ -10,7 +10,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from twinkle.server.gateway.tinker_handlers import _register_gateway_tinker_routes
+from twinkle_server.gateway.tinker_handlers import _register_gateway_tinker_routes
 
 
 class _State:

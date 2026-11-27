@@ -8,8 +8,8 @@ the function form must be unchanged.
 """
 import inspect
 
-from twinkle.server.lifecycle.protocols import DataParallelDeployment, QueuedDeployment
-from twinkle.server.lifecycle.submit import input_metrics, run_submit
+from twinkle_server.lifecycle.protocols import DataParallelDeployment, QueuedDeployment
+from twinkle_server.lifecycle.submit import input_metrics, run_submit
 
 
 def test_run_submit_is_a_free_function():

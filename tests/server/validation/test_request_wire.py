@@ -15,7 +15,7 @@ from pydantic import ValidationError
 
 from fastapi.exceptions import RequestValidationError
 
-from twinkle.server.deployment import validation_error_handler
+from twinkle_server.deployment import validation_error_handler
 from twinkle.protocol.types import model as model_types
 from twinkle.protocol.types import SampleRequest
 from twinkle.protocol.types.base import StrictRequest

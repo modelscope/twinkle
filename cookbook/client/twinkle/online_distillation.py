@@ -12,7 +12,7 @@ from itertools import combinations_with_replacement, cycle, islice
 from uuid import uuid4
 
 import numpy as np
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 from twinkle.data_format import SamplingParams
 from twinkle.processor.trajectory import response_positions
 

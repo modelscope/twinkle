@@ -107,7 +107,7 @@ def _capture_builder(monkeypatch, build_callable, *args, **kwargs) -> _CaptureRe
 
         return _decorate
 
-    from twinkle.server import deployment as app_scaffold
+    from twinkle_server import deployment as app_scaffold
 
     monkeypatch.setattr(app_scaffold.serve, 'ingress', fake_ingress)
     monkeypatch.setattr(app_scaffold.serve, 'deployment', fake_deployment)
@@ -121,7 +121,7 @@ def _capture_builder(monkeypatch, build_callable, *args, **kwargs) -> _CaptureRe
 
 def test_gateway_builder_characterization(monkeypatch) -> None:
     from ray import serve
-    from twinkle.server.gateway import app as gateway_mod
+    from twinkle_server.gateway import app as gateway_mod
 
     gateway = SimpleNamespace(api_key='t', route_prefix='')
     monkeypatch.setattr(serve, 'get_replica_context', lambda: SimpleNamespace(
@@ -139,7 +139,7 @@ def test_gateway_builder_characterization(monkeypatch) -> None:
 
 
 def test_model_builder_characterization(monkeypatch) -> None:
-    from twinkle.server.model import app as model_mod
+    from twinkle_server.model import app as model_mod
 
     res = _capture_builder(
         monkeypatch,
@@ -158,7 +158,7 @@ def test_model_builder_characterization(monkeypatch) -> None:
 
 
 def test_sampler_builder_characterization(monkeypatch) -> None:
-    from twinkle.server.sampler import app as sampler_mod
+    from twinkle_server.sampler import app as sampler_mod
 
     res = _capture_builder(
         monkeypatch,
@@ -177,7 +177,7 @@ def test_sampler_builder_characterization(monkeypatch) -> None:
 
 
 def test_processor_builder_characterization(monkeypatch) -> None:
-    from twinkle.server.processor import app as processor_mod
+    from twinkle_server.processor import app as processor_mod
 
     res = _capture_builder(
         monkeypatch,
@@ -194,7 +194,7 @@ def test_processor_builder_characterization(monkeypatch) -> None:
 
 
 def test_data_plane_builder_characterization(monkeypatch) -> None:
-    from twinkle.server.data_plane import app as data_plane_mod
+    from twinkle_server.data_plane import app as data_plane_mod
 
     res = _capture_builder(
         monkeypatch,
@@ -208,7 +208,7 @@ def test_data_plane_builder_characterization(monkeypatch) -> None:
 
 
 def test_data_plane_builder_rejects_multiple_replicas() -> None:
-    from twinkle.server.data_plane import app as data_plane_mod
+    from twinkle_server.data_plane import app as data_plane_mod
 
     with pytest.raises(ValueError, match='exactly one replica'):
         data_plane_mod.build_data_plane_app(

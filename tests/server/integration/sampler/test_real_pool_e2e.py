@@ -71,10 +71,10 @@ async def exercise(model, directory, namespace, evidence, *, extended=True):
     from ray.util import list_named_actors
     from ray.util.placement_group import placement_group_table
     from transformers import AutoTokenizer
-    from twinkle.server.config.application_spec import SamplerArgs
-    from twinkle.server.sampler.pool.controller import SamplerController
-    from twinkle.server.sampler.pool.driver import SamplerDriver
-    from twinkle.server.state import get_server_state
+    from twinkle_server.config.application_spec import SamplerArgs
+    from twinkle_server.sampler.pool.controller import SamplerController
+    from twinkle_server.sampler.pool.driver import SamplerDriver
+    from twinkle_server.state import get_server_state
 
     devices_count = int(os.environ.get('TWINKLE_TEST_POOL_DEVICES', '4'))
     assert devices_count in (2, 4)

@@ -2,13 +2,13 @@ import asyncio
 from types import SimpleNamespace
 import logging
 import pytest
-from twinkle.server.resources.instances import InstanceLifecycle
+from twinkle_server.resources.instances import InstanceLifecycle
 
 
 @pytest.mark.asyncio
 async def test_spawn_logs_exception_with_traceback(caplog, monkeypatch):
     # Capture one path regardless of the parent logger's runtime configuration.
-    target = logging.getLogger('twinkle.server.resources.instances')
+    target = logging.getLogger('twinkle_server.resources.instances')
     monkeypatch.setattr(target, 'handlers', [caplog.handler])
     monkeypatch.setattr(target, 'propagate', False)
     lifecycle = InstanceLifecycle('Training')
@@ -28,7 +28,7 @@ async def test_spawn_logs_exception_with_traceback(caplog, monkeypatch):
 @pytest.mark.asyncio
 async def test_concurrent_close_shares_one_stop_and_retries_quarantine(caplog, monkeypatch):
     import asyncio
-    target = logging.getLogger('twinkle.server.resources.instances')
+    target = logging.getLogger('twinkle_server.resources.instances')
     monkeypatch.setattr(target, 'handlers', [caplog.handler])
     monkeypatch.setattr(target, 'propagate', False)
     caplog.set_level(logging.WARNING, logger=target.name)
@@ -66,7 +66,7 @@ async def test_concurrent_close_shares_one_stop_and_retries_quarantine(caplog, m
 
 @pytest.mark.asyncio
 async def test_shared_health_rule_tolerates_transient_probe_timeout():
-    from twinkle.server.resources.instances import InstanceLifecycle
+    from twinkle_server.resources.instances import InstanceLifecycle
     clock = SimpleNamespace(now=0)
     lifecycle = InstanceLifecycle('health', clock=lambda: clock.now)
 
@@ -131,7 +131,7 @@ def _patch_actor_cleanup_rpc(monkeypatch, rows):
 @pytest.mark.asyncio
 async def test_shutdown_actor_lookup_cannot_block_the_close_deadline(monkeypatch):
     from unittest.mock import AsyncMock
-    from twinkle.server.resources.runtime import RayRuntime
+    from twinkle_server.resources.runtime import RayRuntime
 
     rpc = _patch_actor_cleanup_rpc(monkeypatch, [{'namespace': 'test', 'name': 'owned-worker'}])
     entered = asyncio.Event()
@@ -161,9 +161,9 @@ async def test_serve_handle_lookup_cannot_block_driver_deadlines(monkeypatch, ki
     import threading
     from types import SimpleNamespace
     from ray import serve
-    from twinkle.server.resources.runtime import RayRuntime
-    from twinkle.server.sampler.pool.driver import SamplerDriver
-    from twinkle.server.model.pool.driver import RayInstanceDriver
+    from twinkle_server.resources.runtime import RayRuntime
+    from twinkle_server.sampler.pool.driver import SamplerDriver
+    from twinkle_server.model.pool.driver import RayInstanceDriver
 
     entered, resume, returned = threading.Event(), threading.Event(), threading.Event()
 
@@ -199,7 +199,7 @@ async def test_orphan_inventory_cannot_block_recovery_deadlines(monkeypatch, kin
     import threading
     from types import SimpleNamespace
     from ray import serve
-    from twinkle.server.resources.runtime import RayRuntime
+    from twinkle_server.resources.runtime import RayRuntime
 
     # Import the module rather than ray.util's same-named public function.
     import importlib
@@ -235,7 +235,7 @@ async def test_orphan_inventory_cannot_block_recovery_deadlines(monkeypatch, kin
 @pytest.mark.asyncio
 async def test_shutdown_uses_actor_ids_and_keeps_namespace_and_instance_scope(monkeypatch):
     from unittest.mock import AsyncMock
-    from twinkle.server.resources.runtime import RayRuntime
+    from twinkle_server.resources.runtime import RayRuntime
 
     rows = [{'namespace': 'test', 'name': 'owned-worker'},
             {'namespace': 'test', 'name': 'owned-registry'},
@@ -258,8 +258,8 @@ async def test_shutdown_requires_trusted_identity_and_successful_gcs_replies(mon
     from unittest.mock import AsyncMock
     from ray.core.generated.gcs_pb2 import ActorTableData
     from ray.core.generated.gcs_service_pb2 import GetNamedActorInfoReply, KillActorViaGcsReply, GetActorInfoReply
-    from twinkle.server.exceptions import ResourceReleaseError
-    from twinkle.server.resources.runtime import RayRuntime
+    from twinkle_server.exceptions import ResourceReleaseError
+    from twinkle_server.resources.runtime import RayRuntime
 
     rpc = _patch_actor_cleanup_rpc(monkeypatch, [{'namespace': 'test', 'name': 'owned-worker'}])
     actor = ActorTableData(actor_id=b'owned-worker', name='owned-worker', ray_namespace='test')
@@ -298,7 +298,7 @@ async def test_shutdown_requires_trusted_identity_and_successful_gcs_replies(mon
 @pytest.mark.parametrize('blocked_rpc', ['KillActorViaGcs', 'GetActorInfo'])
 async def test_shutdown_remote_actor_rpc_remains_within_close_deadline(monkeypatch, blocked_rpc):
     from unittest.mock import AsyncMock
-    from twinkle.server.resources.runtime import RayRuntime
+    from twinkle_server.resources.runtime import RayRuntime
 
     rpc = _patch_actor_cleanup_rpc(monkeypatch, [{'namespace': 'test', 'name': 'owned-worker'}])
     entered = asyncio.Event()
@@ -325,7 +325,7 @@ async def test_shutdown_waits_for_dead_state_not_only_kill_ack(monkeypatch):
     from unittest.mock import AsyncMock
     from ray.core.generated.gcs_pb2 import ActorTableData
     from ray.core.generated.gcs_service_pb2 import GetActorInfoReply
-    from twinkle.server.resources.runtime import RayRuntime
+    from twinkle_server.resources.runtime import RayRuntime
 
     rpc = _patch_actor_cleanup_rpc(monkeypatch, [{'namespace': 'test', 'name': 'owned-worker'}])
     rpc.GetActorInfo.side_effect = [
@@ -345,8 +345,8 @@ async def test_shutdown_waits_for_dead_state_not_only_kill_ack(monkeypatch):
 async def test_worker_death_precedes_group_release_and_removal_timing(monkeypatch, outcome):
     from unittest.mock import AsyncMock, Mock
     from ray.core.generated.gcs_service_pb2 import GetActorInfoReply
-    from twinkle.server.exceptions import ResourceReleaseError
-    from twinkle.server.resources.runtime import RayRuntime
+    from twinkle_server.exceptions import ResourceReleaseError
+    from twinkle_server.resources.runtime import RayRuntime
 
     rows = ([{'namespace': 'test', 'name': 'owned-worker'}]
             if outcome in ('unconfirmed_worker', 'unavailable_worker', 'dead_worker') else [])

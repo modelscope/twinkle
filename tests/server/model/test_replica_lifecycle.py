@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from twinkle.server.model.app import MODEL_SELECTOR, ModelManagement
+from twinkle_server.model.app import MODEL_SELECTOR, ModelManagement
 
 
 class _CapacityState:
@@ -70,11 +70,11 @@ async def test_deferred_startup_registers_replica_before_ready() -> None:
     manager = ModelManagement.__new__(ModelManagement)
     manager._task_queue_config = SimpleNamespace(effective_execution_timeout=1800.0)
 
-    with patch('twinkle.server.model.app.DeviceGroup', return_value=SimpleNamespace(name='group')), \
-         patch('twinkle.server.model.app.init_twinkle_runtime', return_value=None), \
+    with patch('twinkle_server.model.app.DeviceGroup', return_value=SimpleNamespace(name='group')), \
+         patch('twinkle_server.model.app.init_twinkle_runtime', return_value=None), \
          patch.object(MODEL_SELECTOR, 'construct', return_value=MagicMock()), \
-         patch('twinkle.server.model.app.get_server_state', return_value=state), \
-         patch('twinkle.server.data_plane.DataPlaneProxy', return_value=MagicMock()), \
+         patch('twinkle_server.model.app.get_server_state', return_value=state), \
+         patch('twinkle_server.data_plane.DataPlaneProxy', return_value=MagicMock()), \
          patch.object(ModelManagement, '_init_task_queue'), \
          patch.object(ModelManagement, 'initialize_training_runtime', new_callable=AsyncMock), \
          patch.object(ModelManagement, 'wait_for_training_workers', new_callable=AsyncMock):

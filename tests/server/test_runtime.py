@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from unittest import mock
 
-from twinkle.server.runtime import init_twinkle_runtime
+from twinkle_server.runtime import init_twinkle_runtime
 
 
 def test_model_sampler_path_does_not_forward_ncpu_proc_per_node():
