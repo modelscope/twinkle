@@ -140,20 +140,22 @@ class vLLMSampler:
                 raise TwinkleClientValidationError('This server does not support sample idempotency')
             response = self._transport.post_model(f'{self.server_url}/sample', request)
         samples = self._await_task(response, SampleResponseModelList).samples
-        if not token_only:
-            if len(samples) != len(originals):
-                raise RuntimeError('server response count does not match the input batch')
-            for original, result in zip(originals, samples):
-                for sequence in result.sequences:
-                    if sequence.new_input_feature is None:
-                        raise RuntimeError('server omitted a complete trajectory from a normal sample response')
-                    # The server never echoes the request's media / user_data back; restore them here.
-                    sequence.new_input_feature = {
-                        **copy_trajectory({key: original[key] for key in ('images', 'videos', 'audios', 'user_data')
-                                          if key in original}),
-                        **copy_trajectory(sequence.new_input_feature),
-                    }
-        return samples
+        if token_only:
+            return samples
+        if len(samples) != len(originals):
+            raise RuntimeError('server response count does not match the input batch')
+        completed = []
+        for original, result in zip(originals, samples, strict=True):
+            # The server never echoes the request's media / user_data back; restore them here.
+            media = {key: original[key] for key in ('images', 'videos', 'audios', 'user_data') if key in original}
+            sequences = []
+            for sequence in result.sequences:
+                if sequence.new_input_feature is None:
+                    raise RuntimeError('server omitted a complete trajectory from a normal sample response')
+                feature = {**copy_trajectory(media), **copy_trajectory(sequence.new_input_feature)}
+                sequences.append(sequence.model_copy(update={'new_input_feature': feature}))
+            completed.append(result.model_copy(update={'sequences': sequences}))
+        return completed
 
     @staticmethod
     def _sampling_params(sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]],
