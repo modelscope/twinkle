@@ -15,8 +15,8 @@ module. This deliberately means ``twinkle`` holds the RL training field names
 only consumes them.
 
 ``torch`` / ``tensordict`` stay inside the functions: ``tensordict`` arrives with
-``TransferQueue``, which is only in the ``async-rl`` extra, so this module must import
-cleanly without it. Do NOT hoist them.
+``TransferQueue``, which is installed separately from twinkle-kit, so this module
+must import cleanly without it. Do NOT hoist them.
 """
 from __future__ import annotations
 

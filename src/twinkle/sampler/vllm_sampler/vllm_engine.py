@@ -535,19 +535,27 @@ class VLLMEngine(BaseSamplerEngine):
                 seq_logprobs = []
                 for i, lp in enumerate(output.logprobs):
                     if i < len(token_ids):
-                        if logprobs == 1:
-                            # Single logprob mode: return the sampled token's logprob
-                            # in the same [(tid, logprob)] format as multi-logprob mode
-                            tid = token_ids[i]
-                            assert tid in lp, (f'Sampled token {tid} not found in logprobs at position {i}. '
-                                               f'Available tokens: {list(lp.keys())}')
-                            seq_logprobs.append([(tid, lp[tid].logprob)])
-                        else:
-                            # Multiple logprobs mode: return top-k logprobs
+                        tid = token_ids[i]
+                        assert tid in lp, (
+                            f'Sampled token {tid} not found in logprobs at position {i}. '
+                            f'Available tokens: {list(lp.keys())}'
+                        )
+                        entries = [(tid, lp[tid].logprob)]
+                        if logprobs != 1:
                             sorted_items = sorted(lp.items(), key=lambda x: -(x[1].logprob))[:logprobs]
-                            seq_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
+                            entries.extend(
+                                (candidate, item.logprob) for candidate, item in sorted_items if candidate != tid
+                            )
+                        seq_logprobs.append(entries)
 
             stop_reason: StopReason = _map_finish_reason(output.finish_reason)
+
+            # vLLM's detokenizer already applied the stop-string trim to ``output.text`` (an excluded
+            # stop is cut from the text, while ``output.token_ids`` keeps every sampled id). Carry that
+            # trimmed text as ``decoded`` so the excluded stop is honoured decoded-only -- the complete
+            # trajectory's token ids stay intact. When nothing forced detokenization (no stop/bad_words)
+            # ``output.text`` is empty and the template decodes the tokens downstream instead.
+            decoded_text = output.text if getattr(vllm_params, 'detokenize', False) else None
 
             routed_experts = getattr(output, 'routed_experts', None)
             sequences.append(
@@ -555,6 +563,7 @@ class VLLMEngine(BaseSamplerEngine):
                     stop_reason=stop_reason,
                     tokens=token_ids,
                     logprobs=seq_logprobs,
+                    decoded=decoded_text,
                     routed_experts=routed_experts,
                     sampling_masks=sampling_mask,
                 ))
@@ -562,7 +571,7 @@ class VLLMEngine(BaseSamplerEngine):
         # Extract prompt logprobs if requested
         result_prompt_logprobs = None
         result_topk_prompt_logprobs = None
-        if prompt_logprobs_k > 0 and result.prompt_logprobs is not None:
+        if sampling_params.prompt_logprobs is not None and result.prompt_logprobs is not None:
             result_prompt_logprobs = []
             result_topk_prompt_logprobs = []
 

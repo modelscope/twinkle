@@ -32,7 +32,7 @@ These instructions help AI agents work productively in this repo. Focus on concr
 
 ## Developer Workflows
 - **Install:** Python 3.11+. Install with Poetry or pip.
-  - Pip (editable): `pip install -e '.[test,rl]' -e ./twinkle_cs/client -e ./twinkle_cs/server`
+  - Pip (editable): `pip install -e '.[test]' -e ./twinkle_cs/client -e ./twinkle_cs/server`
 - **Run tests:**
   - Unit tests: `python -m unittest tests/infra/test_infra_graph.py`
 - **Local single-process dev:**

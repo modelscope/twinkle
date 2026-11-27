@@ -153,6 +153,7 @@ class TransformersEngine(BaseSamplerEngine):
         topk_prompt_logprobs: int = 0,
         adapter_uri: Optional[str] = None,
         extra_model_inputs: Optional[Dict[str, Any]] = None,
+        use_base_model: bool = False,
         **kwargs,
     ) -> List[SampleResponse]:
         """Generate for several prompts in one padded forward, synchronously.
@@ -164,22 +165,28 @@ class TransformersEngine(BaseSamplerEngine):
         ``extra_model_inputs`` carries the already-processed multimodal tensors (``pixel_values`` and
         friends). Unlike vLLM, this engine cannot accept raw images -- the template's processor has to
         run first -- which is the contract note in ``BaseSamplerEngine.sample``.
+
+        ``use_base_model`` generates from the base weights even when a peft adapter is loaded. It is
+        explicit because a bare ``adapter_uri=None`` means "keep the current adapter" for in-place
+        generation on a live training model (``TransformersModel.generate``), while a sampler request
+        with no adapter must sample the base -- the two callers need opposite defaults.
         """
         if not prompt_token_ids:
             return []
         params = sampling_params or SamplingParams()
         self._check_lengths(prompt_token_ids, params)
         self._activate_adapter(adapter_uri)
-        return self._generate_batch(
-            list(prompt_token_ids),
-            params,
-            num_samples,
-            logprobs,
-            include_prompt_logprobs,
-            topk_prompt_logprobs,
-            extra_model_inputs or {},
-            kwargs,
-        )
+        with self._base_model_context(use_base_model):
+            return self._generate_batch(
+                list(prompt_token_ids),
+                params,
+                num_samples,
+                logprobs,
+                include_prompt_logprobs,
+                topk_prompt_logprobs,
+                extra_model_inputs or {},
+                kwargs,
+            )
 
     async def batch_sample(
         self,
@@ -192,6 +199,7 @@ class TransformersEngine(BaseSamplerEngine):
         topk_prompt_logprobs: int = 0,
         adapter_uri: Optional[str] = None,
         extra_model_inputs: Optional[Dict[str, Any]] = None,
+        use_base_model: bool = False,
         **kwargs,
     ) -> List[SampleResponse]:
         """Async :meth:`generate_batch`: serialized behind a lock and run off the caller's event loop.
@@ -214,6 +222,7 @@ class TransformersEngine(BaseSamplerEngine):
                 topk_prompt_logprobs=topk_prompt_logprobs,
                 adapter_uri=adapter_uri,
                 extra_model_inputs=extra_model_inputs,
+                use_base_model=use_base_model,
                 **kwargs,
             )
 
@@ -222,6 +231,8 @@ class TransformersEngine(BaseSamplerEngine):
         prompt: List[int],
         sampling_params: Optional[SamplingParams] = None,
         lora_request: Optional[str] = None,
+        extra_model_inputs: Optional[Dict[str, Any]] = None,
+        use_base_model: bool = False,
         **kwargs,
     ):
         """Yield ``(delta_text, finish_reason)`` as tokens are produced.
@@ -230,56 +241,104 @@ class TransformersEngine(BaseSamplerEngine):
         so the bridge here is a thread + a thread-safe queue drained from the event loop. finish_reason
         is only known once generation ends, hence the final ``('', reason)`` tuple.
         """
-        from transformers import TextIteratorStreamer
+        from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
+
+        class _AbortOnEvent(StoppingCriteria):
+            """Ends ``model.generate`` once ``aborted`` is set; checked between decoding steps."""
+
+            def __init__(self, aborted: threading.Event):
+                super().__init__()
+                self.aborted = aborted
+
+            def __call__(self, input_ids, scores, **kwargs) -> bool:
+                return self.aborted.is_set()
 
         params = sampling_params or SamplingParams()
         self._check_lengths([prompt], params)
 
         async with self._generate_lock:
             self._activate_adapter(lora_request)
-            streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True,
-                                            clean_up_tokenization_spaces=False if params.stop else None)
-            gen_kwargs = self._build_gen_kwargs(params, num_samples=1, logprobs=False)
-            gen_kwargs['streamer'] = streamer
-            inputs = self._to_model_inputs([prompt])
-            produced: List[int] = []
+            with self._base_model_context(use_base_model):
+                # Same seeded-request contract as _generate_batch: to_transformers spells the seed as
+                # torch.manual_seed, which is process-global. Snapshot before building the gen kwargs
+                # (that is where the reseed happens) and restore once model.generate has really ended,
+                # so a seeded stream stays reproducible without clobbering the caller's RNG (training
+                # dropout / data order share this process). The restore sits in the finally AFTER the
+                # join, covering normal completion, errors and a consumer that closes the stream early.
+                seeded = params.seed is not None
+                if seeded:
+                    cpu_rng_state = torch.get_rng_state()
+                    cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+                streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True,
+                                                clean_up_tokenization_spaces=False if params.stop else None)
+                gen_kwargs = self._build_gen_kwargs(params, num_samples=1, logprobs=False)
+                gen_kwargs['streamer'] = streamer
+                # Cooperative stop for an abandoned stream: checked between decoding steps. Appended, not
+                # assigned: ``to_transformers`` already installs a ``StopStringCriteria`` when ``params.stop``
+                # is a string list.
+                aborted = threading.Event()
+                criteria = gen_kwargs.get('stopping_criteria')
+                if criteria is None:
+                    criteria = gen_kwargs['stopping_criteria'] = StoppingCriteriaList()
+                criteria.append(_AbortOnEvent(aborted))
+                inputs = self._to_model_inputs([prompt], extra_model_inputs)
+                produced: List[int] = []
+                eos_ids = gen_kwargs.get('eos_token_id')
+                eos_ids = set(eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids]) - {None}
 
-            def _run():
+                def _run():
+                    try:
+                        out = self.model.generate(**inputs, **gen_kwargs)
+                        sequences = out.sequences if hasattr(out, 'sequences') else out
+                        produced.extend(_strip_padding(sequences[0, inputs['input_ids'].shape[-1]:], eos_ids))
+                    except Exception as exc:  # surfaced to the consumer via the queue below
+                        streamer.on_finalized_text('', stream_end=True)
+                        raise exc
+
+                thread = threading.Thread(target=_run, daemon=True, name='TransformersEngine-stream')
+                thread.start()
                 try:
-                    out = self.model.generate(**inputs, **gen_kwargs)
-                    produced.append(out.shape[-1] - inputs['input_ids'].shape[-1])
-                except Exception as exc:  # surfaced to the consumer via the queue below
-                    streamer.on_finalized_text('', stream_end=True)
-                    raise exc
-
-            thread = threading.Thread(target=_run, daemon=True, name='TransformersEngine-stream')
-            thread.start()
-
-            loop = asyncio.get_running_loop()
-            sentinel = object()
-            stops = [params.stop] if isinstance(params.stop, str) else list(params.stop or ())
-            strings = [stop for stop in stops if isinstance(stop, str)]
-            # Hold potential stop prefixes so excluded text is never emitted and then retracted.
-            hold = max((len(stop) - 1 for stop in strings), default=0)
-            pending = ''
-            matched = False
-            while True:
-                delta = await loop.run_in_executor(None, lambda: next(streamer, sentinel))
-                if delta is sentinel:
-                    break
-                if not delta or matched:
-                    continue
-                pending, matched = self._trim_stop_text(pending + delta, params)
-                ready = len(pending) if matched else max(0, len(pending) - hold)
-                if ready:
-                    yield pending[:ready], None
-                    pending = pending[ready:]
-            thread.join()
-            if pending:
-                yield pending, None
-            new_tokens = produced[0] if produced else 0
-            reason = 'length' if params.max_tokens and new_tokens >= params.max_tokens else 'stop'
-            yield '', ('stop' if matched else reason)
+                    loop = asyncio.get_running_loop()
+                    sentinel = object()
+                    stops = [params.stop] if isinstance(params.stop, str) else list(params.stop or ())
+                    strings = [stop for stop in stops if isinstance(stop, str)]
+                    # Hold potential stop prefixes so excluded text is never emitted and then retracted.
+                    hold = max((len(stop) - 1 for stop in strings), default=0)
+                    pending = ''
+                    matched = False
+                    while True:
+                        delta = await loop.run_in_executor(None, lambda: next(streamer, sentinel))
+                        if delta is sentinel:
+                            break
+                        if not delta or matched:
+                            continue
+                        pending, matched = self._trim_stop_text(pending + delta, params)
+                        ready = len(pending) if matched else max(0, len(pending) - hold)
+                        if ready:
+                            yield pending[:ready], None
+                            pending = pending[ready:]
+                    if pending:
+                        yield pending, None
+                finally:
+                    # Whatever ends the stream -- completion, a consumer that closed it early, an error --
+                    # ``model.generate`` must have stopped before the lock is released, or the next
+                    # generate / weight sync runs concurrently with this one on the same nn.Module.
+                    # On completion the criteria is already satisfied and the join is immediate.
+                    aborted.set()
+                    thread.join()
+                    if seeded:
+                        torch.set_rng_state(cpu_rng_state)
+                        if cuda_rng_states is not None:
+                            torch.cuda.set_rng_state_all(cuda_rng_states)
+                max_new = gen_kwargs.get('max_new_tokens')
+                yield (
+                    '',
+                    'stop' if matched else (
+                        'length'
+                        if max_new and len(produced) >= max_new and (not produced or produced[-1] not in eos_ids)
+                        else 'stop'
+                    ),
+                )
 
     # ------------------------------------------------------------------ weights / memory
 
@@ -352,6 +411,19 @@ class TransformersEngine(BaseSamplerEngine):
         if adapter_uri != self._active_adapter:
             self.model.set_adapter(adapter_uri)
             self._active_adapter = adapter_uri
+
+    def _base_model_context(self, use_base_model: bool):
+        """Disable any loaded peft adapter for the duration of a base-model request.
+
+        peft activates one adapter at a time and ``_activate_adapter(None)`` deliberately keeps the
+        current one (in-place generation on a live training model must keep its adapter), so a
+        sampler request that explicitly asks for the base weights needs this separate switch.
+        """
+        import contextlib
+        from peft import PeftModel
+        if use_base_model and isinstance(self.model, PeftModel):
+            return self.model.disable_adapter()
+        return contextlib.nullcontext()
 
     # ------------------------------------------------------------------ internals
 
@@ -429,24 +501,33 @@ class TransformersEngine(BaseSamplerEngine):
         completions = sequences[:, prompt_width:]
         step_logprobs = _step_logprobs(output, params) if want_logprobs and hasattr(output, 'scores') else None
 
-        prompt_logprobs = None
-        topk_prompt_logprobs_out = None
+        prompt_logprobs, topk_logprobs = None, None
         if include_prompt_logprobs:
-            prompt_logprobs, topk_prompt_logprobs_out = self._prompt_logprobs(inputs, topk_prompt_logprobs)
+            prompt_logprobs, topk_logprobs = self._prompt_logprobs(inputs, topk_prompt_logprobs)
 
+        eos_ids = gen_kwargs.get('eos_token_id')
+        eos_ids = set(eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids]) - {None}
         max_new = gen_kwargs.get('max_new_tokens')
         responses: List[SampleResponse] = []
         for index, prompt in enumerate(prompts):
             seqs = []
             for offset in range(num_samples):
                 row = index * num_samples + offset
-                tokens = _strip_padding(completions[row], self.tokenizer.pad_token_id)
+                tokens = _strip_padding(completions[row], eos_ids)
                 decoded = self.tokenizer.decode(
                     tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False if params.stop else None)
                 decoded, matched = self._trim_stop_text(decoded, params)
+                stop_reason = (
+                    'length'
+                    if max_new and len(tokens) >= max_new and not matched
+                    and (not tokens or tokens[-1] not in eos_ids)
+                    else 'stop'
+                )
+                if matched and not params.include_stop_str_in_output:
+                    tokens = self._trim_stop_tokens(tokens, decoded)
                 seqs.append(
                     SampledSequence(
-                        stop_reason='length' if max_new and len(tokens) >= max_new and not matched else 'stop',
+                        stop_reason=stop_reason,
                         tokens=tokens,
                         logprobs=None if step_logprobs is None else step_logprobs[row][:len(tokens)],
                         decoded=decoded,
@@ -456,8 +537,9 @@ class TransformersEngine(BaseSamplerEngine):
                     sequences=seqs,
                     prompt_token_ids=list(prompt),
                     prompt_logprobs=None if prompt_logprobs is None else prompt_logprobs[index],
-                    topk_prompt_logprobs=None if topk_prompt_logprobs_out is None else topk_prompt_logprobs_out[index],
-                ))
+                    topk_prompt_logprobs=None if topk_logprobs is None else topk_logprobs[index],
+                )
+            )
         return responses
 
     @staticmethod
@@ -473,34 +555,215 @@ class TransformersEngine(BaseSamplerEngine):
         end = start + len(stop) if params.include_stop_str_in_output else start
         return text[:end], True
 
-    def _prompt_logprobs(self, inputs: Dict[str, Any], topk: int) -> Tuple[List[List[Optional[float]]],
-                                                                          List[Optional[List[List[Tuple[int, float]]]]]]:
+    def _trim_stop_tokens(self, tokens: List[int], text: str) -> List[int]:
+        """The token prefix that stays inside a trimmed stop ``text`` (the same rule as the vLLM engine:
+        the sampled ``tokens`` never carry the stop string when it is excluded from the output).
+        ``generate()`` runs on to the EOS after a stop string appears, so the tail can be long; the
+        decoded prefix grows monotonically with the token count, hence the binary search."""
+        def decoded(count: int) -> str:
+            return self.tokenizer.decode(tokens[:count], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+        low, high = 0, len(tokens)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if text.startswith(decoded(mid)):
+                low = mid
+            else:
+                high = mid - 1
+        return tokens[:low]
+
+    def _prompt_logprobs(self, inputs: Dict[str, Any], topk: int):
         """Score the prompt itself -- ``generate()`` never does, so this is a second forward pass.
 
-        Returns ``(prompt_logprobs, topk_prompt_logprobs)``: the chosen-token logprob per
-        position, and (when ``topk > 0``) the ``topk`` most likely alternatives per position,
-        matching the vLLM engine's convention (leading None for the first real token).
+        Each row is scored on its OWN real tokens, with no padding and no batch neighbours. A
+        batched bf16 forward is not numerically identical to a single-row forward on this stack:
+        the attention / chunked-recurrence kernels pick their reduction order from the batch
+        shape, and hybrid linear-attention layers amplify the drift (measured up to ~0.6 logits /
+        ~0.08 nats and even top-k id flips on Qwen3.5-0.8B, runs/H07 g41). Scoring a padded batch
+        would therefore make a prompt's score depend on which OTHER prompts share the batch --
+        unacceptable for RL prompt scoring, where the score must be a function of the prompt alone
+        (the vLLM backend's per-sequence contract). Per-row forwards restore that independence at
+        the cost of one forward per prompt; scoring is opt-in (``prompt_logprobs``), and callers
+        that need batched throughput at scale use the vLLM backend.
         """
-        with torch.inference_mode():
-            logits = self.model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask']).logits
-        logprobs = torch.log_softmax(logits[:, :-1].float(), dim=-1)
-        targets = inputs['input_ids'][:, 1:]
-        picked = logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        out: List[List[Optional[float]]] = []
-        out_topk: List[Optional[List[List[Tuple[int, float]]]]] = []
-        for row in range(picked.shape[0]):
-            mask = inputs['attention_mask'][row, 1:].bool()
+        input_ids = inputs['input_ids']
+        attention = inputs['attention_mask']
+        out, alternatives = [], [] if topk else None
+        for row in range(input_ids.shape[0]):
+            keep = attention[row].bool()
+            row_inputs = self._score_row_inputs(inputs, row, keep)
+            # Score without building a KV cache this pass never reads (tw 3cb3c4dc contract):
+            # the forward defaults to caching, which for a long prompt allocates a full cache.
+            row_inputs['use_cache'] = False
+            with torch.inference_mode():
+                logits = self.model(**row_inputs).logits
+            logprobs = torch.log_softmax(logits[0, :-1].float(), dim=-1)
+            targets = row_inputs['input_ids'][0, 1:]
+            picked = logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
             # The first real token has no predecessor to be predicted from, hence the leading None,
             # matching vLLM's prompt_logprobs convention.
-            out.append([None] + picked[row][mask].tolist())
-            if topk > 0:
-                values, indices = torch.topk(logprobs[row], topk, dim=-1)
-                out_topk.append([None] + [
-                    list(zip(idx.tolist(), val.tolist())) for idx, val in zip(indices[mask], values[mask])
-                ])
+            out.append([None] + picked.tolist())
+            if topk:
+                values, indices = logprobs.topk(topk, dim=-1)
+                alternatives.append(
+                    [None] + [list(zip(ids, scores, strict=False))
+                              for ids, scores in zip(indices.tolist(), values.tolist(), strict=False)])
+        return out, alternatives
+
+    def _score_row_inputs(self, inputs: Dict[str, Any], row: int, keep: torch.Tensor) -> Dict[str, Any]:
+        """One row's real (unpadded) model inputs, sliced out of the collated batch.
+
+        Per-token companions (``mm_token_type_ids``, M-RoPE ``position_ids``, ...) keep their row
+        and lose the padding. Vision payloads (``pixel_values`` + ``image_grid_thw``, and the video
+        pair) are concatenated across rows by the template's collator, so they are split by walking
+        the grids in row order and matching each row's placeholder-token count; the merge factor is
+        derived from the data (total patches / total placeholders) rather than assumed. Anything
+        that cannot be attributed to a single row fails loudly instead of being scored wrongly.
+        """
+        batch, width = inputs['input_ids'].shape
+        row_inputs = {
+            'input_ids': inputs['input_ids'][row][keep].unsqueeze(0),
+            'attention_mask': inputs['attention_mask'][row][keep].unsqueeze(0),
+        }
+        media = {
+            'pixel_values': ('image_grid_thw', 'image_token_id'),
+            'pixel_values_videos': ('video_grid_thw', 'video_token_id'),
+        }
+        handled = set()
+        for payload_key, (grid_key, token_attr) in media.items():
+            grids = inputs.get(grid_key)
+            if grids is None:
+                continue
+            handled.update((payload_key, grid_key))
+            payload = inputs.get(payload_key)
+            token_id = self._model_config_value(token_attr)
+            if payload is None or token_id is None:
+                raise ValueError(f'{grid_key} present but {payload_key}/{token_attr} missing; '
+                                 'cannot score this batch per row')
+            patches = [int(g.prod()) for g in grids]
+            holders = [int((ids[inputs['attention_mask'][r].bool()] == token_id).sum())
+                       for r, ids in enumerate(inputs['input_ids'])]
+            total_holders = sum(holders)
+            if total_holders == 0:
+                raise ValueError(f'{grid_key} present but no {token_attr} placeholders in any prompt')
+            merge2 = sum(patches) // total_holders
+            if merge2 * total_holders != sum(patches):
+                raise ValueError(f'{grid_key} patches do not divide evenly into placeholder counts')
+            counts = [p // merge2 for p in patches]
+            # Walk images/videos in collation (row) order, assigning each row its contiguous share.
+            spans, cursor = [], 0
+            for holder in holders:
+                start, taken = cursor, 0
+                while taken < holder:
+                    if cursor >= len(counts):
+                        raise ValueError(f'{grid_key} runs out of entries before placeholders are matched')
+                    taken += counts[cursor]
+                    cursor += 1
+                if taken != holder:
+                    raise ValueError(f'{grid_key} entries do not align with per-row placeholder counts')
+                spans.append((start, cursor))
+            start, end = spans[row]
+            if payload_key == 'pixel_values_videos':
+                # ``second_per_grid_ts`` holds one entry per video (seconds per temporal grid),
+                # collated in row order exactly like the grids. The template collator hands it over
+                # as a list[float], which the generic tensor loop below would silently drop -- and
+                # without it the model's internal M-RoPE falls back to the default 1.0 spacing,
+                # scoring fps != 1 videos wrongly whenever position_ids are not supplied. Slice it
+                # with the same video spans so the complete model-ready inputs survive.
+                spg = inputs.get('second_per_grid_ts')
+                if spg is not None:
+                    handled.add('second_per_grid_ts')
+                    if len(spg) != len(grids):
+                        raise ValueError('second_per_grid_ts must hold one entry per video grid')
+                    if end > start:
+                        row_inputs['second_per_grid_ts'] = spg[start:end]
+            if start == end:
+                continue
+            patch_start = sum(patches[:start])
+            patch_end = sum(patches[:end])
+            row_inputs[payload_key] = payload[patch_start:patch_end]
+            row_inputs[grid_key] = grids[start:end]
+        audio = inputs.get('input_features')
+        if audio is not None:
+            # Audio payloads (input_features + input_features_mask / feature_attention_mask) are
+            # concatenated across rows by the template collator with ONE entry per audio, like the
+            # vision grids -- but they carry no grid tensor, so attribute them by the audio
+            # placeholder tokens: every audio expands to the same number of soft tokens (the
+            # processor's fixed audio sequence), so total placeholders / audios gives the factor
+            # and each row's share follows from its own placeholder count. Without this the
+            # generic tensor loop below either dies on a mixed audio+text batch (leading dim !=
+            # batch) or silently misattributes when the audio count happens to equal the batch.
+            handled.add('input_features')
+            mask_keys = [k for k in ('input_features_mask', 'feature_attention_mask') if inputs.get(k) is not None]
+            # Mark every audio companion handled up front: a text-only row in a mixed batch carries
+            # no audio slice, but the batched mask tensor must still not fall through to the generic
+            # per-row loop (its leading dim is the audio count, not the batch size).
+            handled.update(mask_keys)
+            token_id = self._model_config_value('audio_token_id')
+            if token_id is None:
+                raise ValueError('input_features present but audio_token_id missing; '
+                                 'cannot score this batch per row')
+            holders = [int((ids[inputs['attention_mask'][r].bool()] == token_id).sum())
+                       for r, ids in enumerate(inputs['input_ids'])]
+            total_holders = sum(holders)
+            n_audios = audio.shape[0]
+            if total_holders == 0:
+                raise ValueError('input_features present but no audio placeholders in any prompt')
+            per_audio = total_holders // n_audios
+            if per_audio * n_audios != total_holders:
+                raise ValueError('audio placeholder counts do not divide evenly across audio features')
+            spans, cursor = [], 0
+            for holder in holders:
+                if holder % per_audio:
+                    raise ValueError('audio placeholders do not align with per-row audio counts')
+                start = cursor
+                cursor += holder // per_audio
+                spans.append((start, cursor))
+            start, end = spans[row]
+            if end > start:
+                feats = audio[start:end]
+                for mask_key in mask_keys:
+                    row_mask = inputs[mask_key][start:end]
+                    if not bool(row_mask.all()):
+                        # The collator pads unequal-length audios to the batch longest with the
+                        # mask marking valid frames; restore this row's own (unpadded-to-batch)
+                        # processor layout by dropping the trailing padding common to the row.
+                        keep_len = int(row_mask.sum(dim=-1).max())
+                        if feats.shape[-2] == row_mask.shape[-1]:
+                            feats = feats[..., :keep_len, :]  # (audios, time, mel), e.g. gemma3n
+                        else:
+                            feats = feats[..., :keep_len]  # (audios, mel, time), e.g. qwen2-audio
+                        row_mask = row_mask[..., :keep_len]
+                    row_inputs[mask_key] = row_mask
+                row_inputs['input_features'] = feats
+        for key, value in inputs.items():
+            if key in ('input_ids', 'attention_mask') or key in handled or not isinstance(value, torch.Tensor):
+                continue
+            if (key == 'position_ids' and value.dim() == 3 and value.shape[1] == batch
+                    and value.shape[-1] == width):
+                # M-RoPE layout [sections, batch, seq] (the template collator stacks on dim 1)
+                row_inputs[key] = value[:, row, :][:, keep].unsqueeze(1)
+            elif value.dim() >= 2 and value.shape[0] == batch and value.shape[-1] == width:
+                row_inputs[key] = value[row, ..., keep].unsqueeze(0)
+            elif value.dim() >= 1 and value.shape[0] == batch:
+                row_inputs[key] = value[row].unsqueeze(0)
             else:
-                out_topk.append(None)
-        return out, out_topk
+                raise ValueError(f'cannot attribute batched input {key!r} (shape {tuple(value.shape)}) '
+                                 'to a single prompt for per-row scoring')
+        return row_inputs
+
+    def _model_config_value(self, attr: str):
+        """Read a config field from the underlying HF model, looking through a peft wrapper."""
+        model = self.model
+        for _ in range(4):
+            config = getattr(model, 'config', None)
+            if config is not None and hasattr(config, attr):
+                return getattr(config, attr)
+            inner = getattr(model, 'base_model', None) or getattr(model, 'model', None)
+            if inner is None or inner is model:
+                break
+            model = inner
+        return None
 
 
 def _step_logprobs(output: Any, params: SamplingParams) -> List[List[List[Tuple[int, float]]]]:
@@ -526,11 +789,10 @@ def _step_logprobs(output: Any, params: SamplingParams) -> List[List[List[Tuple[
     return result
 
 
-def _strip_padding(tokens: torch.Tensor, pad_id: Optional[int]) -> List[int]:
-    """Drop the trailing pads a short sequence in a batch accumulates once it hits eos."""
+def _strip_padding(tokens: torch.Tensor, eos_ids: set[int]) -> List[int]:
+    """Keep the sampled EOS; discard only the padding produced after termination."""
     ids = tokens.tolist()
-    if pad_id is None:
-        return ids
-    while ids and ids[-1] == pad_id:
-        ids.pop()
+    for index, token in enumerate(ids):
+        if token in eos_ids:
+            return ids[: index + 1]
     return ids

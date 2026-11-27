@@ -52,8 +52,15 @@ def add_base_layer_suffix(name: str, model_keys: Optional[List[str]]) -> str:
         base_layer_name = f'{name[:-5]}.base_layer.bias'
         if not model_keys or base_layer_name in model_keys:
             name = base_layer_name
-    if 'experts' in name and base_layer_name is not None:
-        return base_layer_name
+    # Expert (FusedMoE) weights keep their CANONICAL names: vLLM's RoutedExperts loader
+    # maps fused 3-D HF tensors (experts.gate_up_proj / experts.down_proj, no .weight
+    # suffix -- untouched by the rename above) and per-expert HF names
+    # (experts.{i}.gate_proj.weight) onto its w13/w2 params itself. Forcing a leaf
+    # ``.base_layer`` here (experts.{i}.gate_proj.base_layer.weight) produces a name no
+    # vLLM loader resolves (the LoRA wrapper's base_layer is the MoERunner, not a leaf
+    # param), so expert names are left to the model_keys-gated rename above. The
+    # LoRA-wrapped receiver dispatch is handled in vllm_worker_extension
+    # (_load_lora_wrapped_moe_experts).
     return name
 
 

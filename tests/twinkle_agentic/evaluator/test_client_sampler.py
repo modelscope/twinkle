@@ -20,15 +20,17 @@ class _Session:
         self.request = request
 
     def post(self, url, *, data=None, json=None, **_kwargs):
+        import json as json_module
         self.request['url'] = url
-        if data is not None:
-            import json as json_module
-            self.request['body'] = json_module.loads(data)
-        else:
-            self.request['body'] = json
+        body = json_module.loads(data) if data is not None else json
+        self.request['body'] = body
         if url.endswith('/create'):
             return _Response({})
-        return _Response({'request_id': 'test', 'status': 'completed', 'result': {'samples': []}})
+        # 012aff34 complete-Trajectory contract: a normal (non token_only) response must return
+        # one sample per input, each sequence carrying a complete new_input_feature.
+        samples = [{'sequences': [{'stop_reason': 'stop', 'tokens': [],
+                                   'new_input_feature': dict(item)}]} for item in body['inputs']]
+        return _Response({'request_id': 'test', 'status': 'completed', 'result': {'samples': samples}})
 
     def close(self):
         pass

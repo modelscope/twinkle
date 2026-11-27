@@ -17,19 +17,24 @@ from twinkle.infra._ray.ray_helper import RayHelper  # noqa: E402
 
 @ray.remote
 class _Sleeper:
-    """A plain Ray actor whose only method sleeps for a caller-supplied time."""
+    """A plain Ray actor whose only method sleeps for a caller-supplied time.
 
-    def slow(self, seconds: float):
+    The dispatch path injects ``_dispatch_context`` on the wire (b26f5e08); a twinkle remote_class
+    method pops it in ``_call_impl``, but this minimal stand-in is a plain Ray actor, so its methods
+    absorb the kwarg directly.
+    """
+
+    def slow(self, seconds: float, _dispatch_context=None):
         import time
         time.sleep(seconds)
         return seconds
 
-    def slow_batch(self, seconds: list[float]):
+    def slow_batch(self, seconds: list[float], _dispatch_context=None):
         import time
         time.sleep(seconds[0])
         return seconds
 
-    def _twinkle_async_slow_batch(self, seconds: list[float]):
+    def _twinkle_async_slow_batch(self, seconds: list[float], _dispatch_context=None):
         return self.slow_batch(seconds)
 
 

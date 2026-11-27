@@ -47,7 +47,7 @@ class DevicePool:
         return f"resources-{self.namespace}-{epoch}-{instance_id}"
 
     @staticmethod
-    def _create_group(resource, count, name):
+    def _create_group(resource, count, name, node_selector=None):
         import ray
         from ray.util.placement_group import placement_group
 
@@ -58,9 +58,15 @@ class DevicePool:
         # pg.ready() is the allocation witness and is bounded by allocate().
         cpus = min(_gpu_placement_group_cpus(int(node["Resources"].get("CPU", 0)), count) for node in candidates)
         bundle = {resource: count, "CPU": count if resource == "CPU" else cpus}
-        return placement_group([bundle], strategy="STRICT_PACK", name=name)
+        return placement_group(
+            [bundle], strategy="STRICT_PACK", name=name,
+            bundle_label_selector=[node_selector] if node_selector else None,
+        )
 
-    async def allocate(self, num_devices: int, device_type: str, epoch: str, instance_id: str) -> DeviceAllocation:
+    async def allocate(
+        self, num_devices: int, device_type: str, epoch: str, instance_id: str,
+        *, node_selector: dict[str, str] | None = None,
+    ) -> DeviceAllocation:
         import ray
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
@@ -69,7 +75,7 @@ class DevicePool:
         resource = "CPU" if device_type == "cpu" else Platform.get_platform(device_type).__name__
         count = num_devices
         name = self.name(epoch, instance_id)
-        creating = asyncio.create_task(asyncio.to_thread(self._create_group, resource, count, name))
+        creating = asyncio.create_task(asyncio.to_thread(self._create_group, resource, count, name, node_selector))
         self._creating[name] = creating
         try:
             async with asyncio.timeout(self.allocation_timeout):

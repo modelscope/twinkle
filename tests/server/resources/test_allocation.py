@@ -9,7 +9,8 @@ import pytest
 from twinkle_server.resources.allocation import DevicePool
 
 
-def test_stale_resource_summary_does_not_reject_a_schedulable_group(monkeypatch):
+@pytest.mark.parametrize('node_selector', [None, {'twinkle-node': 'a'}])
+def test_stale_resource_summary_does_not_reject_a_schedulable_group(monkeypatch, node_selector):
     import importlib
     import ray
     placement = importlib.import_module('ray.util.placement_group')
@@ -23,9 +24,13 @@ def test_stale_resource_summary_does_not_reject_a_schedulable_group(monkeypatch)
         return group
 
     monkeypatch.setattr(placement, 'placement_group', create)
-    assert DevicePool._create_group('GPU', 2, 'replacement') is group
+    assert DevicePool._create_group('GPU', 2, 'replacement', node_selector) is group
     assert created[0][0][0]['GPU'] == 2
-    assert created[0][1] == {'strategy': 'STRICT_PACK', 'name': 'replacement'}
+    assert created[0][1] == {
+        'strategy': 'STRICT_PACK',
+        'name': 'replacement',
+        'bundle_label_selector': [node_selector] if node_selector else None,
+    }
 
 
 @pytest.mark.asyncio

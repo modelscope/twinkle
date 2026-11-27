@@ -35,6 +35,13 @@ class _Model:
         self.peft_config_calls += 1
         return {'r': 8, 'target_modules': ['q_proj']}
 
+    def checkpoint_transfer_capabilities(self):
+        # Capability contract (58b2b979): a local object answers with the plain dict (direct-stream
+        # co-execution); a Ray actor handler answers with a pending handle (callable), whose non-dict
+        # shape is what tells the manager the role runs elsewhere. Mirror that via ``_actors``.
+        cap = {'direct_stream': True, 'device_type': 'GPU'}
+        return (lambda: cap) if getattr(self, '_actors', None) else cap
+
 
 class _Sampler:
 
@@ -51,6 +58,10 @@ class _Sampler:
 
     def get_state_keys(self):
         return ['q_proj.weight']
+
+    def checkpoint_transfer_capabilities(self):
+        cap = {'direct_stream': True, 'device_type': 'GPU'}
+        return (lambda: cap) if getattr(self, '_actors', None) else cap
 
     def pause_generation(self) -> None:
         self.gate.append('pause')
@@ -238,21 +249,26 @@ def test_close_checkpoint_channel_resets_both_sides_concurrently():
     assert sorted(reset_calls) == [('default', 'nccl'), ('default', 'nccl')]
 
 
-def test_mixed_deployment_shape_fails_at_initialization():
+def test_mixed_deployment_shape_resolves_standalone(monkeypatch):
+    # 58b2b979 replaced the _actors "same deployment shape" rejection with capability-based auto
+    # resolution: a non-direct endpoint forces standalone (the local role joins the collective in
+    # process), so a mixed local/actor pair is no longer an initialization error.
     model = _Model([])
     sampler = _Sampler()
     sampler._actors = [object()]
 
-    with pytest.raises(ValueError, match='same deployment shape'):
-        CheckpointEngineManager(model, sampler, platform='CPU')
+    monkeypatch.setattr(CheckpointEngineManager, 'decide_backend_engine',
+                        staticmethod(lambda platform=None, mode='standalone': type('backend', (), {'backend_name': 'nccl'})))
+    monkeypatch.setattr(CheckpointEngineManager, '_activate_checkpoint_channel', lambda self: ())
+    manager = CheckpointEngineManager(model, sampler, platform='CPU')
+    assert manager.requested_mode == 'auto'
+    assert manager.mode == 'standalone'
 
 
 @pytest.mark.parametrize(
     ('mode', 'use_actors', 'match'),
     [
-        ('naive', True, "mode='naive' requires local"),
-        ('colocate', False, "mode='colocate' requires"),
-        ('standalone', False, "mode='standalone' requires"),
+        ('naive', True, "mode='naive' requires a shared direct-stream"),
         ('unknown', False, 'Unknown checkpoint engine mode'),
     ],
 )
@@ -265,6 +281,20 @@ def test_explicit_mode_validates_deployment_shape(mode, use_actors, match):
 
     with pytest.raises(ValueError, match=match):
         CheckpointEngineManager(model, sampler, platform='CPU', mode=mode)
+
+
+@pytest.mark.parametrize('mode', ['colocate', 'standalone'])
+def test_explicit_colocate_standalone_trust_allocation(mode, monkeypatch):
+    # 58b2b979: colocate/standalone are explicit allocation choices. The capability contract no
+    # longer rejects them for local objects -- a local role participates in the collective in
+    # process -- so the manager trusts the requested mode instead of gating on _actors.
+    model = _Model([])
+    sampler = _Sampler()
+    monkeypatch.setattr(CheckpointEngineManager, 'decide_backend_engine',
+                        staticmethod(lambda platform=None, mode='standalone': type('backend', (), {'backend_name': 'nccl'})))
+    monkeypatch.setattr(CheckpointEngineManager, '_activate_checkpoint_channel', lambda self: ())
+    manager = CheckpointEngineManager(model, sampler, platform='CPU', mode=mode)
+    assert manager.mode == mode
 
 
 def test_backend_selection_uses_resolved_mode():
@@ -441,6 +471,10 @@ def test_colocate_mode_configures_actor_backends(monkeypatch):
 
     class _ActorRole:
         _actors = [object()]
+
+        def checkpoint_transfer_capabilities(self):
+            cap = {'direct_stream': True, 'device_type': 'GPU'}
+            return lambda: cap
 
         def activate_checkpoint_engine(self, backend, channel, auth_key=None):
             # This is how the manager tells each actor which engine its channel runs on; the model side

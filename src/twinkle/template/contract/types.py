@@ -1,24 +1,67 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
+
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Dict, List, NewType, Optional, Tuple
-
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from typing_extensions import Required, TypedDict
 
-Message = Dict[str, Any]
-Tool = Dict[str, Any]
+from twinkle.data_format import Message, Tool, Trajectory
+EngineBackend = Literal['vllm', 'sglang', 'lmdeploy', 'transformers']
 
 
-class ConversationSample(TypedDict, total=False):
+class MaxLengthError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class EncodeIntent:
+    add_generation_prompt: bool
+    with_labels: bool
+    expand_media: bool
+
+    def __post_init__(self):
+        if self.with_labels and self.add_generation_prompt:
+            raise ValueError(
+                'EncodeIntent(with_labels=True, add_generation_prompt=True) is contradictory: an open '
+                'generation prompt has no response to supervise.')
+        if not self.expand_media and self.with_labels:
+            raise ValueError(
+                'EncodeIntent(expand_media=False, with_labels=True) is contradictory: labels are aligned '
+                'with the expanded sequence the model forward consumes.')
+
+    def render_mode(self, engine: EngineBackend = 'vllm') -> str:
+        check_backend(engine)
+        return 'train' if self.with_labels else 'transformers' if self.expand_media else engine
+
+
+TRAIN = EncodeIntent(False, True, True)
+INFER = EncodeIntent(True, False, True)
+ENGINE = EncodeIntent(True, False, False)
+SCORE = EncodeIntent(False, False, True)
+
+
+def check_backend(backend):
+    if backend not in ('vllm', 'sglang', 'lmdeploy', 'transformers'):
+        raise ValueError(f'Unsupported engine backend: {backend!r}')
+
+
+def resolve_intent(intent, add_generation_prompt):
+    if add_generation_prompt is not None and not isinstance(add_generation_prompt, bool):
+        raise TypeError('add_generation_prompt must be a bool or None')
+    if intent is None:
+        return INFER if add_generation_prompt else TRAIN
+    if not isinstance(intent, EncodeIntent):
+        raise TypeError('intent must be an EncodeIntent')
+    if add_generation_prompt is not None and add_generation_prompt != intent.add_generation_prompt:
+        raise ValueError(f'add_generation_prompt={add_generation_prompt} contradicts {intent}.')
+    return intent
+
+
+class ConversationSample(Trajectory, total=False):
     messages: Required[List[Message]]
     system: Optional[str]
-    tools: List[Tool]
     label: bool
-    channel: str
-    images: List[Any]
-    videos: List[Any]
-    audios: List[Any]
     objects: Dict[str, Any]
     chat_template_kwargs: Dict[str, Any]
     extra_kwargs: Dict[str, Any]
@@ -36,44 +79,12 @@ class PreferenceSample:
 class KTOSample:
     conversation: ConversationSample
     label: bool
-    #: The optional rejected counterpart (``rejected_response`` column): the KTO recipe's KL-batch
-    #: rotation pairs each prompt with an unrelated completion and encodes both sides in one pass;
-    #: rows without a rejected side leave this None and encode the conversation only.
+    #: Optional KTO KL counterpart; without it, encode only the conversation.
     rejected: Optional[ConversationSample] = None
 
 
-InputOrderLabels = NewType("InputOrderLabels", List[int])
-OutputOrderLabels = NewType("OutputOrderLabels", List[int])
-InputOrderLossScale = NewType("InputOrderLossScale", List[float])
-OutputOrderLossScale = NewType("OutputOrderLossScale", List[float])
-InputOrderCompletionMask = NewType("InputOrderCompletionMask", List[int])
-OutputOrderCompletionMask = NewType("OutputOrderCompletionMask", List[int])
-
-
-class InputOrderRow(TypedDict, total=False):
-    input_ids: Required[List[int]]
-    labels: InputOrderLabels
-    loss_scale: InputOrderLossScale
-    completion_mask: InputOrderCompletionMask
-
-
-class EncodedRow(TypedDict, total=False):
-    input_ids: Required[List[int]]
-    labels: OutputOrderLabels
-    loss_scale: OutputOrderLossScale
-    completion_mask: OutputOrderCompletionMask
-
-
-class PreparedRow(EncodedRow, total=False):
-    position_ids: Required[Any]
-    attention_mask: Any
-
-
-@dataclass(frozen=True)
-class PreferencePair:
-    chosen: EncodedRow
-    rejected: Optional[EncodedRow]
-    margin: Optional[float] = None
+#: One row before (``InputOrderRow``) and after (``EncodedRow``) the labels shift; both are trajectories.
+InputOrderRow = EncodedRow = Trajectory
 
 
 @dataclass(frozen=True)
@@ -84,7 +95,7 @@ class MediaBundle:
 
     @classmethod
     def from_sources(cls, *sources):
-        values = {"images": (), "videos": (), "audios": ()}
+        values = {'images': (), 'videos': (), 'audios': ()}
         for source in sources:
             if source is None:
                 continue
@@ -94,7 +105,7 @@ class MediaBundle:
                 value = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
                 present = value is not None and (not isinstance(value, (list, tuple)) or bool(value))
                 if not present and isinstance(source, dict):
-                    value = cls._from_messages(source.get("messages") or (), key)
+                    value = cls._from_messages(source.get('messages') or (), key)
                     present = bool(value)
                 if present:
                     values[key] = tuple(value if isinstance(value, (list, tuple)) else [value])
@@ -105,47 +116,28 @@ class MediaBundle:
         media_type = key[:-1]
         result = []
         for message in messages:
-            message_media = message.get(key) or ()
-            result.extend(message_media if isinstance(message_media, (list, tuple)) else [message_media])
-            content = message.get("content")
+            message_media = message.get(key)
+            if message_media is not None:
+                result.extend(message_media if isinstance(message_media, (list, tuple)) else [message_media])
+            content = message.get('content')
             if not isinstance(content, list):
                 continue
             for item in content:
-                if not isinstance(item, dict) or item.get("type") not in {media_type, f"{media_type}_url"}:
+                if not isinstance(item, dict) or item.get('type') not in {media_type, f'{media_type}_url'}:
                     continue
-                value = item.get(item["type"]) or item.get(media_type)
-                if isinstance(value, dict):
-                    value = value.get("url")
+                value = item.get(item['type'])
+                if value is None:
+                    value = item.get(media_type)
+                if value is None:
+                    value = item.get('url') or item.get('path')
+                if isinstance(value, dict) and value.get('url') is not None:
+                    value = value['url']
                 if value is not None:
                     result.append(value)
         return result
 
-    def __bool__(self) -> bool:
+    def __bool__(self):
         return bool(self.images or self.videos or self.audios)
-
-
-@dataclass(frozen=True)
-class RolloutState:
-    feature: EncodedRow
-    engine_input_ids: Tuple[int, ...]
-    messages: Tuple[Message, ...]
-    tools: Tuple[Tool, ...]
-    reasoning_started: bool
-    media: MediaBundle
-    render_cache: Optional[Any] = None
-    mm_processor_kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
-
-    def __reduce__(self):
-        return (
-            type(self),
-            (self.feature, self.engine_input_ids, self.messages, self.tools, self.reasoning_started, self.media, None,
-             self.mm_processor_kwargs),
-        )
-
-
-@dataclass(frozen=True)
-class PromptEncoding:
-    state: RolloutState
 
 
 @dataclass(frozen=True)
@@ -166,12 +158,6 @@ class DecodedResponse:
     errors: Tuple[str, ...] = ()
     reasoning_content: Optional[str] = None
     reasoning_started: Optional[bool] = None
-
-
-@dataclass(frozen=True)
-class CompletionEncoding:
-    state: RolloutState
-    response: DecodedResponse
 
 
 @dataclass(frozen=True)

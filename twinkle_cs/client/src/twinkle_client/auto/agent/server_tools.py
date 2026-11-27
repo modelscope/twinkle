@@ -269,7 +269,7 @@ class _ServerTools:
                     log_path,
                     'hint':
                     'Check required packages (from the Twinkle repository root: '
-                    'pip install -e ".[rl]" -e ./twinkle_cs/client -e ./twinkle_cs/server; '
+                    'pip install -e . -e ./twinkle_cs/client -e ./twinkle_cs/server; '
                     'add the megatron extra for the Megatron backend).',
                 }
             try:

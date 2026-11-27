@@ -13,6 +13,10 @@ from twinkle.checkpoint_engine.delta import DeltaSyncConfig
 def manager_pair():
     model = Mock(_actors=[1, 2], device_mesh=SimpleNamespace(world_size=2))
     sampler = Mock(_actors=[3], device_mesh=SimpleNamespace(data_world_size=1))
+    # Capability contract (58b2b979): actor handlers answer with a pending handle (callable), whose
+    # non-dict shape resolves auto -> standalone. device_type drives the transport platform.
+    model.checkpoint_transfer_capabilities.return_value = lambda: {'direct_stream': True, 'device_type': 'GPU'}
+    sampler.checkpoint_transfer_capabilities.return_value = lambda: {'direct_stream': True, 'device_type': 'GPU'}
     model.prepare_delta_sync.return_value = dict(device='cuda', master_metadata=object())
     sampler.validate_delta_sampler.return_value = dict(device='cuda', tp=2)
     sampler.delta_sampler_metadata.return_value = [
@@ -65,8 +69,12 @@ def test_delta_timeout_restores_existing_proxy_value(driver_proxy_manager, previ
 
 
 def test_delta_rejects_local_deployment():
+    # Local objects declare a plain direct-stream dict -> auto resolves naive; delta_sharded still
+    # requires standalone, so the rejection fires (capability contract, 58b2b979).
+    local = lambda: SimpleNamespace(
+        checkpoint_transfer_capabilities=lambda: {'direct_stream': True, 'device_type': 'GPU'})
     with pytest.raises(ValueError, match='standalone'):
-        CheckpointEngineManager(SimpleNamespace(), SimpleNamespace(), sync_backend='delta_sharded')
+        CheckpointEngineManager(local(), local(), sync_backend='delta_sharded')
 
 
 def test_seed_then_sparse_reuses_transport():
@@ -199,6 +207,8 @@ def test_manager_begin_pauses_before_receivers_or_sender_run():
     events = []
     model = Mock(_actors=[1])
     sampler = Mock(_actors=[2])
+    model.checkpoint_transfer_capabilities.return_value = lambda: {'direct_stream': True, 'device_type': 'GPU'}
+    sampler.checkpoint_transfer_capabilities.return_value = lambda: {'direct_stream': True, 'device_type': 'GPU'}
     model.prepare_delta_sync.return_value = dict(device='cuda')
     sampler.validate_delta_sampler.return_value = {'tp': 2}
     sampler.delta_sampler_metadata.return_value = [

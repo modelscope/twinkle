@@ -19,7 +19,7 @@ DeepSpeed / mcore dist_checkpointing, all path APIs) uses unchanged:
   rotation) and defers an async save's seal to a join on the training loop.
 
 Remote filesystems go through fsspec: ``ossfs`` for ``oss://`` (install
-``twinkle[oss]``), ``s3fs`` for ``s3://`` (install ``twinkle[s3]``). Both
+``ossfs``), ``s3fs`` for ``s3://`` (install ``s3fs``). Both
 are imported lazily on first use, so this module never disturbs the base
 import chain. Credentials come from the environment variables the
 filesystems themselves read; they are never logged.
@@ -304,8 +304,9 @@ class _FsspecStorage(Storage):
         except ImportError as e:
             raise ImportError(
                 f'{self.scheme} paths need the {self.package} filesystem; '
-                f'install it (e.g. `pip install twinkle[{self.scheme[:-3]}]`) '
-                'and retry.') from e
+                f'install it (e.g. `pip install {self.package}`) '
+                'and retry.'
+            ) from e
 
     def _fs_path(self, path: str) -> str:
         return path[len(self.scheme):]

@@ -129,6 +129,10 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
         processor_id = body.processor_id
         function_name = body.function
         _kwargs = dict(body.call_kwargs)
+        if function_name == 'set_template' and _kwargs.get('template_spec') is not None:
+            name = _kwargs.get('template_func', _kwargs.get('template_cls'))
+            if not isinstance(name, str) or not name.isidentifier():
+                raise RequestRejectedError('HTTP TemplateSpec setup requires a registered template class name')
         processor_id = processor_id[4:]
         self.assert_resource_exists(processor_id)
         processor = self.resource_dict.get(processor_id)
@@ -152,6 +156,13 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
         def _do_call():
             try:
                 result = function(**resolved_kwargs)
+                # The HTTP wire carries plain values only: a component method may hand back
+                # remote handles (ObjectRef / LazyCollect) nested anywhere in its result (e.g. a
+                # DataLoader batch whose rows are lazy dataset fetches). Materialise them here,
+                # at the serialization boundary, with the same deep resolution the ray argument
+                # path uses -- a handle can never cross HTTP.
+                from twinkle.infra._ray import RayHelper
+                (result,), _ = RayHelper.do_get_and_collect([result], {})
                 return False, result
             except StopIteration:
                 return True, None

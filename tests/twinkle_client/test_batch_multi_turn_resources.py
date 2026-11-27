@@ -2,6 +2,7 @@
 """Run the three Blackjack entry points without model weights or external services."""
 
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -26,12 +27,22 @@ from twinkle_client.manager import TwinkleClient
 
 
 class OfflineTemplate(FakeTemplate):
-
-    def render_delta(self, _messages, _observations, **_):
-        return self.tokenizer.encode('\n')
+    """Token-only wire contract (75e969ab/012aff34): the server receives only ``input_ids``,
+    so the tool bridge must carry the real observation text (inherited ``Template.render_delta``
+    over the char-level FakeTokenizer) and the client rebuilds the extended feature through
+    ``append_completion`` / ``decode`` instead of a server-returned ``new_input_feature``."""
 
     def finalize_appended_features(self, rows):
         return [shift(row) for row in rows]
+
+    def decode(self, tokens, **kwargs):
+        return self.tokenizer.decode(list(tokens), **kwargs)
+
+    def append_completion(self, prompt, tokens, **kwargs):
+        feature = append_ids(prompt, list(tokens), self, trainable=True)
+        feature['messages'] = list(prompt.get('messages') or []) + [
+            {'role': 'assistant', 'content': self.decode(tokens)}]
+        return feature
 
     def parse_tool_call(self, text):
         if text not in ('hit', 'stand'):
@@ -128,21 +139,31 @@ def test_blackjack_cookbooks_offline(entry, outcome, monkeypatch, request):
         ClientContext(base_url='http://offline-test', api_key='offline-test-key'), session=session))
 
     def sample(inputs, params, *, adapter_uri, **kwargs):
-        feature, = inputs
-        episode = feature['episode_id']
-        observations = [m['content'] for m in feature['messages'] if m['role'] == 'tool']
+        # Token-only contract: the wire entry carries just the encoded prompt ids. The scripted
+        # server recovers the tool observations by decoding the prompt (a real engine sees the
+        # same text), and alternates hit/stand per member of the same opening deal: members of
+        # one group share the identical opening prompt, so the n-th first-turn call for an
+        # opening is that group's n-th member (the old per-episode index parity).
+        (entry,) = inputs
+        assert kwargs.get('token_only') is True
+        prompt_ids = list(entry['input_ids'])
+        text = tokenizer.decode(prompt_ids)
+        observations = re.findall(r'<\|im_start\|>tool\n(.*?)<\|im_end\|>', text, flags=re.S)
+        index = 0
         with lock:
-            index = opening_ids.setdefault(episode, len(opening_ids))
+            if not observations:
+                key = tuple(prompt_ids)
+                index = opening_ids.get(key, 0)
+                opening_ids[key] = index + 1
             requests.append(adapter_uri)
         if outcome == 'zero-updates' or observations and observations[-1].endswith('Game over: True.'):
             decoded = 'finished'
         else:
             decoded = 'hit' if not observations and index % 2 else 'stand'
         ids = tokenizer.encode(decoded)
-        extended = append_ids(feature, ids, template, trainable=True)
-        return [SampleResponse(sequences=[SampledSequence(
+        return [SampleResponse(prompt_token_ids=prompt_ids, sequences=[SampledSequence(
             tokens=ids, logprobs=[[(token, -0.25)] for token in ids], stop_reason='stop',
-            decoded=decoded, new_input_feature=extended,
+            decoded=decoded,
         )])]
 
     sampler = SimpleNamespace(sample=sample, set_template=lambda *args, **kwargs: None)

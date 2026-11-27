@@ -50,6 +50,10 @@ def wrapper():
     model = VisionLanguageModel()
     wrapper = object.__new__(TransformersModel)
     torch.nn.Module.__init__(wrapper)
+    # fe9174f3: forward() reads mixed_precision via _compute_precision_autocast; __init__
+    # defaults it, a __new__ shell must carry it. 'no' keeps the fp32 no-autocast behavior
+    # these hook tests had before the autocast lane existed.
+    wrapper.mixed_precision = 'no'
     wrapper.model = model
     wrapper.active_group = 'b'
     wrapper.device_mesh = None

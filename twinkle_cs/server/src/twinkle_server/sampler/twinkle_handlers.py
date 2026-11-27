@@ -24,9 +24,10 @@ if TYPE_CHECKING:
 import numpy as np
 
 import twinkle.protocol.types as types
-from twinkle.data_format import PoolingParams, SamplingParams
+from twinkle.data_format import PoolingParams, SamplingParams, last_assistant_text
 from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTENCY_SUPPORTED
-from twinkle.protocol.json_utils import json_safe
+from twinkle.data_format.sampling import sampled_token_logprobs
+from twinkle.protocol.json_utils import json_safe, wire_trajectory
 from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
 from twinkle_server.checkpoint import create_checkpoint_manager
@@ -89,13 +90,15 @@ def _json_safe_value(value):
 
 
 def _serialize_input_feature(feature: dict) -> dict:
-    """Convert an InputFeature into a JSON-safe dict for the HTTP response."""
-    safe = _json_safe_value(feature)
-    return safe if isinstance(safe, dict) else {}
+    """A returned trajectory without the media and ``user_data`` the request already carries: the
+    client restores them from its own copy, so the heavy payload never travels back."""
+    return _json_safe_value(
+        json_safe({key: value for key, value in feature.items() if key not in ('images', 'videos', 'audios', 'user_data')})
+    )
 
 
 def _build_rollout_rows_and_tags(
-    sample_models: list[types.SampleResponseModel],
+    sample_models: list,
     *,
     group_ids: list[str] | None,
     policy_version: int | None,
@@ -110,15 +113,15 @@ def _build_rollout_rows_and_tags(
     tags = []
     for prompt_index, (response, group_id) in enumerate(zip(sample_models, resolved_group_ids)):
         for generation_idx, sequence in enumerate(response.sequences):
-            sampled_logprobs = [
-                0.0 if not position else float(position[0][1]) for position in (sequence.logprobs or [])
-            ]
+            sampled_logprobs = sampled_token_logprobs(sequence.tokens, sequence.logprobs)
             rows.append({
                 'train_input': sequence.new_input_feature,
                 'sampled_logprobs': sampled_logprobs,
                 'tokens': sequence.tokens,
                 'decoded': sequence.decoded,
                 'stop_reason': sequence.stop_reason,
+                'routed_experts': json_safe(sequence.routed_experts),
+                'sampling_masks': json_safe(sequence.sampling_masks),
                 'prompt_logprobs': response.prompt_logprobs,
                 'topk_prompt_logprobs': response.topk_prompt_logprobs,
             })
@@ -134,7 +137,7 @@ def _build_rollout_rows_and_tags(
     return rows, tags
 
 
-def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
+def _to_sample_response_models(responses) -> List[types.SampleResponseModel]:
     """Convert internal sampler responses to the HTTP response schema."""
     sample_models = []
     for response in responses:
@@ -144,9 +147,14 @@ def _to_sample_response_models(responses) -> list[types.SampleResponseModel]:
                 tokens=list(sequence.tokens),
                 logprobs=list(sequence.logprobs) if sequence.logprobs is not None else None,
                 decoded=sequence.decoded,
-                text=sequence.new_state.messages[-1].get('content') if sequence.new_state is not None else None,
-                new_input_feature=(_serialize_input_feature(sequence.new_input_feature)
-                                   if sequence.new_input_feature is not None else None),
+                text=last_assistant_text(sequence.new_input_feature)
+                if sequence.new_input_feature is not None
+                else None,
+                new_input_feature=(
+                    _serialize_input_feature(sequence.new_input_feature)
+                    if sequence.new_input_feature is not None
+                    else None
+                ),
                 routed_experts=json_safe(sequence.routed_experts),
                 sampling_masks=({'token_ids': json_safe(sequence.sampling_masks.token_ids),
                                  'offsets': json_safe(sequence.sampling_masks.offsets)}
@@ -337,7 +345,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
             responses = await sample_with_weights(
                 self, resolved_uri, generate, full_checkpoint=None if body.adapter_uri else False)
-            return types.SampleResponseModelList(samples=_to_sample_response_models(responses)).model_dump()
+            return types.SampleResponseModelList(
+                samples=_to_sample_response_models(responses)
+            ).model_dump()
 
         # Calculate metrics for queue scheduling. The body is wire-validated, so the
         # entries are models and ``input_ids`` is absent or a list of ints.
@@ -418,12 +428,12 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
             responses = await sample_with_weights(self, adapter_path, generate)
             rows, tags = _build_rollout_rows_and_tags(
-                _to_sample_response_models(responses),
+                responses,
                 group_ids=body.group_ids,
                 policy_version=body.policy_version,
                 adapter_uri=body.adapter_uri,
             )
-            ref = await self.data_plane.put([json_safe(item) for item in rows], kind='rollout', tags=tags)
+            ref = await self.data_plane.put(wire_trajectory(rows), kind='rollout', tags=tags)
             return ref.model_dump()
 
         return await self.submit_concurrent_and_peek(
@@ -490,14 +500,18 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     ) -> sampler_types.SamplerSetTemplateResponse:
         """Set the chat template for encoding Trajectory inputs.
 
-        A deployment that pinned its template at construction (``SamplerArgs.template``) ignores this
-        call: the pinned template was chosen deliberately and the gateway's name-based fallback must
-        not clobber it. The response is still success, so a caller that sets templates lazily is
-        unaffected either way.
+        Reapplying a pinned configuration is idempotent; conflicting configurations are rejected.
         """
         if self._template_pinned:
-            logger.debug('set_template ignored: this sampler was configured with a pinned template.')
-            return sampler_types.SamplerSetTemplateResponse()
+            pinned = dict(json_safe(self._startup_template))
+            template_cls = pinned.pop('template_cls')
+            if 'template_spec' not in pinned:
+                pinned.setdefault('model_id', self.model_id)
+            requested = dict(body.init_kwargs)
+            if body.template_cls == template_cls and not body.adapter_name and all(
+                    key in pinned and pinned[key] == value for key, value in requested.items()):
+                return sampler_types.SamplerSetTemplateResponse()
+            raise RequestRejectedError('sampler template is pinned; a different template configuration cannot be applied')
         # Multi-tenant safety: this sampler replica is shared, and set_template mutates a single
         # self.template (it is not keyed per adapter), so one client's call would otherwise change the
         # encoding every other client sees. The guard above is what makes this safe: a deployment pins

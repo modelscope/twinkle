@@ -80,12 +80,17 @@ def test_backend_is_read_from_the_deployment_not_guessed():
 
 
 def test_megatron_rejects_the_split_gradient_endpoints_with_501():
-    for capability in (BackendCapability.Forward, BackendCapability.Backward, BackendCapability.CalculateLoss):
+    for capability in (BackendCapability.Forward, BackendCapability.Backward):
         with pytest.raises(EndpointUnavailableError) as raised:
             assert_request_supported(
                 _Deployment('megatron'), model_types.AdapterRequest(adapter_name='a', training_id='training-a'), capability=capability)
         assert raised.value.error_code == 501
         assert 'forward_backward' in str(raised.value), 'the alternative endpoints must be named'
+    # f660300f: calculate_loss is deliberately NOT unsupported on megatron — it reports the
+    # loss the fused forward already recorded, so the wire accepts what the method face accepts.
+    assert_request_supported(
+        _Deployment('megatron'), model_types.AdapterRequest(adapter_name='a', training_id='training-a'),
+        capability=BackendCapability.CalculateLoss)
 
 
 def test_transformers_serves_the_split_gradient_endpoints():

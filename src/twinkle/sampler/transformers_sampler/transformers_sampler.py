@@ -25,9 +25,7 @@ workers. Nothing is loaded and nothing is synced, because there is only ever one
 """
 
 from __future__ import annotations
-import asyncio
 import atexit
-import threading
 from copy import copy
 from typing import Any, Optional, Union
 
@@ -38,7 +36,7 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.perf import timed
 from twinkle.sampler import generation
 from twinkle.sampler.base import Sampler
-from twinkle.template.contract import RolloutState
+from twinkle.data_format import copy_trajectory
 
 logger = get_logger()
 
@@ -47,10 +45,6 @@ logger = get_logger()
 class TransformersSampler(Sampler):
     """Sample with ``AutoModelForCausalLM.generate()``."""
 
-    # Declared so a rollout hands this sampler its RolloutState instead of a bare encoded feature:
-    # a multimodal row's pixel tensors can only be carried by the state (encode_all rejects a media
-    # feature without one), and the token account is the same object either way.
-    accepts_rollout_state = True
 
     def __init__(
         self,
@@ -102,13 +96,8 @@ class TransformersSampler(Sampler):
         self.max_batch_size = engine_kwargs.pop("max_batch_size", 8)
 
         # Mirror the other samplers: a private loop on a background thread, so the public methods stay
-        # synchronous and blocking even when the caller already runs inside an event loop (Ray workers
-        # run uvloop, which forbids asyncio.run).
-        self._async_loop = asyncio.new_event_loop()
-        self._async_thread = threading.Thread(
-            target=self._run_event_loop, daemon=True, name="TransformersSampler-EventLoop"
-        )
-        self._async_thread.start()
+        # synchronous and blocking even when the caller already runs inside an event loop.
+        self._start_async_loop()
 
         if model is not None:
             # Nothing to build: generation happens in the model's workers.
@@ -122,38 +111,6 @@ class TransformersSampler(Sampler):
 
         self._shutdown_called = False
         atexit.register(self.shutdown)
-
-    def _run_event_loop(self):
-        asyncio.set_event_loop(self._async_loop)
-        self._async_loop.run_forever()
-
-    def _run_in_loop(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self._async_loop).result()
-
-    def _iter_in_loop(self, async_gen):
-        """Drain an async generator running on the background loop into a plain iterator."""
-        import queue as stdlib_queue
-
-        q: stdlib_queue.Queue = stdlib_queue.Queue()
-        sentinel = object()
-
-        async def _drain():
-            try:
-                async for item in async_gen:
-                    q.put(item)
-            except Exception as exc:
-                q.put(exc)
-            finally:
-                q.put(sentinel)
-
-        asyncio.run_coroutine_threadsafe(_drain(), self._async_loop)
-        while True:
-            item = q.get()
-            if item is sentinel:
-                break
-            if isinstance(item, Exception):
-                raise item
-            yield item
 
     def apply_patch(self, patch_cls: Patch | type[Patch] | str, **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
@@ -236,28 +193,17 @@ class TransformersSampler(Sampler):
                     strict=strict,
                 )
             params = self._coerce_params(sampling_params)
-            inputs_list = [inputs] if isinstance(inputs, RolloutState) else self._normalize_inputs(inputs)
+            inputs_list = self._normalize_inputs(inputs)
             if not inputs_list:
                 return []
-            if adapter_paths is not None:
-                if adapter_path is not None:
-                    raise ValueError(
-                        "Pass either adapter_path (one adapter for the whole call) or adapter_paths "
-                        "(one per input), not both."
-                    )
-                if len(adapter_paths) != len(inputs_list):
-                    raise ValueError(
-                        f"adapter_paths has {len(adapter_paths)} entries but there are "
-                        f"{len(inputs_list)} inputs; they must correspond one-to-one so that "
-                        "request routing keeps them aligned."
-                    )
+            generation.check_adapter_arguments(adapter_paths, adapter_path, len(inputs_list))
 
             logprobs_only = params.max_tokens == 0
             if logprobs_only:
                 params = copy(params)
                 params.max_tokens = 1
 
-            encoded, states, failures = generation.encode_all(
+            encoded, failures = generation.encode_all(
                 self.template, inputs_list, logprobs_only=logprobs_only, strict=strict
             )
 
@@ -271,23 +217,11 @@ class TransformersSampler(Sampler):
                 adapter_uri = self._resolve_adapter(path, adapter_name, use_base_model)
                 for chunk in generation.chunks(indices, self.max_batch_size):
                     for index, response in zip(
-                        chunk, self._run_chunk(chunk, encoded, states, params, adapter_uri, strict), strict=False
+                        chunk, self._run_chunk(chunk, encoded, params, adapter_uri, strict), strict=False
                     ):  # noqa: E501
                         results[index] = response
 
-            if not logprobs_only:
-                generation.attach_features(self.template, results, encoded, states)
-            else:
-                # "Score, do not generate": the one token generated to carry the prompt
-                # logprobs is discarded, matching the vLLM backend's contract (tokens=[],
-                # no step logprobs); the prompt_logprobs ride on the response itself.
-                for response in results:
-                    if response is None:
-                        continue
-                    for seq in response.sequences:
-                        seq.tokens = []
-                        seq.logprobs = None
-                        seq.decoded = None
+            generation.attach_features(self.template, results, encoded, logprobs_only=logprobs_only)
             return [r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)]
 
     def sample_stream(
@@ -306,20 +240,17 @@ class TransformersSampler(Sampler):
                 )
                 return
             params = self._coerce_params(sampling_params)
-            state = inputs if isinstance(inputs, RolloutState) else None
-            if state is not None:
-                feat = state.feature
-            elif self._not_encoded(inputs):
+            feat = copy_trajectory(inputs)
+            if self._not_encoded(feat):
                 if self.template is None:
-                    raise ValueError(f"Template not set for adapter '{adapter_name}'. Pass template= to the sampler.")
-                state = self.template.encode_prompt(inputs, backend="transformers").state
-                feat = state.feature
-            else:
-                feat = inputs
+                    raise ValueError('Template not set; pass template= to the sampler')
+                feat = self.template.encode_prompt(feat, backend='transformers')
             adapter_uri = self._resolve_adapter(adapter_path, adapter_name, use_base_model=False)
-            prompt = generation.prompt_ids(feat, state)
+            prompt = generation.prompt_ids(feat)
+            extra = generation.collate_extra_model_inputs([0], {0: feat}, self.template)
             yield from self._iter_in_loop(
-                self.engine.generate_stream(prompt=prompt, sampling_params=params, lora_request=adapter_uri)
+                self.engine.generate_stream(prompt=prompt, sampling_params=params, lora_request=adapter_uri,
+                                            extra_model_inputs=extra, use_base_model=adapter_uri is None)
             )
 
     # ------------------------------------------------------------------ engine passthrough
@@ -395,7 +326,6 @@ class TransformersSampler(Sampler):
         self,
         chunk: list[int],
         encoded: dict[int, dict[str, Any]],
-        states,
         params: SamplingParams,
         adapter_uri: str | None,
         strict: bool,
@@ -413,7 +343,8 @@ class TransformersSampler(Sampler):
                     topk_prompt_logprobs=params.prompt_logprobs or 0,
                     adapter_uri=adapter_uri,
                     extra_model_inputs=extra or None,
+                    use_base_model=adapter_uri is None,
                 )
             )
 
-        return generation.run_chunk(chunk, encoded, states, call_batch, strict=strict)
+        return generation.run_chunk(chunk, encoded, call_batch, template=self.template, strict=strict)

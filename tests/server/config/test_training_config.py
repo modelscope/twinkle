@@ -100,7 +100,13 @@ def test_catalog_defaults_and_mode_selection():
         catalog.get('not-in-catalog', 'lora')
 
 
-def test_existing_yaml_uses_explicit_instance_limits_and_business_idle():
+@pytest.fixture
+def deployment_endpoints(monkeypatch):
+    monkeypatch.setenv('TWINKLE_REDIS_URL', 'redis://127.0.0.1:6380/0')
+    monkeypatch.setenv('TWINKLE_OTLP_ENDPOINT', 'http://127.0.0.1:4317')
+
+
+def test_existing_yaml_uses_explicit_instance_limits_and_business_idle(deployment_endpoints):
     from pathlib import Path
     paths = sorted(Path('cookbook/client/server').glob('**/server_config*.yaml'))
     assert paths
@@ -178,7 +184,7 @@ def test_training_namespace_conflicts_are_rejected():
         ServerConfig(training={'models': [model_config()]})
 
 
-def test_existing_yaml_examples_keep_their_model_entries(monkeypatch):
+def test_existing_yaml_examples_keep_their_model_entries(monkeypatch, deployment_endpoints):
     from pathlib import Path
     monkeypatch.setenv('TWINKLE_LOCAL_MODEL_PATH', '/tmp/model-cache')
     paths = list(Path('cookbook/client/server').rglob('server_config*.yaml'))
@@ -194,6 +200,7 @@ def test_existing_yaml_examples_keep_their_model_entries(monkeypatch):
             assert model.model_id == original.args.model_id
             assert model.route_prefix == original.route_prefix
             assert model.config.min_replicas == original.args.min_replicas
+            assert model.config.node_selector == original.args.node_selector
         assert ServerConfig.model_validate(config.to_yaml_dict()).training_config == config.training_config
 
 

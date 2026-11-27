@@ -54,7 +54,14 @@ def tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) -> Dict[
 
         first_value = values[0]
 
-        if isinstance(first_value, list):
+        if isinstance(first_value, (list, torch.Tensor)):
+            # A per-worker value may be a tensor OR a per-micro-batch LIST of tensors (variable-seq
+            # returns, e.g. the megatron R2 RECORD routing / logps): assemble_recorded_routing stacks
+            # a rank's micro-batches when they share a shape and keeps a list otherwise, so the value
+            # KIND is rank-dependent. Flatten both domains into one tensor list before pad_and_stack
+            # (the old tensor-only branch raised 'list object has no attribute ndim' the moment one
+            # rank stacked and another listed). Row order -- data-rank order, then micro-batch order
+            # -- is preserved, which is the per-row consumer contract (RoutingReplay stitching).
             merged = []
             for v in values:
                 if isinstance(v, list):
@@ -64,9 +71,6 @@ def tensor_dict(outputs: List[Dict[str, Any]], device_mesh: DeviceMesh) -> Dict[
             if merged and isinstance(merged[0], torch.Tensor):
                 merged = pad_and_stack_tensors(merged)
             result[key] = merged
-
-        elif isinstance(first_value, torch.Tensor):
-            result[key] = pad_and_stack_tensors(values)
 
         elif isinstance(first_value, dict):
             result[key] = tensor_dict(values, device_mesh)

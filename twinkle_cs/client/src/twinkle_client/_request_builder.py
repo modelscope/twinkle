@@ -21,6 +21,7 @@ wrong callable -- a silently wrong result rather than an error.
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import asdict, is_dataclass
 from pydantic import BaseModel
 from typing import Any, Mapping
@@ -49,10 +50,8 @@ def to_wire_value(value: Any) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [to_wire_value(item) for item in value]
 
-    from peft import LoraConfig
-
     from twinkle.protocol.serialize import is_dataset_meta, serialize_object
-    if isinstance(value, LoraConfig) or is_dataset_meta(value):
+    if isinstance(value, getattr(sys.modules.get('peft'), 'LoraConfig', ())) or is_dataset_meta(value):
         return serialize_object(value)
     if is_dataclass(value) and not isinstance(value, type):
         return to_wire_value(asdict(value))

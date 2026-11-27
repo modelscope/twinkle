@@ -17,7 +17,7 @@ matching :mod:`twinkle.protocol.types.processor`.
 """
 from __future__ import annotations
 
-from pydantic import Field, JsonValue, StrictInt, model_validator
+from pydantic import Field, JsonValue, StrictInt, field_validator, model_validator
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from .base import ResponseModel, StrictRequest, passthrough
@@ -43,7 +43,8 @@ class SampleRequest(StrictRequest):
     require_deployed_adapter: bool | None = Field(
         None, description='Require adapter_name to be deployed on this sampler')
     token_only: bool = Field(
-        False, description='Return sampled tokens/logprobs only; encoded inputs are engine ids, media alongside')
+        False, description='Return sampled tokens/logprobs only; encoded inputs are engine ids, media alongside'
+    )
 
     @model_validator(mode='after')
     def _validate_adapter_selection(self) -> SampleRequest:
@@ -75,7 +76,7 @@ class SampledSequenceModel(ResponseModel):
     decoded: str | None = Field(None, description='Decoded text of the sampled sequence')
     text: str | None = Field(None, description='Assistant content parsed by the serving template')
     new_input_feature: dict[str, Any] | None = Field(
-        None, description='Updated InputFeature after sampling (input_ids, labels, etc.)')
+        None, description='Complete trajectory after sampling; request media and user_data may be omitted on the wire')
     routed_experts: Ints3 | None = Field(None, description='Expert routing exported by token-only sampling')
     sampling_masks: SamplingMaskModel | None = Field(None, description='Support sets for sampled tokens')
 
@@ -114,6 +115,14 @@ class SamplerSetTemplateRequest(StrictRequest):
     template_cls: str = Field(..., description="Template class name (e.g. 'Template')")
     adapter_name: str = Field('', description='Adapter name to associate the template with')
     init_kwargs: dict[str, JsonValue] = passthrough()
+
+
+    @field_validator('template_cls')
+    @classmethod
+    def registered_template_name(cls, value):
+        if not value.isidentifier():
+            raise ValueError('HTTP template setup requires a registered class name, not a source path')
+        return value
 
 
 class SamplerSetTemplateResponse(ResponseModel):

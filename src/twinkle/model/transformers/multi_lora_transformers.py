@@ -126,6 +126,14 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
             with self.strategy.pretrained_load_context():
                 self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
+        # ``from_pretrained``/``from_config`` may deepcopy the supplied config before applying runtime
+        # overrides such as ``attn_implementation``. Keep Twinkle's config reference aligned with the
+        # config the model actually uses -- the SAME sync the single-tenant TransformersModel does. This
+        # fork overrides ``__init__`` wholesale and previously omitted it, so ``self.hf_config`` stayed
+        # the fresh pre-load config (``_attn_implementation=None``) while the loaded model ran FA2. The
+        # packed/padding-free processor guard reads ``hf_config._attn_implementation`` and therefore
+        # refused every remote packed value forward even on a FA2 host (G43 B4).
+        self.hf_config = self.model.config
         # pop: tokenizer_id is not a from_pretrained argument, so it must not leak into the model
         # construction kwargs above.
         self.tokenizer_id = kwargs.pop('tokenizer_id', self.model_id)

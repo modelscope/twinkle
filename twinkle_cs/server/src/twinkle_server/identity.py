@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Checkpoint and telemetry fingerprint primitives and request identity."""
 
+import hashlib
 import hmac
 import os
 from contextvars import ContextVar
@@ -10,6 +11,19 @@ CHECKPOINT_SALT_DEFAULT = "twinkle-path-salt-v1"
 
 def fingerprint(value: str, key: str) -> str:
     return hmac.digest(key.encode("utf-8"), value.encode("utf-8"), "sha256").hex()
+
+
+def sampler_controller_name(namespace, pool_id):
+    """Actor-name convention shared by the sampling pool and any router that looks it up.
+
+    Lives in the identity layer so HTTP components (gateway) can resolve the name without
+    importing the pool composition layer above them.
+    """
+    return f"sampler-controller-{namespace}-{pool_id}"
+
+
+def sampling_pool_id(route):
+    return hashlib.sha256(route.encode()).hexdigest()[:16]
 
 
 USER_ID_KEY_ENV = "TWINKLE_TELEMETRY_USER_ID_KEY"

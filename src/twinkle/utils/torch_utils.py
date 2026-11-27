@@ -217,7 +217,7 @@ def bits_fingerprint(tensor: 'torch.Tensor', block: int = 1 << 24) -> List[int]:
     return [total & mask, squared & mask]
 
 
-def selective_log_softmax(logits, index, return_entropy: bool = False):
+def selective_log_softmax(logits, index, return_entropy: bool = False, vocab_parallel: bool | None = None):
     """
     refer: trl/trainer/utils
 
@@ -237,6 +237,15 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
             If True, also compute per-token entropy ``H = -sum_v p_v * log p_v`` in the
             same pass (logits are only resident here, so computing entropy at this call
             site avoids materializing a second full-vocab tensor later).
+        vocab_parallel (`bool`, *optional*):
+            Provenance of ``logits``: True iff they are Megatron vocab-parallel shards
+            (one contiguous vocab slice per TP rank). None auto-detects from the GLOBAL
+            Megatron TP state, which is only correct when that state belongs to the model
+            that produced these logits (e.g. a Megatron student in its own process).
+            Callers holding FULL-vocab logits (e.g. TransformersModel, whose DTensor TP
+            replicates logits) MUST pass False: a co-resident TP>1 Megatron student would
+            otherwise make the auto-detection all-gather full logits into a duplicated
+            vocab, shifting every logp by -ln(TP size).
 
     Returns:
         Gathered log probabilities with the same shape as ``index``. The dtype is
@@ -247,18 +256,23 @@ def selective_log_softmax(logits, index, return_entropy: bool = False):
     """
     import torch
 
-    try:
-        from megatron.core import parallel_state as mpu
-        if mpu.get_tensor_model_parallel_world_size() > 1:
-            if return_entropy:
-                # Under vocab TP, entropy needs extra all-reduces over softmax*logits;
-                # not implemented yet — caller should disable entropy_coef under TP>1.
-                raise NotImplementedError('selective_log_softmax(return_entropy=True) is not supported '
-                                          'under vocab tensor parallelism (TP>1).')
+    if vocab_parallel is None:
+        try:
+            from megatron.core import parallel_state as mpu
+            vocab_parallel = mpu.get_tensor_model_parallel_world_size() > 1
+        except (ImportError, AssertionError, OSError):
+            vocab_parallel = False
+    if vocab_parallel:
+        if return_entropy:
+            # Under vocab TP, entropy needs extra all-reduces over softmax*logits;
+            # not implemented yet — caller should disable entropy_coef under TP>1.
+            raise NotImplementedError('selective_log_softmax(return_entropy=True) is not supported '
+                                      'under vocab tensor parallelism (TP>1).')
+        try:
             # clone to avoid modifying the original logits
             return _vocab_parallel_selective_log_softmax(logits.clone(), index)
-    except (ImportError, AssertionError, OSError):
-        pass
+        except (ImportError, AssertionError, OSError):
+            pass
 
     vocab_size = logits.shape[-1]
     # The FlashAttention CE reduction accumulates in FP32 and returns FP32 logps,

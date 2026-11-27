@@ -4,7 +4,7 @@ import re
 import threading
 from typing import Any, Dict, List
 
-from twinkle.data_format import ground_truth, last_assistant_text, user_data_get
+from twinkle.data_format import ground_truth, last_assistant_text
 from twinkle.reward.base import Reward
 
 logger = logging.getLogger(__name__)
@@ -174,13 +174,8 @@ class GSM8KAccuracyReward(Reward):
             # Get model completion (last assistant message)
             completion = last_assistant_text(trajectory)
 
-            # Get ground truth from user_data
-            user_data = trajectory.get('user_data') or []
-            gt = ''
-            for item in user_data:
-                if item[0] == 'ground_truth':
-                    gt = item[1]
-                    break
+            gt = ground_truth(trajectory)
+            gt = '' if gt is None else str(gt)
 
             predicted = self.extract_answer(completion)
 

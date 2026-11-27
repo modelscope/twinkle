@@ -26,6 +26,8 @@ class GaLoreOptimizerStateMixin:
             state[pid] = entry
         # Rebuild before Optimizer recursively casts dictionaries to the parameter dtype.
         super().load_state_dict({**state_dict, 'state': state}, *args, **kwargs)
+        # bnb's Optimizer2State.load_state_dict has a real move_to_device flag: with False the
+        # caller wants state kept on its SAVED device, so the projector must not be moved either.
         if not (args[0] if args else kwargs.get('move_to_device', True)):
             return
         for param, entry in self.state.items():

@@ -2,7 +2,7 @@
 import re
 from typing import Any, Dict, List
 
-from twinkle.data_format import last_assistant_text
+from twinkle.data_format import ground_truth, last_assistant_text
 from twinkle.reward.base import Reward
 
 
@@ -26,14 +26,10 @@ class MultiModalAccuracyReward(Reward):
         for trajectory in trajectories:
             completion = last_assistant_text(trajectory)
 
-            user_data = trajectory.get('user_data', [])
-            gt = ''
-            solution = ''
-            for item in user_data:
-                if item[0] == 'ground_truth':
-                    gt = str(item[1])
-                elif item[0] == 'solution':
-                    solution = str(item[1])
+            gt = ground_truth(trajectory)
+            gt = '' if gt is None else str(gt)
+            solution = ground_truth(trajectory, 'solution')
+            solution = '' if solution is None else str(solution)
 
             predicted = self.extract_answer(completion)
             reward = 0.0

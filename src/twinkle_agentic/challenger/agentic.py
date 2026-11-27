@@ -10,7 +10,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from twinkle.advantage.group_admission import GroupAdmissionPolicy
 from twinkle.data_format import SamplingParams, Trajectory, attach_user_data, user_data_get
 from twinkle.data_format.sampling import SampledSequence, SampleResponse
-from twinkle.template.contract import RolloutState
 from twinkle.utils import get_logger
 from twinkle_agentic.envs import Env
 from twinkle_agentic.protocol.api_sampler import APISampler
@@ -54,9 +53,7 @@ def check_script_judge(language: str = 'python') -> Callable[[Trajectory, Env, s
 
 
 def _sample_one(sampler: Any, state: Any, sampling_params: SamplingParams, **kwargs: Any) -> SampledSequence:
-    """One sequence from ``sampler``, given the rollout's state (or its bare feature)."""
-    if isinstance(state, RolloutState) and not getattr(type(sampler), 'accepts_rollout_state', False):
-        state = state.feature
+    """One sequence from the complete current trajectory."""
     responses = sampler.sample([state], sampling_params=sampling_params, **kwargs)
     if not isinstance(responses, list) or len(responses) != 1:
         count = len(responses) if isinstance(responses, list) else type(responses).__name__

@@ -4,9 +4,9 @@ from requests.exceptions import Timeout
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from twinkle.data_format import InputFeature, SamplingParams, Trajectory
+from twinkle.data_format import InputFeature, SamplingParams, Trajectory, copy_trajectory
 from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTENCY_SUPPORTED
-from twinkle.protocol.json_utils import json_safe
+from twinkle.protocol.json_utils import wire_trajectory
 from twinkle.protocol.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
 from twinkle.protocol.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
                                             SampleResponseModel, SampleResponseModelList, SamplerApplyPatchRequest,
@@ -34,7 +34,7 @@ def _json_safe(obj: Any) -> Any:
     duck-typing (``.tolist()``) so this stays free of a hard torch/numpy import,
     honouring the CPU-only client contract noted above.
     """
-    return json_safe(obj)
+    return wire_trajectory(obj)
 
 
 class vLLMSampler:
@@ -120,10 +120,10 @@ class vLLMSampler:
         """
         if adapter_uri is None:
             adapter_uri = adapter_path if adapter_path is not None else getattr(self, 'adapter_uri', None)
-        url = f'{self.server_url}/sample'
-        body = build_request(
+        originals = [copy_trajectory(item) for item in (inputs if isinstance(inputs, list) else [inputs])]
+        request = build_request(
             SampleRequest,
-            inputs=_json_safe(inputs),
+            inputs=_json_safe(originals),
             sampling_params=self._sampling_params(sampling_params, num_samples),
             adapter_name=adapter_name,
             adapter_uri=adapter_uri,
@@ -132,14 +132,34 @@ class vLLMSampler:
             key = uuid.uuid4().hex if idempotency_key is None else idempotency_key
             headers = {H_SAMPLE_IDEMPOTENCY_KEY: key}
             try:
-                response = self._transport.post_model(url, body, headers=headers)
+                response = self._transport.post_model(f'{self.server_url}/sample', request, headers=headers)
             except Timeout:
-                response = self._transport.post_model(url, body, headers=headers)
+                response = self._transport.post_model(f'{self.server_url}/sample', request, headers=headers)
         else:
             if idempotency_key is not None:
                 raise TwinkleClientValidationError('This server does not support sample idempotency')
-            response = self._transport.post_model(url, body)
-        return self._await_task(response, SampleResponseModelList).samples
+            response = self._transport.post_model(f'{self.server_url}/sample', request)
+        samples = self._await_task(response, SampleResponseModelList).samples
+        if not token_only:
+            if len(samples) != len(originals):
+                raise RuntimeError('server response count does not match the input batch')
+            restored = []
+            for original, result in zip(originals, samples):
+                sequences = []
+                for sequence in result.sequences:
+                    if sequence.new_input_feature is None:
+                        raise RuntimeError('server omitted a complete trajectory from a normal sample response')
+                    # The server never echoes the request's media / user_data back; restore them here.
+                    # Response models are frozen wire records: rebuild, never mutate in place.
+                    feature = {
+                        **copy_trajectory({key: original[key] for key in ('images', 'videos', 'audios', 'user_data')
+                                           if key in original}),
+                        **copy_trajectory(sequence.new_input_feature),
+                    }
+                    sequences.append(sequence.model_copy(update={'new_input_feature': feature}))
+                restored.append(result.model_copy(update={'sequences': sequences}))
+            samples = restored
+        return samples
 
     @staticmethod
     def _sampling_params(sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]],

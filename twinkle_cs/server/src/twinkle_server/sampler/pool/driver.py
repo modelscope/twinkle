@@ -40,12 +40,14 @@ class SamplerDriver:
             device_type,
             f"sampling_{self.pool_id}_{instance.epoch}",
             instance.identity,
+            node_selector=self.args.node_selector,
         )
         instance.application = allocation.name
         instance.devices = list(allocation.devices)
         options = self.runtime.deployment_options(self.options, allocation.name)
         values = self.args.model_dump(
-            exclude={"min_replicas", "max_replicas", "idle_timeout_s", "target_ongoing_requests", "queue_config"}
+            exclude={"min_replicas", "max_replicas", "idle_timeout_s", "target_ongoing_requests", "queue_config",
+                     "node_selector"}
         )
         values["device_group"].setdefault("name", "sampler")
         values["device_group"].setdefault("ranks", self.args.nproc_per_node)

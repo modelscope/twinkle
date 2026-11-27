@@ -18,6 +18,9 @@ PLAN (case | input | expected | failure it kills):
 7 single output | one worker's list | passthrough unchanged | single-worker micro-batch frame
   contract
 8 empty | [] | [] / {} | empty guard
+9 mixed tensor / variable-seq list channel (G46-4) | dr0 stacked [2,3], dr1 per-mb list [2],[4]
+  | 4 rows flattened in dr+mb order, seq padded | old tensor-only branch 'list has no ndim'
+  (megatron R2 RECORD variable-seq return across dp ranks)
 
 Oracle: expected data rank per worker computed independently from the mesh ARRAY coordinates
 (dr = dp_idx * fsdp_ws + fsdp_idx), never via _data_rank_order/get_data_rank_from_global_rank.
@@ -115,3 +118,29 @@ def test_empty_outputs():
     mesh = DeviceMesh.from_sizes(fsdp_size=2, dp_size=2)
     assert dp_flatten([], mesh) == []
     assert tensor_dict([], mesh) == {}
+
+
+def test_tensor_dict_mixed_tensor_and_variable_seq_list():
+    """G46-4 defect gate: a variable-seq channel (megatron R2 RECORD routing) is a STACKED tensor
+    on ranks whose local micro-batches share a shape and a per-micro-batch LIST on ranks that do
+    not (assemble_recorded_routing). tensor_dict must flatten both domains in data-rank order --
+    the old tensor-only branch raised AttributeError('list' object has no attribute 'ndim') the
+    moment one rank stacked and another listed (chain20 window 3, real MoE GRPO R2 run).
+    """
+    mesh = DeviceMesh.from_sizes(dp_size=2)
+    drs = _worker_data_ranks(mesh, 2)
+    assert drs == [0, 1]
+    # dr0: two equal-shape micro-batches -> one stacked [2, 3, ...] tensor (rows tagged 0, 1)
+    stacked = torch.stack([torch.full((3,), 0.0), torch.full((3,), 1.0)])
+    # dr1: two unequal micro-batches -> per-mb list ([2, ...] and [4, ...]; rows tagged 2, 3)
+    per_mb = [torch.full((2,), 2.0), torch.full((4,), 3.0)]
+    outputs = [{'routed_experts': stacked}, {'routed_experts': per_mb}]
+    merged = tensor_dict(outputs, mesh)['routed_experts']
+    # 4 rows in data-rank then micro-batch order; seq dim padded to the max (4), tags intact
+    assert merged.shape == (4, 4)
+    assert merged[:, 0].tolist() == [0.0, 1.0, 2.0, 3.0]
+    # the short rows' pad tail carries the representable pad sentinel, never a fabricated row
+    assert merged[0, 3].item() == -200.0 and merged[2, 2].item() == -200.0
+    # reverse symmetry: list-first ordering takes the same flatten path
+    merged_rev = tensor_dict([{'routed_experts': per_mb}, {'routed_experts': stacked}], mesh)
+    assert merged_rev['routed_experts'][:, 0].tolist() == [2.0, 3.0, 0.0, 1.0]
