@@ -75,6 +75,11 @@ def _as_backend_entry(entry: dict[str, Any]) -> Any:
         return Trajectory(**entry)
     result = InputFeature(**entry)
     media = VLM_TENSOR_FIELDS.intersection(result)
+    first_image_value = result.get('images')
+    while isinstance(first_image_value, list) and first_image_value:
+        first_image_value = first_image_value[0]
+    if isinstance(first_image_value, (float, int)):
+        media = media | {'images'}
     if media:
         import torch
         for key in media:

@@ -65,6 +65,20 @@ def test_a_valid_body_reaches_the_handler(client):
     assert response.status_code == 200
     assert response.json() == {'reached_handler': True}
 
+@pytest.mark.parametrize('images', [['data:image/png;base64,AAA='], [[0.25, 0.5]]])
+def test_encoded_images_keep_wire_references_or_restore_training_tensors(images):
+    from twinkle.protocol.types.data import WireInputFeature
+    from twinkle.server.lifecycle.submit import to_backend_inputs
+
+    entry = WireInputFeature.model_validate({'input_ids': [1], 'images': images})
+    backend_entry, = to_backend_inputs([entry])
+    actual = backend_entry['images']
+    if isinstance(images[0], str):
+        assert actual == images
+    else:
+        assert actual.tolist() == images
+
+
 def test_native_sampling_omits_deployed_adapter_requirement_by_default():
     request = SampleRequest(inputs=[{'input_ids': [1]}])
     assert 'require_deployed_adapter' not in request_json(request)

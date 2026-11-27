@@ -56,7 +56,8 @@ class HTTPSampler:
         engine_ids = engine_input_ids(prompt_feature)
         if not media and engine_ids != prefix_ids:
             raise ValueError('A text trajectory must have identical training and engine input_ids.')
-        entry = {'input_ids': engine_ids, **_wire_media(media)}
+        wire_media = _wire_media(media)
+        entry = {'input_ids': engine_ids, **wire_media}
         if prompt_feature.get('mm_processor_kwargs'):
             entry['mm_processor_kwargs'] = prompt_feature['mm_processor_kwargs']
         responses = self.sampler.sample(
@@ -64,8 +65,17 @@ class HTTPSampler:
         if len(responses) != 1:
             raise RuntimeError(f'the server returned {len(responses)} responses for one prompt.')
         response = responses[0]
-        # Engines may expand visual placeholders, so collapsed media IDs cannot be compared directly.
-        if not media and response.prompt_token_ids != engine_ids:
+        if media:
+            echoed = getattr(response, 'prompt_token_ids_echoed', None)
+            prompt_ids = response.prompt_token_ids
+            # Older SGLang servers echoed the request without setting this flag.
+            legacy_echo = echoed is None and prompt_ids == engine_ids
+            expected = engine_ids if echoed is True else prefix_ids
+            if prompt_ids != expected and not legacy_echo:
+                prefix = 'request' if echoed is True else 'expanded training prompt'
+                raise ValueError(f'Remote sampler prompt_token_ids do not match the {prefix}. '
+                                 'Check that the training and sampler media processors use the same settings.')
+        elif response.prompt_token_ids != engine_ids:
             raise RuntimeError('Token-only sampling returned different or missing prompt_token_ids; '
                                'the training prefix must match the sampled text prompt exactly.')
         sequences = []
@@ -78,6 +88,9 @@ class HTTPSampler:
             if list(feature['input_ids']) != prefix_ids + tokens:
                 raise RuntimeError('Appending sampled tokens changed or truncated input_ids; '
                                    'increase max_length or use a template that preserves the sampled sequence.')
+            for key, refs in wire_media.items():
+                if key not in feature or _is_raw_media(feature[key]):
+                    feature[key] = refs
             # Routing belongs to this generation; a missing export must not reuse the prefix's old routing.
             feature.pop('routed_experts', None)
             if seq.routed_experts is not None:
@@ -132,4 +145,10 @@ def _wire_media(media: Any) -> Dict[str, List[str]]:
     return out
 
 
-
+def _is_raw_media(value: Any) -> bool:
+    entries = value if isinstance(value, (list, tuple)) else [value]
+    return bool(entries) and all(
+        isinstance(entry, (str, bytes, bytearray))
+        or (isinstance(entry, dict) and ('bytes' in entry or 'path' in entry))
+        or callable(getattr(entry, 'save', None))
+        for entry in entries)

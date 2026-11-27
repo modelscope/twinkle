@@ -134,6 +134,9 @@ class WireInputFeature(_WireConversation):
     routed_experts: Ints3 | None = None
     length: StrictInt | None = None
 
+    # Some training templates use images for encoded tensors. Raw trajectories still use media references.
+    images: MediaList | Numbers1to4 | None = None
+
     # VLM tensors: float values are normal here, so no strict-int leaves.
     pixel_values: Numbers1to4 | None = None
     image_grid_thw: Numbers1to4 | None = None
