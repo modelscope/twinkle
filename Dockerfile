@@ -15,7 +15,9 @@ COPY src/ ./src/
 # Resolve the pinned Swift revision and Twinkle together. Reuse compatible
 # packages from the base image, including Ray via Twinkle's server extra.
 # TE 2.19 makes the tensor handle pool configurable for the 35B LoRA trainer.
+# Its PyTorch extension needs the base image's pip-installed cuDNN headers.
 RUN --mount=type=cache,id=twinkle-cu130-py312-pip,target=/var/cache/twinkle-pip \
+    CPLUS_INCLUDE_PATH="/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}" \
     pip install --index-url "$PIP_INDEX_URL" --cache-dir /var/cache/twinkle-pip \
     --no-build-isolation --retries 5 --timeout 30 \
     --only-binary=torch,vllm,ray,megatron-core,mcore-bridge,sentence-transformers,transformer-engine-cu13 \
