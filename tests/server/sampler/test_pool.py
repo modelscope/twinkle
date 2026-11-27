@@ -332,6 +332,50 @@ async def test_partial_control_broadcast_fences_all_participants(fault):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('fault_at,expect_fence', [(1, False), (2, True)])
+async def test_user_error_rejection_fences_only_after_partial_apply(fault_at, expect_fence):
+    """A 4xx Decision_Boundary-left rejection leaves replica state unchanged (RequestRejectedError).
+
+    When the FIRST replica rejects, nothing was applied anywhere and the pool is still
+    homogeneous -- the healthy replicas must NOT be fenced (they keep serving). When a LATER
+    replica rejects after an earlier one already applied, pool state diverged and fencing is
+    still required. Regression gate for the gateway-hang root cause: a pinned-template
+    set_template 400 used to fence the whole pool on every OpenAI chat.
+    """
+    pool, driver, _ = setup()
+    driver.finish.set()
+    await pool.initialize()
+    invoke = driver.invoke
+    changed = []
+
+    async def update(instance, ticket, payload, queue=None):
+        changed.append(instance.identity)
+        if len(changed) == fault_at:
+            return {'status': 400, 'headers': [], 'body': b'{"error":"rejected"}'}
+        return await invoke(instance, ticket, payload, queue)
+
+    driver.invoke = update
+    try:
+        reply = await pool.request(request('twinkle/set_template'))
+        assert reply['status'] == 400
+        await settle_jobs(pool)
+        if expect_fence:
+            assert len(driver.stopped) == 2
+            assert not pool._ready_instances() and not pool._actions
+        else:
+            assert not driver.stopped
+            assert len(pool._ready_instances()) == 2
+            assert not pool._actions  # a rejection commits nothing
+            # The healthy pool must keep serving immediately after the rejection
+            # (the gateway-hang defect fenced it into an engine restart instead).
+            driver.invoke = invoke
+            reply = await pool.request(request())
+            assert reply['status'] == 200
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_unknown_generation_exit_keeps_quarantined_capacity_reserved():
     pool, driver, clock = setup(minimum=1, maximum=1)
     await pool.initialize()

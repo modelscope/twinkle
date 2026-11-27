@@ -722,10 +722,65 @@ class TwinkleWorkerExtension:
             if not converted:
                 return
 
-            self.model_runner.model.load_weights(converted)
+            # vLLM's LoRA MoE wrapper (FusedMoEWithLoRA) exposes no load_weights, so the
+            # model-level AutoWeightsLoader cannot resolve expert tensors against it.
+            # Dispatch that slice straight to the wrapped runner's fused/per-expert loader.
+            remaining = self._load_lora_wrapped_moe_experts(converted)
+            self.model_runner.model.load_weights(remaining)
             self._load_drafter_weights(converted)
             self._repack_derived_weights(self.model_runner.model)
             logger.info(f'Loaded {len(converted)} base weights')
+
+    def _load_lora_wrapped_moe_experts(self, weights: List[Tuple[str, torch.Tensor]]) -> List[Tuple[str, torch.Tensor]]:
+        """Load expert tensors of LoRA-wrapped MoE layers via the wrapped runner.
+
+        vLLM 0.27.1 wraps ``experts`` as ``FusedMoEWithLoRA`` when ``enable_lora`` is on.
+        The wrapper has no ``load_weights``, so ``AutoWeightsLoader`` recurses into its
+        children and rejects every expert name (fused HF ``experts.gate_up_proj`` /
+        ``experts.down_proj`` 3-D tensors from transformers>=5 fused-MoE checkpoints, or
+        per-expert ``experts.{i}.gate_proj.weight`` from Megatron) with ValueError — the
+        only child is ``base_layer``. The wrapped ``MoERunner`` DOES carry the proper
+        loader (``RoutedExperts.load_weights``: fused-3D orientation, per-expert mapping,
+        TP/EP sharding), so route the expert slice of the stream to it directly.
+
+        ``routed_experts.lora_base_layer_prefix`` ('base_layer.', set by the wrapper)
+        targets the legacy full-checkpoint-name mapping; in this runner-relative dispatch
+        it would bake 'base_layer.' into the resolved param attribute and break the
+        getattr lookup, so it is cleared for the load and restored afterwards.
+
+        Returns the weights NOT consumed here (everything outside the wrapped experts),
+        which continue through the normal model-level loader. Non-LoRA engines and
+        non-MoE models are untouched (no wrapped modules -> identity).
+        """
+        try:
+            from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
+        except ImportError:
+            return weights
+        wrapped = {
+            name: module
+            for name, module in self.model_runner.model.named_modules()
+            if isinstance(module, FusedMoEWithLoRA)
+        }
+        if not wrapped:
+            return weights
+        groups: Dict[str, List[Tuple[str, torch.Tensor]]] = {}
+        remaining: List[Tuple[str, torch.Tensor]] = []
+        for name, tensor in weights:
+            for prefix in wrapped:
+                if name.startswith(prefix + '.'):
+                    groups.setdefault(prefix, []).append((name[len(prefix) + 1:], tensor))
+                    break
+            else:
+                remaining.append((name, tensor))
+        for prefix, items in groups.items():
+            routed_experts = wrapped[prefix].base_layer.routed_experts
+            saved_prefix = routed_experts.lora_base_layer_prefix
+            routed_experts.lora_base_layer_prefix = ''
+            try:
+                list(wrapped[prefix].base_layer.load_weights(items))
+            finally:
+                routed_experts.lora_base_layer_prefix = saved_prefix
+        return remaining
 
     @staticmethod
     def _repack_derived_weights(root: torch.nn.Module) -> int:

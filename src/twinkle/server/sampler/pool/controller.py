@@ -214,19 +214,29 @@ class SamplerController:
 
                 async def broadcast():
                     response = None
+                    applied = False
                     for replica in replicas:
                         if payload is None:
                             await self.driver.load_weights(replica, full_path)
                         else:
                             response = await self._invoke_finished(replica, payload)
                             if response["status"] >= 400:
-                                return response
-                    return response
+                                return response, applied
+                        applied = True
+                    return response, applied
 
                 try:
-                    response = await asyncio.wait_for(broadcast(), self.args.queue_config.effective_execution_timeout)
+                    response, applied = await asyncio.wait_for(
+                        broadcast(), self.args.queue_config.effective_execution_timeout)
                     if response is not None and response["status"] >= 400:
-                        await self._fence(replicas)
+                        # A 4xx is a Decision_Boundary-left rejection (see RequestRejectedError):
+                        # the replica validated the request and changed nothing. While no replica
+                        # has applied the op, the pool is still homogeneous -- return the rejection
+                        # to the caller WITHOUT fencing healthy replicas. Fence only when a
+                        # server-side failure left replica state unknown (>=500) or an earlier
+                        # replica in the sequential broadcast already applied (state diverged).
+                        if response["status"] >= 500 or applied:
+                            await self._fence(replicas)
                         return response
                     # A health probe or shutdown can invalidate a participant while
                     # its RPC is pending. Such an ACK must not commit pool state.

@@ -41,8 +41,10 @@ REL_TOL = 1e-4
 
 
 def _find_free_port():
+    # TCPStore's server socket binds the wildcard address, so the probe must bind the same scope:
+    # a loopback-only probe can return a port occupied on another interface (EADDRINUSE at init).
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(('127.0.0.1', 0))
+        sock.bind(('', 0))
         return sock.getsockname()[1]
 
 

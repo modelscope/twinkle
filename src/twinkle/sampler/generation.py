@@ -174,7 +174,12 @@ def attach_features(template, results, encoded, *, logprobs_only=False, token_on
                     raise ValueError('normal sampling requires a template; use token_only for engine primitives')
                 seq.new_input_feature = template.append_completion(feat, list(seq.tokens or ()))
                 if seq.decoded is None:
-                    seq.decoded = template.decode(seq.tokens)
+                    # Decode the visible completion WITHOUT special tokens (e.g. the EOS
+                    # ``<|im_end|>``), matching the streaming surface (vLLM generate_stream decodes
+                    # deltas with skip_special_tokens=True) and the transformers engine. The default
+                    # tokenizer.decode keeps special tokens, which leaked the EOS into the
+                    # non-streaming OpenAI chat content while the stream correctly excluded it.
+                    seq.decoded = template.decode(seq.tokens, skip_special_tokens=True)
             seq.new_input_feature.pop('routed_experts', None)
             if seq.routed_experts is not None:
                 seq.new_input_feature['routed_experts'] = seq.routed_experts

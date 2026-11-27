@@ -165,9 +165,14 @@ def test_weight_sync(model_gpus: int = 2, sampler_gpus: int = 1, vllm_tp: int = 
 
     # Base model sync
     sync_start = time.time()
-    manager.sync_weights()
-    # lora
-    manager.sync_weights()
+    # Current contract (same as test_weight_sync.py, re-anchored in 139cfed5): an enable_lora
+    # receiver takes merge_and_sync=False -- the first call syncs the base (renamed to vLLM's
+    # .base_layer params), later calls sync only the LoRA delta of the auto-detected default
+    # adapter. The default merge_and_sync=True sends canonical names the LoRA-wrapped receiver
+    # does not expose (embed_tokens.weight vs embed_tokens.base_layer.weight).
+    manager.sync_weights(merge_and_sync=False)
+    # lora-only incremental
+    manager.sync_weights(merge_and_sync=False)
     base_time = time.time() - sync_start
     log(f'  Base weight sync completed in {base_time:.2f}s')
 

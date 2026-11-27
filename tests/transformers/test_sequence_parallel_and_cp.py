@@ -26,8 +26,10 @@ GRAD_ATOL = 1e-2
 
 
 def _find_free_port() -> int:
+    # TCPStore's server socket binds the wildcard address, so the probe must bind the same scope:
+    # a loopback-only probe can return a port occupied on another interface (EADDRINUSE at init).
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(('127.0.0.1', 0))
+        sock.bind(('', 0))
         return sock.getsockname()[1]
 
 
@@ -411,6 +413,7 @@ def _measure_peak_memory(
     seq_len: int,
     device: torch.device,
     device_type: str,
+    padding_free: bool = False,
 ) -> int:
     vocab_size = int(model.config.vocab_size)
     input_ids = torch.randint(low=0, high=vocab_size, size=(batch_size, seq_len), device=device)
@@ -421,7 +424,8 @@ def _measure_peak_memory(
     device_module = _get_device_module(device_type)
     device_module.empty_cache()
     device_module.reset_peak_memory_stats(device)
-    prepared = strategy.prepare_model_inputs({'input_ids': input_ids, 'position_ids': position_ids})
+    prepared = strategy.prepare_model_inputs({'input_ids': input_ids, 'position_ids': position_ids},
+                                             padding_free=padding_free)
     # Disabled SP (baseline arm, ulysses_size=1) passes inputs through untouched since 88c1d480,
     # so the layout metadata only exists on the SP-enabled arm.
     prepared.pop('_sequence_layout', None)
@@ -603,6 +607,10 @@ def _run_memory_worker(rank: int, world_size: int, port: int, case_name: str, ba
         peaks = []
         for batch_size in case['batch_sizes']:
             for seq_len in case['seq_lens']:
+                # Same contract as the precision worker: derived ring (rp > 1) only accepts
+                # padding-free inputs; the dense random grid carries no attention_mask, so the
+                # ring arms enter through the product's padding_free path (cu_seqlens from
+                # position_ids) instead of a synthesized SP-alignment padding mask.
                 peak = _measure_peak_memory(
                     model,
                     strategy,
@@ -610,6 +618,7 @@ def _run_memory_worker(rank: int, world_size: int, port: int, case_name: str, ba
                     seq_len=seq_len,
                     device=device,
                     device_type=backend_config['device_type'],
+                    padding_free=case['expected_mode'] in ('cp_only', 'cp_sp'),
                 )
                 if rank == 0:
                     baseline_peak = baseline_peaks[(int(batch_size), int(seq_len))]
