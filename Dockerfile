@@ -12,15 +12,15 @@ WORKDIR /twinkle
 COPY pyproject.toml setup.cfg README.md LICENSE ./
 COPY src/ ./src/
 
-# Resolve the pinned Swift revision and Twinkle together. Keep the base image's
-# CUDA wheels and let vLLM enforce the matching TileLang and TVM FFI versions.
+# Resolve the pinned Swift revision and Twinkle together. Reuse compatible
+# packages from the base image, including Ray via Twinkle's server extra.
 # TE 2.19 makes the tensor handle pool configurable for the 35B LoRA trainer.
 RUN --mount=type=cache,id=twinkle-cu130-py312-pip,target=/var/cache/twinkle-pip \
     pip install --index-url "$PIP_INDEX_URL" --cache-dir /var/cache/twinkle-pip \
     --no-build-isolation --retries 5 --timeout 30 \
     --only-binary=torch,vllm,ray,megatron-core,mcore-bridge,sentence-transformers,transformer-engine-cu13 \
     "torch==2.14.0" "vllm==0.33.0" \
-    "ray[serve]==2.55.1" "megatron-core==0.20.0" "mcore-bridge==1.7.0" \
+    "megatron-core==0.20.0" "mcore-bridge==1.7.0" \
     "transformer-engine[pytorch,core-cu13]==2.19.0" \
     "sentence-transformers==6.3.0" \
     "ms-swift[megatron] @ https://codeload.github.com/modelscope/ms-swift/tar.gz/e1ac89d24f47cb8fd73a7245dd79df0959aec284" \
