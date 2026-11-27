@@ -14,16 +14,21 @@ COPY src/ ./src/
 
 # Resolve the pinned Swift revision and Twinkle together. Reuse compatible
 # packages from the base image, including Ray via Twinkle's server extra.
-# TE 2.19 makes the tensor handle pool configurable for the 35B LoRA trainer.
-# Its PyTorch extension needs the base image's pip-installed cuDNN headers.
+# Build TE 2.19 against this image's CUDA 13.0 toolkit. Its published cu13
+# wheel requires a newer cuBLAS than the toolkit pinned by Torch.
 RUN --mount=type=cache,id=twinkle-cu130-py312-pip,target=/var/cache/twinkle-pip \
+    pip install --index-url "$PIP_INDEX_URL" --cache-dir /var/cache/twinkle-pip \
+        --only-binary=:all: "nvidia-cudnn-frontend==1.28.0" && \
+    pip uninstall -y transformer-engine transformer-engine-cu13 transformer-engine-torch && \
+    NVTE_FRAMEWORK=pytorch NVTE_CUDA_ARCHS=90 NVTE_WITH_NCCL_EP=0 \
+    CUDNN_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cudnn \
     CPLUS_INCLUDE_PATH="/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}" \
     pip install --index-url "$PIP_INDEX_URL" --cache-dir /var/cache/twinkle-pip \
     --no-build-isolation --retries 5 --timeout 30 \
-    --only-binary=torch,vllm,ray,megatron-core,mcore-bridge,sentence-transformers,transformer-engine-cu13 \
+    --only-binary=torch,vllm,ray,megatron-core,mcore-bridge,sentence-transformers \
     "torch==2.14.0" "vllm==0.33.0" \
     "megatron-core==0.20.0" "mcore-bridge==1.7.0" \
-    "transformer-engine[pytorch,core-cu13]==2.19.0" \
+    "transformer-engine @ git+https://github.com/NVIDIA/TransformerEngine.git@5e52befd5262c06289106338c308079d6adb391f" \
     "sentence-transformers==6.3.0" \
     "ms-swift[megatron] @ https://codeload.github.com/modelscope/ms-swift/tar.gz/e1ac89d24f47cb8fd73a7245dd79df0959aec284" \
     -e ".[server]"

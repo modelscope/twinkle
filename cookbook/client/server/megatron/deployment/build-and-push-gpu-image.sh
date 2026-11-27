@@ -19,9 +19,12 @@ git archive "$revision" -- .dockerignore Dockerfile pyproject.toml setup.cfg REA
     "${build_args[@]}" \
     --label "org.opencontainers.image.revision=$revision" -t "$image" -
 
-sudo docker run --rm -i --platform linux/amd64 --entrypoint python "$image" - <<'PYTHON'
+sudo docker run --rm -i --platform linux/amd64 --entrypoint python \
+    --env NVTE_TENSOR_HANDLE_POOL_SIZE_MB=128 "$image" - <<'PYTHON'
+import ctypes
 import json
 from importlib import metadata
+import os
 import re
 import subprocess
 import sys
@@ -34,10 +37,9 @@ expected = {
     'mcore-bridge': '1.7.0',
     'sentence-transformers': '6.3.0',
     'transformer-engine': '2.19.0',
-    'transformer-engine-cu13': '2.19.0',
-    'transformer-engine-torch': '2.19.0',
 }
-for name in (*expected, 'ray', 'twinkle-kit', 'ms-swift', 'transformers', 'peft', 'tilelang', 'apache-tvm-ffi'):
+for name in (*expected, 'cuda-toolkit', 'nvidia-cublas', 'ray', 'twinkle-kit', 'ms-swift',
+             'transformers', 'peft', 'tilelang', 'apache-tvm-ffi'):
     version = metadata.version(name)
     print(f'{name}=={version}', flush=True)
     if name in expected and version.split('+', 1)[0] != expected[name]:
@@ -53,7 +55,20 @@ from ray import serve  # noqa: F401
 from sentence_transformers import SentenceTransformer  # noqa: F401
 from swift.dev import template_contract  # noqa: F401
 from swift.dev.model.multi_lora_sentence_transformer_model import MultiLoraSentenceTransformerModel  # noqa: F401
+from transformer_engine.common import _TE_LIB_CTYPES
 from transformer_engine.pytorch.optimizers import FusedAdam, multi_tensor_scale  # noqa: F401
+
+# Resolve all native symbols, then check the configured pool without a GPU.
+te = ctypes.CDLL(_TE_LIB_CTYPES._name, mode=os.RTLD_NOW)
+te.nvte_create_tensors.argtypes = (ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t)
+te.nvte_create_tensors.restype = None
+te.nvte_destroy_tensors.argtypes = (ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t)
+te.nvte_destroy_tensors.restype = None
+handles = (ctypes.c_void_p * 25_000)()
+te.nvte_create_tensors(0, handles, len(handles))
+assert all(handles) and len(set(handles)) == len(handles)
+te.nvte_destroy_tensors(handles, len(handles))
+print(f'Transformer Engine native handle check passed ({len(handles)} handles).', flush=True)
 
 check = subprocess.run(
     [sys.executable, '-m', 'pip', 'check'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
