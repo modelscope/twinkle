@@ -50,10 +50,7 @@ from .types import (
     KTOSample,
     MediaBundle,
     Message,
-    ModelInfo,
-    ModelRef,
     PreferenceSample,
-    TemplateSpec,
     Tool,
 )
 
