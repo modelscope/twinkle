@@ -4,13 +4,13 @@
 
 ## 目录
 
-- [代码规约](#-代码规约)
+- [行为准则](#-行为准则)
 - [贡献流程](#-贡献流程)
 - [资源支持](#-资源支持)
 
-## 📖 代码规约
+## 📖 行为准则
 
-请查看我们的[代码规约文档](./CODE_OF_CONDUCT.md).
+请遵守我们的[行为准则](./CODE_OF_CONDUCT.md).
 
 ## 🔁 贡献流程
 
@@ -40,6 +40,16 @@
 
 5. Review：我们希望合入的代码简洁高效，因此可能会提出一些问题并讨论。请注意，任何review中提出的问题是针对代码本身，而非您个人。在所有问题讨论通过后，您的代码会被通过
 
+### 开发环境
+
+在仓库根目录以可编辑模式安装（Python 3.11–3.13）：
+
+```shell
+pip install -e '.[test]' -e ./twinkle_cs/client -e ./twinkle_cs/server
+```
+
+依赖范围全部声明在 `pyproject.toml`（twinkle-client / twinkle-server 各自位于 `twinkle_cs/<name>/pyproject.toml`），`test` extra 已包含 pytest 和钉到 CI 版本的 ruff。CI 以 `pip install --no-deps -e . -e ./twinkle_cs/client -e ./twinkle_cs/server` 安装同一份源码后运行 `pytest`。
+
 ### 代码规范和开发方式
 
 twinkle有约定俗成的变量命名方式和开发方式。在开发中请尽量遵循这些方式。
@@ -54,14 +64,14 @@ twinkle使用 [ruff](https://docs.astral.sh/ruff/) 同时进行代码检查和�
 - **目标版本**：Python 3.11
 - **检查规则**：`B`、`E`、`F`、`W`、`I`、`UP`、`T`（bugbear、pycodestyle、pyflakes、isort、pyupgrade、flake8-print）
 - **格式化风格**：双引号（`quote-style = "double"`）
-- **排除路径**：`examples/`、`cookbook/`、`client_tools/`、`twinkle_cs/client/src/twinkle_client/`、`tests/`、`docs/src`
+- **排除路径**：`cookbook/`、`twinkle_cs/client/src/twinkle_client/`、`tests/`
 
 twinkle在PR提交后会进行两类测试：
 
 - Code Lint测试 对代码进行静态规范走查的测试，为保证该测试通过，请保证本地预先进行了Code lint。方法是：
 
   ```shell
-  pip install pre-commit ruff
+  pip install pre-commit ruff==0.13.0  # ruff 钉到 CI / pre-commit 使用的版本
   pre-commit run --all-files
   # 或直接使用ruff：
   ruff check .              # 检查lint问题（只读，不修改文件）
@@ -74,6 +84,6 @@ twinkle在PR提交后会进行两类测试：
 
 ### Running CI Tests
 
-在提交PR前，请保证您的开发代码已经受到了测试用例的保护。例如，对新功能的冒烟测试，或者各种边缘case的单元测试等。在代码review时Reviewers也会关注这一点。同时，也会有服务专门运行CI Tests，运行所有的测试用例，测试用例通过后代码才可以合并。
+在提交PR前，请保证您的开发代码已经受到了测试用例的保护。例如，对新功能的冒烟测试，或各种边缘case的单元测试等。在代码review时Reviewers也会关注这一点。CI会在PR上运行`pytest -m "not slow"`，定时任务不带`-m`过滤（额外运行标记为`slow`的用例），测试用例通过后代码才可以合并。
 
 请保证该测试可以正常通过。

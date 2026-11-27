@@ -1,6 +1,7 @@
 [project]
 name = "twinkle-kit"
-version = "0.4.0.dev0"
+# Single source for every distribution in this repository: the root VERSION file.
+dynamic = ["version"]
 description = "Training API for large language models with efficient data handling and advanced optimization techniques."
 readme = "README.md"
 authors = [{ name = "ModelScope", email = "contact@modelscope.cn" }]
@@ -76,10 +77,13 @@ include = ["twinkle", "twinkle.*", "twinkle_agentic", "twinkle_agentic.*"]
 [tool.setuptools.package-data]
 "twinkle.kernel.ops.dsv4_sas_li.aclnn" = ["*.h", "*.cpp", "**/*.cpp"]
 
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
+
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-exclude = ["docs/src", "*.pyi", ".git", "peft.py", "examples", "cookbook", "client_tools", "twinkle_cs/client/src/twinkle_client", "tests"]
+exclude = ["*.pyi", ".git", "peft.py", "cookbook", "twinkle_cs/client/src/twinkle_client", "tests"]
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "W", "I", "UP", "T"]

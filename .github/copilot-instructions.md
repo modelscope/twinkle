@@ -31,10 +31,10 @@ These instructions help AI agents work productively in this repo. Focus on concr
   - Adapter ops are routed through remote functions and grouped by DP process groups.
 
 ## Developer Workflows
-- **Install:** Python 3.11+. Install with Poetry or pip.
-  - Pip (editable): `pip install -e '.[test]' -e ./twinkle_cs/client -e ./twinkle_cs/server`
+- **Install:** Python 3.11–3.13. Install from the repository root with pip (editable):
+  - `pip install -e '.[test]' -e ./twinkle_cs/client -e ./twinkle_cs/server` (the `test` extra includes pytest and the CI-pinned ruff)
 - **Run tests:**
-  - Unit tests: `python -m unittest tests/infra/test_infra_graph.py`
+  - `pytest tests/infra/test_infra_graph.py`; CI runs `pytest -m "not slow"` on PRs and the full suite (including `slow`) on the schedule
 - **Local single-process dev:**
   - Initialize infra: `twinkle.initialize(mode='local', seed=42)`
   - Inspect device placement: call `twinkle.infra.get_device_placement()`.
