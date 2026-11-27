@@ -3,19 +3,17 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd -- "$script_dir/../../../../.."
-if [[ -n $(git status --porcelain) ]]; then
-    printf 'Build from a clean deployment checkout.\n' >&2
-    exit 2
-fi
 revision=$(git rev-parse HEAD)
 registry=${REGISTRY:-openmind-registry.cn-hangzhou.cr.aliyuncs.com}
 image="$registry/openmind/modelscope:twinkle-h20-group-${revision:0:12}"
 
 sudo -v
 sudo docker login "$registry"
-sudo env DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --progress=plain \
+printf 'Building %s from Git commit %s\n' "$image" "$revision"
+git archive "$revision" -- .dockerignore Dockerfile pyproject.toml setup.cfg README.md LICENSE src cookbook | \
+    sudo env DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --progress=plain \
     --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}" \
-    --label "org.opencontainers.image.revision=$revision" -t "$image" .
+    --label "org.opencontainers.image.revision=$revision" -t "$image" -
 
 sudo docker run --rm -i --platform linux/amd64 --entrypoint python "$image" - <<'PYTHON'
 import json

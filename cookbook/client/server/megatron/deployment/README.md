@@ -43,7 +43,7 @@ bash "$build_script" observability 20261125-1
 
 ## Spectrum GPU 成组验收
 
-在 Linux 构建机用部署分支打包 GPU 镜像。脚本实时打印构建日志和实际依赖版本，仅在版本匹配、Swift 契约可加载且依赖检查没有新增冲突后推送。
+在 Linux 构建机用部署分支打包 GPU 镜像。脚本用当前 Git 提交中的文件构建，可以保留本地未提交文件。它实时打印构建日志和实际依赖版本，仅在版本匹配、Swift 契约可加载且依赖检查没有新增冲突后推送。
 
 ```bash
 git fetch origin server-runtime-deployment:refs/remotes/origin/server-runtime-deployment && git checkout server-runtime-deployment && git pull --ff-only origin server-runtime-deployment && bash cookbook/client/server/megatron/deployment/build-and-push-gpu-image.sh
