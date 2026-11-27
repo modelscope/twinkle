@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .base import Loss
+from .qwen3_tts import TTSLoss
 from .channel import ChannelLoss
 from .chunked_cross_entropy import ChunkedCrossEntropyLoss
 from .clip_cov import ClipCovLoss
@@ -24,6 +25,7 @@ from .seq_cls import SeqClsLoss
 from .value import PPOValueLoss
 
 torch_loss_mapping = {
+    'tts': TTSLoss,
     'mse': MSELoss,
     'channel': ChannelLoss,
     'chunked_cross_entropy': ChunkedCrossEntropyLoss,
