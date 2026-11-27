@@ -278,8 +278,9 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
         self.backend = backend
         self.device_group = DeviceGroup(**device_group)
         self.training_context = TrainingRuntimeContext.model_validate(kwargs.pop('training_context'))
-        await self.initialize_training_runtime(self.training_context, kwargs.pop('placement_group'),
-                                               kwargs.pop('allocation_devices'))
+        allocation_node = kwargs.pop('allocation_node', None)
+        allocation_devices = kwargs.pop('allocation_devices')
+        await self.initialize_training_runtime(self.training_context, kwargs.pop('placement_group'), allocation_devices)
         self.device_mesh = init_twinkle_runtime(
             is_mock=(backend == 'mock'),
             nproc_per_node=nproc_per_node,
@@ -331,6 +332,8 @@ class ModelManagement(TrainingRuntime, TaskQueueMixin):
             on_backend_timeout=self._probe_after_timeout,
             collect_width=len(actors) if actors else 1,
             telemetry_base_model=self._telemetry_base_model,
+            compute_node=allocation_node,
+            gpu_devices=allocation_devices if self.device_group.device_type == 'cuda' else (),
         )
         self.model._ray_get_timeout = self.task_queue_config.effective_execution_timeout
         self._training_states = {}

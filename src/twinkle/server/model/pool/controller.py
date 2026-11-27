@@ -245,7 +245,7 @@ class TrainingController:
                     if instance.state != "ALLOCATING":
                         raise RuntimeError("Instance became unavailable during allocation")
                     for name in details:
-                        if name not in ("application_name", "placement_group_id", "node_id", "devices"):
+                        if name not in ("application_name", "placement_group_id", "node_id", "node_name", "devices"):
                             raise ValueError(f"Unknown runtime allocation field: {name}")
                     allocated = instance.model_copy(deep=True, update=details)
                     await self.store.save_instance(allocated)

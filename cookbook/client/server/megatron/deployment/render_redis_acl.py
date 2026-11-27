@@ -35,7 +35,8 @@ def main() -> None:
             f"user twinkle on #{runtime} ~{prefix}* "
             "+get +mget +set +del +exists +scan +watch +unwatch +multi +exec +discard "
             "+ping +select +hello +client|setinfo\n"
-            f"user twinkle-grafana on #{grafana} {snapshots} +get\n"
+            f"user twinkle-grafana on #{grafana} {snapshots} "
+            "+get +ping +select +hello +client|setinfo\n"
         )
 
 

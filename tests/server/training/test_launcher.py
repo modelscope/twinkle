@@ -158,7 +158,7 @@ def test_launch_preserves_blocking_policy_and_deploys_on_demand_training(monkeyp
     monkeypatch.setattr(launcher, '_wait_for_shutdown', lambda: calls.append('wait'))
     monkeypatch.setattr(launcher, '_shutdown', lambda **kwargs: calls.append('shutdown'))
     launcher.launch(blocking=blocking)
-    expected = ['environment', 'ray', 'serve', 'gateway', 'train', 'training']
+    expected = ['environment', 'ray', 'serve', 'train', 'training', 'gateway']
     assert calls == expected + (['wait', 'shutdown'] if blocking else [])
 
 

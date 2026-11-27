@@ -1,7 +1,10 @@
 """Adapt the production Compose configuration to one network namespace."""
 
+import ipaddress
+import os
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import json
 import yaml
@@ -25,6 +28,16 @@ def rebase(value, source, destination):
 
 
 def main(output, data, limits, key_prefix):
+    redis_host = urlsplit(os.environ['OBS_REDIS_URL']).hostname
+    if not redis_host:
+        raise ValueError('OBS_REDIS_URL must include the private Redis host')
+    try:
+        loopback = ipaddress.ip_address(redis_host).is_loopback
+    except ValueError:
+        loopback = redis_host.rstrip('.') == 'localhost'
+    if loopback:
+        raise ValueError('Observability Runtime requires the private address of the Redis Runtime')
+
     for index, (name, old_dir) in enumerate((('mimir', '/data'), ('loki', '/loki'), ('tempo', '/var/tempo'))):
         path = data / name
         path.mkdir(parents=True, exist_ok=True)

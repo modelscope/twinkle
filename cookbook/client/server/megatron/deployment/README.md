@@ -40,3 +40,16 @@ bash "$build_script" observability 20261125-1
 - 保留上一版镜像和 YAML 供回滚。直连灰度失败时，可切回已验证的 Mesh/Adapter 路径。
 
 [观测 Compose](../../../../observability/docker-compose.production.yaml) 用于有 Docker Compose 的开发环境。
+
+## Spectrum GPU 成组验收
+
+在 Linux 构建机用部署分支打包 GPU 镜像。脚本实时打印构建日志和实际依赖版本，仅在版本匹配、Swift 契约可加载且依赖检查没有新增冲突后推送。
+
+```bash
+git switch server-runtime-deployment && git pull --ff-only && bash cookbook/client/server/megatron/deployment/build-and-push-gpu-image.sh
+```
+
+1. 为同一个应用创建 GPU Runtime 版本，使用脚本打印的镜像。运行命令填 `exec /usr/local/bin/twinkle-runtime spectrum-group`，平台端口填 `9000`，探针填 `/healthz`。只将此探针交给平台。把 Serve `8000`、Ray 和 OTLP 留在授权的内网。
+2. 创建一个成组部署，基数选 3，组数填 1。扩展配置开启 `{"cache_volume":{"enabled":true,"scope":"application"}}`。把 [GPU 私有配置模板](gpu-group.runtime.env.example) 配置为应用卷上的 `runtime-config/twinkle-gpu.env`。Redis URL 和 Grafana 必须指向同一个 Redis 和 key prefix，Grafana 使用独立的快照只读账户。验双机时同时把基数和 `TWINKLE_EXPECTED_RAY_NODES` 改为 2。
+3. 先核对平台给的 Rank、Ray 的 24 张卡和三个节点的任务落点，再通过 Head 的 `/readyz` 检查业务路由。默认 [4B 验收配置](../server_config_h20_smoke.yaml) 把 Megatron 放 A、vLLM 放 B，C 参与 Ray 组网。使用 [3×8 正式模型配置](../server_config_h20_3x8.yaml) 时显式设置 `TWINKLE_SERVER_CONFIG`，单独验收各模型。
+4. 运行客户端训练并对账。训练活跃时查 Grafana 的 **Current trainings**，打开对应 trace 的 `task_queue.execute`，通过 **Allocated GPU utilization** 或 **Allocated GPU memory** 查实际分配的卡。在同一次训练中保存训练和采样 checkpoint，让 B 从共享卷读取采样权重。上传 ModelScope 时只使用获准的私有仓库。

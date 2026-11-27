@@ -328,9 +328,15 @@ class ServerLauncher:
         try:
             self._start_serve()
             for app in self.config.applications:
-                self._deploy_application(app)
+                if app.import_path != 'server':
+                    self._deploy_application(app)
             if self.config.training_config.models:
                 self._deploy_training()
+            # The gateway health endpoint announces readiness to clients. Publish
+            # it only after the downstream route prefixes have been registered.
+            for app in self.config.applications:
+                if app.import_path == 'server':
+                    self._deploy_application(app)
             logger.info('All applications started')
             if not blocking:
                 return

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from twinkle import Platform
 from twinkle.infra._ray.resource_manager import _gpu_placement_group_cpus
 from twinkle.server.exceptions import RequestRejectedError, ResourceReleaseError
+from twinkle.server.telemetry.correlation import telemetry_node
 
 
 class CapacityUnavailableError(RequestRejectedError):
@@ -20,6 +21,7 @@ class DeviceAllocation:
     placement_group_id: str
     node_id: str
     devices: tuple[str, ...]
+    node_name: str
 
 
 def _probe_allocation(resource: str, device_type: str):
@@ -33,7 +35,7 @@ def _probe_allocation(resource: str, device_type: str):
     else:
         env = os.environ.get(Platform.get_platform(device_type).visible_device_env())
         devices = env.split(",") if env else context.get_accelerator_ids().get(resource, [])
-    return context.get_node_id(), [str(device) for device in devices]
+    return context.get_node_id(), [str(device) for device in devices], telemetry_node()
 
 
 class DevicePool:
@@ -86,14 +88,14 @@ class DevicePool:
                 options["num_gpus"] = count
             elif resource != "CPU":
                 options["resources"] = {resource: count}
-            node, devices = await asyncio.wait_for(
+            node, devices, node_name = await asyncio.wait_for(
                 ray.remote(_probe_allocation).options(**options).remote(resource, device_type), self.shutdown_timeout
             )
             if resource == "CPU":
                 devices = [str(index) for index in range(count)]
             if len(devices) != count or len(set(devices)) != count:
                 raise RuntimeError("Ray allocation did not return the requested unique device IDs")
-            return DeviceAllocation(name, pg.id.hex(), node, tuple(devices))
+            return DeviceAllocation(name, pg.id.hex(), node, tuple(devices), node_name)
         except BaseException as exc:
             # Cancellation cannot stop a synchronous GCS create. Keep its task
             # owned until removal has observed the late result; a close timeout

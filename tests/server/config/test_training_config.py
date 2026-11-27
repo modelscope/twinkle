@@ -104,6 +104,8 @@ def test_catalog_defaults_and_mode_selection():
 def deployment_endpoints(monkeypatch):
     monkeypatch.setenv('TWINKLE_REDIS_URL', 'redis://127.0.0.1:6380/0')
     monkeypatch.setenv('TWINKLE_OTLP_ENDPOINT', 'http://127.0.0.1:4317')
+    monkeypatch.setenv('TWINKLE_REDIS_KEY_PREFIX', 'twinkle:test:')
+    monkeypatch.setenv('TWINKLE_GATEWAY_API_KEY', 'test-only-key')
 
 
 def test_existing_yaml_uses_explicit_instance_limits_and_business_idle(deployment_endpoints):

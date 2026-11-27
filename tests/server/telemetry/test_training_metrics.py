@@ -230,7 +230,7 @@ async def test_driver_records_allocation_attempts(failed):
     store = SimpleNamespace(models=SimpleNamespace(unregister_replica_capacity=AsyncMock()))
     driver = RayInstanceDriver(config, store, 'test', 'controller')
     driver._metrics = MagicMock()
-    allocation = DeviceAllocation('owned', 'pg', 'node', ('0',))
+    allocation = DeviceAllocation('owned', 'pg', 'node', ('0',), 'worker-node')
     driver.runtime.pool.allocate = AsyncMock(return_value=allocation,
         side_effect=RuntimeError('allocation failed') if failed else None)
     instance = SimpleNamespace(instance_id='instance', controller_epoch='epoch', application_name='owned',

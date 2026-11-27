@@ -130,15 +130,18 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
         self.device_group = DeviceGroup(**device_group)
         context = kwargs.pop('sampling_context', None)
         telemetry_base_model = kwargs.pop('telemetry_base_model', None) or model_id
+        allocation_node = kwargs.pop('allocation_node', None)
+        allocation_devices = ()
         if context is not None:
             context = RuntimeContext.model_validate(context)
             from twinkle.infra._ray.ray_helper import RayHelper
             from twinkle.infra._ray.resource_manager import ResourceManager
             os.environ['TWINKLE_RAY_NAMESPACE'] = context.namespace
             os.environ['TWINKLE_RAY_REGISTRY_NAME'] = context.registry_name
+            allocation_devices = kwargs.pop('allocation_devices')
             RayHelper.resource_manager = ResourceManager.from_allocation(self.device_group,
                                                                          kwargs.pop('placement_group'),
-                                                                         kwargs.pop('allocation_devices'))
+                                                                         allocation_devices)
         self.device_mesh = init_twinkle_runtime(
             is_mock=(sampler_type == 'mock'),
             nproc_per_node=nproc_per_node,
@@ -184,6 +187,8 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
             deployment_name='Sampler',
             telemetry_base_model=telemetry_base_model,
             collect_width=len(actors) if actors else 1,
+            compute_node=allocation_node,
+            gpu_devices=allocation_devices if self.device_group.device_type == 'cuda' else (),
         )
         # ComputeWorker bounds the client future. Keep collecting the actual
         # backend result so a timed-out request cannot release live weights.

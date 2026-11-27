@@ -1,0 +1,77 @@
+# Spectrum acceptance: Megatron on A and vLLM on B.
+ray_namespace: twinkle-h20-smoke
+proxy_location: EveryNode
+trust_remote_code: false
+http_options: {host: 0.0.0.0, port: 8000}
+
+persistence:
+  mode: redis
+  redis_url: "${oc.env:TWINKLE_REDIS_URL}"
+  key_prefix: "${oc.env:TWINKLE_REDIS_KEY_PREFIX}"
+
+telemetry:
+  enabled: true
+  service_name: twinkle-h20-smoke
+  otlp_endpoint: "${oc.env:TWINKLE_OTLP_ENDPOINT}"
+  export_interval_ms: 15000
+
+resources:
+  startup_timeout_s: 1800
+  shutdown_timeout_s: 180
+
+applications:
+  - name: server
+    import_path: server
+    route_prefix: /api/v1
+    args:
+      api_key: "${oc.env:TWINKLE_GATEWAY_API_KEY}"
+      server_config:
+        metrics_update_interval: 15
+    deployments:
+      - name: GatewayServer
+        max_ongoing_requests: 64
+        ray_actor_options: {num_cpus: 1}
+
+  - name: train-qwen35-4b
+    import_path: model
+    route_prefix: /api/v1/model/Qwen/Qwen3.5-4B
+    args:
+      model_id: ms://Qwen/Qwen3.5-4B
+      node_selector: {twinkle-node: a}
+      backend: megatron
+      train_mode: lora
+      task_type: causal_lm
+      language_model_only: true
+      mixed_precision: bf16
+      min_replicas: 0
+      max_replicas: 1
+      max_loras: 2
+      max_r: 16
+      max_length: 4096
+      target_modules: [linear_qkv]
+      nproc_per_node: 2
+      device_group: {name: model, ranks: 2, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 2}
+
+  - name: sample-qwen35-4b
+    import_path: sampler
+    route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
+    args:
+      model_id: ms://Qwen/Qwen3.5-4B
+      node_selector: {twinkle-node: b}
+      sampler_type: vllm
+      min_replicas: 0
+      max_replicas: 1
+      nproc_per_node: 1
+      device_group: {name: sampler, ranks: 1, device_type: cuda}
+      device_mesh: {device_type: cuda, dp_size: 1}
+      engine_args:
+        tensor_parallel_size: 1
+        dtype: bfloat16
+        language_model_only: true
+        max_model_len: 4096
+        gpu_memory_utilization: 0.70
+        enable_lora: true
+        max_loras: 2
+        max_lora_rank: 16
+        logprobs_mode: processed_logprobs
