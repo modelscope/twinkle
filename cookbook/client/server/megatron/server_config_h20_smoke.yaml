@@ -60,7 +60,9 @@ applications:
       model_id: ms://Qwen/Qwen3.5-4B
       node_selector: {twinkle-node: b}
       sampler_type: vllm
-      min_replicas: 0
+      # Load the sampler before Gateway readiness so client setup can finish
+      # within its HTTP timeout even when the model cache is cold.
+      min_replicas: 1
       max_replicas: 1
       nproc_per_node: 1
       device_group: {name: sampler, ranks: 1, device_type: cuda}
