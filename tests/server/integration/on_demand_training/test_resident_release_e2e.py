@@ -49,7 +49,7 @@ def release_gate(actor, action):
 
 def worker_origin(actor):
     import twinkle
-    from twinkle.server.model.pool import controller
+    from twinkle_server.model.pool import controller
     return {'python': sys.executable, 'twinkle': twinkle.__file__, 'controller': controller.__file__,
             'visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES')}
 
@@ -58,8 +58,8 @@ def test_resident_release_ack_after_worker_failure(tmp_path):
     import ray
     from ray import serve
     from ray.util import list_named_actors
-    from twinkle.server.config import ServerConfig
-    from twinkle.server.launcher.server_launcher import ServerLauncher
+    from twinkle_server.config import ServerConfig
+    from twinkle_server.launcher.server_launcher import ServerLauncher
     from tests.server.integration.on_demand_training.acceptance_support import TrainingHandle, wait_until, assert_released
     from tests.server.integration.on_demand_training.managed_redis import ManagedRedis
 

@@ -5,13 +5,13 @@ from starlette.requests import Request
 from tinker import types
 from unittest.mock import ANY, AsyncMock, MagicMock
 
-from twinkle.server.model.app import ModelManagement
-from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
-from twinkle.server.deployment import twinkle_server_error_handler
-from twinkle.server.exceptions import BatchSizeError, TwinkleServerError
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.task_queue.mixin import TaskQueueMixin
-from twinkle.server.model.runtime import TrainingExecutionState
+from twinkle_server.model.app import ModelManagement
+from twinkle_server.model.tinker_handlers import _register_model_tinker_routes
+from twinkle_server.deployment import twinkle_server_error_handler
+from twinkle_server.exceptions import BatchSizeError, TwinkleServerError
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.task_queue.mixin import TaskQueueMixin
+from twinkle_server.model.runtime import TrainingExecutionState
 
 
 class _DummyManagement:
@@ -220,10 +220,10 @@ class _SaveWeightsDummyManagement:
                          ids=['lora', 'full-model', 'backend-failure'])
 async def test_training_save_records_metadata_only_after_backend_success(monkeypatch, tmp_path, fail_backend, full_mode):
     from pathlib import Path
-    import twinkle.server.model.tinker_handlers as handlers
-    from twinkle.server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
+    import twinkle_server.model.tinker_handlers as handlers
+    from twinkle_server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
 
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     runs = TinkerTrainingRunManager('token1')
     runs._write_info('model1', {'base_model': 'test-model'})
     manager = TinkerCheckpointManager('token1', runs)
@@ -262,9 +262,9 @@ async def test_training_save_records_metadata_only_after_backend_success(monkeyp
 @pytest.mark.asyncio
 @pytest.mark.parametrize('path,output_dir', [('org/model', None), ('twinkle://model1/weights/step', 'local')])
 async def test_load_weights_resolves_location_and_preserves_optimizer_flag(monkeypatch, tmp_path, path, output_dir):
-    import twinkle.server.model.tinker_handlers as handlers
-    from twinkle.server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    import twinkle_server.model.tinker_handlers as handlers
+    from twinkle_server.checkpoint.tinker import TinkerCheckpointManager, TinkerTrainingRunManager
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     manager = TinkerCheckpointManager('token1', TinkerTrainingRunManager('token1'))
     if output_dir:
         manager.save('model1', 'step')
@@ -320,9 +320,9 @@ async def test_tinker_loss_metric_survives_sdk_reduction(backward):
 @pytest.mark.parametrize('full_mode', [False, True], ids=['lora', 'full-model'])
 async def test_sampler_save_materializes_weights_and_returns_sdk_mode(monkeypatch, tmp_path, name, sequence_id, full_mode):
     from pathlib import Path
-    from twinkle.server.checkpoint import create_checkpoint_manager
-    import twinkle.server.model.tinker_handlers as handlers
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    from twinkle_server.checkpoint import create_checkpoint_manager
+    import twinkle_server.model.tinker_handlers as handlers
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     manager = create_checkpoint_manager('token1', client_type='tinker')
     manager.training_run_manager._write_info('model1', {'base_model': 'test-model'})
     monkeypatch.setattr(handlers, 'create_checkpoint_manager', lambda *args, **kwargs: manager)
@@ -355,7 +355,7 @@ async def test_sampler_save_materializes_weights_and_returns_sdk_mode(monkeypatc
 
 @pytest.mark.asyncio
 async def test_hybrid_save_weights_for_sampler_is_rejected():
-    from twinkle.server.exceptions import RequestRejectedError
+    from twinkle_server.exceptions import RequestRejectedError
 
     management = _SaveWeightsDummyManagement()
     management.train_mode = 'hybrid'

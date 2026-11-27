@@ -12,11 +12,11 @@ Twinkle's DPO extension also uses `importance_sampling`, with `ref_logps` on **e
 
 ## Initialization
 
-From the repository root, run `python -m pip install -e '.[client]'` to install the Tinker SDK version pinned by Twinkle.
+From the repository root, run `python -m pip install -e . -e ./twinkle_cs/client` to install the Tinker SDK version pinned by Twinkle.
 
 ```python
 # Initialize Tinker client before importing ServiceClient
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 
 init_tinker_client()
 
@@ -51,11 +51,11 @@ import os
 import numpy as np
 from tqdm import tqdm
 from tinker import types
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.model.tinker_datum import input_feature_to_datum
+from twinkle_client.utils.tinker_datum import input_feature_to_datum
 
 # Step 1: Initialize Tinker client before importing ServiceClient
 init_tinker_client()
@@ -142,7 +142,7 @@ You can also load saved checkpoints for inference:
 ```python
 import os
 from tinker import types
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
 

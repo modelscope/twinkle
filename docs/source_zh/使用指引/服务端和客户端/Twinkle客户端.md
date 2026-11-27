@@ -5,7 +5,7 @@
 ## 初始化
 
 ```python
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 
 # 初始化客户端，连接到 Twinkle Server
 client = init_twinkle_client(
@@ -50,7 +50,7 @@ from twinkle.model import MultiLoraTransformersModel
 # DataLoader 和 Dataset 使用本地 twinkle 或远端 twinkle_client 均可
 from twinkle.dataloader import DataLoader        # 或 from twinkle_client.dataloader import DataLoader
 from twinkle.dataset import Dataset              # 或 from twinkle_client.dataset import Dataset
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 
 client = init_twinkle_client(base_url=base_url, api_key=api_key)
 model = client.model(f'ms://{base_model}')
@@ -69,7 +69,7 @@ dotenv.load_dotenv('.env')
 from peft import LoraConfig
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 
 # DataLoader 和 Dataset 使用本地 twinkle 或远端 twinkle_client 均可
 from twinkle.dataloader import DataLoader
@@ -224,7 +224,7 @@ Twinkle Client 场景下，推荐的断点续训流程是：
 在与本指南同一版本的仓库根目录安装客户端，填入管理员提供的地址、令牌和模型名：
 
 ```bash
-python -m pip install -e '.[client]'
+python -m pip install -e . -e ./twinkle_cs/client
 export TWINKLE_SERVER_URL=https://your-twinkle-server
 export TWINKLE_SERVER_TOKEN=your-token
 python cookbook/client/twinkle/online_distillation.py --method opsd --model distill-student --steps 4
@@ -283,7 +283,8 @@ TWINKLE_MAX_STEPS=6 python cookbook/client/async_rl/client_orchestrated_grpo.py
 先在仓库根目录安装公共客户端依赖。运行 E2B 版本也需要这一步。
 
 ```bash
-python -m pip install -e '.[client]' python-dotenv \
+python -m pip install -e . -e ./twinkle_cs/client
+python -m pip install python-dotenv \
   'ms-swift @ git+https://github.com/modelscope/ms-swift.git@e1ac89d24f47cb8fd73a7245dd79df0959aec284'
 ```
 
@@ -305,7 +306,7 @@ python cookbook/client/async_rl/streaming_multi_turn_grpo.py
 安装上面的公共客户端依赖后，在 `.env` 设置 `E2B_API_KEY`。使用官方 E2B 服务时，留空端点覆盖配置。
 
 ```bash
-pip install -e '.[client,e2b]'
+pip install -e '.[e2b]' -e ./twinkle_cs/client
 python cookbook/client/async_rl/e2b_multi_turn_grpo.py
 ```
 

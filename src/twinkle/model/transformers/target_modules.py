@@ -36,6 +36,14 @@ __all__ = [
 #: the all-linear search nor PEFT's own all-linear expansion may treat them as "invisible" linears.
 GLU_LINEAR_CLS = ('glulinear', 'gemma4clippablelinear')  # phi4-mm, gemma4
 
+#: ``nn.Linear`` subclasses whose forward is NOT a plain matmul over the last dim, so the standard
+#: LoRA residual ``lora_B(lora_A(x))`` (shape ``[..., out_features]``) does not match the base
+#: output. DeepseekV4GroupedLinear (DSV4 ``self_attn.o_a_proj``) is block-diagonal: weight is
+#: ``[n_groups * out_per_group, in_per_group]`` and forward maps ``[..., n_groups, in_per_group]``
+#: to ``[..., n_groups, out_per_group]`` -- plain LoRA on it raises a shape mismatch. The multi-LoRA
+#: preallocation default already excludes ``o_a_proj``; the single-adapter all-linear path must too.
+NON_PLAIN_LINEAR_CLS = ('deepseekv4groupedlinear',)
+
 
 def find_layers(model: nn.Module,
                 cond: Callable[[str, nn.Module], bool],
@@ -98,10 +106,14 @@ def find_all_linears(model: nn.Module,
     # 'score' / 'classifier': sequence-classification head; 'v_head': reward-model head. The lora_* /
     # base_layer entries keep an already-adapted model from being targeted through its own wrappers.
     ignore_layers = [lm_head_name, 'score', 'v_head', 'classifier', 'lora_A', 'lora_B', 'base_layer']
-    ignore_linear_cls = list(GLU_LINEAR_CLS)
+    ignore_linear_cls = list(GLU_LINEAR_CLS) + list(NON_PLAIN_LINEAR_CLS)
 
     def _cond(name: str, module: nn.Module) -> bool:
         module_name = module.__class__.__name__.lower()
+        # Non-plain nn.Linear subclasses (block-diagonal grouped forward) can never carry the
+        # standard LoRA residual -- exclude them even when extra_layers isinstance-matches them.
+        if any(linear_cls in module_name for linear_cls in NON_PLAIN_LINEAR_CLS):
+            return False
         if (extra_layers and isinstance(module, tuple(extra_layers)) or
             ('linear' in module_name and all(linear_cls not in module_name
                                              for linear_cls in ignore_linear_cls))) and all(layer not in name
@@ -230,7 +242,18 @@ def expand_multimodal_lora_target(model: nn.Module,
             and type(module).__name__.lower() not in GLU_LINEAR_CLS
             and not any(part in name for part in ('lora_A', 'lora_B', 'base_layer'))
             for name, module in base_model.named_modules())
-        if invisible:
+        # nn.Linear subclasses with a non-plain forward ARE visible to PEFT's native all-linear
+        # expansion but cannot carry the standard LoRA residual (shape mismatch at forward);
+        # switch to the explicit expansion, which skips NON_PLAIN_LINEAR_CLS.
+        non_plain = [
+            name for name, module in base_model.named_modules()
+            if type(module).__name__.lower() in NON_PLAIN_LINEAR_CLS
+        ]
+        if non_plain:
+            logger.warning(
+                f"all-linear: skipping non-plain grouped linear modules {non_plain} "
+                '(block-diagonal forward; standard LoRA residual does not shape-match).')
+        if invisible or non_plain:
             expanded = find_all_linears(base_model, model_arch.get('lm_head'), extra_layers=[nn.Linear, Conv1D])
             if not expanded:
                 raise ValueError("Dense 'all-linear' expansion found no LoRA-able layer; "

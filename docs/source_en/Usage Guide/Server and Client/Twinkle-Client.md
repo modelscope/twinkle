@@ -5,7 +5,7 @@ Use Twinkle Client to define training data, objectives, and evaluation. Twinkle 
 ## Initialization
 
 ```python
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 
 # Initialize client, connect to Twinkle Server
 client = init_twinkle_client(
@@ -50,7 +50,7 @@ from twinkle.model import MultiLoraTransformersModel
 # DataLoader and Dataset can be imported from either local twinkle or remote twinkle_client
 from twinkle.dataloader import DataLoader        # or: from twinkle_client.dataloader import DataLoader
 from twinkle.dataset import Dataset              # or: from twinkle_client.dataset import Dataset
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 
 client = init_twinkle_client(base_url=base_url, api_key=api_key)
 model = client.model(f'ms://{base_model}')
@@ -69,7 +69,7 @@ dotenv.load_dotenv('.env')
 from peft import LoraConfig
 from twinkle import get_logger
 from twinkle.dataset import DatasetMeta
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 
 # DataLoader and Dataset can be imported from either local twinkle or remote twinkle_client
 from twinkle.dataloader import DataLoader
@@ -224,7 +224,7 @@ Ask your service administrator for its URL, token, and model services. The examp
 Install the client from the repository root for the same version as this guide. Use the URL, token, and model name provided by your administrator:
 
 ```bash
-python -m pip install -e '.[client]'
+python -m pip install -e . -e ./twinkle_cs/client
 export TWINKLE_SERVER_URL=https://your-twinkle-server
 export TWINKLE_SERVER_TOKEN=your-token
 python cookbook/client/twinkle/online_distillation.py --method opsd --model distill-student --steps 4
@@ -283,7 +283,8 @@ Use the server URL and token from the section above. The default model is `Qwen/
 Install the shared client dependencies from the repository root. The E2B recipe also needs this step.
 
 ```bash
-python -m pip install -e '.[client]' python-dotenv \
+python -m pip install -e . -e ./twinkle_cs/client
+python -m pip install python-dotenv \
   'ms-swift @ git+https://github.com/modelscope/ms-swift.git@e1ac89d24f47cb8fd73a7245dd79df0959aec284'
 ```
 
@@ -305,7 +306,7 @@ Games in one group use the same deal seed and keep independent state. Training u
 After installing the shared client dependencies above, set `E2B_API_KEY` in `.env`. Leave endpoint overrides unset to use the official E2B service.
 
 ```bash
-pip install -e '.[client,e2b]'
+pip install -e '.[e2b]' -e ./twinkle_cs/client
 python cookbook/client/async_rl/e2b_multi_turn_grpo.py
 ```
 

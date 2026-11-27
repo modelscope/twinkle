@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Lazy re-exports: importing ``twinkle.utils`` must stay dependency-light.
 
-The server-config import path (``twinkle.server.config`` -> ``hub.model_alias`` ->
+The server-config import path (``twinkle_server.config`` -> ``hub.model_alias`` ->
 ``get_logger``) is guarded by tests/server/test_dependencies.py to never load torch/ray;
 eagerly re-exporting the torch-dependent helpers (kl/torch_utils/safetensors/...) here
 dragged torch into that path. Same _LazyModule pattern as the twinkle root package.

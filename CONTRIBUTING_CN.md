@@ -54,7 +54,7 @@ twinkle使用 [ruff](https://docs.astral.sh/ruff/) 同时进行代码检查和�
 - **目标版本**：Python 3.11
 - **检查规则**：`B`、`E`、`F`、`W`、`I`、`UP`、`T`（bugbear、pycodestyle、pyflakes、isort、pyupgrade、flake8-print）
 - **格式化风格**：双引号（`quote-style = "double"`）
-- **排除路径**：`examples/`、`cookbook/`、`client_tools/`、`src/twinkle_client/`、`tests/`、`docs/src`
+- **排除路径**：`examples/`、`cookbook/`、`client_tools/`、`twinkle_cs/client/src/twinkle_client/`、`tests/`、`docs/src`
 
 twinkle在PR提交后会进行两类测试：
 

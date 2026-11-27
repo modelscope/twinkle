@@ -6,7 +6,7 @@
 # It will:
 #   1. Check if conda is installed; if not, download and install Miniconda
 #   2. Create a new conda environment with Python 3.11
-#   3. Install twinkle-kit with tinker dependencies
+#   3. Install twinkle-client and its twinkle-kit dependency
 #
 # Usage:
 #   chmod +x INSTALL_CLIENT.sh
@@ -165,11 +165,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/pyproject.toml" ]; then
     echo ""
     echo "Installing twinkle from source (with tinker support)..."
-    pip install -e "$SCRIPT_DIR[tinker]"
+    pip install -e "$SCRIPT_DIR" -e "$SCRIPT_DIR/twinkle_cs/client"
 else
     echo ""
-    echo "Installing twinkle-kit from PyPI (with tinker support)..."
-    pip install 'twinkle-kit[tinker]'
+    echo "Installing twinkle-client from PyPI (with tinker support)..."
+    pip install 'twinkle-client'
 fi
 
 # ==============================================================================

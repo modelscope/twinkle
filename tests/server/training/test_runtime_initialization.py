@@ -9,8 +9,8 @@ import pytest
 
 from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import create, setup
-from twinkle.server.model.runtime import TrainingRuntime
-from twinkle.server.state.training_records import CreateTraining
+from twinkle_server.model.runtime import TrainingRuntime
+from twinkle_server.state.training_records import CreateTraining
 
 
 @pytest.mark.asyncio
@@ -26,9 +26,9 @@ async def test_configuration_deserialization_does_not_block_event_loop(monkeypat
         finished.set()
         return None
 
-    monkeypatch.setattr('twinkle.server.model.runtime.deserialize_object', deserialize)
+    monkeypatch.setattr('twinkle_server.model.runtime.deserialize_object', deserialize)
     manager = SimpleNamespace(save=Mock())
-    monkeypatch.setattr('twinkle.server.model.runtime.create_training_run_manager', lambda *args, **kw: manager)
+    monkeypatch.setattr('twinkle_server.model.runtime.create_training_run_manager', lambda *args, **kw: manager)
 
     async def serial(factory, task_type):
         return await factory()

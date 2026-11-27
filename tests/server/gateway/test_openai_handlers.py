@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from twinkle.server.gateway.openai_bridge import translate_response
+from twinkle_server.gateway.openai_bridge import translate_response
 
 # ---------- Fixtures ------------------------------------------------------- #
 
@@ -25,7 +25,7 @@ from twinkle.server.gateway.openai_bridge import translate_response
 def mock_gateway():
     """Build a minimal FastAPI app with OpenAI routes and a mock GatewayServer."""
     import twinkle.protocol.types as types
-    from twinkle.server.gateway.openai_handlers import _register_openai_routes
+    from twinkle_server.gateway.openai_handlers import _register_openai_routes
 
     mock_state = AsyncMock()
     mock_state.get_model_metadata = AsyncMock(return_value=None)
@@ -122,8 +122,8 @@ class TestChatCompletions:
         import ray
 
         from twinkle.protocol.types import SupportedModel
-        from twinkle.server.gateway import openai_handlers
-        from twinkle.server.sampler.pool.controller import sampler_controller_name, sampling_pool_id
+        from twinkle_server.gateway import openai_handlers
+        from twinkle_server.sampler.pool.controller import sampler_controller_name, sampling_pool_id
 
         gateway, app = mock_gateway
         base = next(iter(gateway.supported_model_names))
@@ -405,7 +405,7 @@ class TestChatCompletions:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('blocked_step', ['disconnect_check', 'initial_read', 'long_poll'])
     async def test_non_stream_timeout_covers_each_wait_step(self, mock_gateway, monkeypatch, blocked_step):
-        from twinkle.server.gateway import openai_handlers
+        from twinkle_server.gateway import openai_handlers
 
         monkeypatch.setenv('TWINKLE_OPENAI_SAMPLE_TIMEOUT', '0.01')
         mock_self, app = mock_gateway
@@ -443,8 +443,8 @@ class TestChatCompletions:
 
     @pytest.mark.asyncio
     async def test_non_stream_polls_share_one_total_budget(self, mock_gateway, monkeypatch):
-        from twinkle.server.gateway import openai_handlers
-        from twinkle.server.gateway.use_cases import FuturePollResult
+        from twinkle_server.gateway import openai_handlers
+        from twinkle_server.gateway.use_cases import FuturePollResult
 
         monkeypatch.setenv('TWINKLE_OPENAI_SAMPLE_TIMEOUT', '0.05')
         mock_self, app = mock_gateway
@@ -726,7 +726,7 @@ class TestListModels:
         assert data['data'][0]['object'] == 'model'
 
     def test_alias_cannot_reuse_a_registered_name(self, monkeypatch):
-        from twinkle.server.gateway import app as gateway_app
+        from twinkle_server.gateway import app as gateway_app
 
         monkeypatch.setattr(gateway_app, 'get_server_state', MagicMock())
         with pytest.raises(ValueError, match='conflict with registered model names: model-a'):
@@ -734,7 +734,7 @@ class TestListModels:
                 supported_models=['model-a', 'model-b'], openai_model_aliases={'model-a': 'model-b'})
 
     def test_reconfigure_keeps_adapters_and_updates_aliases(self, monkeypatch):
-        from twinkle.server.gateway import app as gateway_app
+        from twinkle_server.gateway import app as gateway_app
 
         monkeypatch.setattr(gateway_app, 'get_server_state', MagicMock())
         gateway = gateway_app.GatewayServer(

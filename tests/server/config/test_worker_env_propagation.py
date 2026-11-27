@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle.server.config.env_propagation import (
+from twinkle_server.config.env_propagation import (
     SHARED_WORKER_ENV_KEYS,
     build_propagated_env_vars,
     build_shared_env_vars,
@@ -43,7 +43,7 @@ def test_propagated_env_includes_perf(monkeypatch):
 
 
 def test_ray_runtime_env_seeds_workers_with_perf(monkeypatch):
-    from twinkle.server.launcher.server_launcher import build_ray_runtime_env
+    from twinkle_server.launcher.server_launcher import build_ray_runtime_env
 
     monkeypatch.setenv('TWINKLE_PERF', '1')
     runtime_env = build_ray_runtime_env()
@@ -59,8 +59,8 @@ def test_ray_runtime_env_seeds_workers_with_perf(monkeypatch):
 def test_launch_config_sets_driver_and_worker_trust_remote_code(monkeypatch, tmp_path, yaml_value, inherited, expected):
     import os
 
-    from twinkle.server.config import ServerConfig
-    from twinkle.server.launcher.server_launcher import ServerLauncher, build_ray_runtime_env
+    from twinkle_server.config import ServerConfig
+    from twinkle_server.launcher.server_launcher import ServerLauncher, build_ray_runtime_env
 
     key = 'TWINKLE_TRUST_REMOTE_CODE'
     monkeypatch.setenv(key, inherited or '')

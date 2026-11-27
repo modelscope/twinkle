@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Static check: no direct Blocking_Backend_Call in ``src/twinkle/server/**``.
+"""Static check: no direct Blocking_Backend_Call in ``twinkle_cs/server/src/twinkle_server/**``.
 
 Asserts that backend methods are invoked only through ``call_backend``. The check
 covers direct calls, aliases created with ``getattr``, and methods passed to generic
@@ -15,10 +15,10 @@ from __future__ import annotations
 import ast
 import pathlib
 
-import twinkle
+import twinkle_server
 from tests.server.static.backend_call_exemptions import BACKEND_CALL_EXEMPTIONS
 
-_SERVER_ROOT = pathlib.Path(twinkle.__file__).resolve().parent / 'server'
+_SERVER_ROOT = pathlib.Path(twinkle_server.__file__).resolve().parent
 
 
 def _backend_method(node: ast.AST) -> str | None:

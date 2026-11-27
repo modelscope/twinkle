@@ -1,0 +1,140 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""
+Processor management application.
+
+Provides a Ray Serve deployment for managing distributed processors
+(datasets, dataloaders, preprocessors, rewards, templates, weight loaders, etc.).
+
+Follows the same structural pattern as model/app.py:
+- ProcessorManagement is a top-level class inheriting ProcessorManagerMixin
+- Routes are registered in build_processor_app() via _register_processor_routes()
+- serve.ingress(app)(ProcessorManagement) applied before deployment
+- One Serve replica owns the processor registry
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+from fastapi import FastAPI
+from typing import Any
+
+from twinkle import DeviceGroup, get_logger
+from twinkle_server.config.application_spec import validate_processor_replicas
+from twinkle_server.deployment import LazyCleanupMixin, bind_deployment, build_deployment_app
+from twinkle_server.runtime import init_twinkle_runtime
+from twinkle_server.session_resource import ProcessorManagerMixin
+from twinkle_server.state import ServerState, get_server_state
+from .twinkle_handlers import _register_processor_routes
+
+logger = get_logger()
+
+
+class ProcessorManagement(LazyCleanupMixin, ProcessorManagerMixin):
+    """Processor management service.
+
+    Manages lifecycle and invocation of distributed processor objects
+    (datasets, dataloaders, rewards, templates, etc.).
+
+    Lifecycle is handled by ProcessorManagerMixin:
+    - Processors are registered with a session ID on creation.
+    - A background task expires processors whose session has timed out.
+    - Per-user processor limit is enforced at registration.
+    """
+
+    def __init__(self,
+                 ncpu_proc_per_node: int,
+                 device_group: dict[str, Any],
+                 device_mesh: dict[str, Any],
+                 nproc_per_node: int = 1,
+                 processor_config: dict[str, Any] | None = None):
+        self.device_group = DeviceGroup(**device_group)
+        self.device_mesh = init_twinkle_runtime(
+            is_mock=False,
+            nproc_per_node=nproc_per_node,
+            device_group=self.device_group,
+            device_mesh_dict=device_mesh,
+            ncpu_proc_per_node=ncpu_proc_per_node,
+        )
+
+        # processor objects keyed by processor_id
+        self.resource_dict: dict[str, Any] = {}
+        self.state: ServerState = get_server_state()
+
+        _cfg = processor_config or {}
+        _env_limit = int(os.environ.get('TWINKLE_PER_USER_PROCESSOR_LIMIT', 20))
+        self._init_processor_manager(
+            processor_timeout=float(_cfg.get('processor_timeout', 1800.0)),
+            per_token_processor_limit=int(_cfg.get('per_token_processor_limit', _env_limit)),
+        )
+
+    async def _ensure_resource_cleanup_started(self) -> None:
+        # Start on the first request, when the replica has a running event loop.
+        self._ensure_countdown_started()
+        await self._ensure_state_cleanup_started()
+
+    async def _on_processor_expired(self, processor_id: str) -> None:
+        """Close the processor's workers and release its shared quota lease."""
+        info = self.get_resource_info(processor_id)
+        close = getattr(self.resource_dict.get(processor_id), 'close', None)
+        if callable(close):
+            await asyncio.to_thread(close)
+        self.resource_dict.pop(processor_id, None)
+        # A failed quota release must leave the closed processor unregistered.
+        self.unregister_resource(processor_id)
+        if info is not None:
+            await self.state.release_processor_quota(
+                info['token'],
+                processor_id,
+                lease_seconds=self._processor_quota_lease_seconds,
+            )
+
+
+def build_processor_app(ncpu_proc_per_node: int,
+                        device_group: dict[str, Any],
+                        device_mesh: dict[str, Any],
+                        deploy_options: dict[str, Any],
+                        nproc_per_node: int = 1,
+                        processor_config: dict[str, Any] | None = None,
+                        **kwargs):
+    """Build the processor management application.
+
+    Follows the same pattern as build_model_app(): FastAPI app and routes are
+    built here BEFORE serve.ingress so that the frozen app contains the full
+    route table visible to ProxyActor.
+
+    Args:
+        ncpu_proc_per_node: Number of CPU processes per node.
+        device_group: Device group configuration dict.
+        device_mesh: Device mesh configuration dict.
+        deploy_options: Ray Serve deployment options.
+        nproc_per_node: Number of GPU processes per node (default 1).
+        processor_config: Optional lifecycle configuration dict.
+            Supported keys:
+            - ``processor_timeout`` (float): Session inactivity timeout seconds. Default 1800.0.
+            - ``per_token_processor_limit`` (int): Max processors per user.
+              Overrides ``TWINKLE_PER_USER_PROCESSOR_LIMIT`` env var when provided.
+        **kwargs: Additional arguments.
+
+    Returns:
+        Ray Serve deployment bound with configuration.
+    """
+
+    validate_processor_replicas(deploy_options)
+    if deploy_options.get('autoscaling_config') is None:
+        deploy_options = {**deploy_options, 'num_replicas': 1}
+
+    # Build the FastAPI app + middleware stack + routes via the shared scaffold,
+    # then bind the Ray Serve deployment. No per-builder copy of the lifespan /
+    # middleware construction remains here.
+    def register_routes(app: FastAPI, get_self: Any) -> None:
+        _register_processor_routes(app, get_self)
+
+    app = build_deployment_app('Processor', register_routes)
+
+    return bind_deployment(
+        app,
+        ProcessorManagement,
+        deploy_options,
+        deployment_name='ProcessorManagement',
+        bind_args=(ncpu_proc_per_node, device_group, device_mesh, nproc_per_node, processor_config),
+    )

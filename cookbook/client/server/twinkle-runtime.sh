@@ -11,7 +11,7 @@ start_worker() {
 start_head() {
     : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray head address (host:port)}"
     : "${TWINKLE_SERVER_CONFIG:?Set TWINKLE_SERVER_CONFIG to the server YAML path}"
-    python -m twinkle.server check-config --config "$TWINKLE_SERVER_CONFIG"
+    python -m twinkle_server check-config --config "$TWINKLE_SERVER_CONFIG"
 
     source "$(dirname -- "${BASH_SOURCE[0]}")/twinkle-runtime-common.sh"
     local finished readiness_pid
@@ -51,7 +51,7 @@ PYTHON
     fi
     unset 'pids[1]' 'services[1]'
 
-    start_service python -m twinkle.server launch --config "$TWINKLE_SERVER_CONFIG"
+    start_service python -m twinkle_server launch --config "$TWINKLE_SERVER_CONFIG"
     wait_for_services
 }
 
@@ -91,7 +91,7 @@ case "$role" in
         ;;
     server)
         : "${RAY_ADDRESS:?Set RAY_ADDRESS to the Ray head address (host:port)}"
-        exec python -m twinkle.server launch "$@"
+        exec python -m twinkle_server launch "$@"
         ;;
     *)
         printf 'Usage: twinkle-runtime {h20-a|h20-b|h20-c|head|ray-head|ray-worker|server} [options]\n' >&2

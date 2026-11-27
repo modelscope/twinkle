@@ -73,7 +73,7 @@ def test_tool_schema_names_are_unique_and_dispatchable():
 @pytest.mark.parametrize('samplers', [[], [{'model_id': 'Qwen/teacher', 'engine': 'vllm', 'tp': 2, 'dp': 2}]])
 def test_generated_server_config_matches_launcher_schema(tmp_path, monkeypatch, backend, samplers):
     from pathlib import Path
-    from twinkle.server.config import ServerConfig
+    from twinkle_server.config import ServerConfig
 
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
     path = ToolExecutor._generate_server_config('Qwen/student', train_gpus=2, backend=backend, samplers=samplers)

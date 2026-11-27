@@ -8,8 +8,8 @@ import uuid
 
 from twinkle import DeviceGroup
 from twinkle.infra._ray.resource_manager import ResourceManager
-from twinkle.server.config.training import TrainingConfig
-from twinkle.server.resources.allocation import CapacityUnavailableError, DevicePool
+from twinkle_server.config.training import TrainingConfig
+from twinkle_server.resources.allocation import CapacityUnavailableError, DevicePool
 
 
 async def main():

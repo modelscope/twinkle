@@ -19,10 +19,10 @@ import pytest
 
 ray = pytest.importorskip('ray')
 
-from twinkle.server.lifecycle.poll_config import long_poll_window, retrieve_poll_interval  # noqa: E402
-from twinkle.server.state import ServerState                              # noqa: E402
-from twinkle.server.config.task_queue import TaskQueueConfig        # noqa: E402
-from twinkle.server.task_queue.mixin import TaskQueueMixin          # noqa: E402
+from twinkle_server.lifecycle.poll_config import long_poll_window, retrieve_poll_interval  # noqa: E402
+from twinkle_server.state import ServerState                              # noqa: E402
+from twinkle_server.config.task_queue import TaskQueueConfig        # noqa: E402
+from twinkle_server.task_queue.mixin import TaskQueueMixin          # noqa: E402
 
 _WINDOW = 0.05
 
@@ -85,9 +85,9 @@ def test_both_retrieve_endpoints_share_one_interval_declaration():
     per step. If backoff is ever reintroduced, it needs a ceiling around 0.2s and an
     explicit decision to pay 2.5x the poll rate.
     """
-    import twinkle.server.gateway.tinker_handlers as tinker_h
-    import twinkle.server.gateway.twinkle_handlers as twinkle_h
-    from twinkle.server.lifecycle import poll_config
+    import twinkle_server.gateway.tinker_handlers as tinker_h
+    import twinkle_server.gateway.twinkle_handlers as twinkle_h
+    from twinkle_server.lifecycle import poll_config
 
     assert not hasattr(poll_config, 'initial_poll_interval'), 'backoff was reverted by measurement'
     assert not hasattr(poll_config, 'max_poll_interval'), 'backoff was reverted by measurement'
@@ -109,7 +109,7 @@ def test_gateway_guard_warns_once_per_value_not_once_per_request(monkeypatch):
     Counts calls on a stub logger rather than using ``caplog``: ``get_logger()`` sets
     ``propagate = False``, so records never reach the root handler caplog installs.
     """
-    from twinkle.server.lifecycle import poll_config
+    from twinkle_server.lifecycle import poll_config
 
     class _Counter:
         def __init__(self):

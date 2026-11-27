@@ -48,6 +48,19 @@ pytestmark = [
                        reason='30B MoE weights not cached (or SKIP_MODEL_DOWNLOAD set)'),
 ]
 
+
+@pytest.fixture(autouse=True)
+def _twinkle_ray_isolation():
+    # twinkle.initialize is once-per-process: RayHelper caches the ResourceManager from the FIRST
+    # call and the shared registry's group config is first-write-wins. When the tiered suite runs
+    # several ray-mode weight-sync tests in one pytest process, a later test's different topology
+    # is silently ignored (it inherits this test's groups/placements) and leaked actors keep GPU
+    # memory. Release everything after each test so the next initialize builds its own topology.
+    yield
+    import twinkle
+    twinkle.shutdown()
+
+
 # For MoE models, vLLM does not support LoRA on expert layers.
 # Only target attention QKV + output projection.
 LORA_TARGET_MODULES = ['q_proj', 'k_proj', 'v_proj', 'o_proj']

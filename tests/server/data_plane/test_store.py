@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle.server.data_plane.store import TQDataRefStore, _partition
+from twinkle_server.data_plane.store import TQDataRefStore, _partition
 
 
 @pytest.mark.asyncio

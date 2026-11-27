@@ -48,6 +48,18 @@ logger = logging.getLogger(__name__)
 pytestmark = [pytest.mark.slow, pytest.mark.accel(4)]
 
 
+@pytest.fixture(autouse=True)
+def _twinkle_ray_isolation():
+    # twinkle.initialize is once-per-process: RayHelper caches the ResourceManager from the FIRST
+    # call and the shared registry's group config is first-write-wins. When the tiered suite runs
+    # several ray-mode weight-sync tests in one pytest process, a later test's different topology
+    # is silently ignored (it inherits this test's groups/placements) and leaked actors keep GPU
+    # memory. Release everything after each test so the next initialize builds its own topology.
+    yield
+    import twinkle
+    twinkle.shutdown()
+
+
 def log(msg):
     """Print message with timestamp."""
     import datetime
@@ -193,6 +205,15 @@ def test_megatron_weight_sync(
             'enforce_eager': False,
             'enable_sleep_mode': True,
             'enable_lora': True,
+            # Qwen3.5-27B is a hybrid (gated-delta-net / Mamba-style) model: each decode sequence
+            # needs one Mamba cache block. At gpu_memory_utilization=0.7 with CUDA graphs enabled
+            # on a 96GB H20, the full-27B-per-engine budget yields ~229 Mamba blocks, below vLLM's
+            # default max_num_seqs=256 -> EngineCore refuses to start ("max_num_seqs (256) exceeds
+            # available Mamba cache blocks (229)"). This test exercises weight sync + single-prompt
+            # sampling, not 256-way serving concurrency, so pin max_num_seqs to fit the declared
+            # memory budget (vLLM's own diagnostic recommends lowering it). Unrelated to the
+            # weight-sync property under test; assertions unchanged.
+            'max_num_seqs': 128,
         },
         device_mesh=DeviceMesh.from_sizes(world_size=sampler_gpus, dp_size=sampler_gpus),
         remote_group='sampler',

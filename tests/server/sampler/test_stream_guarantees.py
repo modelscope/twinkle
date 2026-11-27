@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import FastAPI
 
-from twinkle.server.sampler.app import SamplerManagement
-from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes, _stream_queue
+from twinkle_server.sampler.app import SamplerManagement
+from twinkle_server.sampler.twinkle_handlers import _register_twinkle_sampler_routes, _stream_queue
 
 
 class _BlockingQueue:

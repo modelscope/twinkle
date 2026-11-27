@@ -12,11 +12,11 @@ Twinkle 的 DPO 扩展也使用 `importance_sampling`，要求**每条** datum �
 
 ## 初始化
 
-在仓库根目录运行 `python -m pip install -e '.[client]'`，安装 Twinkle 锁定的 Tinker SDK 版本。
+在仓库根目录运行 `python -m pip install -e . -e ./twinkle_cs/client`，安装 Twinkle 锁定的 Tinker SDK 版本。
 
 ```python
 # 在导入 ServiceClient 之前，先初始化 Tinker 客户端
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 
 init_tinker_client()
 
@@ -51,11 +51,11 @@ import os
 import numpy as np
 from tqdm import tqdm
 from tinker import types
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.model.tinker_datum import input_feature_to_datum
+from twinkle_server.model.tinker_datum import input_feature_to_datum
 
 # Step 1: 在导入 ServiceClient 之前，先初始化 Tinker 客户端
 init_tinker_client()
@@ -142,7 +142,7 @@ for i, seq in enumerate(result.sequences):
 ```python
 import os
 from tinker import types
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 from twinkle.data_format import Message, Trajectory
 from twinkle.template import Template
 

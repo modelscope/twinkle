@@ -1,6 +1,6 @@
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.task_queue.mixin import TaskQueueMixin
-from twinkle.server.task_queue.worker import ComputeWorker
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.task_queue.mixin import TaskQueueMixin
+from twinkle_server.task_queue.worker import ComputeWorker
 
 
 class _DummyState:

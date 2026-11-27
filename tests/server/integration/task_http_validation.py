@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 
 def validate(base_url, controller, args):
     import ray
-    from twinkle import init_twinkle_client
+    from twinkle_client import init_twinkle_client
     from tests.server.integration.cs_tasks.task_models import encoded_batch
     from tests.server.integration.on_demand_training.acceptance_support import wait_until
 
@@ -184,8 +184,8 @@ def main():
     directory.mkdir(parents=True, exist_ok=True)
     import ray
     from ray import serve
-    from twinkle.server.config import ServerConfig
-    from twinkle.server.launcher.server_launcher import ServerLauncher
+    from twinkle_server.config import ServerConfig
+    from twinkle_server.launcher.server_launcher import ServerLauncher
 
     config = ServerConfig.from_yaml(Path(__file__).with_name('cs_tasks') / f'task_server_{args.backend}.yaml')
     model_apps = []

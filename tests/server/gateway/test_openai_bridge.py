@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle.server.gateway.openai_bridge import (make_error, translate_chat_request, translate_response,
+from twinkle_server.gateway.openai_bridge import (make_error, translate_chat_request, translate_response,
                                                   translate_stream_chunk)
 
 # ---------- translate_chat_request ----------------------------------------- #

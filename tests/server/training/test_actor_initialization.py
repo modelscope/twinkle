@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from twinkle.server.resources.instances import InstanceLifecycle
-from twinkle.server.model.pool.actor import TrainingControllerActor
+from twinkle_server.resources.instances import InstanceLifecycle
+from twinkle_server.model.pool.actor import TrainingControllerActor
 
 
 @pytest.mark.asyncio
@@ -25,9 +25,9 @@ async def test_failed_initialization_restarts_only_after_backoff(monkeypatch):
         sleeping.set()
         await gate.wait()
 
-    monkeypatch.setattr('twinkle.server.model.pool.actor.asyncio.sleep', sleep)
-    monkeypatch.setattr('twinkle.server.model.pool.actor.ray.get_actor', get_actor)
-    monkeypatch.setattr('twinkle.server.model.pool.actor.ray.kill', kill)
+    monkeypatch.setattr('twinkle_server.model.pool.actor.asyncio.sleep', sleep)
+    monkeypatch.setattr('twinkle_server.model.pool.actor.ray.get_actor', get_actor)
+    monkeypatch.setattr('twinkle_server.model.pool.actor.ray.kill', kill)
     actor = SimpleNamespace(core=SimpleNamespace(initialize=AsyncMock(side_effect=RuntimeError('allocation failed'))),
                             config=SimpleNamespace(sweep_interval_s=7), namespace='initialization-test', _monitors=[])
     actor._restart_after_failure = lambda: cls._restart_after_failure(actor)

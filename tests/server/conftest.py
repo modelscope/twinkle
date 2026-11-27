@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import pytest
 
-# ``twinkle.server`` speaks the tinker wire format all the way down -- ``server/common/datum.py`` and
+# ``twinkle_server`` speaks the tinker wire format all the way down -- ``server/common/datum.py`` and
 # the model backends import ``tinker.types`` at module scope -- so without it every test under here
 # fails to import. Skip the subtree instead of breaking collection for the whole repo.
 pytest.importorskip('tinker')
@@ -79,6 +79,6 @@ def _reset_canonical_state_actor():
 
 @pytest.fixture
 def isolated_metrics_registry(monkeypatch):
-    from twinkle.server.telemetry.metrics import MetricsRegistry
+    from twinkle_server.telemetry.metrics import MetricsRegistry
 
     monkeypatch.setattr(MetricsRegistry, '_instance', None)

@@ -54,7 +54,7 @@ twinkle uses [ruff](https://docs.astral.sh/ruff/) for both linting and formattin
 - **Target version**: Python 3.11
 - **Lint rules**: `B`, `E`, `F`, `W`, `I`, `UP`, `T` (bugbear, pycodestyle, pyflakes, isort, pyupgrade, flake8-print)
 - **Format style**: double quotes (`quote-style = "double"`)
-- **Excluded paths**: `examples/`, `cookbook/`, `client_tools/`, `src/twinkle_client/`, `tests/`, `docs/src`
+- **Excluded paths**: `examples/`, `cookbook/`, `client_tools/`, `twinkle_cs/client/src/twinkle_client/`, `tests/`, `docs/src`
 
 twinkle runs two types of tests after a PR is submitted:
 

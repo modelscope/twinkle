@@ -44,19 +44,26 @@ which offers more functionalities.
 
 ## Installation
 
-### Install with package:
-
-```shell
-pip install 'twinkle-kit'
-```
+| What you want to do | Install |
+| --- | --- |
+| Train or run inference on your own GPU | `pip install twinkle-kit` |
+| Use the Python SDK against a remote service | see the source installation below |
+| Run the HTTP service yourself | see the source installation below |
 
 ### Install from Source:
 
 ```shell
 git clone https://github.com/modelscope/twinkle.git
 cd twinkle
-pip install -e .
+pip install -e .                                                        # local training and inference
+pip install -e . -e ./twinkle_cs/client                                 # Python SDK, provides twinkle-auto
+pip install -e . -e ./twinkle_cs/server                                 # HTTP service, provides twinkle-server
+pip install -e '.[test]' -e ./twinkle_cs/client -e ./twinkle_cs/server  # work on all three
 ```
+
+Install a matching `ms-swift` when you use Swift templates or model loaders.
+
+
 
 ### Use our docker image：
 
@@ -252,11 +259,11 @@ if __name__ == '__main__':
 import os
 from tqdm import tqdm
 from tinker import types
-from twinkle import init_tinker_client
+from twinkle_client import init_tinker_client
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor import SelfCognitionProcessor
-from twinkle.server.model.tinker_datum import input_feature_to_datum
+from twinkle_client.utils.tinker_datum import input_feature_to_datum
 
 base_model = 'ms://Qwen/Qwen3.8-27B'
 base_url='your-base-url'

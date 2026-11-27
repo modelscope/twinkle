@@ -27,7 +27,7 @@ import dotenv
 from peft import LoraConfig
 
 from twinkle import get_logger
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 from twinkle.advantage import compute_advantages
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta

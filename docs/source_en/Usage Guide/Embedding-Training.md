@@ -129,7 +129,7 @@ The difference from the bare library is that the client passes **class-name stri
 
 ```python
 from peft import LoraConfig
-from twinkle import init_twinkle_client
+from twinkle_client import init_twinkle_client
 
 # --- Connect to the running Twinkle server ---
 client = init_twinkle_client(base_url='http://127.0.0.1:8000', api_key='EMPTY_TOKEN')
