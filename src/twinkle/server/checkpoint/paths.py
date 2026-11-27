@@ -4,11 +4,11 @@ helpers for the checkpoint subsystem.
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import os
 import re
 from pathlib import Path
+
+from twinkle.server.identity import CHECKPOINT_SALT_DEFAULT, fingerprint
 
 TWINKLE_DEFAULT_SAVE_DIR = os.environ.get('TWINKLE_DEFAULT_SAVE_DIR', './outputs')
 CHECKPOINT_INFO_FILENAME = 'checkpoint_metadata.json'
@@ -17,7 +17,7 @@ SAVE_DIR_POINTER_KEY = 'save_dir_pointer'
 
 # Salt used when hashing tokens for directory isolation.
 # Override via env var TWINKLE_TOKEN_SALT to customise per-deployment.
-_TOKEN_SALT = os.environ.get('TWINKLE_TOKEN_SALT', 'twinkle-path-salt-v1').encode('utf-8')
+_TOKEN_SALT = os.environ.get('TWINKLE_TOKEN_SALT', CHECKPOINT_SALT_DEFAULT)
 
 
 def _hash_token(token: str) -> str:
@@ -26,7 +26,7 @@ def _hash_token(token: str) -> str:
     The digest is used as the per-user base directory name so that the raw
     token value is never written to the filesystem.
     """
-    return hmac.new(_TOKEN_SALT, token.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
+    return fingerprint(token, _TOKEN_SALT)[:16]
 
 
 def _resolve_client_save_dir(save_dir: str) -> Path:

@@ -187,6 +187,7 @@ async def run_submit(
     """
     token = await self._on_request_start(request)
     adapter_name = body.training_id
+    request.state.training_id = adapter_name
 
     # ---- Preflight: decidable from the body plus this deployment's backend, so it
     # runs before any state write and before the enqueue. ----

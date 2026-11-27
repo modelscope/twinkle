@@ -21,31 +21,8 @@ arithmetic is a second set of off-by-one bugs. No Ray decorators
 
 from typing import Any, Optional
 
-import numpy as np
-
-from twinkle.template.contract import Continuation, append_and_finalize
-
-
-def _to_plain(obj: Any) -> Any:
-    """Recursively convert numpy arrays/scalars to plain Python lists/numbers.
-
-    Mirrors ``vllm_sampler._convert_ndarray_to_list`` but lives locally so we
-    do not depend on a private symbol.
-    """
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    if isinstance(obj, dict):
-        return {k: _to_plain(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        conv = [_to_plain(x) for x in obj]
-        return type(obj)(conv) if isinstance(obj, tuple) else conv
-    return obj
+from twinkle.data_format import copy_trajectory
+from twinkle.template.contract import Continuation, append_and_finalize, engine_input_ids
 
 
 def encode_appended_turn(
@@ -109,11 +86,14 @@ def extend_with_bridge(
             "Bridge computation returned no tokens; tool turn would add nothing (template misconfiguration?)."
         )
 
-    new_pif = append_ids(pif, bridge_ids, template, trainable=False)
+    engine_bridge = template.render_delta(
+        messages_before, list(tool_messages), gen_prompt_before=False, gen_prompt_after=True,
+        tools=pif.get("tools"), engine=True)
+    new_pif = append_ids(pif, bridge_ids, template, trainable=False, engine_ids=engine_bridge)
     if new_pif is None:
         # Trajectory exceeds max_length and strategy is 'delete'
         return None
-    new_pif["messages"] = messages_after
+    new_pif["messages"] = copy_trajectory({'messages': messages_after})['messages']
     return new_pif
 
 
@@ -123,6 +103,7 @@ def append_ids(
     template: Continuation,
     *,
     trainable: bool,
+    engine_ids: list[int] | None = None,
 ) -> dict[str, Any] | None:
     """Grow the sequence by ``ids``; ``trainable`` says whose tokens they are.
 
@@ -149,16 +130,24 @@ def append_ids(
     re-copying image buffers every turn.
     """
     labels = pif.get("labels")
-    if labels is not None and len(labels) != len(pif.get("input_ids") or []):
+    if labels is not None and len(labels) != len(pif.get("input_ids", [])):
         raise RuntimeError(
             f"labels length ({len(labels)}) != input_ids length "
-            f"({len(pif.get('input_ids') or [])}); cannot safely append tokens."
+            f"({len(pif.get('input_ids', []))}); cannot safely append tokens."
         )
     result = append_and_finalize(
-        pif,
+        copy_trajectory(pif),
         ids,
         scored=trainable,
         sampled=trainable,
         finalize=template.finalize_appended_features,
     )
-    return None if result is None else _to_plain(result)
+    if result is None:
+        return None
+    engine_prefix = engine_input_ids(pif)
+    if 'engine_input_ids' in pif or (engine_ids is not None and list(engine_ids) != list(ids)):
+        result["engine_input_ids"] = engine_prefix + list(ids if engine_ids is None else engine_ids)
+    else:
+        result.pop('engine_input_ids', None)
+    result["reasoning_started"] = template._reasoning_started(result["input_ids"])
+    return result

@@ -6,11 +6,12 @@ All endpoints are prefixed /* and registered via _register_gateway_tinker_routes
 self_fn is injected via FastAPI Depends to obtain the GatewayServer instance at request time.
 """
 from __future__ import annotations
-
+import logging
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from tinker import types
-from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .app import GatewayServer
@@ -18,13 +19,12 @@ if TYPE_CHECKING:
 from twinkle.hub import HubOperation
 from twinkle.server.checkpoint import create_checkpoint_manager, create_training_run_manager
 from twinkle.server.lifecycle.envelope import error_payload_from_failure
+from twinkle.server.lifecycle.sampling_target import resolve_tinker_sampling_target
 from twinkle.server.middleware.auth import get_token_from_request
-from twinkle.utils.logger import get_logger
-from .use_cases import delete_checkpoint
+from .use_cases import delete_checkpoint, get_weights_info, list_checkpoints, list_training_runs, poll_future
 from .use_cases import get_training_run as get_training_run_use_case
-from .use_cases import get_weights_info, list_checkpoints, list_training_runs, poll_future
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 def _tinker_error_from_failure(stored: Any, *, request_id: str) -> dict[str, Any]:
@@ -90,6 +90,7 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
         request_id = body.request_id
         outcome = await poll_future(self.state, request_id, owner_token=get_token_from_request(request))
         record = outcome.record
+        request.state.task_id = request_id
         if outcome.timed_out:
             response_data: dict[str, Any] = {'type': 'try_again'}
             if record is not None:
@@ -177,7 +178,7 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
                 hub_api.login()
                 username = ModelScopeConfig.get_user_info()[0]
             except Exception as e:
-                logger.error(f'Failed to get username from ModelScope: {e}')
+                logger.error('Failed to get username from ModelScope (%s)', type(e).__name__)
                 raise HTTPException(
                     status_code=401,
                     detail='Failed to get username from ModelScope. Please ensure your token is valid.')
@@ -233,11 +234,12 @@ def _register_gateway_tinker_routes(app: FastAPI, self_fn: Callable[[], GatewayS
 
     @app.post('/asample')
     async def asample(request: Request, body: types.SampleRequest, self: GatewayServer = Depends(self_fn)) -> Any:
-        base_model = body.base_model
-        if not base_model and body.sampling_session_id:
-            session = await self.state.get_sampling_session(body.sampling_session_id)
-            if session:
-                base_model = session.get('base_model')
+        base_model, _ = await resolve_tinker_sampling_target(
+            self.state,
+            base_model=body.base_model,
+            model_path=body.model_path,
+            sampling_session_id=body.sampling_session_id,
+        )
         if not base_model:
             raise HTTPException(status_code=400, detail='base_model is required but could not be resolved')
         return await self.proxy.proxy_to_sampler(request, 'asample', base_model)

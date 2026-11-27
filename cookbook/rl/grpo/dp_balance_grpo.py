@@ -201,8 +201,7 @@ def main():
         for sample_response in sample_responses:
             for sequence in sample_response.sequences:
                 all_inputs.append(sequence.new_input_feature)
-                # new_input_feature carries tokens only; the conversation, which rewards score, is in new_state.
-                trajectories.append({**sequence.new_input_feature, 'messages': list(sequence.new_state.messages)})
+                trajectories.append(sequence.new_input_feature)
                 all_old_logps.append([logprob[0][1] for logprob in sequence.logprobs])
                 completion_lengths.append(len(sequence.tokens))
 

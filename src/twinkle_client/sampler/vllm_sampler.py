@@ -1,15 +1,19 @@
 import asyncio
+import uuid
+from requests.exceptions import Timeout
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from twinkle.data_format import InputFeature, SamplingParams, Trajectory
-from twinkle.protocol.json_utils import json_safe
+from twinkle.data_format import InputFeature, SamplingParams, Trajectory, copy_trajectory
+from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTENCY_SUPPORTED
+from twinkle.protocol.json_utils import wire_trajectory
 from twinkle.protocol.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
 from twinkle.protocol.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
                                             SampleResponseModel, SampleResponseModelList, SamplerApplyPatchRequest,
                                             SamplerSetTemplateRequest,
                                             SamplerSetTemplateResponse)
 from twinkle_client._request_builder import build_request
+from twinkle_client.exceptions import TwinkleClientValidationError
 from twinkle_client.http import ClientTransport
 from twinkle_client.http.context import capture_transport
 from twinkle_client.operations import _guarded_operation
@@ -30,7 +34,7 @@ def _json_safe(obj: Any) -> Any:
     duck-typing (``.tolist()``) so this stays free of a hard torch/numpy import,
     honouring the CPU-only client contract noted above.
     """
-    return json_safe(obj)
+    return wire_trajectory(obj)
 
 
 class vLLMSampler:
@@ -57,7 +61,8 @@ class vLLMSampler:
             model_id = model_id.split('://')[1]
         self.model_id = model_id
         self.server_url = f'{self._transport.context.base_url}/sampler/{model_id}/twinkle'
-        self._transport.post(f'{self.server_url}/create', json_data=kwargs)
+        response = self._transport.post(f'{self.server_url}/create', json_data=kwargs)
+        self._sample_idempotency = getattr(response, 'headers', {}).get(H_SAMPLE_IDEMPOTENCY_SUPPORTED) == '1'
 
     def _await_task(self, response, model_cls):
         """Resolve a Submit_Endpoint response through the Client_Future_Layer."""
@@ -86,6 +91,8 @@ class vLLMSampler:
         session_id: Optional[str] = None,
         num_samples: int = 1,
         token_only: bool = False,
+        *,
+        idempotency_key: str | None = None,
     ) -> List[SampleResponseModel]:
         """Sample from the model.
 
@@ -105,22 +112,48 @@ class vLLMSampler:
             num_samples: Number of completions to generate per prompt.
             token_only: Return the sampled tokens and logprobs only (no ``new_input_feature``); the
                 inputs are the ids the engine runs on, with their media alongside.
+            idempotency_key: Reuse this key and the same inputs when retrying this call after a
+                timeout. The server replays the existing receipt within its retention period.
 
         Returns:
             SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
         """
         if adapter_uri is None:
             adapter_uri = adapter_path if adapter_path is not None else getattr(self, 'adapter_uri', None)
-        response = self._transport.post_model(
-            f'{self.server_url}/sample',
-            build_request(
-                SampleRequest,
-                inputs=_json_safe(inputs),
-                sampling_params=self._sampling_params(sampling_params, num_samples),
-                adapter_name=adapter_name,
-                adapter_uri=adapter_uri,
-                token_only=token_only))
-        return self._await_task(response, SampleResponseModelList).samples
+        originals = [copy_trajectory(item) for item in (inputs if isinstance(inputs, list) else [inputs])]
+        request = build_request(
+            SampleRequest,
+            inputs=_json_safe(originals),
+            sampling_params=self._sampling_params(sampling_params, num_samples),
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            token_only=token_only)
+        if getattr(self, '_sample_idempotency', False):
+            key = uuid.uuid4().hex if idempotency_key is None else idempotency_key
+            headers = {H_SAMPLE_IDEMPOTENCY_KEY: key}
+            try:
+                response = self._transport.post_model(f'{self.server_url}/sample', request, headers=headers)
+            except Timeout:
+                response = self._transport.post_model(f'{self.server_url}/sample', request, headers=headers)
+        else:
+            if idempotency_key is not None:
+                raise TwinkleClientValidationError('This server does not support sample idempotency')
+            response = self._transport.post_model(f'{self.server_url}/sample', request)
+        samples = self._await_task(response, SampleResponseModelList).samples
+        if not token_only:
+            if len(samples) != len(originals):
+                raise RuntimeError('server response count does not match the input batch')
+            for original, result in zip(originals, samples):
+                for sequence in result.sequences:
+                    if sequence.new_input_feature is None:
+                        raise RuntimeError('server omitted a complete trajectory from a normal sample response')
+                    # The server never echoes the request's media / user_data back; restore them here.
+                    sequence.new_input_feature = {
+                        **copy_trajectory({key: original[key] for key in ('images', 'videos', 'audios', 'user_data')
+                                          if key in original}),
+                        **copy_trajectory(sequence.new_input_feature),
+                    }
+        return samples
 
     @staticmethod
     def _sampling_params(sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]],
@@ -166,6 +199,8 @@ class vLLMSampler:
         adapter_name: str = '',
         adapter_uri: Optional[str] = None,
         num_samples: int = 1,
+        *,
+        idempotency_key: str | None = None,
     ) -> List[SampleResponseModel]:
         """Asynchronous convenience wrapper for the materialized sample API."""
         return await asyncio.to_thread(
@@ -175,6 +210,7 @@ class vLLMSampler:
             adapter_name=adapter_name,
             adapter_uri=adapter_uri,
             num_samples=num_samples,
+            idempotency_key=idempotency_key,
         )
 
     async def asample_to_data_plane(
@@ -207,8 +243,8 @@ class vLLMSampler:
                                    build_request(UnloadAdapterPathsRequest, adapter_paths=adapter_paths))
 
     @_guarded_operation
-    def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SamplerSetTemplateResponse:
-        """Set the template for encoding trajectories."""
+    def set_template(self, template_cls: Any, adapter_name: str = '', **kwargs) -> SamplerSetTemplateResponse:
+        """Set a Template instance, subclass, or registered name for encoding trajectories."""
         body = build_request(SamplerSetTemplateRequest, template_cls=template_cls, adapter_name=adapter_name, **kwargs)
         response = self._transport.post_model(f'{self.server_url}/set_template', body)
         return SamplerSetTemplateResponse(**response.json())

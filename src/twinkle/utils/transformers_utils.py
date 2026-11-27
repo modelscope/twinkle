@@ -21,6 +21,9 @@ def align_logps_to_mask(
     ragged: Any,
     mask: 'torch.Tensor',
     dtype: 'torch.dtype',
+    *,
+    strict: bool = True,
+    broadcast_scalar: bool = True,
 ) -> Optional['torch.Tensor']:
     """Scatter ragged per-sample values onto the trainable positions of ``mask``.
 
@@ -38,8 +41,14 @@ def align_logps_to_mask(
         masked positions are gathered directly -- the same contract the loss side
         (``GRPOLoss._pad_and_align_to_batch``) enforces for per-sample RL fields
         that arrive un-padded while the batch is right-padded.
-    Anything shorter than its farthest masked position is unusable; that row stays
-    zero rather than guessing a truncation scatter.
+    Anything shorter than its farthest masked position is unusable: with ``strict``
+    (the default, every ratio/advantage consumer) it is rejected exactly like
+    ``GRPOLoss._pad_and_align_to_batch`` -- a silent zero would report ratios on tokens
+    the loss never optimises. Only the sampler-reconciliation lane passes
+    ``strict=False``: its whole job is to REPORT such gaps (sampler_token_delta), so a
+    short row contributes zero coverage there instead of killing the panel. That lane
+    also passes ``broadcast_scalar=False``: its rows are per-token logps, so a 1-element
+    row is a one-token response (possibly short), never a scalar to broadcast.
     """
     import torch
 
@@ -76,7 +85,10 @@ def align_logps_to_mask(
         n = int(vals.numel())
         n_pos = len(pos)
         last_pos = int(pos[-1].item())
-        if n == n_pos:
+        if n == 1 and broadcast_scalar:
+            # Scalar form broadcast to every masked position (loss side: n_sample == 1).
+            result[i, pos] = vals[0]
+        elif n == n_pos:
             # Response-only form (e.g. old_logps from vLLM).
             result[i, pos] = vals
         elif n >= seq_len:
@@ -87,8 +99,17 @@ def align_logps_to_mask(
             # (GRPOLoss._pad_and_align_to_batch): per-sample RL fields may arrive
             # un-padded while the batch is right-padded; select the masked positions.
             result[i, pos] = vals[pos]
-        # else: the row is shorter than its farthest masked position -- malformed for
-        # every consumer; leave zeros instead of guessing a truncation scatter.
+        else:
+            # Shorter than the farthest masked position: unusable for every consumer.
+            if strict:
+                # Fail loud exactly like GRPOLoss._raise_alignment_mismatch -- silent zeros
+                # would compute ratios on tokens the loss never optimises.
+                raise AssertionError(
+                    f'data/mask length mismatch at sample {i}: '
+                    f'n_pos={n_pos}, n_sample={n}, seq_len={seq_len} '
+                    '(expected n_sample == n_pos for response-only form, or all masked positions '
+                    'to exist in the per-sample full-sequence form)')
+            # Reconciliation lane: leave zeros so the coverage mask reports the gap.
     return result
 
 

@@ -574,8 +574,10 @@ class StreamingDriver:
             return {'handed': self._handed, 'prompts_drawn': self._prompt_seq}
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
-    def close(self, timeout: float = 30.0) -> None:
+    def close(self, timeout: float = 30.0) -> dict:
         """Wait up to timeout seconds for cleanup; retry close to confirm settlement.
+
+        Returns the terminal statistics once cleanup settles.
 
         Raises:
             TimeoutError: Cleanup did not settle before the deadline.
@@ -600,6 +602,7 @@ class StreamingDriver:
                 drain.result()
             else:
                 raise TimeoutError(f'StreamingDriver.close timed out waiting for {self._close_waiting_on}') from None
+        return self.stats()
 
     def _drain_on_close(self, drain: Future) -> None:
         try:

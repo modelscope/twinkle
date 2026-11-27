@@ -9,6 +9,17 @@ from twinkle.utils import get_logger
 logger = get_logger()
 
 
+def _allocation_address() -> str:
+    """Read the network address of the node on which an allocation probe actually runs."""
+    import ray
+
+    node_id = ray.get_runtime_context().get_node_id()
+    for node in ray.nodes():
+        if node['NodeID'] == node_id and node['Alive']:
+            return node['NodeManagerAddress']
+    raise RuntimeError('The allocated node is absent from the live runtime topology.')
+
+
 def _gpu_placement_group_cpus(node_cpu: int, nproc_per_node: int) -> int:
     """Return the logical CPUs reserved by one GPU placement group."""
     cpus_per_proc = int(os.environ.get('TWINKLE_GPU_PG_CPUS_PER_PROC', 4))
@@ -52,7 +63,7 @@ class ResourceManager:
                 'placement_group': placement_group,
                 'ray_address': str(ray.get_runtime_context().gcs_address)
             } for _ in devices]
-        manager._sort_npu_worker_devices()
+        manager._publish_addresses()
         return manager
 
     def __init__(self, nproc_per_node: int, ncpu_proc_per_node: int, groups: List[DeviceGroup]):
@@ -344,18 +355,26 @@ class ResourceManager:
                 self.device_groups[group.name] = local_device_groups
 
         self.group_configs = groups
-        self._sort_npu_worker_devices()
+        self._publish_addresses()
         logger.info(f"nodes: {[n['NodeID'][:8] for n in self.nodes]}")
         logger.info(f'node_ranks: {self.node_ranks}')
         logger.info(f'node2pg keys: {list(self.node2pg.keys())}')
 
-    def _sort_npu_worker_devices(self) -> None:
-        # Ray-selected IDs can be unordered, but Ascend RTS requires ascending visible IDs.
-        # Sort within each worker so its card set and the allocation metadata stay consistent.
-        for group in self.group_configs:
-            if (group.device_type or '').upper() == 'NPU':
-                for worker in self.device_groups[group.name]:
-                    worker['gpu_rank'].sort(key=int)
+    def _publish_addresses(self) -> None:
+        """Attach actual node addresses to every reusable allocation, including physical rank views."""
+        import ray
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+        groups = list(dict.fromkeys(self.placement_groups + self.cpu_placement_groups))
+        probe = ray.remote(_allocation_address)
+        refs = [probe.options(num_cpus=0, scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=group)).remote() for group in groups]
+        addresses = dict(zip(groups, ray.get(refs)))
+        for placements in self.device_groups.values():
+            for placement in placements:
+                placement['node_ip'] = addresses[placement['placement_group']]
+        for placement in self.rank_placements.values():
+            placement['node_ip'] = addresses[placement['placement_group']]
 
     @staticmethod
     def noset_env():

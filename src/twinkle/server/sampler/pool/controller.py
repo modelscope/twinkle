@@ -4,6 +4,7 @@
 from __future__ import annotations
 import asyncio
 import hashlib
+import logging
 import math
 import time
 import uuid
@@ -12,21 +13,26 @@ from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 import json
+from starlette.datastructures import Headers
 
 if TYPE_CHECKING:
     from twinkle.server.lifecycle.proxy import ForwardedReply, ForwardedRequest
 
-from twinkle.protocol.headers import H_CLIENT_ID, H_REQUEST_ID, H_SESSION_ID
+from twinkle.protocol.headers import H_CLIENT_ID, H_REQUEST_ID, H_SAMPLE_IDEMPOTENCY_SUPPORTED, H_SESSION_ID
 from twinkle.server.config.application_spec import SamplerArgs
 from twinkle.server.config.resource_options import ResourceOptions
-from twinkle.server.exceptions import ResourceExhaustedError
+from twinkle.server.exceptions import RequestRejectedError, ResourceExhaustedError
 from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.sampler.concurrency import SamplerConcurrency
-from twinkle.utils.logger import get_logger
+from twinkle.server.sampler.submission import SampleSubmission
+from twinkle.server.telemetry.tracing import extract_context, traced_operation
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 _CONTROL_ENDPOINTS = frozenset(
     {"twinkle/set_template", "twinkle/add_adapter_to_sampler", "twinkle/apply_patch", "twinkle/unload_adapter_paths"}
+)
+_SAMPLING_ENDPOINTS = frozenset(
+    {"twinkle/sample", "twinkle/sample_stream", "twinkle/sample_to_data_plane", "twinkle/encode", "tinker/asample"}
 )
 
 
@@ -66,6 +72,7 @@ class SamplerController:
         self._stopping = False
         self._initialization = None
         self._monitor_task = None
+        self._sample_replies: dict[str, tuple[str, asyncio.Future]] = {}
 
     def _owned_count(self):
         return self.lifecycle.owned_count(self.instances.values())
@@ -176,6 +183,10 @@ class SamplerController:
                     break
                 if self._action_key(previous) == key:
                     del self._actions[index]
+        if ("base_path" in action and action["base_path"] is None
+                and not any(previous.get("endpoint") == "twinkle/apply_patch" for previous in self._actions)):
+            # Fresh replicas already start with the original weights.
+            return
         self._actions.append(deepcopy(action))
 
     async def _release(self, instance, ticket):
@@ -212,7 +223,7 @@ class SamplerController:
                 async def broadcast():
                     response = None
                     for replica in replicas:
-                        if full_path is not None:
+                        if payload is None:
                             await self.driver.load_weights(replica, full_path)
                         else:
                             response = await self._invoke_finished(replica, payload)
@@ -229,7 +240,7 @@ class SamplerController:
                     # its RPC is pending. Such an ACK must not commit pool state.
                     if any(replica.state != "READY" for replica in replicas):
                         raise ResourceExhaustedError("Sampler changed state during control update")
-                    if full_path is not None:
+                    if payload is None:
                         self._base_path = full_path
                         self._remember({"base_path": full_path})
                     elif payload["endpoint"] != "twinkle/unload_adapter_paths":
@@ -243,13 +254,38 @@ class SamplerController:
                 await self._release(replica, ticket)
             await self._release(seed, seed_ticket)
 
-    async def request(self, payload: ForwardedRequest, stream_queue=None, full_path=None) -> ForwardedReply:
+    async def request(self, payload: ForwardedRequest, stream_queue=None, full_path=None,
+                      submission: SampleSubmission | None = None) -> ForwardedReply:
         await self.initialize()
         endpoint = payload["endpoint"]
         if endpoint == "twinkle/create":
-            return {"status": 200, "headers": [(b"content-type", b"application/json")], "body": b'{"status":"ok"}'}
+            return {
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (H_SAMPLE_IDEMPOTENCY_SUPPORTED.lower().encode(), b"1"),
+                ],
+                "body": b'{"status":"ok"}',
+            }
         control = endpoint in _CONTROL_ENDPOINTS
+        selects_weights = endpoint in _SAMPLING_ENDPOINTS
+        if submission is not None and submission.request_id in self._sample_replies:
+            fingerprint, reply_ready = self._sample_replies[submission.request_id]
+            if fingerprint != submission.fingerprint:
+                raise RequestRejectedError("Sample idempotency key was already used for a different submission")
+            return await asyncio.shield(reply_ready)
+
         reply_ready = asyncio.get_running_loop().create_future()
+        if submission is not None:
+            self._sample_replies[submission.request_id] = (submission.fingerprint, reply_ready)
+
+            def clear_submission(reply):
+                self._sample_replies.pop(submission.request_id, None)
+                # The disconnected original caller might never collect an exception.
+                if not reply.cancelled():
+                    reply.exception()
+
+            reply_ready.add_done_callback(clear_submission)
 
         async def operation():
             instance = None
@@ -258,9 +294,13 @@ class SamplerController:
                 if control:
                     reply_ready.set_result(await self._mutate(payload=payload))
                     return
-                if full_path is not None and full_path != self._base_path:
+                if selects_weights and full_path != self._base_path:
+                    # A missing checkpoint selects the sampler's original base weights.
                     await self._mutate(full_path=full_path)
-                instance, ticket = await self._select()
+                # This background operation survives cancellation of the forwarding RPC.
+                parent = extract_context(Headers(raw=payload["headers"]))
+                with traced_operation("sampler.wait_for_replica", parent_context=parent):
+                    instance, ticket = await self._select()
                 response = await self.driver.invoke(instance, ticket, payload, stream_queue)
                 if not reply_ready.done():
                     reply_ready.set_result(response)
@@ -278,13 +318,23 @@ class SamplerController:
                 if instance is not None and ticket is not None:
                     await self._release(instance, ticket)
 
+        async def read_if_weights_match():
+            # Check the weights while holding the same guard that all writers use.
+            if selects_weights and full_path != self._base_path:
+                return False
+            await operation()
+            return True
+
         async def guarded():
             try:
-                await self._guard.run(
-                    operation,
-                    exclusive=control or full_path is not None,
-                    queue_timeout=self.args.queue_config.queue_timeout,
-                )
+                timeout = self.args.queue_config.queue_timeout
+                if control or full_path is not None:
+                    await self._guard.run(operation, exclusive=True, queue_timeout=timeout)
+                else:
+                    deadline = asyncio.get_running_loop().time() + timeout
+                    if not await self._guard.run(read_if_weights_match, queue_timeout=timeout):
+                        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+                        await self._guard.run(operation, exclusive=True, queue_timeout=remaining)
             except BaseException as error:
                 if not reply_ready.done():
                     reply_ready.set_exception(error)

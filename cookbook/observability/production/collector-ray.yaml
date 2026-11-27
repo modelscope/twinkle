@@ -1,0 +1,19 @@
+receivers:
+  prometheus/ray:
+    config:
+      scrape_configs:
+        - job_name: twinkle-ray
+          scrape_interval: 5s
+          static_configs:
+            - targets: ['${env:OBS_RAY_METRICS_TARGET}']
+          metric_relabel_configs:
+            - source_labels: [__name__]
+              regex: ray_serve_request_router_fulfillment_time_ms_(bucket|sum|count)
+              action: keep
+
+service:
+  pipelines:
+    metrics/ray:
+      receivers: [prometheus/ray]
+      processors: [batch]
+      exporters: [otlphttp/mimir]

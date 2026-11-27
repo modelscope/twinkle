@@ -20,7 +20,7 @@ user-supplied argument.
 from __future__ import annotations
 
 from pydantic import Field, JsonValue, StrictInt, field_validator, model_validator
-from typing import Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from .base import ResponseModel, StrictRequest, backend_kwarg, backend_only, passthrough
 from .component import DataRef
@@ -43,6 +43,24 @@ class TrainingRequest(StrictRequest):
 
     training_id: str = Field(min_length=1)
     adapter_name: str
+
+
+_Temperature = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
+
+
+class TaskHeadTemperatureUpdate(StrictRequest):
+    global_temperature: _Temperature | None = None
+    kind_temperatures: list[_Temperature] = Field(min_length=1)
+
+
+class TaskHeadTemperaturesRequest(TrainingRequest):
+    """Read the bound head's temperatures, or replace them if update is supplied."""
+
+    update: TaskHeadTemperatureUpdate | None = None
+
+
+class TaskHeadTemperaturesResponse(ResponseModel):
+    temperatures: TaskHeadTemperatureUpdate | None
 
 
 class AdapterRequest(TrainingRequest):
@@ -112,7 +130,25 @@ class CalculateMetricRequest(TrainingRequest):
 # --------------------------------------------------------------------------- #
 
 
-class _InlineForwardBase(TrainingRequest):
+class _ForwardBase(TrainingRequest):
+    """Routing controls and dynamic loss parameters shared by inline and data-plane forwards."""
+
+    router_replay_mode: Literal['disabled', 'R2', 'R3'] | None = backend_kwarg(default=None)
+    router_replay_action: str | None = Field(default=None, description='Unsupported; use router_replay_mode')
+    loss_kwargs: dict[str, JsonValue] = passthrough()
+
+    @model_validator(mode='after')
+    def validate_router_replay_parameters(self) -> _ForwardBase:
+        if self.router_replay_action is not None:
+            raise ValueError('router_replay_action is no longer supported; use router_replay_mode')
+        misplaced = {'router_replay_mode', 'router_replay_action'}.intersection(self.loss_kwargs)
+        if misplaced:
+            raise ValueError(f'{", ".join(sorted(misplaced))} must not be passed in loss_kwargs; '
+                             'use the top-level router_replay_mode field')
+        return self
+
+
+class _InlineForwardBase(_ForwardBase):
     """Fields common to the three inline forward endpoints."""
 
     inputs: WireInputBatch
@@ -123,12 +159,6 @@ class _InlineForwardBase(TrainingRequest):
     gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
     # Read only by the transformers backend.
     sampling_masks: JsonValue | None = backend_only('transformers', default=None)
-    router_replay_action: str | None = backend_only('transformers', default=None)
-    # Loss inputs (``advantages`` / ``old_logps`` / ``ref_outputs`` / ...). Their key
-    # set is decided by the configured Loss, so they get a declared dict rather than
-    # top-level fields; the flattening in ``backend_kwargs`` keeps the backend call
-    # shape identical to before.
-    loss_kwargs: dict[str, JsonValue] = passthrough()
 
 
 class ForwardRequest(_InlineForwardBase):
@@ -170,7 +200,7 @@ class ForwardBackwardTaskRequest(_InlineForwardBase):
 # --------------------------------------------------------------------------- #
 
 
-class DataPlaneForwardRequest(TrainingRequest):
+class DataPlaneForwardRequest(_ForwardBase):
     """Body of the ``*_from_data_plane`` forward endpoints."""
 
     input_refs: list[DataRef] = Field(min_length=1)
@@ -185,10 +215,9 @@ class DataPlaneForwardRequest(TrainingRequest):
     disable_lora: bool | None = backend_kwarg(default=None)
     micro_batch_size: int | None = backend_kwarg(default=None, ge=1)
     gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
-    loss_kwargs: dict[str, JsonValue] = passthrough()
 
 
-class DataPlaneForwardOnlyRequest(TrainingRequest):
+class DataPlaneForwardOnlyRequest(_ForwardBase):
     """Body of ``POST /twinkle/forward_only_from_data_plane``.
 
     This endpoint is read-only, so it deliberately has no ``seq_id`` idempotency
@@ -205,7 +234,6 @@ class DataPlaneForwardOnlyRequest(TrainingRequest):
     disable_lora: bool | None = backend_kwarg(default=None)
     micro_batch_size: int | None = backend_kwarg(default=None, ge=1)
     gradient_accumulation_steps: int | None = backend_kwarg(default=None, ge=1)
-    loss_kwargs: dict[str, JsonValue] = passthrough()
     output_ref: DataRef | None = None
     output_fields: dict[str, str] = Field(default_factory=dict)
 
@@ -255,6 +283,13 @@ class SetTemplateRequest(TrainingRequest):
 
     template_cls: str
     init_kwargs: dict[str, JsonValue] = passthrough()
+
+    @field_validator('template_cls')
+    @classmethod
+    def registered_template_name(cls, value):
+        if not value.isidentifier():
+            raise ValueError('HTTP template setup requires a registered class name, not a source path')
+        return value
 
 
 class SetProcessorRequest(TrainingRequest):

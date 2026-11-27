@@ -58,28 +58,13 @@ def _cuda_visible_device(device: torch.device) -> str:
     return selectors[device_index]
 
 
-def _ray_node_manager_address() -> str:
-    """The ray node address of the worker's node, as ``ray.nodes()`` reports it.
-
-    The delta receiver placement (``checkpoint_engine/delta/rollout/mixin.py``) looks the
-    worker's node up by ``ray.nodes()[...]['NodeManagerAddress']``. Reporting an independently
-    discovered interface IP (``find_node_ip`` picks the alphabetically-first non-virtual NIC)
-    diverges from ray's address on multi-NIC hosts -- ray binds the default-route NIC -- and the
-    lookup raises ``KeyError`` (defect111). Use ray's own address so the two sides always agree;
-    fall back to ``find_node_ip`` only when ray is not initialized (local single-process mode).
-    """
-    import ray
-    try:
-        # Ray actor/worker processes connect via the raylet without calling ray.init(), so
-        # ray.is_initialized() is False there even though the runtime context and GCS client
-        # are live. Use the runtime context directly; fall back only if it is unavailable.
-        ctx = ray.get_runtime_context()
-        node_id = ctx.get_node_id() if hasattr(ctx, 'get_node_id') else ctx.node_id
-        for node in ray.nodes():
-            if node.get('NodeID') == node_id and node.get('Alive'):
-                return node['NodeManagerAddress']
-    except Exception:
-        pass
+def _worker_node_address() -> str:
+    """Use this process's initialization address; standalone engines discover their local interface."""
+    address = os.environ.get('TWINKLE_NODE_IP')
+    if address:
+        return address
+    if os.environ.get('WORKER_NAME'):
+        raise RuntimeError('Distributed workers require TWINKLE_NODE_IP from their initialization context.')
     from twinkle.utils import find_node_ip
     return find_node_ip()
 
@@ -179,7 +164,7 @@ class TwinkleWorkerExtension:
 
     def delta_receiver_metadata(self) -> 'DeltaWorkerMetadata':
         return {
-            'node_ip': _ray_node_manager_address(),
+            'node_ip': _worker_node_address(),
             'device_uuid': str(torch.cuda.get_device_properties(self.device).uuid),
             'cuda_visible_device': _cuda_visible_device(self.device),
             'zmq_handle': self.delta_ipc_endpoint(),
@@ -739,7 +724,45 @@ class TwinkleWorkerExtension:
 
             self.model_runner.model.load_weights(converted)
             self._load_drafter_weights(converted)
+            self._repack_derived_weights(self.model_runner.model)
             logger.info(f'Loaded {len(converted)} base weights')
+
+    @staticmethod
+    def _repack_derived_weights(root: torch.nn.Module) -> int:
+        """Recompute parameters that a backend derives from a *source* weight at load time.
+
+        ``load_weights`` only writes the tensors the training side sends; whatever the model
+        computed from them during ``process_weights_after_loading`` keeps the values it saw when
+        the model was built. On Ascend that is not a rounding detail: vllm-ascend's GDN kernel
+        reads ``conv1d.ascend_conv1d_weight``, a kernel-layout copy of ``conv1d.weight`` that only
+        a repack refreshes ("Register the packed weight and repack it after every source load" --
+        ``vllm_ascend/ops/gdn.py``), and its own repack is wired to ``process_weights_after_loading``.
+        A full-sync therefore leaves every hybrid layer convolving with its initial random weights
+        while all other tensors match the trainer bit for bit. CUDA models expose no such hook, so
+        the walk finds nothing there and costs one pass over ``modules()``.
+
+        Two passes, on purpose. The hook is backend-private and optional, so a backend that renames
+        or drops it would be repaired silently by the second pass, which keys off the packed
+        *parameter* (``refresh_derived_weights``, already used by the delta path) and validates the
+        layout instead of silently skipping modules it does not recognise. Neither pass hides a
+        failure: a sync that cannot repack must fail, because the alternative is a rollout that
+        looks healthy and emits garbage.
+        """
+        from twinkle.sampler.vllm_sampler.delta.weight_update_utils import refresh_derived_weights
+
+        repacked = 0
+        for module in root.modules():
+            pack = getattr(module, '_pack_conv_weights', None)
+            if not callable(pack):
+                continue
+            # Deliberately unguarded: a hook that raises leaves the kernel reading its build-time
+            # copy, and only this exception can tell the trainer the sync did not take effect.
+            pack()
+            repacked += 1
+        refreshed = refresh_derived_weights(root)
+        if repacked or refreshed:
+            logger.info(f'Repacked derived weights for {max(repacked, refreshed)} modules')
+        return max(repacked, refreshed)
 
     def _drafter_model(self):
         """The speculative-decoding draft model, or None when there is no weight-bearing drafter.
@@ -781,6 +804,7 @@ class TwinkleWorkerExtension:
         if drafter_model is None:
             return
         drafter_model.load_weights(weights)
+        self._repack_derived_weights(drafter_model)
 
     def get_state_keys(self):
         """Return internal parameter names; each loader adapts its own input names."""

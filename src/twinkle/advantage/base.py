@@ -422,7 +422,7 @@ class Advantage:
         self._teacher = TeacherReweight()
         self._correction = RolloutCorrection()
 
-    def _call(self, trajs: List[Trajectory], *, scores: List[Dict[str, Any]],
+    def _call(self, trajs: List[Trajectory], *, scores: Optional[List[Dict[str, Any]]] = None,
               ref_out: Optional[ModelOutput] = None,
               teacher_out: Optional[ModelOutput] = None, old_out: Optional[ModelOutput] = None,
               value_out: Optional[ModelOutput] = None,
@@ -443,6 +443,10 @@ class Advantage:
         """
         if not trajs:
             raise ValueError('advantage received an empty batch.')
+        if scores is None:
+            from twinkle.processor.trajectory import TrajectoryUpdate
+
+            scores = TrajectoryUpdate.score_rows(trajs)
         if len(scores) != len(trajs):
             raise ValueError(f'scores carries {len(scores)} rows for {len(trajs)} trajectories; the driver '
                              'hands out exactly one score entry per trajectory.')

@@ -16,6 +16,7 @@ Environment:
     TWINKLE_MODEL_ID: model to sample from (default Qwen/Qwen2.5-0.5B-Instruct, small and cache-friendly)
     TWINKLE_MAX_MODEL_LEN: max model length (default 512)
     TWINKLE_VL_MODEL_DIR: local Qwen3-VL checkpoint for the remote image resize regression
+    TWINKLE_QWEN35_MODEL_DIR: local Qwen3.5 checkpoint for the same regression
 """
 import os
 
@@ -131,11 +132,15 @@ def test_sample_from_input_feature_skips_the_template(sampler):
     assert all(isinstance(t, int) for t in tokens)
 
 
-def test_remote_multimodal_prompt_keeps_preprocessed_image():
+@pytest.mark.parametrize(('template_name', 'model_env'), [
+    ('qwen3_vl', 'TWINKLE_VL_MODEL_DIR'),
+    ('qwen3_5', 'TWINKLE_QWEN35_MODEL_DIR'),
+])
+def test_remote_multimodal_prompt_keeps_preprocessed_image(template_name, model_env):
     """Round-trip a request through the HTTP schema and generate with the real vLLM sampler."""
-    model_dir = os.environ.get('TWINKLE_VL_MODEL_DIR')
+    model_dir = os.environ.get(model_env)
     if not model_dir or not os.path.isdir(model_dir):
-        pytest.skip('Set TWINKLE_VL_MODEL_DIR to a local Qwen3-VL checkpoint.')
+        pytest.skip(f'Set {model_env} to a local {template_name} checkpoint.')
 
     from types import SimpleNamespace
 
@@ -152,16 +157,16 @@ def test_remote_multimodal_prompt_keeps_preprocessed_image():
     from twinkle_client.rollout import HTTPSampler
 
     _, processor = get_model_processor(model_dir, load_model=False)
-    template = build_template(TemplateConfig(template='qwen3_vl', max_length=2048), processor)
-    template.max_pixels = 262144
+    template = build_template(TemplateConfig(template=template_name, max_length=2048, max_pixels=262144), processor)
     image = Image.new('RGB', (1024, 768))
-    state = template.encode_prompt({'messages': [{'role': 'user', 'content': '<image>Describe this image.'}],
-                                    'images': [image]}, backend='vllm').state
-    assert state.media.images[0].size != image.size
+    prompt = template.encode_prompt({'messages': [{'role': 'user', 'content': '<image>Describe this image.'}],
+                                    'images': [image]}, backend='vllm')
+    assert prompt['images'][0].size != image.size
     engine = vLLMSampler(
         model_id=model_dir,
         engine_args={
             'max_model_len': 2048,
+            'enforce_eager': True,
             'gpu_memory_utilization': 0.35,
             'mm_processor_kwargs': {'size': {'shortest_edge': 4096, 'longest_edge': 65536}},
         },
@@ -175,9 +180,17 @@ def test_remote_multimodal_prompt_keeps_preprocessed_image():
         return _to_sample_response_models(engine.sample(rows, sampling_params=params, token_only=request.token_only))
 
     try:
-        response, = HTTPSampler(SimpleNamespace(sample=sample), template).sample(state, _greedy(max_tokens=2))
-        assert response.prompt_token_ids == list(state.feature['input_ids'])
-        assert response.sequences[0].tokens
+        response, = HTTPSampler(SimpleNamespace(sample=sample), template).sample(prompt, _greedy(max_tokens=2))
+        prefix = list(prompt['input_ids'])
+        assert prefix != list(prompt['engine_input_ids'])
+        assert response.prompt_token_ids == prefix
+        sequence, = response.sequences
+        assert sequence.tokens
+        assert list(sequence.new_input_feature['input_ids']) == prefix + list(sequence.tokens)
+        assert sequence.new_input_feature['pixel_values'] is not None
+        assert sequence.new_input_feature['image_grid_thw'] is not None
+        if template_name == 'qwen3_5':
+            assert len(sequence.new_input_feature['mm_token_type_ids']) == len(sequence.new_input_feature['input_ids'])
     finally:
         engine.shutdown()
 

@@ -6,8 +6,8 @@ used for I/O and for engines such as vLLM that own their compute concurrency
 and continuous batching internally.
 """
 from __future__ import annotations
-
 import asyncio
+import logging
 import time
 import uuid
 from collections.abc import Callable, Coroutine
@@ -17,11 +17,12 @@ from twinkle.protocol.types.errors import QueueState
 from twinkle.protocol.types.lifecycle import TERMINAL_STATUSES, TaskEnvelope, TaskStatus
 from twinkle.server.config.task_queue import TaskQueueConfig
 from twinkle.server.exceptions import BatchSizeError, ConfigError, InputTokensExceededError, RateLimitExceededError
+from twinkle.server.identity import current_tenant_fingerprint
 from twinkle.server.lifecycle.envelope import envelope_from_record
 from twinkle.server.lifecycle.poll_config import long_poll_window
 from twinkle.server.state.models import FutureFailureRecord
-from twinkle.server.telemetry.metrics import get_task_metrics
-from twinkle.utils.logger import get_logger
+from twinkle.server.telemetry.metrics import MetricsRegistry
+from twinkle.server.telemetry.tracing import get_trace_context
 from .backend_gate import BackendGate
 from .rate_limiter import RateLimiter
 from .types import ExecutionScope, QueuedTask
@@ -30,7 +31,7 @@ from .worker import ComputeWorker
 if TYPE_CHECKING:
     from twinkle.server.state import ServerState
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 class TaskQueueMixin:
@@ -59,6 +60,7 @@ class TaskQueueMixin:
 
     state: ServerState
     replica_id: str
+    _telemetry_base_model: str | None = None
 
     def _init_task_queue(
         self,
@@ -68,6 +70,7 @@ class TaskQueueMixin:
         enable_admission_gate: bool = False,
         on_backend_timeout: Callable[[], Coroutine[Any, Any, None]] | None = None,
         collect_width: int = 1,
+        telemetry_base_model: str | None = None,
     ) -> None:
         """Initialise the task queue, rate limiter, and compute worker.
 
@@ -102,7 +105,8 @@ class TaskQueueMixin:
                 message=(f'inline_fast_path_timeout ({_inline}s) must be < Long_Poll_Window '
                          f'({_window}s); lower it or raise TWINKLE_LONG_POLL_TIMEOUT.'))
         self._deployment_name = deployment_name
-        self._task_metrics = get_task_metrics(deployment_name) if deployment_name else None
+        self._telemetry_base_model = telemetry_base_model
+        self._task_metrics = MetricsRegistry.get() if deployment_name else None
         self._future_absolute_ttl = self._task_queue_config.absolute_future_ttl(collect_width)
 
         self._rate_limiter = RateLimiter(
@@ -204,7 +208,7 @@ class TaskQueueMixin:
         allowed, reason = await self._rate_limiter.check_and_record(token, input_tokens)
         if not allowed:
             if self._task_metrics:
-                self._task_metrics.rate_limit_rejections.inc(tags={'deployment': self._deployment_name})
+                self._task_metrics.rate_limit_rejections.add(1, attributes={'deployment': self._deployment_name})
             raise RateLimitExceededError(f'Rate limit exceeded: {reason}')
 
     async def _schedule_task(
@@ -240,7 +244,11 @@ class TaskQueueMixin:
             token=token,
             input_tokens=input_tokens,
             task_type=task_type,
-            created_at=time.monotonic())
+            tenant_fingerprint=current_tenant_fingerprint.get(),
+            base_model=self._telemetry_base_model,
+            trace_context=get_trace_context(),
+            created_at=time.monotonic(),
+            training_id=model_id)
         await self._prepare_queued_task(task)
 
         if self._event_loop is None:
@@ -283,6 +291,8 @@ class TaskQueueMixin:
                         attribution='server',
                         message='Replica stopped before the task could be enqueued.'))
             finally:
+                logger.warning(f'[TaskQueue] Task {request_id} could not be enqueued',
+                               extra=task.log_fields('failed'))
                 await self._compute_worker.finish_task(task, False)
             raise
         queue_key = self._queue_key(model_id=model_id, token=task.token)
@@ -291,15 +301,16 @@ class TaskQueueMixin:
         self._compute_worker.track_task(request_id)
         await q.put(task)
         try:
+            self._compute_worker.record_admission(task)
+            logger.info(f'[TaskQueue] Task {request_id} queued, type={task.task_type or "unknown"}, '
+                        f'model_id={model_id}, tenant_fingerprint={task.tenant_fingerprint}, '
+                        f'queue_depth={q.qsize()}, input_tokens={task.input_tokens}', extra=task.log_fields('queued'))
             await self.state.store_future_status(
                 request_id,
                 TaskStatus.QUEUED.value,
                 model_id,
                 queue_state=QueueState.ACTIVE.value,
             )
-            logger.info(f'[TaskQueue] Task {request_id} queued, type={task.task_type or "unknown"}, '
-                        f'model_id={model_id}, queue_key={queue_key}, '
-                        f'queue_depth={q.qsize()}, input_tokens={task.input_tokens}')
         finally:
             # Once q.put succeeds the sleeping worker must always be woken, even
             # if an acknowledgement or status write fails afterwards.
@@ -357,6 +368,7 @@ class TaskQueueMixin:
         request_id: str | None = None,
         execution_scope: ExecutionScope | None = None,
         submission_fingerprint: str | None = None,
+        training_id: str | None = None,
     ) -> dict[str, Any]:
         """Schedule a compute task that runs now instead of in serial order.
 
@@ -373,23 +385,27 @@ class TaskQueueMixin:
         # Decision_Boundary: raises RequestRejectedError before any state write.
         await self._perform_preflight_checks(model_id=model_id, token=token, input_tokens=input_tokens)
 
+        task = QueuedTask(
+            request_id=request_id,
+            coro_factory=coro_factory,
+            model_id=model_id,
+            token=token,
+            input_tokens=input_tokens,
+            task_type=task_type,
+            tenant_fingerprint=current_tenant_fingerprint.get(),
+            base_model=self._telemetry_base_model,
+            trace_context=get_trace_context(),
+            created_at=time.monotonic(),
+            execution_scope=execution_scope,
+            training_id=training_id or model_id)
         started = await self._compute_worker.submit_detached(
-            QueuedTask(
-                request_id=request_id,
-                coro_factory=coro_factory,
-                model_id=model_id,
-                token=token,
-                input_tokens=input_tokens,
-                task_type=task_type,
-                created_at=time.monotonic(),
-                execution_scope=execution_scope),
-            self._queue_key(model_id=model_id, token=token),
+            task,
             replica_id=getattr(self, 'replica_id', None),
             absolute_deadline=self._future_deadline(),
             submission_fingerprint=submission_fingerprint)
         if started:
             logger.info(f'[TaskQueue] Task {request_id} started concurrently, type={task_type or "unknown"}, '
-                        f'model_id={model_id}, input_tokens={input_tokens}')
+                        f'model_id={model_id}, input_tokens={input_tokens}', extra=task.log_fields('started'))
         return {'request_id': request_id, 'model_id': model_id}
 
     # Poll cadence *inside* the Inline_Fast_Path window. Much smaller than the window

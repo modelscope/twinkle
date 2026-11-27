@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from twinkle.protocol.types import DataRef
 
 
@@ -422,3 +424,45 @@ def test_sequence_and_handle_selection_are_object_local(monkeypatch):
     second.step()
     assert [(body['adapter_name'], body['training_id'], body['seq_id']) for _, body in calls] == [
         ('default', 'first-default', 1), ('other', 'first-other', 2), ('default', 'second-default', 1)]
+
+
+@pytest.mark.parametrize('advertises_idempotency', [True, False])
+def test_sample_submission_retries_a_timeout_only_when_server_can_replay(monkeypatch, advertises_idempotency):
+    from requests.exceptions import ReadTimeout
+    from types import SimpleNamespace
+
+    from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTENCY_SUPPORTED
+    from twinkle_client.exceptions import TwinkleClientValidationError
+    from twinkle_client.http import ClientContext, ClientTransport
+    from twinkle_client.sampler import vllm_sampler as module
+
+    posts = []
+    reply = object()
+
+    def post_model(url, body, *, headers=None):
+        posts.append((url, body, headers))
+        if len(posts) == 1:
+            raise ReadTimeout()
+        return reply
+
+    transport = ClientTransport(ClientContext(base_url='http://stub', api_key='synthetic'))
+    advertised_headers = {H_SAMPLE_IDEMPOTENCY_SUPPORTED: '1'} if advertises_idempotency else {}
+    monkeypatch.setattr(transport, 'post', lambda *args, **kwargs: SimpleNamespace(headers=advertised_headers))
+    monkeypatch.setattr(transport, 'post_model', post_model)
+    sampler = module.vLLMSampler('mock', transport=transport)
+    monkeypatch.setattr(sampler, '_await_task', lambda response, _: SimpleNamespace(samples=[response]))
+
+    if advertises_idempotency:
+        assert sampler.sample([{'input_ids': [1, 2]}]) == [reply]
+        assert len(posts) == 2 and posts[0] == posts[1]
+        assert posts[0][2][H_SAMPLE_IDEMPOTENCY_KEY]
+        assert sampler.sample([{'input_ids': [1, 2]}], idempotency_key='caller-key') == [reply]
+        assert asyncio.run(sampler.asample([{'input_ids': [1, 2]}], idempotency_key='caller-key')) == [reply]
+        assert posts[2] == posts[3] and posts[3][2][H_SAMPLE_IDEMPOTENCY_KEY] == 'caller-key'
+    else:
+        with pytest.raises(ReadTimeout):
+            sampler.sample([{'input_ids': [1, 2]}])
+        assert len(posts) == 1 and posts[0][2] is None
+        with pytest.raises(TwinkleClientValidationError, match='does not support'):
+            sampler.sample([{'input_ids': [1, 2]}], idempotency_key='caller-key')
+        assert len(posts) == 1

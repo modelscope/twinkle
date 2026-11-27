@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from twinkle.hub import HubOperation
 from . import deepseek_v4_encoding as bundled_encoding
-from .base import Template
+from .base import Template, logger
 
 _ENCODING_RELATIVE_PATH = os.path.join('encoding', 'encoding_dsv4.py')
 _REQUIRED_ENCODING_ATTRIBUTES = (
@@ -92,7 +92,7 @@ def get_deepseek_v4_tokenizer(tokenizer, encoding_model_dir: Optional[str] = Non
             prompt_str = encoding.encode_messages(
                 messages,
                 thinking_mode=thinking_mode,
-                drop_thinking=kwargs.get('drop_thinking', True),
+                drop_thinking=kwargs.get('drop_thinking', not kwargs.get('preserve_thinking', False)),
                 reasoning_effort=reasoning_effort,
             )
 
@@ -174,26 +174,28 @@ class DeepseekV4Template(Template):
         self,
         model_id: str,
         use_chat_template: bool = True,
-        max_length: Optional[int] = 8192,
+        max_length: Optional[int] = None,
         truncation_strategy: Literal['raise', 'left', 'right', 'split', 'delete'] = 'raise',
         default_system: Optional[str] = None,
-        enable_thinking: bool = True,
-        **kwargs,
+        enable_thinking: Optional[bool] = None,
+        *, processor=None, media_types=None, preserve_thinking=None, padding_side='right', **kwargs,
     ):
         self.model_id = model_id
         model_id = HubOperation.download_model(model_id, ignore_model=True)
         self._encoding_model_dir = model_id
         # Load eagerly so an invalid model-provided encoding fails during initialization.
         load_deepseek_v4_encoding(model_id)
-        base_tokenizer = PreTrainedTokenizerFast.from_pretrained(model_id, **kwargs)
+        self._processor_kwargs = dict(kwargs)
+        base_tokenizer = processor or PreTrainedTokenizerFast.from_pretrained(model_id, **kwargs)
         self.processor = get_deepseek_v4_tokenizer(base_tokenizer, model_id)
         self.config = AutoConfig.from_pretrained(model_id, **kwargs)
 
-        self.use_chat_template = use_chat_template
-        self.max_length = max_length
-        self.enable_thinking = enable_thinking
-        self.truncation_strategy = truncation_strategy
+        self._init_common(model_id=self.model_id, max_length=max_length, truncation_strategy=truncation_strategy,
+                          use_chat_template=use_chat_template, enable_thinking=enable_thinking,
+                          preserve_thinking=preserve_thinking, media_types=media_types, padding_side=padding_side)
         self.default_system = default_system
+        logger.info(f'default_system: {self.default_system!r}')
+        logger.info(f'max_length: {self.max_length}')
         self._test_support_assistant_tokens_mask()
         # pre_pipeline_names / post_pipeline_names inherit from Template (class-level).
 

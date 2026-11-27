@@ -8,7 +8,7 @@ import time
 
 from twinkle.server.resources.runtime import RayRuntime
 from twinkle.server.state.training_records import InstanceRecord, TrainingRuntimeContext
-from twinkle.server.telemetry.metrics import get_training_metrics
+from twinkle.server.telemetry.metrics import MetricsRegistry
 from twinkle.utils.logger import get_logger
 
 logger = get_logger()
@@ -18,7 +18,7 @@ class RayInstanceDriver:
     def __init__(self, config, store, namespace, controller_name):
         self.config, self.store = config, store
         self.namespace, self.controller_name = namespace, controller_name
-        self._metrics = get_training_metrics()
+        self._metrics = MetricsRegistry.get()
         self.runtime = RayRuntime(
             namespace, allocation_timeout=config.allocation_timeout_s, shutdown_timeout=config.shutdown_timeout_s
         )
@@ -31,7 +31,8 @@ class RayInstanceDriver:
         tags = {"backend": spec.backend, "mode": spec.mode, "device_type": spec.device_type}
         try:
             allocation = await self.runtime.pool.allocate(
-                spec.config.num_devices, spec.device_type, instance.controller_epoch, instance.instance_id
+                spec.config.num_devices, spec.device_type, instance.controller_epoch, instance.instance_id,
+                node_selector=spec.config.node_selector,
             )
             status = "success"
             return {
@@ -41,7 +42,9 @@ class RayInstanceDriver:
                 "devices": list(allocation.devices),
             }
         finally:
-            self._metrics.allocation_seconds.observe(time.monotonic() - started, tags={**tags, "status": status})
+            self._metrics.training_allocation_seconds.record(
+                time.monotonic() - started, attributes={**tags, "status": status}
+            )
 
     async def deploy(self, instance, spec):
         from ray.util.placement_group import get_placement_group
@@ -65,6 +68,7 @@ class RayInstanceDriver:
                 "idle_timeout_s",
                 "adapter_config",
                 "queue_config",
+                "node_selector",
             },
             exclude_none=True,
         )
@@ -74,6 +78,7 @@ class RayInstanceDriver:
         options = self.runtime.deployment_options(spec.deploy_options, name, spec.env_vars)
         app = build_model_app(
             model_id=spec.model_id,
+            telemetry_base_model=instance.base_model,
             backend=spec.backend,
             nproc_per_node=spec.config.num_devices,
             device_group={"name": "model", "ranks": spec.config.num_devices, "device_type": spec.device_type},
@@ -119,7 +124,7 @@ class RayInstanceDriver:
             tags = {"backend": spec.backend, "mode": spec.mode, "device_type": spec.device_type}
 
         def observe_removal(duration, status):
-            self._metrics.removal_seconds.observe(duration, tags={**tags, "status": status})
+            self._metrics.training_removal_seconds.record(duration, attributes={**tags, "status": status})
 
         await self.runtime.shutdown(instance.instance_id, name, observe_removal=observe_removal)
         await self.store.models.unregister_replica_capacity(instance.instance_id)

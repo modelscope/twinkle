@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
+import queue
 import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Future
@@ -57,10 +58,21 @@ class _GenerationGate:
 
 
 class Sampler(ABC):
+    # The teardown entries of every sampler: ``close`` composes the subclass ``shutdown``
+    # (below) and releases the owned replicas; ``shutdown`` is the entry drivers call
+    # directly at the end of an infer or eval run.
+    _lifecycle = ('close', 'shutdown')
 
     def __init__(self):
         self.engine = None
         self.template = None
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def close(self) -> None:
+        """Shut down this sampler's engine before its owned replicas are released."""
+        shutdown = getattr(self, 'shutdown', None)
+        if shutdown is not None:
+            shutdown()
 
     def _init_template(self, template: Optional[Union[Template, Type[Template], str]],
                        template_kwargs: Optional[dict] = None) -> None:
@@ -69,14 +81,12 @@ class Sampler(ABC):
             self.template = self._build_template(template, **(template_kwargs or {}))
 
     def _build_template(self, template_cls, **kwargs) -> Template:
-        if 'template_spec' not in kwargs and 'model_id' not in kwargs and getattr(self, 'model_id', None):
-            kwargs['model_id'] = self.model_id
-        return construct_template(template_cls, **kwargs)
+        return construct_template(template_cls, _default_model_id=getattr(self, 'model_id', None), **kwargs)
 
     @abstractmethod
     def sample(
         self,
-        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        inputs: Union[Trajectory, List[Trajectory]],
         sampling_params: Optional[SamplingParams] = None,
         adapter_name: str = '',
         *,
@@ -85,9 +95,9 @@ class Sampler(ABC):
         """Sample responses for given inputs.
 
         Args:
-            inputs: Either InputFeature(s) or Trajectory(s).
-                - InputFeature: Must contain 'input_ids'. For multimodal, include 'images'/'videos'.
-                - Trajectory: Must contain 'messages'. Requires template to be set.
+            inputs: Complete trajectory dict(s), encoded with 'input_ids' or awaiting
+                encoding with 'messages'. Normal sampling requires a template. Encoded
+                multimodal inputs retain 'engine_input_ids' and original media.
             sampling_params: Sampling parameters.
             adapter_name: Optional LoRA adapter name.
             num_samples: Number of completions to generate per input prompt.
@@ -101,7 +111,7 @@ class Sampler(ABC):
 
     def encode(
         self,
-        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        inputs: Union[Trajectory, List[Trajectory]],
         pooling_params: Optional[PoolingParams] = None,
         adapter_name: str = '',
     ) -> List[PoolingResponse]:
@@ -129,7 +139,7 @@ class Sampler(ABC):
 
     @staticmethod
     def _not_encoded(inputs: Any) -> bool:
-        """Check if inputs are not yet encoded (i.e., is Trajectory, not InputFeature).
+        """Check whether a trajectory dict still needs encoding.
 
         Delegates to the single shared predicate so the three backends and the wire
         schema cannot drift apart.
@@ -138,7 +148,7 @@ class Sampler(ABC):
         return not is_encoded(inputs)
 
     def _is_trajectory(self, inputs: Any) -> bool:
-        """Check if inputs are Trajectory type (not encoded)."""
+        """Check whether the first input dict in a batch still needs encoding."""
         if isinstance(inputs, list):
             if not inputs:
                 return False
@@ -183,6 +193,60 @@ class Sampler(ABC):
         """Schedule the coroutine on the engine's background event loop, returning a Future waitable
         from this thread."""
         return asyncio.run_coroutine_threadsafe(coro, self._async_loop)
+
+    def _start_async_loop(self) -> None:
+        """Own a private event loop on a daemon thread, so the engine's async API is drivable with
+        plain blocking calls even when the caller already runs inside an event loop (Ray workers
+        run uvloop, which forbids asyncio.run). Engine samplers call this in ``__init__``; a sampler
+        without an engine never does and has no ``_async_loop``."""
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(
+            target=self._run_event_loop, daemon=True, name=f'{type(self).__name__}-EventLoop'
+        )
+        self._async_thread.start()
+
+    def _run_event_loop(self) -> None:
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_forever()
+
+    def _run_in_loop(self, coro):
+        """Run a coroutine on the background loop and block until it returns."""
+        return asyncio.run_coroutine_threadsafe(coro, self._async_loop).result()
+
+    def _iter_in_loop(self, async_gen):
+        """Drain an async generator on the background loop into a plain iterator.
+
+        Items travel over a thread-safe queue and the generator's exceptions surface at the consumer.
+        Ending the iteration -- normally or by closing it early -- does not return until the loop-side
+        task has really exited, generator finalisation included: no engine work may outlive the caller
+        (the weight-sync paths release weights right after a stream ends).
+        """
+        q = queue.Queue()
+        sentinel = object()
+
+        async def _drain():
+            try:
+                async for item in async_gen:
+                    q.put(item)
+            except Exception as exc:
+                q.put(exc)
+            finally:
+                try:
+                    await async_gen.aclose()
+                finally:
+                    q.put(sentinel)
+
+        drained = asyncio.run_coroutine_threadsafe(_drain(), self._async_loop)
+        try:
+            while True:
+                item = q.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            drained.result()
 
     @staticmethod
     async def _gather_generation_tasks(coroutines):
@@ -298,9 +362,9 @@ class Sampler(ABC):
         finally:
             ids.discard(request_id)
 
-    async def _abort_all_inflight(self) -> int:
+    async def _abort_requests(self, request_ids) -> int:
         aborted = 0
-        for request_id in list(self.__dict__.get('_inflight_request_ids', ())):
+        for request_id in request_ids:
             try:
                 await self.engine.abort_request(request_id)
                 aborted += 1
@@ -308,12 +372,29 @@ class Sampler(ABC):
                 logger.warning('Failed to abort in-flight request %s: %s', request_id, error)
         return aborted
 
+    async def _abort_all_inflight(self) -> int:
+        return await self._abort_requests(list(self.__dict__.get('_inflight_request_ids', ())))
+
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def abort_all_inflight(self) -> dict:
         """Abort every in-flight generation on this replica (server shutdown)."""
         if not hasattr(self, '_async_loop'):
             return {'aborted': 0}
         return {'aborted': asyncio.run_coroutine_threadsafe(self._abort_all_inflight(), self._async_loop).result()}
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def abort_requests(self, request_ids: List[str]) -> dict:
+        """Abort specific in-flight requests, leaving the replica's other generations running.
+
+        The failed-group sibling cleanup: when one request of a submitted group fails, the group's
+        result is discarded, so its siblings would otherwise burn engine capacity to an end nobody
+        reads. Aborting an already-finished or unknown id is a harmless engine no-op, which is what
+        makes the dispatch='all' fan-out safe (the ids live on one replica only).
+        """
+        if not hasattr(self, '_async_loop'):
+            return {'aborted': 0}
+        return {'aborted': asyncio.run_coroutine_threadsafe(self._abort_requests(request_ids),
+                                                            self._async_loop).result()}
 
     def _drain(self) -> None:
         """Replica removal: abort what is running so those requests are resubmitted elsewhere."""

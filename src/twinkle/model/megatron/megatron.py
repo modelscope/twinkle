@@ -527,7 +527,15 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         if response_rows is not None:
             # Row identity for the response projection, captured before the feature split.
             kwargs['_response_rows'] = response_rows
-        return self.forward_backward(inputs=inputs, micro_batch_size=micro_batch_size, forward_only=True, **kwargs)
+        self._lazy_wrap_model()
+        modules = {module: module.training for chunk in self.model for module in chunk.modules()}
+        try:
+            for chunk in self.model:
+                chunk.eval()
+            return self.forward_backward(inputs=inputs, micro_batch_size=micro_batch_size, forward_only=True, **kwargs)
+        finally:
+            for module, training in modules.items():
+                module.training = training
 
     def _project_response_output(self, model_output, inputs, response_rows, optimizer_config):
         """Flatten the megatron micro-batch layout to rows, then run the shared projection.
@@ -620,7 +628,24 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
     @remote_function(collect='mean')
     @timed
     def calculate_loss(self, **kwargs):
-        return float('inf')
+        """Report the loss the fused forward already recorded on its status.
+
+        Megatron computes the loss inside forward_backward's schedule, so there is no
+        separate loss pass to re-run: read the value the last forward recorded -- the
+        same call-after-forward contract as TransformersModel.calculate_loss. The former
+        ``float('inf')`` placeholder was unread locally but cannot cross the wire
+        (pydantic serializes inf to null, breaking the client's float contract).
+        """
+        adapter_name = kwargs.pop('adapter_name', self._get_default_group())
+        optimizer_config = self.optimizer_group[adapter_name]
+        is_training = optimizer_config.last_forward_training
+        if is_training is None:
+            is_training = False
+        status = optimizer_config.train_status if is_training else optimizer_config.eval_status
+        loss = (status.outputs or {}).get('loss')
+        if loss is None:
+            raise ValueError('calculate_loss requires a forward that recorded a loss first.')
+        return float(loss)
 
     @remote_function()
     def backward(self, **kwargs):
@@ -669,8 +694,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # would reject). eval/training omit it; megatron's calculate_loss is a raise, so eval_loss
         # depends on forward_only computing it here.
         compute_loss = kwargs.pop('compute_loss', not (forward_only and disable_lora))
-        return_logits = kwargs.pop('return_logits', False) or 'logits' in output_fields
         task = kwargs.pop('task', 'causal_lm')
+        return_logits = (kwargs.pop('return_logits', False) or 'logits' in output_fields
+                         or (task == 'value' and 'values' in output_fields))
         # MoE routing replay (R2/R3): the driver passes the MODE scalar, resolved below to this
         # backend's action. Popped before loss_extra_kwargs_per_mb so it never reaches the loss.
         router_replay_mode = kwargs.pop('router_replay_mode', None)
@@ -987,6 +1013,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                                 _packed = batch.get('packed_seq_params')
                                 cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
                                 per_token = head(output_tensor, None, None)
+                                if per_token.dim() == 3 and per_token.shape[-1] == 1:
+                                    per_token = per_token.squeeze(-1)
                                 per_token = processor.postprocess_tensor_cp(per_token, cu_seqlens=cu_seqlens_q)
                                 unpacked_logits = per_token
                         else:
@@ -1025,10 +1053,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                             unpacked_logits = _generative_reranker_score(
                                 unpacked_logits, self.optimizer_group[adapter_name].template)
                 elif task == 'value':
-                    # Legacy path -- PPO critic over the bridge-built head: keep its per-token
-                    # V(s_t) riding the logits channel ([b, s]); PPOValueLoss masks to response
-                    # tokens. Non-packed / non-SP only, mirroring the transformers
-                    # TransformersValuePatch scope.
+                    # Legacy path -- PPO critic over the bridge-built head: keep per-token V(s_t)
+                    # on the logits channel. The common token-level tail below restores sequence
+                    # rows before PPOValueLoss masks and aligns its response-token targets.
                     if is_last_pp and labels is not None:
                         _packed = batch.get('packed_seq_params')
                         cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
@@ -1057,31 +1084,33 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                         logps = processor.postprocess_tensor_cp(logps, cu_seqlens=cu_seqlens_q)
                         if entropies is not None:
                             entropies = processor.postprocess_tensor_cp(entropies, cu_seqlens=cu_seqlens_q)
+                if labels is not None and is_last_pp and spec.token_level_labels:
+                    # All token-level tasks restore the same label/output frame before loss:
+                    # vocabulary logps and critic values must share the packed sequence boundaries.
+                    _packed = batch.get('packed_seq_params')
+                    cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
                     batch['labels'] = processor.postprocess_tensor_cp(labels, cu_seqlens=cu_seqlens_q)
-                    if batch.get('loss_scale') is not None:
-                        batch['loss_scale'] = processor.postprocess_tensor_cp(
-                            batch['loss_scale'], cu_seqlens=cu_seqlens_q)
+                    if loss_scale is not None:
+                        batch['loss_scale'] = processor.postprocess_tensor_cp(loss_scale, cu_seqlens=cu_seqlens_q)
                     if completion_mask is not None:
-                        # Same index space as labels, so it needs the same CP reassembly.
                         batch['completion_mask'] = processor.postprocess_tensor_cp(
                             completion_mask, cu_seqlens=cu_seqlens_q)
                     if 'position_ids' in batch:
                         pos = batch['position_ids']
                         if pos.dim() == 3:
-                            pos = pos[0]  # [2/3, 1, seq] → [1, seq]
+                            pos = pos[0]  # [2/3, 1, seq] -> [1, seq]
                         batch['position_ids'] = processor.postprocess_tensor_cp(pos, cu_seqlens=cu_seqlens_q)
-                    # Unpack packed sequences into per-sequence batch format
                     _outputs = {'logps': logps}
                     if entropies is not None:
                         _outputs['entropies'] = entropies
-                    if hasattr(_loss_instance, 'require_logits') and _loss_instance.require_logits:
+                    if unpacked_logits is not None:
+                        _outputs['logits'] = unpacked_logits
+                    elif getattr(_loss_instance, 'require_logits', False) or 'logits' in output_fields:
                         _outputs['logits'] = output_tensor
-                    elif 'logits' in output_fields:
-                        _outputs['logits'] = output_tensor
-                    batch, _outputs = processor.unpack_packed_sequences(batch, _outputs)
+                    batch, _outputs = processor.unpack_packed_sequences(batch, _outputs, task=task)
                     logps = _outputs['logps']
-                    entropies = _outputs.get('entropies', None)
-                    unpacked_logits = _outputs.get('logits', None)
+                    entropies = _outputs.get('entropies')
+                    unpacked_logits = _outputs.get('logits')
             except Exception as e:
                 # Log the rank-attributed failure, then re-raise: swallowing it would let this DP
                 # rank skip the PP collectives while the others wait, and a degraded value would
@@ -1231,7 +1260,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         elif not logps:
             logps = None
         if logits:
-            if not self.variable_seq_lengths:
+            if forward_only and task == 'decision' and return_logits:
+                logits = pad_and_stack_tensors(logits, pad_value=0)
+            elif not self.variable_seq_lengths:
                 logits = torch.cat(logits, dim=0)
             elif not get_task_spec(task).token_level_labels:
                 # Pooled tasks (seq_cls / decision ...): variable lengths split the batch, but the
@@ -1272,6 +1303,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # TransformersModel.forward's return_outputs['routed_experts']).
         rr.finish(model_output, unwrapped_model.config, num_microbatches, vpp_size,
                   router_replay_manual_cleanup)
+        # Mirror TransformersModel._finalize_forward_outputs: record which status this
+        # forward populated, so a later calculate_loss reads the right one.
+        optimizer_config.last_forward_training = not forward_only
         if forward_only:
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = model_output
@@ -1882,6 +1916,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                                           'trainer_state.json')
         with open(trainer_state_path) as f:
             trainer_state = json.load(f)
+        from twinkle.model.base import warn_cumulative_metric_state_not_restored
+        warn_cumulative_metric_state_not_restored(optimizer_config, 'megatron')
         result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
@@ -2477,9 +2513,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        if 'template_spec' not in kwargs:
-            kwargs['model_id'] = self.tokenizer_id
-        optimizer_config.template = construct_template(template_cls, **kwargs)
+        optimizer_config.template = construct_template(template_cls, _default_model_id=self.tokenizer_id, **kwargs)
 
     @remote_function(dispatch='all')
     def set_processor(self, processor_cls: Union[InputProcessor, Type[InputProcessor], str, Callable], **kwargs):

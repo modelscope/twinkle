@@ -160,6 +160,12 @@ class XPU(GPU):
         return True
 
     @staticmethod
+    def communicator_backend() -> str:
+        # BKCL answers to 'nccl' in torch, but a directly built ProcessGroupNCCL deadlocks when
+        # two ranks share a local device index; the xccl backend builds ProcessGroupXCCL instead.
+        return 'xccl'
+
+    @staticmethod
     def ray_resources():
         # The XPU runtime ships no nvidia-smi, so Ray autodetects zero GPUs.
         # Register the cuda-alike count explicitly; ``RayHelper`` routes the

@@ -39,7 +39,7 @@ def build_ray_runtime_env() -> dict[str, Any]:
     return runtime_env
 
 
-def ensure_ray_cluster(*, namespace: str, address: str | None = None) -> None:
+def ensure_ray_cluster(*, namespace: str, address: str | None = None, persistent: bool = False) -> None:
     """Bring up (or attach to) the Ray runtime a Serve deployment needs.
 
     The deploy-side entry for Ray bring-up: with no cluster running this starts a local head seeded
@@ -53,6 +53,45 @@ def ensure_ray_cluster(*, namespace: str, address: str | None = None) -> None:
 
     if ray.is_initialized():
         return
+    if address in (None, 'auto'):
+        address = os.environ.get('RAY_ADDRESS') or address
+    if address == 'local':
+        address = None
+    if persistent and address is None:
+        import shutil
+        import socket
+        import subprocess
+        import sys
+
+        from ray._private.services import find_bootstrap_address
+
+        # A detached deployment needs a head whose lifetime is independent of this driver.
+        # Attach by the head's CONCRETE recorded address (whatever host/port it actually uses,
+        # read from Ray's own session record -- not a hardcoded 6379): ray.init('auto') lets
+        # RAY_ADDRESS=local spawn a driver-owned ephemeral head, and ray.shutdown() at driver
+        # exit would then kill the "detached" deployment. A concrete address is never overridden.
+        def _head_alive(addr: str | None) -> bool:
+            if not addr:
+                return False
+            host, _, port = addr.rpartition(':')
+            try:
+                with socket.create_connection((host, int(port)), timeout=1.0):
+                    return True
+            except (OSError, ValueError):
+                return False
+
+        address = find_bootstrap_address(None)
+        if not _head_alive(address):
+            executable = Path(sys.executable).parent / 'ray'
+            ray_cli = str(executable) if executable.is_file() else shutil.which('ray')
+            if ray_cli is None:
+                raise RuntimeError('The Ray CLI is required to start a persistent local cluster.')
+            result = subprocess.run([ray_cli, 'start', '--head'], capture_output=True, text=True)
+            if result.returncode:
+                raise RuntimeError(f'Ray head startup failed:\n{result.stdout}\n{result.stderr}')
+            address = find_bootstrap_address(None)
+            if not _head_alive(address):
+                raise RuntimeError(f'Ray head started but is not reachable at {address!r}.')
     init_kwargs: dict[str, Any] = {
         'namespace': namespace,
         'runtime_env': build_ray_runtime_env(),
@@ -67,7 +106,8 @@ def ensure_ray_cluster(*, namespace: str, address: str | None = None) -> None:
 class ServerLauncher:
     """Own startup and cleanup; business scheduling stays in the controllers."""
 
-    def __init__(self, config: ServerConfig, ray_namespace: str | None = None):
+    def __init__(self, config: ServerConfig, ray_namespace: str | None = None, *,
+                 ray_address: str | None = 'auto', persistent_cluster: bool = False):
         if not isinstance(config, ServerConfig):
             raise TypeError('ServerLauncher requires a typed ServerConfig instance; '
                             f'got {type(config).__name__}. Build one with '
@@ -79,6 +119,193 @@ class ServerLauncher:
         self._serve_started = False
         self._training_controller = None
         self._sampler_controllers = []
+        self.ray_address = ray_address
+        self.persistent_cluster = persistent_cluster
+        self._existing_applications: set[str] = set()
+        self._owned_applications: set[str] = set()
+        self._published_models: set[str] = set()
+
+    @staticmethod
+    def _application_details() -> dict[str, Any]:
+        """Read the authoritative route table; an unavailable controller is not an empty deployment."""
+        from ray.serve.context import _get_global_client
+
+        client = _get_global_client(raise_if_no_controller_running=False)
+        return {} if client is None else dict(client.get_serve_details()['applications'])
+
+    @classmethod
+    def _model_names(cls) -> list[str]:
+        names = []
+        for name, details in cls._application_details().items():
+            route = details.get('route_prefix') or ''
+            if name.startswith('sampler-') and '/sampler/' in route:
+                names.append(route.split('/sampler/', 1)[1])
+        return names
+
+    @staticmethod
+    def _gateway_state(gateway_name: str):
+        """Read the live gateway's deployment info, route, user config and model registry."""
+        from ray.serve.context import _get_global_client
+        client = _get_global_client()
+        info, route = client.get_deployment_info('GatewayServer', gateway_name)
+        config = deepcopy(info.deployment_config.user_config or {})
+        current = config.get('supported_models', info.replica_config.init_kwargs.get('supported_models') or [])
+        return info, route, config, current
+
+    @staticmethod
+    def _update_gateway_models(gateway_name: str, *, add: list | None = None,
+                               remove: list[str] | None = None, replace: list | None = None,
+                               aliases: dict[str, str] | None = None) -> list[str]:
+        """Persist discovery through Serve reconfiguration while preserving all existing deployment settings.
+
+        Returns the names now registered to the given ``add`` entries (newly added or already
+        identical). A name registered to a DIFFERENT entry is a cross-deployment collision:
+        the registry routes a name to one deployment, so keeping the first writer silently
+        would misroute the second -- fail loudly instead.
+        """
+        from ray import serve
+        from ray.serve.deployment import Application, Deployment
+
+        info, route, config, current = ServerLauncher._gateway_state(gateway_name)
+        removed = set(remove or ())
+        current_aliases = config.get('openai_model_aliases',
+                                     info.replica_config.init_kwargs.get('openai_model_aliases') or {})
+
+        def model_name(item):
+            return item if isinstance(item, str) else item['model_name']
+
+        source = current if replace is None else replace
+        models = {model_name(item): item for item in source if model_name(item) not in removed}
+        published = []
+        for item in add or ():
+            name = model_name(item)
+            if name in models:
+                if models[name] != item:
+                    raise ValueError(f'Model name {name!r} is already registered to a different entry '
+                                     f'({models[name]!r}); stop that deployment or rename the adapter.')
+            else:
+                models[name] = item
+            published.append(name)
+        registry = list(models.values())
+        updated_aliases = ({name: base for name, base in current_aliases.items() if base not in removed}
+                           if replace is None else {})
+        for name, base in (aliases or {}).items():
+            if updated_aliases.setdefault(name, base) != base:
+                raise ValueError(f'OpenAI alias {name!r} is already registered to a different model.')
+        if conflicts := updated_aliases.keys() & models.keys():
+            raise ValueError(f'OpenAI aliases conflict with registered model names: {", ".join(sorted(conflicts))}')
+        if registry == current and updated_aliases == current_aliases:
+            return published
+        config['supported_models'] = registry
+        config['openai_model_aliases'] = updated_aliases
+        deployment = Deployment('GatewayServer', info.deployment_config, info.replica_config,
+                                version=info.version, _internal=True).options(user_config=config)
+        serve.run(Application(deployment), name=gateway_name, route_prefix=route)
+        return published
+
+    def _publish_models(self, base_names: list[str]) -> None:
+        """Register this launcher's samplers and their adapter aliases on every gateway.
+
+        A reused gateway kept its original registry, so the freshly built spec is the only
+        place the adapter aliases exist: publish the full entries (dict aliases carry
+        base_model routing), not just the base names, and own exactly the names that got
+        registered so shutdown removes only this launcher's entries.
+        """
+        for app in self.config.applications:
+            if app.import_path != 'server':
+                continue
+            registry = app.args.supported_models or []
+            entries = []
+            for base in base_names:
+                matched = [item for item in registry
+                           if item == base or (isinstance(item, dict) and
+                                               (item.get('base_model') or item['model_name']) == base)]
+                entries.extend(matched or [base])
+            if entries:
+                aliases = {name: base for name, base in app.args.openai_model_aliases.items() if base in base_names}
+                self._published_models.update(self._update_gateway_models(app.name, add=entries, aliases=aliases))
+
+    def _prepare_model_deployment(self, model_name: str) -> None:
+        """Share gateway/data-plane applications without replacing a live sampler."""
+        applications = self._application_details()
+        sampler_name = f'sampler-{model_name.replace("/", "_")}'
+        if sampler_name in applications:
+            raise ValueError(f'Model {model_name!r} is already deployed; stop it before replacing it.')
+        names = set(self._model_names()) | {model_name}
+        for app in self.config.applications:
+            if app.import_path == 'server':
+                registry = list(app.args.supported_models or [])
+                registry.extend(name for name in sorted(names) if name not in registry)
+                app.args.supported_models = registry
+        self.config.applications = [app for app in self.config.applications
+                                    if not (app.import_path == 'data_plane' and app.name in applications)]
+
+    @staticmethod
+    def _wait_for_application(name: str, timeout: float = 600.0) -> None:
+        """Wait for readiness and propagate terminal startup failures."""
+        from time import monotonic, sleep
+        from ray import serve
+
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            details = serve.status().applications.get(name)
+            if details is not None:
+                status = getattr(details.status, 'value', str(details.status))
+                if status == 'RUNNING':
+                    return
+                if status in ('DEPLOY_FAILED', 'UNHEALTHY'):
+                    raise RuntimeError(f'Application {name!r} reached {status}: {details.message}')
+            sleep(min(2.0, max(0.0, deadline - monotonic())))
+        raise TimeoutError(f'Application {name!r} did not reach RUNNING within {timeout}s.')
+
+    def stop_model(self, model_name: str) -> None:
+        """Release one deployed sampler and update the gateway without stopping other tenants."""
+        from ray import serve
+        from twinkle.server.sampler.pool.actor import stop_sampler_controller
+
+        self._init_ray()
+        applications = self._application_details()
+        gateways = [app for app in self.config.applications if app.import_path == 'server']
+        if len(gateways) != 1:
+            raise ValueError('Stopping a model requires exactly one gateway configuration.')
+        gateway = gateways[0]
+        gateway_route = (applications.get(gateway.name) or {}).get('route_prefix') or gateway.route_prefix
+        route = f"{gateway_route.rstrip('/')}/sampler/{model_name}"
+        sampler_name = next((name for name, details in applications.items() if details.get('route_prefix') == route),
+                            None)
+        failures = []
+        released = False
+        try:
+            released = stop_sampler_controller(self.ray_namespace, route)
+        except Exception as exc:
+            failures.append(exc)
+            logger.exception('Sampler pool cleanup failed for %s', model_name)
+        if sampler_name is None and not released and not failures:
+            raise ValueError(f'No deployment found for model {model_name!r}.')
+        if sampler_name is not None:
+            serve.delete(sampler_name)
+        remaining = [name for name in self._model_names() if name != model_name]
+        if gateway.name in applications:
+            try:
+                # Adapter aliases route to this sampler through base_model; leaving them
+                # behind would advertise a model whose engine is gone. Derive them from
+                # the LIVE registry (this launcher may not be the one that published them).
+                _, _, _, current = ServerLauncher._gateway_state(gateway.name)
+                aliases = [item['model_name'] for item in current
+                           if isinstance(item, dict) and item.get('base_model') == model_name]
+                self._update_gateway_models(gateway.name, remove=[model_name] + aliases)
+            except BaseException as error:
+                failures.append(error)
+                logger.exception('Gateway discovery cleanup failed for %s', model_name)
+            # Other training/processor deployments may still rely on the shared gateway.
+            unrelated = set(self._application_details()) - {gateway.name, 'data-plane'}
+            if not remaining and not unrelated and not failures:
+                serve.delete(gateway.name)
+                if 'data-plane' in applications:
+                    serve.delete('data-plane')
+        if failures:
+            raise RuntimeError(f'Sampler cleanup is incomplete for {model_name!r}.') from failures[0]
+        logger.info('Stopped deployment for model %s', model_name)
 
     def _get_builders(self) -> dict[str, Callable]:
         if not self._builders:
@@ -91,7 +318,7 @@ class ServerLauncher:
     def _configure_environment(self) -> None:
         if self.config.trust_remote_code is not None:
             os.environ['TWINKLE_TRUST_REMOTE_CODE'] = '1' if self.config.trust_remote_code else '0'
-        if any(app.import_path in ('model', 'sampler') for app in self.config.applications):
+        if any(app.import_path in ('server', 'model', 'sampler') for app in self.config.applications):
             os.environ['TWINKLE_STATE_RAY_NAMESPACE'] = self.ray_namespace
         os.environ.update(self.config.persistence.to_env_vars())
         gateways = [app for app in self.config.applications if app.import_path == 'server']
@@ -106,24 +333,23 @@ class ServerLauncher:
 
     def _configure_telemetry(self) -> None:
         telemetry = self.config.telemetry
-        os.environ['TWINKLE_TELEMETRY_ENABLED'] = str(int(telemetry.enabled))
+        os.environ.update(telemetry.to_env_vars())
         if not telemetry.enabled:
             return
+        from twinkle.server.identity import USER_ID_KEY_ENV, user_id_key
         from twinkle.server.telemetry import init_telemetry
+        if USER_ID_KEY_ENV in os.environ and user_id_key() is None:
+            raise ValueError(f'{USER_ID_KEY_ENV} must be nonempty and distinct from TWINKLE_TOKEN_SALT')
+        if USER_ID_KEY_ENV not in os.environ:
+            logger.warning('Tenant usage and snapshots require %s', USER_ID_KEY_ENV)
         init_telemetry(telemetry)
-        os.environ.update({
-            'TWINKLE_TELEMETRY_DEBUG': str(int(telemetry.debug)),
-            'TWINKLE_TELEMETRY_SERVICE': telemetry.service_name,
-            'TWINKLE_TELEMETRY_ENDPOINT': telemetry.otlp_endpoint,
-            'TWINKLE_TELEMETRY_INTERVAL': str(telemetry.export_interval_ms),
-        })
 
     def _init_ray(self) -> None:
         """Initialize Ray with the resolved namespace (attach-or-local via :func:`ensure_ray_cluster`)."""
         if self._ray_initialized:
             return
         namespace = self.ray_namespace or self.config.ray_namespace or 'twinkle_cluster'
-        ensure_ray_cluster(namespace=namespace, address='auto')
+        ensure_ray_cluster(namespace=namespace, address=self.ray_address, persistent=self.persistent_cluster)
         self._ray_initialized = True
 
     def _start_serve(self) -> None:
@@ -139,11 +365,9 @@ class ServerLauncher:
             return
         from ray import serve
 
-        try:
-            from ray.serve.context import _get_global_client
-            client = _get_global_client()
-        except Exception:
-            client = None
+        from ray.serve.context import _get_global_client
+        client = _get_global_client(raise_if_no_controller_running=False)
+        self._existing_applications = set(self._application_details())
         if client is not None:
             requested = self.config.http_options.model_dump()
             logger.info('Ray Serve is already running on this cluster; reusing it. Its listener '
@@ -171,14 +395,16 @@ class ServerLauncher:
         return options
 
     def _gateway_arguments(self) -> dict[str, Any]:
-        args = {'http_options': self.config.http_options.model_dump()}
+        args = {
+            'http_options': self.config.http_options.model_dump(),
+            'supported_models': list(
+                dict.fromkeys(
+                    alias for app in self.config.applications
+                    if app.import_path == 'sampler' and (alias := extract_model_alias(app.route_prefix, 'sampler')))),
+        }
         models = self.config.training_config.models
         if models:
             args['training_models'] = [model.name for model in models]
-            args['supported_models'] = list(
-                dict.fromkeys(
-                    alias for app in self.config.applications
-                    if app.import_path == 'sampler' and (alias := extract_model_alias(app.route_prefix, 'sampler'))))
         return args
 
     def _deploy_sampler(self, app: ApplicationSpec) -> None:
@@ -187,13 +413,33 @@ class ServerLauncher:
 
         from twinkle.server.sampler.pool.actor import create_sampler_controller
         from twinkle.server.sampler.pool.router import build_sampler_router
-        controller, options, pool_id = create_sampler_controller(app, self.ray_namespace,
-                                                                 self.config.resources.model_dump(),
-                                                                 build_worker_env_vars())
+        base_model = extract_model_alias(app.route_prefix, 'sampler') or app.name
+        # The sampler router and every replica app share the proxy port with the gateway, so all of
+        # them enforce the same credential: an explicit SamplerArgs.api_key wins, else inherit the
+        # gateway's key so a deployment authenticated at the gateway cannot be bypassed by dialing the
+        # sampler route directly. (The gateway forwards the caller's Bearer key, so proxied traffic
+        # still passes.) Written into the args BEFORE the controller serializes them: the pool driver
+        # builds each replica app from that dump and installs the same gate on it.
+        if app.args.api_key is None:
+            app.args.api_key = next(
+                (getattr(other.args, 'api_key', None) for other in self.config.applications
+                 if other.import_path == 'server'),
+                None,
+            )
+        controller, options, pool_id = create_sampler_controller(
+            app, self.ray_namespace, self.config.resources.model_dump(), build_worker_env_vars(),
+            base_model=base_model,
+        )
         self._sampler_controllers.append(controller)
+        if app.name not in self._existing_applications:
+            self._owned_applications.add(app.name)
         ray.get(controller.initialize.remote())
         serve.run(
-            build_sampler_router(self.ray_namespace, pool_id, options), name=app.name, route_prefix=app.route_prefix)
+            build_sampler_router(
+                self.ray_namespace, pool_id, options, model_id=base_model, api_key=app.args.api_key),
+            name=app.name,
+            route_prefix=app.route_prefix,
+        )
 
     def _deploy_application(self, app_spec: ApplicationSpec) -> None:
         """Model declarations go to the training controller; other apps deploy here."""
@@ -202,10 +448,21 @@ class ServerLauncher:
         if app_spec.import_path == 'sampler':
             self._deploy_sampler(app_spec)
             return
+        if app_spec.import_path == 'server' and app_spec.name in self._existing_applications:
+            logger.info('Reusing gateway %s with its existing listener, authentication and session settings.',
+                        app_spec.name)
+            if len(self.config.applications) == 1 and app_spec.args.supported_models is not None:
+                self._update_gateway_models(app_spec.name, replace=app_spec.args.supported_models,
+                                            aliases=app_spec.args.openai_model_aliases)
+            return
+        if app_spec.name not in self._existing_applications:
+            self._owned_applications.add(app_spec.name)
         from ray import serve
         args = {key: value for key, value in dict(app_spec.args).items() if value is not None}
         if app_spec.import_path == 'server':
             defaults = self._gateway_arguments()
+            if 'supported_models' not in args and defaults['supported_models']:
+                defaults.setdefault('training_models', [])
             for key, value in defaults.items():
                 args.setdefault(key, value)
         deployment = app_spec.deployments[0] if app_spec.deployments else {}
@@ -237,13 +494,16 @@ class ServerLauncher:
         try:
             ray.get(controller.initialize.remote())
             for model in config.models:
+                router_name = f'training-router-{self.ray_namespace}-{model.name}'
+                if router_name not in self._existing_applications:
+                    self._owned_applications.add(router_name)
                 app = build_training_router(config, model, self.ray_namespace, self.config.http_options.model_dump(),
                                             self._training_router_options(model))
                 serve.run(
                     app,
                     name=f'training-router-{self.ray_namespace}-{model.name}',
                     route_prefix=model.route_prefix or f'/api/v1/model/{model.name}')
-        except Exception:
+        except BaseException:
             self._run_cleanup([('training controller rollback', self._stop_training_controller)], raise_errors=False)
             raise
 
@@ -271,27 +531,58 @@ class ServerLauncher:
         for name, action in actions:
             try:
                 action()
-            except Exception as exc:
+            except BaseException as exc:
                 failures.append((name, exc))
                 logger.exception('%s failed', name)
         if failures and raise_errors:
             names = ', '.join(name for name, _ in failures)
-            raise RuntimeError(f'Server cleanup is incomplete: {names}') from failures[0][1]
+            raise BaseExceptionGroup(f'Server cleanup is incomplete: {names}', [error for _, error in failures])
+
+    def _unpublish_models(self) -> None:
+        """Remove only this launcher's discovery entries from gateways that remain shared."""
+        if not self._published_models:
+            return
+        applications = self._application_details()
+        actions = [(f'{app.name} discovery cleanup',
+                    lambda app=app: self._update_gateway_models(app.name, remove=list(self._published_models)))
+                   for app in self.config.applications
+                   if app.import_path == 'server' and app.name in applications]
+        self._run_cleanup(actions, raise_errors=True)
+        self._published_models.clear()
+
+    def _delete_owned_applications(self) -> None:
+        """Leave shared applications alive while any other deployment still uses them."""
+        from ray import serve
+
+        shared = {app.name for app in self.config.applications if app.import_path in ('server', 'data_plane')}
+        unrelated = set(self._application_details()) - self._owned_applications - shared
+        failures = []
+        for name in tuple(self._owned_applications):
+            if name in shared and unrelated:
+                continue
+            try:
+                serve.delete(name)
+            except BaseException as error:
+                failures.append(error)
+                logger.exception('Application cleanup failed for %s', name)
+            else:
+                self._owned_applications.remove(name)
+        if failures:
+            raise BaseExceptionGroup('Owned application cleanup is incomplete', failures)
 
     def _shutdown(self, *, raise_errors: bool = True) -> None:
         from functools import partial
 
-        from ray import serve
-
-        from twinkle.server.telemetry import flush_telemetry_safely
+        from twinkle.server.telemetry import shutdown_telemetry_safely
         actions = [('training controller shutdown', self._stop_training_controller)]
         actions.extend(('sampler controller shutdown', partial(self._stop_sampler_controller, controller))
                        for controller in tuple(self._sampler_controllers))
         if self._serve_started:
-            actions.append(('Ray Serve shutdown', serve.shutdown))
-        actions.append(('telemetry flush', flush_telemetry_safely))
+            actions.append(('gateway discovery cleanup', self._unpublish_models))
+            actions.append(('owned application cleanup', self._delete_owned_applications))
+        actions.append(('telemetry shutdown', shutdown_telemetry_safely))
         self._run_cleanup(actions, raise_errors=raise_errors)
-        self._serve_started = False
+        self._serve_started = bool(self._owned_applications or self._published_models)
 
     @staticmethod
     def _wait_for_shutdown() -> None:
@@ -305,24 +596,36 @@ class ServerLauncher:
         signal.signal(signal.SIGTERM, signal_shutdown)
         stopped.wait()
 
-    def launch(self, blocking: bool = True) -> None:
+    def launch(self, blocking: bool = True, *, model_name: str | None = None) -> None:
         """Launch applications and their controllers, optionally waiting for shutdown."""
         if not self.config.applications:
             logger.warning('No applications configured')
             return
         self._configure_environment()
         self._init_ray()
+        if model_name is not None:
+            self._prepare_model_deployment(model_name)
         try:
             self._start_serve()
             for app in self.config.applications:
                 self._deploy_application(app)
             if self.config.training_config.models:
                 self._deploy_training()
+            if model_name is not None:
+                self._wait_for_application(f'sampler-{model_name.replace("/", "_")}')
+                self._publish_models([model_name])
+            else:
+                # Plain config launches share the same discovery path: a reused gateway
+                # never sees this config's args, so its samplers must be published here
+                # too -- otherwise they run but no request can route to them.
+                self._publish_models([alias for app in self.config.applications
+                                      if app.import_path == 'sampler'
+                                      and (alias := extract_model_alias(app.route_prefix, 'sampler'))])
             logger.info('All applications started')
             if not blocking:
                 return
             self._wait_for_shutdown()
-        except Exception:
+        except BaseException:
             self._shutdown(raise_errors=False)
             raise
         self._shutdown()
@@ -351,6 +654,10 @@ def launch_server(
     config_path: str | Path | None = None,
     ray_namespace: str | None = None,
     blocking: bool = True,
+    *,
+    ray_address: str | None = 'auto',
+    persistent_cluster: bool = False,
+    model_name: str | None = None,
 ) -> None:
     """Launch a twinkle server — the single launch choke point.
 
@@ -384,5 +691,7 @@ def launch_server(
     launcher = ServerLauncher(
         config=config,
         ray_namespace=ray_namespace or config.ray_namespace,
+        ray_address=ray_address,
+        persistent_cluster=persistent_cluster,
     )
-    launcher.launch(blocking=blocking)
+    launcher.launch(blocking=blocking, model_name=model_name)

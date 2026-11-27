@@ -2,7 +2,14 @@ from .base import Platform
 from .gpu import GPU
 from .metax import Metax, is_metax_available
 from .mps import MPS, is_mps_available
-from .npu import NPU, ensure_hccl_socket_env, ensure_npu_backend, hccl_socket_env
+from .npu import (
+                  HCCL_SOCKET_ENV_KEYS,
+                  NPU,
+                  ensure_hccl_socket_env,
+                  ensure_npu_backend,
+                  hccl_socket_env,
+                  hccl_socket_env_scope,
+)
 from .xpu import XPU, ensure_bkcl_nonuniform_env, ensure_xpu_compat
 
 # Run the detected platform's one-shot runtime fixups. This has to stay an

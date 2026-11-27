@@ -6,5 +6,6 @@ Server and Client
    Overview.md
    Server.md
    Observability.md
+   Multitenant-Operations.md
    Twinkle-Client.md
    Tinker-Compatible-Client.md
