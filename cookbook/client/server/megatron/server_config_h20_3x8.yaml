@@ -97,8 +97,6 @@ applications:
       task_type: causal_lm
       language_model_only: true
       mixed_precision: bf16
-      # The MoE LoRA optimizer clips many gradients in a single Transformer Engine call.
-      env_vars: {NVTE_TENSOR_HANDLE_POOL_SIZE_MB: "128"}
       min_replicas: 1
       max_replicas: 1
       adapter_config: *lora_lifetime
