@@ -30,8 +30,11 @@ expected = {
     'megatron-core': '0.20.0',
     'mcore-bridge': '1.7.0',
     'sentence-transformers': '6.3.0',
+    'transformer-engine': '2.19.0',
+    'transformer-engine-cu13': '2.19.0',
+    'transformer-engine-torch': '2.19.0',
 }
-for name in (*expected, 'twinkle', 'ms-swift', 'transformers', 'peft', 'tilelang', 'apache-tvm-ffi'):
+for name in (*expected, 'twinkle-kit', 'ms-swift', 'transformers', 'peft', 'tilelang', 'apache-tvm-ffi'):
     version = metadata.version(name)
     print(f'{name}=={version}', flush=True)
     if name in expected and version.split('+', 1)[0] != expected[name]:
@@ -46,6 +49,7 @@ print(f'ms-swift revision {commit}', flush=True)
 from sentence_transformers import SentenceTransformer  # noqa: F401
 from swift.dev import template_contract  # noqa: F401
 from swift.dev.model.multi_lora_sentence_transformer_model import MultiLoraSentenceTransformerModel  # noqa: F401
+from transformer_engine.pytorch.optimizers import FusedAdam, multi_tensor_scale  # noqa: F401
 
 check = subprocess.run(
     [sys.executable, '-m', 'pip', 'check'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
