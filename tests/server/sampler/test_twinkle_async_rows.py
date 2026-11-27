@@ -143,6 +143,9 @@ async def test_sample_to_data_plane_returns_ref_after_short_admission() -> None:
         'tokens': [7],
         'decoded': 'answer',
         'stop_reason': 'stop',
+        # 012aff34: every TQ row carries the token-only routing/mask exports (None here).
+        'routed_experts': None,
+        'sampling_masks': None,
         'prompt_logprobs': None,
         'topk_prompt_logprobs': None,
     }]

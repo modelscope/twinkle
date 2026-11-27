@@ -7,6 +7,18 @@ from twinkle import DeviceGroup, Platform
 from twinkle.infra._ray.resource_manager import ResourceManager, _gpu_placement_group_cpus
 
 
+def _stub_publish_addresses(self):
+    # 58b2b979 added _publish_addresses, which probes each placement group's node address with a Ray
+    # actor and keys a dict by the (hashable) Ray placement group. These tests fake placement groups as
+    # SimpleNamespace/object and assert device ORDER, not address discovery, so attach a stub node_ip
+    # directly -- preserving the placement['node_ip'] contract without the Ray probe.
+    for placements in self.device_groups.values():
+        for placement in placements:
+            placement['node_ip'] = '127.0.0.1'
+    for placement in self.rank_placements.values():
+        placement['node_ip'] = '127.0.0.1'
+
+
 def test_gpu_placement_group_cpus_uses_per_process_default(monkeypatch):
     monkeypatch.delenv('TWINKLE_GPU_PG_CPUS_PER_PROC', raising=False)
 
@@ -52,6 +64,7 @@ def test_worker_device_order_preserves_group_allocation(monkeypatch, device_type
     ])
     monkeypatch.setattr(ray.util, 'placement_group', lambda bundles: SimpleNamespace(ready=lambda: True))
     monkeypatch.setattr(Platform, 'get_platform', lambda platform=None: type(device_type, (), {}))
+    monkeypatch.setattr(ResourceManager, '_publish_addresses', _stub_publish_addresses)
     manager = ResourceManager(
         nproc_per_node=8, ncpu_proc_per_node=8,
         groups=[
@@ -70,6 +83,7 @@ def test_external_device_allocation_preserves_order(monkeypatch, device_type):
     import ray
 
     monkeypatch.setattr(ray, 'get_runtime_context', lambda: SimpleNamespace(gcs_address='test-gcs'))
+    monkeypatch.setattr(ResourceManager, '_publish_addresses', _stub_publish_addresses)
     devices = ['6', '13', '8', '9', '10', '11', '7', '12']
     manager = ResourceManager.from_allocation(
         DeviceGroup(name='sampler', ranks=2, device_type=device_type, gpus_per_worker=4),
@@ -95,7 +109,11 @@ def test_worker_visibility_preserves_devices_and_orders_npu_ids(
 
     pg = object()
     devices = ['13', '6', '12', '7']
-    table = {rank: {'gpu_rank': device, 'placement_group': pg} for rank, device in enumerate(devices)}
+    # 58b2b979: create_workers awaits worker._twinkle_ready.remote() via ray.get; this test drives the
+    # placement/visibility seam with Mock workers, so resolve refs by identity.
+    monkeypatch.setattr(ray, 'get', lambda value, **kwargs: value)
+    table = {rank: {'gpu_rank': device, 'placement_group': pg, 'node_ip': '127.0.0.1'}
+             for rank, device in enumerate(devices)}
     manager = None if placement_source == 'lend_registry' else SimpleNamespace(rank_placements=table)
     monkeypatch.setattr(RayHelper, 'resource_manager', manager)
     monkeypatch.setattr(RayHelper, 'get_config', lambda key: table)

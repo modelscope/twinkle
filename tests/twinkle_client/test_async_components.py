@@ -437,7 +437,13 @@ def test_sample_submission_retries_a_timeout_only_when_server_can_replay(monkeyp
     from twinkle_client.sampler import vllm_sampler as module
 
     posts = []
-    reply = object()
+    # 012aff34 complete-Trajectory contract: sample() validates one response per input and a
+    # complete new_input_feature per sequence, then restores media/user_data onto frozen wire
+    # copies. Use the real (frozen) response models so the retry/idempotency assertions compare
+    # genuine wire records by value.
+    from twinkle.protocol.types import SampledSequenceModel, SampleResponseModel
+    reply = SampleResponseModel(sequences=[
+        SampledSequenceModel(stop_reason='stop', tokens=[], new_input_feature={'input_ids': [1, 2]})])
 
     def post_model(url, body, *, headers=None):
         posts.append((url, body, headers))

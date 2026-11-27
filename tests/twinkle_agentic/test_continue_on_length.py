@@ -20,6 +20,8 @@ and its two-layer HEAD-worktree reverse-verification live in the regression camp
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from twinkle.data_format.sampling import SampledSequence, SamplingParams
 from twinkle.template.base import Template
 from twinkle_agentic.rollout.endpoint import EndpointRequest
@@ -54,6 +56,9 @@ class _Engine:
         feature['input_ids'] = list(state['input_ids']) + tokens
         # shifted order: drop the trailing -100, append the new labels, re-mask the tail
         feature['labels'] = list(state.get('labels') or [])[:-1] + tokens + [-100]
+        # 012aff34: the ledger validates a complete trajectory incl. completion_mask, derived
+        # from labels exactly like the product (template/contract/encoding.py:250).
+        feature['completion_mask'] = [0 if label == -100 else 1 for label in feature['labels']]
         feature['messages'] = list(state.get('messages') or []) + [_a(text)]
         return SampledSequence(stop_reason=stop, tokens=tokens, decoded=text,
                                new_input_feature=feature, logprobs=[-0.5] * len(tokens))
@@ -110,15 +115,25 @@ class _FakeTemplate:
     model_id = 'qwen-fake'
     truncation_strategy = 'right'
     enable_thinking = False
+    # 8314e88d/ef063fc2: borrowed Template.render_delta gates enable_thinking on this flag.
+    _explicit_enable_thinking = False
     max_length = None
     render_delta = Template.render_delta
     decode_tool_calls = staticmethod(Template.decode_tool_calls)
     _collapse_system_messages = staticmethod(Template._collapse_system_messages)
     _engine_input_ids = Template._engine_input_ids
+    # token_utils.extend_with_bridge stamps reasoning_started via the template hook.
+    _reasoning_started = staticmethod(lambda input_ids: False)
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.encode_calls = 0
+
+    def encode_prompt(self, trajectory, *, backend='vllm', add_generation_prompt=True):
+        # 012aff34: ledger.open encodes the opening via the public template.encode_prompt
+        # contract (backend/add_generation_prompt keywords) instead of the old encode().
+        # Delegate to the fake's encode contract unchanged.
+        return self.encode(trajectory, add_generation_prompt=add_generation_prompt)
 
     def encode(self, trajectory, add_generation_prompt=False):
         self.encode_calls += 1
@@ -143,6 +158,7 @@ class _FakeTemplate:
             if len(labels) != n:
                 raise RuntimeError('labels length != input_ids length')
             pif['labels'] = labels[1:] + labels[:1]  # np.roll(labels, -1): shifted order
+            pif['completion_mask'] = [0 if label == -100 else 1 for label in pif['labels']]
             pif['attention_mask'] = [1] * n
             pif['position_ids'] = list(range(n))
             pif['length'] = n
@@ -159,14 +175,18 @@ class _FakeTemplate:
         return text
 
 
-def _make(script, token_face=False, segment_policy='drop', max_length=None):
+def _make(script, token_face=False, segment_policy='drop', max_length=None, merge_strips=False):
     tokenizer = _CharTokenizer() if token_face else None
     template = _FakeTemplate(tokenizer) if token_face else None
     if template is not None:
         template.max_length = max_length
     engine = _Engine(script, token_face=token_face, tokenizer=tokenizer)
     rollout = MultiTurnRollout(response_callback=engine, template=template, segment_policy=segment_policy)
-    rollout.harness = None
+    # 58b2b979 gated the strip-recurrence fold on harness.merge_strips (ms_agent declares it).
+    # A test that feeds ms-agent-style stripped merged echoes must declare the harness, else the
+    # rollout folds raw concatenation and reads the continuation as a rewrite. noise_reply=None
+    # keeps every request a generation, exactly as harness=None did.
+    rollout.harness = SimpleNamespace(merge_strips=True, noise_reply=lambda *a, **k: None) if merge_strips else None
     return rollout, engine, template, tokenizer
 
 
@@ -261,7 +281,8 @@ def test_m8_whitespace_boundary_repeated():
     # The attempt4 crash shape: ms-agent strips stored content at send time, so the merged
     # echo LOSES boundary whitespace ('answer = ' + '42 and ' echoes as 'answer =42 and').
     # A raw-concatenation merged view reads the second continuation as a rewrite.
-    rollout, engine, _, _ = _make([('answer = ', 'length'), ('42 and ', 'length'), ('done.', 'stop')])
+    rollout, engine, _, _ = _make([('answer = ', 'length'), ('42 and ', 'length'), ('done.', 'stop')],
+                                  merge_strips=True)
     ep = _ep([U1])
     _serve(rollout, ep, [U1])
     r2 = _serve(rollout, ep, [U1, _a('answer =')])  # echo_1 = strip(partial)
@@ -273,7 +294,7 @@ def test_m8_whitespace_boundary_repeated():
 
 
 def test_m9_whitespace_boundary_merged_suffix():
-    rollout, engine, _, _ = _make([('answer = ', 'length'), ('42.', 'stop'), ('ok', 'stop')])
+    rollout, engine, _, _ = _make([('answer = ', 'length'), ('42.', 'stop'), ('ok', 'stop')], merge_strips=True)
     ep = _ep([U1])
     _serve(rollout, ep, [U1])
     _serve(rollout, ep, [U1, _a('answer =')])
@@ -381,7 +402,7 @@ def test_t7_whitespace_boundary_token():
     # Token face of the attempt4 crash: pre-follow-up the second continuation re-encodes
     # an assistant-ending prompt and the template contract raises.
     rollout, engine, template, tok = _make([('answer = ', 'length'), ('42 and ', 'length'), ('done.', 'stop')],
-                                           token_face=True)
+                                           token_face=True, merge_strips=True)
     ep = _ep([U1])
     prompt_ids = tok.encode(tok.apply_chat_template([U1], add_generation_prompt=True))
     _serve(rollout, ep, [U1])

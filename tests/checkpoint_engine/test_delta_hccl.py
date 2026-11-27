@@ -149,7 +149,11 @@ def test_prepare_publishes_effective_hccl_env(env, monkeypatch):
     e.prepare()
     derived = _derive_hccl_socket_env_defaults(222)
     assert e.hccl_env == dict(derived, HCCL_IF_BASE_PORT='12345')
-    assert 'HCCL_HOST_SOCKET_PORT_RANGE' not in os.environ  # read-only: prepare() must not mutate env
+    # 183fa921: prepare() now pins the derived layout into the process env (ensure_hccl_socket_env,
+    # setdefault) so the published layout is the one this process will apply; explicit user overrides
+    # (HCCL_IF_BASE_PORT above) are preserved rather than overwritten.
+    for key, value in e.hccl_env.items():
+        assert os.environ[key] == value
     e.close()
     assert e.hccl_env is None
 

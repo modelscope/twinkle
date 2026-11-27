@@ -1,5 +1,6 @@
 """Streaming delivery hands out whole batch_size rows of complete groups; an incomplete tail is dropped, never padded."""
 
+import time
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event, current_thread
@@ -444,6 +445,48 @@ def test_sync_during_reclaim_replaces_stale_batch_before_spending_last_step():
         finally:
             resume.set()
             driver.close(timeout=5)
+
+
+def test_close_mid_lend_settles_the_reclaim_before_returning():
+    """close() must not declare cleanup settled while a delivery is still in its lend->reclaim cycle.
+
+    The component lifecycle release kills the driver actor as soon as close returns; a close that
+    returns mid-cycle truncates the reclaim and strands the trainer merged and CPU-offloaded
+    (G48-b attempt 11: the next forward died on the cuda/cpu device mix). The grow leg here stands
+    in for a slow first-time engine init -- longer than the episode drain, the common case.
+    """
+    lending, released, reclaimed = Event(), Event(), Event()
+
+    class Adapter:
+        def lend(self, idle_ratio, waited=None):
+            lending.set()
+            assert released.wait(5), 'grow leg never released'
+
+        def reclaim(self):
+            reclaimed.set()
+
+        def adjust(self):
+            pass
+
+    # Episodes complete at once, so the episode drain is fast and the ONLY thing a correct close
+    # may still wait on is the in-flight lend->reclaim cycle.
+    driver = make_driver(1, batch_size=1, cluster_adapter=Adapter())
+    with ThreadPoolExecutor(2) as pool:
+        consuming = pool.submit(list, driver)
+        try:
+            assert lending.wait(5)
+            closing = pool.submit(driver.close, timeout=5)
+            time.sleep(0.3)
+            assert not closing.done(), 'close returned before the in-flight reclaim settled'
+            assert not reclaimed.is_set()
+            released.set()
+            assert reclaimed.wait(5)
+            closing.result(timeout=5)
+            assert consuming.result(timeout=5) == []
+        finally:
+            released.set()
+            driver.close(timeout=5)
+    assert reclaimed.is_set()
 
 
 def test_stale_group_regeneration_runs_on_the_driver_thread():

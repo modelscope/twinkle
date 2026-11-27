@@ -466,20 +466,23 @@ if __name__ == '__main__':
 def _pin_cpu_torch_kernels():
     """Force the pure-torch kernel surface for this CPU worker's process.
 
-    transformers >= 5.12 binds the causal_conv1d/fla GPU kernels unconditionally at
-    module import whenever the packages are installed (no device check), and
-    FusedRMSNormGated even queries torch.cuda.current_device() at construction -- both
-    die on CPU. This test's contract is the torch-fallback SP path, so null the kernel
-    globals BEFORE model construction (instance attributes bind from them in __init__)
-    and in twinkle's SP kernel selector. Spawned subprocess only; no leak to other tests.
+    transformers 5.16 wraps the causal_conv1d/fla entry points with
+    use_kernel_func_from_hub_with_fallback: the module global IS the torch fallback
+    body, wrapped so an installed causal_conv1d/fla package (GPU/triton kernels) takes
+    priority over it. Nulling the globals -- the <=5.15 contract, where forward()
+    None-checked an instance binding and fell back to torch -- now kills the fallback
+    itself (TypeError: 'NoneType' object is not callable). Unwrap each global to its
+    pure-torch body instead, and null twinkle's SP kernel selectors so the SP lane
+    takes its torch fallback too. Spawned subprocess only; no leak to other tests.
     """
     from importlib import import_module
     modeling = import_module('transformers.models.qwen3_5.modeling_qwen3_5')
-    modeling.causal_conv1d_fn = None
-    modeling.causal_conv1d_update = None
-    modeling.chunk_gated_delta_rule = None
-    modeling.fused_recurrent_gated_delta_rule = None
-    modeling.FusedRMSNormGated = None
+    for name in ('causal_conv1d_fn', 'causal_conv1d_update',
+                 'torch_chunk_gated_delta_rule', 'torch_recurrent_gated_delta_rule'):
+        fn = getattr(modeling, name)
+        while hasattr(fn, '__wrapped__'):
+            fn = fn.__wrapped__
+        setattr(modeling, name, fn)
     from twinkle.model.transformers.strategy.sequence_parallel import linear_attention_sp as sp_mod
     sp_mod._FLA_CAUSAL_CONV1D_FN = None
     sp_mod._FLA_CHUNK_GATED_DELTA_RULE = None

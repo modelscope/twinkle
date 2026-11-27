@@ -122,6 +122,8 @@ def test_encode_prompt_preserves_metadata_when_encode_consumes_sample():
     template.pre_pipeline_names = []
     template.post_pipeline_names = []
     template.truncation_strategy = 'raise'
+    # c94096a4: encode() now reads use_chat_template (set by __init__, absent on __new__).
+    template.use_chat_template = True
 
     def encode(sample, **kwargs):
         sample.pop('messages')
@@ -272,9 +274,11 @@ class TestTextTemplate:
         input_ids = encoded['input_ids']
         labels = encoded['labels']
 
-        assert isinstance(input_ids, np.ndarray)
-        assert isinstance(labels, np.ndarray)
+        # 8314e88d normalize_token_fields: encode returns plain lists, not ndarrays.
+        assert isinstance(input_ids, list)
+        assert isinstance(labels, list)
 
+        labels = np.asarray(labels)
         assert (labels == -100).sum() > 0
         assert (labels != -100).sum() > 0
 
@@ -316,13 +320,14 @@ class TestTextTemplate:
 
         assert len(input_ids) == len(labels)
 
+        labels = np.asarray(labels)
         prompt_mask = labels == -100
         completion_mask = labels != -100
 
         assert prompt_mask.sum() > 0
         assert completion_mask.sum() > 0
 
-        completion_tokens = input_ids[completion_mask]
+        completion_tokens = np.asarray(input_ids)[completion_mask]
         assert len(completion_tokens) > 0
 
 
@@ -360,8 +365,9 @@ class TestMultimodalTemplate:
         input_ids = encoded['input_ids']
         labels = encoded['labels']
 
-        assert isinstance(input_ids, np.ndarray)
-        assert isinstance(labels, np.ndarray)
+        # 8314e88d normalize_token_fields: encode returns plain lists, not ndarrays.
+        assert isinstance(input_ids, list)
+        assert isinstance(labels, list)
 
     @pytest.mark.skipif(SKIP_MODEL_DOWNLOAD, reason='Skipping tests that require model download')
     def test_qwen2vl_multimodal_template_with_placeholder(self):
@@ -416,6 +422,7 @@ class TestMultimodalTemplate:
 
         assert len(input_ids) == len(labels)
 
+        labels = np.asarray(labels)
         prompt_mask = labels == -100
         completion_mask = labels != -100
 

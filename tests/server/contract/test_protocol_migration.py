@@ -21,13 +21,14 @@ ProcessorCreateResponse ProcessorHeartbeatRequest ProcessorHeartbeatResponse Pro
 ResponseModel ResumeFromCheckpointRequest RetrieveFutureRequest SampleRequest SampleResponseModel
 SampleResponseModelList SampledSequenceModel SamplerAddAdapterRequest SamplerAddAdapterResponse SamplerApplyPatchRequest
 SamplerCreateResponse
-SamplerSetTemplateRequest SamplerSetTemplateResponse SaveRequest SaveResponse SessionHeartbeatRequest
+SamplerSetTemplateRequest SamplerSetTemplateResponse SamplingMaskModel SaveRequest SaveResponse SessionHeartbeatRequest
 SessionHeartbeatResponse SetLossRequest SetLossResponse SetLrSchedulerRequest SetLrSchedulerResponse SetOptimizerRequest
 SetOptimizerResponse SetProcessorRequest SetProcessorResponse SetTemplateRequest SetTemplateResponse StepRequest
 StepResponse StrictRequest SupportedModel TERMINAL_STATUSES TaskEnvelope TaskStatus TrainingProgressResponse TrainingRun
 TrainingRunsResponse UnloadAdapterPathsRequest UploadToHubRequest VLM_TENSOR_FIELDS WeightsInfoRequest
 WeightsInfoResponse WireInputBatch WireInputFeature WireInputs WireMessage WireTrajectory ZeroGradResponse backend_kwarg
 backend_only declared_wire_keys export_batch fields_with_role passthrough read_backend_only read_field_role
+TaskHeadTemperaturesRequest TaskHeadTemperaturesResponse
 """.split())
 
 
@@ -35,7 +36,8 @@ def test_protocol_exports_match_committed_snapshot() -> None:
     import twinkle.protocol.types as types
 
     assert set(types.__all__) == _MIGRATED_NAMES
-    assert len(types.__all__) == 122
+    # 122 + SamplingMaskModel (794ef5a9) + TaskHeadTemperatures{Request,Response} (f660300f).
+    assert len(types.__all__) == 125
     assert 'ErrorResponse' not in types.__all__
 
 

@@ -568,6 +568,13 @@
       "response": "TaskEnvelope",
       "statusCode": 200
     },
+    "POST /twinkle/task_head_temperatures": {
+      "body": [
+        "TaskHeadTemperaturesRequest"
+      ],
+      "response": "TaskEnvelope",
+      "statusCode": 200
+    },
     "POST /twinkle/upload_to_hub": {
       "body": [
         "UploadToHubRequest"

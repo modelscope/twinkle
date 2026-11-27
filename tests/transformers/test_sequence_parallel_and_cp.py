@@ -422,7 +422,9 @@ def _measure_peak_memory(
     device_module.empty_cache()
     device_module.reset_peak_memory_stats(device)
     prepared = strategy.prepare_model_inputs({'input_ids': input_ids, 'position_ids': position_ids})
-    prepared.pop('_sequence_layout')
+    # Disabled SP (baseline arm, ulysses_size=1) passes inputs through untouched since 88c1d480,
+    # so the layout metadata only exists on the SP-enabled arm.
+    prepared.pop('_sequence_layout', None)
     with strategy.context():
         outputs = model(**prepared, use_cache=False)
     local_logits = outputs.logits
