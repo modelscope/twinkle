@@ -280,6 +280,8 @@ def test_start_ray_cluster_npu_and_cuda_args(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_start_server_wires_detected_npu_end_to_end(monkeypatch):
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
+    monkeypatch.delenv('ASCEND_RT_VISIBLE_DEVICES', raising=False)
     executor = ToolExecutor(_Connection())
     captured: dict[str, object] = {}
 
@@ -291,7 +293,7 @@ async def test_start_server_wires_detected_npu_end_to_end(monkeypatch):
         captured['config_train_gpus'] = train_gpus
         return '/tmp/fake_server_config.yaml'
 
-    def _fake_ray(train_gpus, sampler_gpus, device_type='cuda'):
+    def _fake_ray(train_gpus, sampler_gpus, device_type='cuda', visible_devices=None):
         captured['ray_device_type'] = device_type
         captured['ray_train_gpus'] = train_gpus
         return None
@@ -319,3 +321,101 @@ async def test_start_server_wires_detected_npu_end_to_end(monkeypatch):
         'ray_device_type': 'npu',
         'ray_train_gpus': 2,
     }
+
+
+@pytest.mark.parametrize(
+    ('device_type', 'env_var'),
+    [('npu', 'ASCEND_RT_VISIBLE_DEVICES'), ('cuda', 'CUDA_VISIBLE_DEVICES')],
+)
+def test_start_ray_cluster_preserves_inherited_visible_device_ids(monkeypatch, tmp_path, device_type, env_var):
+    import subprocess
+    import tempfile
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(tmp_path))
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
+    monkeypatch.delenv('ASCEND_RT_VISIBLE_DEVICES', raising=False)
+    monkeypatch.setenv(env_var, '4,5,6,7')
+
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append((list(cmd), kwargs.get('env')))
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr(subprocess, 'run', _fake_run)
+
+    assert ToolExecutor._start_ray_cluster(2, 2, device_type=device_type) is None
+    starts = [(cmd, env) for cmd, env in calls if cmd[:2] == ['ray', 'start']]
+    assert len(starts) == 3
+    assert starts[0][1] is not None and starts[0][1][env_var] == '4,5'
+    assert starts[1][1] is not None and starts[1][1][env_var] == '6,7'
+    assert starts[2][1] is not None and starts[2][1][env_var] == ''
+
+    calls.clear()
+    monkeypatch.setenv(env_var, '4,5')
+    err = ToolExecutor._start_ray_cluster(2, 2, device_type=device_type)
+    assert err is not None and 'only 2 visible' in err
+    assert not [cmd for cmd, _env in calls if cmd[:2] == ['ray', 'start']]
+
+
+@pytest.mark.asyncio
+async def test_start_server_uses_inherited_visible_devices_for_capacity_and_partition(monkeypatch, tmp_path):
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(tmp_path))
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
+    monkeypatch.setenv('ASCEND_RT_VISIBLE_DEVICES', '4,5,6,7')
+
+    executor = ToolExecutor(_Connection())
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    async def _not_running(url):
+        return False
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append((list(cmd), kwargs.get('env')))
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr(executor, '_check_server_health', _not_running)
+    monkeypatch.setattr(ToolExecutor, '_detect_accelerator', staticmethod(lambda: ('npu', 8)))
+    monkeypatch.setattr(subprocess, 'run', _fake_run)
+    monkeypatch.setattr(
+        ToolExecutor,
+        '_launch_server_process',
+        staticmethod(lambda config_path: (object(), str(tmp_path / 'server.log'), None)),
+    )
+    monkeypatch.setattr(
+        ToolExecutor,
+        '_wait_server_ready',
+        staticmethod(lambda **kwargs: {'status': 'started', 'server_url': kwargs['server_url']}),
+    )
+
+    rejected = await executor._tool_start_server(
+        'Qwen/Qwen2.5-0.5B',
+        train_gpus=3,
+        samplers=[{'model_id': 'Qwen/teacher', 'engine': 'vllm', 'tp': 2}],
+    )
+    assert rejected['status'] == 'error'
+    assert '4 available' in rejected['error']
+    assert not [cmd for cmd, _env in calls if cmd[:2] == ['ray', 'start']]
+
+    calls.clear()
+    started = await executor._tool_start_server(
+        'Qwen/Qwen2.5-0.5B',
+        train_gpus=2,
+        samplers=[{'model_id': 'Qwen/teacher', 'engine': 'vllm', 'tp': 2}],
+    )
+    assert started['status'] == 'started'
+    npu_starts = [(cmd, env) for cmd, env in calls if cmd[:2] == ['ray', 'start']]
+    assert len(npu_starts) == 3
+    head_res = [arg.split('=', 1)[1] for arg in npu_starts[0][0] if arg.startswith('--resources=')]
+    worker_res = [arg.split('=', 1)[1] for arg in npu_starts[1][0] if arg.startswith('--resources=')]
+    assert len(head_res) == 1 and json.loads(head_res[0]) == {'NPU': 2}
+    assert len(worker_res) == 1 and json.loads(worker_res[0]) == {'NPU': 2}
+    assert npu_starts[0][1] is not None and npu_starts[0][1]['ASCEND_RT_VISIBLE_DEVICES'] == '4,5'
+    assert npu_starts[1][1] is not None and npu_starts[1][1]['ASCEND_RT_VISIBLE_DEVICES'] == '6,7'

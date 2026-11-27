@@ -57,10 +57,11 @@ class _ServerTools:
 
             # Step 1: Detect hardware & compute device partition
             device_type, total_hw_gpus = self._detect_accelerator()
-            if total_hw_gpus == 0:
+            visible_devices = self._visible_device_ids(device_type, total_hw_gpus)
+            if not visible_devices:
                 return {'status': 'error', 'error': 'No GPUs or NPUs detected. Cannot start training server.'}
 
-            alloc = self._compute_gpu_allocation(sampler_list, train_gpus, total_hw_gpus)
+            alloc = self._compute_gpu_allocation(sampler_list, train_gpus, len(visible_devices))
             if 'error' in alloc:
                 return {'status': 'error', 'error': alloc['error']}
             t_gpus, sampler_gpu_total = alloc['train_gpus'], alloc['sampler_gpus']
@@ -76,7 +77,12 @@ class _ServerTools:
             )
 
             # Step 3: Start Ray cluster (multi-node device partitioning)
-            ray_err = self._start_ray_cluster(t_gpus, sampler_gpu_total, device_type=device_type)
+            ray_err = self._start_ray_cluster(
+                t_gpus,
+                sampler_gpu_total,
+                device_type=device_type,
+                visible_devices=visible_devices,
+            )
             if ray_err:
                 return {'status': 'error', 'error': ray_err}
 
@@ -203,7 +209,38 @@ class _ServerTools:
         return {'train_gpus': t_gpus, 'sampler_gpus': sampler_gpu_total}
 
     @staticmethod
-    def _start_ray_cluster(train_gpus: int, sampler_gpus: int, device_type: str = 'cuda') -> str | None:
+    def _visible_device_env(device_type: str) -> str:
+        """Return the visible-device env var name via Platform.visible_device_env()."""
+        from twinkle.utils.platforms.base import Platform
+        from twinkle.utils.platforms.npu import NPU
+
+        dev_type = (device_type or 'cuda').lower()
+        try:
+            return Platform.visible_device_env(dev_type)
+        except RuntimeError:
+            # Cpu-only hosts may have npu-smi without torch_npu installed.
+            if dev_type == 'npu':
+                return NPU.visible_device_env()
+            raise
+
+    @staticmethod
+    def _visible_device_ids(device_type: str, total_count: int) -> list[str]:
+        """Return ordered visible accelerator IDs capped by hardware count."""
+        if total_count <= 0:
+            return []
+        raw = os.environ.get(_ServerTools._visible_device_env(device_type))
+        if raw is None:
+            return [str(i) for i in range(total_count)]
+        ids = list(dict.fromkeys(d.strip() for d in raw.split(',') if d.strip()))
+        return ids[:total_count]
+
+    @staticmethod
+    def _start_ray_cluster(
+        train_gpus: int,
+        sampler_gpus: int,
+        device_type: str = 'cuda',
+        visible_devices: list[str] | None = None,
+    ) -> str | None:
         """Start Ray multi-node cluster with accelerator partitioning.
 
         Each role gets its own Ray node with dedicated visible-device env vars
@@ -220,6 +257,14 @@ class _ServerTools:
         from pathlib import Path
 
         dev_type = (device_type or 'cuda').lower()
+        visible_env = _ServerTools._visible_device_env(dev_type)
+        needed = train_gpus + sampler_gpus
+        device_ids = (
+            list(visible_devices) if visible_devices is not None else _ServerTools._visible_device_ids(
+                dev_type, needed))
+        if len(device_ids) < needed:
+            return (f'Requested {needed} devices (train={train_gpus}, samplers={sampler_gpus}) '
+                    f'but only {len(device_ids)} visible in {visible_env}.')
 
         _sp.run(['ray', 'stop', '--force'], capture_output=True, timeout=15)
 
@@ -241,13 +286,12 @@ class _ServerTools:
                 cmd += ['--head', '--port=6379', '--disable-usage-stats', '--include-dashboard=false']
             else:
                 cmd += ['--address=127.0.0.1:6379']
+            env[visible_env] = devices
             if dev_type == 'npu':
-                env['ASCEND_RT_VISIBLE_DEVICES'] = devices
                 if num_gpus > 0:
                     res_spec = json.dumps({'NPU': num_gpus})
                     cmd.append(f'--resources={res_spec}')
             else:
-                env['CUDA_VISIBLE_DEVICES'] = devices
                 cmd.append(f'--num-gpus={num_gpus}')
             r = _sp.run(cmd, capture_output=True, text=True, timeout=30, env=env)
             if r.returncode != 0 and 'already' not in r.stderr.lower():
@@ -255,14 +299,14 @@ class _ServerTools:
             return None
 
         # Head node — training model GPUs
-        model_devices = ','.join(str(i) for i in range(train_gpus))
+        model_devices = ','.join(device_ids[:train_gpus])
         err = _ray_node(model_devices, train_gpus, head=True, node_name='head')
         if err:
             return f'Ray head start failed: {err}'
 
         # GPU Worker node — sampler GPUs
         if sampler_gpus > 0:
-            sampler_devices = ','.join(str(i) for i in range(train_gpus, train_gpus + sampler_gpus))
+            sampler_devices = ','.join(device_ids[train_gpus:needed])
             err = _ray_node(sampler_devices, sampler_gpus, node_name='gpu_worker')
             if err:
                 return f'Ray GPU worker start failed: {err}'
