@@ -84,6 +84,13 @@ class TransformersEngine(BaseSamplerEngine):
         # the lock is what turns concurrent callers into a queue instead of a corrupted forward.
         self._generate_lock = asyncio.Lock()
         self._adapters: Dict[str, str] = {}
+        # Serializes adapter loading across caller threads: sample() dispatches one thread per
+        # prompt, so without this lock N concurrent first-requests all miss the _adapters cache
+        # and run PeftModel.from_pretrained on the SAME nn.Module simultaneously -- concurrent
+        # parameter injection/.to() corrupts the allocator (glibc 'corrupted double-linked list')
+        # or double-wraps the model. threading.Lock (not the asyncio generate lock): load_lora is
+        # called from synchronous dispatch threads.
+        self._lora_lock = threading.Lock()
         self._active_adapter: Optional[str] = None
 
         if tokenizer is None:
@@ -108,6 +115,27 @@ class TransformersEngine(BaseSamplerEngine):
             model = model_cls_resolved.from_pretrained(model_id, **load_kwargs)
         self.model = model
         self.model.eval()
+        # transformers' `_keep_in_fp32_modules_strict` contract (modeling_utils dtype plan): when a
+        # model declares strict fp32 modules (e.g. DeepseekV4's norms/hyper-connections) and is
+        # loaded in fp16/bf16, those weights stay fp32 and the model's forward is only dtype-safe
+        # under AMP -- plain eager calls hit `expected mat1 and mat2 to have the same dtype`
+        # (fp32 norm output into a bf16 linear). Training gets autocast from the trainer; inference
+        # must supply it here. Models without the strict list keep the exact previous behavior.
+        self._amp_dtype = None
+        if getattr(model, '_keep_in_fp32_modules_strict', None):
+            mdtype = getattr(getattr(model, 'config', None), 'dtype', None)
+            if isinstance(mdtype, str):
+                mdtype = getattr(torch, mdtype, None)
+            if mdtype in (torch.float16, torch.bfloat16):
+                self._amp_dtype = mdtype
+
+    def _amp_context(self):
+        """AMP context honoring the loaded model's strict-fp32 contract; no-op otherwise."""
+        if self._amp_dtype is None:
+            import contextlib
+            return contextlib.nullcontext()
+        device_type = next(self.model.parameters()).device.type
+        return torch.autocast(device_type=device_type, dtype=self._amp_dtype)
 
     # ------------------------------------------------------------------ engine contract
 
@@ -288,7 +316,9 @@ class TransformersEngine(BaseSamplerEngine):
 
                 def _run():
                     try:
-                        out = self.model.generate(**inputs, **gen_kwargs)
+                        # autocast is thread-local: enter it inside the streaming thread.
+                        with self._amp_context():
+                            out = self.model.generate(**inputs, **gen_kwargs)
                         sequences = out.sequences if hasattr(out, 'sequences') else out
                         produced.extend(_strip_padding(sequences[0, inputs['input_ids'].shape[-1]:], eos_ids))
                     except Exception as exc:  # surfaced to the consumer via the queue below
@@ -380,20 +410,21 @@ class TransformersEngine(BaseSamplerEngine):
         Note that peft can hold many adapters but activates one at a time, so mixing adapters within a
         single batch is impossible here -- callers must group requests by adapter.
         """
-        if adapter_path in self._adapters:
-            return self._adapters[adapter_path]
-        requires('peft')
-        from peft import PeftModel
+        with self._lora_lock:
+            if adapter_path in self._adapters:
+                return self._adapters[adapter_path]
+            requires('peft')
+            from peft import PeftModel
 
-        name = adapter_name or f'adapter_{len(self._adapters)}'
-        if isinstance(self.model, PeftModel):
-            self.model.load_adapter(adapter_path, adapter_name=name)
-        else:
-            self.model = PeftModel.from_pretrained(self.model, adapter_path, adapter_name=name)
-        self.model.eval()
-        self._adapters[adapter_path] = name
-        logger.info(f'TransformersEngine loaded LoRA {adapter_path} as {name!r}')
-        return name
+            name = adapter_name or f'adapter_{len(self._adapters)}'
+            if isinstance(self.model, PeftModel):
+                self.model.load_adapter(adapter_path, adapter_name=name)
+            else:
+                self.model = PeftModel.from_pretrained(self.model, adapter_path, adapter_name=name)
+            self.model.eval()
+            self._adapters[adapter_path] = name
+            logger.info(f'TransformersEngine loaded LoRA {adapter_path} as {name!r}')
+            return name
 
     def _activate_adapter(self, adapter_uri: Optional[str]) -> None:
         """Switch the active peft adapter, or disable adapters entirely when None."""
@@ -443,7 +474,16 @@ class TransformersEngine(BaseSamplerEngine):
         gen_kwargs['num_return_sequences'] = num_samples
         if logprobs:
             gen_kwargs['output_scores'] = True
-            gen_kwargs['return_dict_in_generate'] = True
+            # Request dict output on a GenerationConfig copy, not as a call kwarg: generate()
+            # wrappers that hardcode return_dict_in_generate when delegating to a submodel
+            # (qwen-asr's Qwen3ASRForConditionalGeneration.generate -> thinker.generate) forward
+            # the caller's same-named kwarg too and raise TypeError 'multiple values for keyword
+            # argument'. GenerationMixin merges config values with call kwargs (kwargs win), so
+            # standard models keep identical behavior; the copy never mutates the model's config.
+            import copy
+            generation_config = copy.copy(self.model.generation_config)
+            generation_config.return_dict_in_generate = True
+            gen_kwargs['generation_config'] = generation_config
         return gen_kwargs
 
     def _to_model_inputs(self, prompts: Sequence[List[int]], extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -488,7 +528,7 @@ class TransformersEngine(BaseSamplerEngine):
             gen_kwargs.update(passthrough)
             prompt_width = inputs['input_ids'].shape[-1]
 
-            with torch.inference_mode():
+            with torch.inference_mode(), self._amp_context():
                 output = self.model.generate(**inputs, **gen_kwargs)
         finally:
             if seeded:
@@ -595,7 +635,7 @@ class TransformersEngine(BaseSamplerEngine):
             # Score without building a KV cache this pass never reads (tw 3cb3c4dc contract):
             # the forward defaults to caching, which for a long prompt allocates a full cache.
             row_inputs['use_cache'] = False
-            with torch.inference_mode():
+            with torch.inference_mode(), self._amp_context():
                 logits = self.model(**row_inputs).logits
             logprobs = torch.log_softmax(logits[0, :-1].float(), dim=-1)
             targets = row_inputs['input_ids'][0, 1:]

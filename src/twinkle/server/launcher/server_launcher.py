@@ -117,6 +117,7 @@ class ServerLauncher:
         self._builders: dict[str, Callable] = {}
         self._ray_initialized = False
         self._serve_started = False
+        self._serve_instance_owner = False
         self._training_controller = None
         self._sampler_controllers = []
         self.ray_address = ray_address
@@ -374,6 +375,7 @@ class ServerLauncher:
                         '(host/port) was fixed when Serve first started; the requested '
                         f'http_options {requested} take effect only through route prefixes.')
             self._serve_started = True
+            self._serve_instance_owner = False
             return
 
         http_options = self.config.http_options.model_dump()
@@ -385,6 +387,7 @@ class ServerLauncher:
             serve_kwargs['proxy_location'] = self.config.proxy_location
         serve.start(**serve_kwargs)
         self._serve_started = True
+        self._serve_instance_owner = True
 
     def _deployment_options(self, options: dict, env: dict | None = None) -> dict:
         options = deepcopy(options)
@@ -570,6 +573,26 @@ class ServerLauncher:
         if failures:
             raise BaseExceptionGroup('Owned application cleanup is incomplete', failures)
 
+    def _shutdown_owned_serve_instance(self) -> None:
+        """Release the cluster-scoped HTTP listener when this launcher started Serve itself.
+
+        Deleting the owned applications leaves the Serve controller and its HTTP proxy alive, so
+        the listener (host/port) stays bound after the deployment is gone: a later deployment on
+        the same cluster attaches to the zombie instance, its requested port is silently ignored
+        ("reusing it ... take effect only through route prefixes"), and its readiness probe polls
+        a port that never opens. The deploy contract (stop -> port released -> restart on the same
+        port) requires the owner to shut the instance down once nothing is deployed on it anymore.
+        Coexisting deployments are preserved: an attached (non-owner) launcher never shuts Serve
+        down, and an owner keeps the instance alive while any other application still remains.
+        """
+        if not self._serve_instance_owner:
+            return
+        if self._application_details():
+            return
+        from ray import serve
+        serve.shutdown()
+        self._serve_instance_owner = False
+
     def _shutdown(self, *, raise_errors: bool = True) -> None:
         from functools import partial
 
@@ -580,6 +603,7 @@ class ServerLauncher:
         if self._serve_started:
             actions.append(('gateway discovery cleanup', self._unpublish_models))
             actions.append(('owned application cleanup', self._delete_owned_applications))
+            actions.append(('owned serve instance shutdown', self._shutdown_owned_serve_instance))
         actions.append(('telemetry shutdown', shutdown_telemetry_safely))
         self._run_cleanup(actions, raise_errors=raise_errors)
         self._serve_started = bool(self._owned_applications or self._published_models)
