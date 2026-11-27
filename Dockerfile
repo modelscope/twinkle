@@ -6,7 +6,7 @@ FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:
 # driver shim and pip cuDNN ahead of apt cuDNN.
 ENV LD_LIBRARY_PATH="/usr/local/cuda-13.0/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/cuda/compat:/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 
-ARG PIP_INDEX_URL=https://mirrors.cloud.aliyuncs.com/pypi/simple
+ARG PIP_INDEX_URL=https://pypi.org/simple
 
 WORKDIR /twinkle
 COPY pyproject.toml setup.cfg README.md LICENSE ./
