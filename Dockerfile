@@ -9,7 +9,7 @@ ENV LD_LIBRARY_PATH="/usr/local/cuda-13.0/targets/x86_64-linux/lib:/usr/local/cu
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
 WORKDIR /twinkle
-COPY pyproject.toml setup.cfg README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
 
 COPY twinkle_cs/server/ ./twinkle_cs/server/
