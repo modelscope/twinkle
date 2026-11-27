@@ -12,10 +12,6 @@ WORKDIR /twinkle
 COPY pyproject.toml setup.cfg README.md LICENSE ./
 COPY src/ ./src/
 
-# Drop the bundled web UI and the Decord wheel tagged for CPython 3.6.
-# Qwen video preprocessing prefers TorchCodec, supplied by vLLM.
-RUN pip uninstall -y gradio decord
-
 # Resolve the pinned Swift revision and Twinkle together. Keep the base image's
 # CUDA wheels and let vLLM enforce the matching TileLang and TVM FFI versions.
 RUN pip install --no-cache-dir --no-build-isolation \
