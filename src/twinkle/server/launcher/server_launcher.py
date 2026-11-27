@@ -416,46 +416,47 @@ class ServerLauncher:
             args['training_models'] = [model.name for model in models]
         return args
 
-    def _deploy_sampler(self, app: ApplicationSpec) -> None:
+    def _deploy_samplers(self, applications: list[ApplicationSpec]) -> None:
+        if not applications:
+            return
+
         import ray
         from ray import serve
 
         from twinkle.server.sampler.pool.actor import create_sampler_controller
         from twinkle.server.sampler.pool.router import build_sampler_router
-        base_model = extract_model_alias(app.route_prefix, 'sampler') or app.name
-        # The sampler router and every replica app share the proxy port with the gateway, so all of
-        # them enforce the same credential: an explicit SamplerArgs.api_key wins, else inherit the
-        # gateway's key so a deployment authenticated at the gateway cannot be bypassed by dialing the
-        # sampler route directly. (The gateway forwards the caller's Bearer key, so proxied traffic
-        # still passes.) Written into the args BEFORE the controller serializes them: the pool driver
-        # builds each replica app from that dump and installs the same gate on it.
-        if app.args.api_key is None:
-            app.args.api_key = next(
-                (getattr(other.args, 'api_key', None) for other in self.config.applications
-                 if other.import_path == 'server'),
-                None,
+        gateway_key = next(
+            (app.args.api_key for app in self.config.applications if app.import_path == 'server'), None)
+        pending = []
+        routers = []
+        for app in applications:
+            base_model = extract_model_alias(app.route_prefix, 'sampler') or app.name
+            # Both the router and its replicas enforce the gateway's credential on the shared port.
+            if app.args.api_key is None:
+                app.args.api_key = gateway_key
+            controller, options, pool_id = create_sampler_controller(
+                app, self.ray_namespace, self.config.resources.model_dump(), build_worker_env_vars(),
+                base_model=base_model,
             )
-        controller, options, pool_id = create_sampler_controller(
-            app, self.ray_namespace, self.config.resources.model_dump(), build_worker_env_vars(),
-            base_model=base_model,
-        )
-        self._sampler_controllers.append(controller)
-        if app.name not in self._existing_applications:
-            self._owned_applications.add(app.name)
-        ray.get(controller.initialize.remote())
-        serve.run(
-            build_sampler_router(
-                self.ray_namespace, pool_id, options, model_id=base_model, api_key=app.args.api_key),
-            name=app.name,
-            route_prefix=app.route_prefix,
-        )
+            self._sampler_controllers.append(controller)
+            pending.append(controller.initialize.remote())
+            routers.append((app, pool_id, options, base_model))
+
+        # Submit all warmups before waiting. One model's weight load must not delay starting another.
+        ray.get(pending)
+        for app, pool_id, options, base_model in routers:
+            if app.name not in self._existing_applications:
+                self._owned_applications.add(app.name)
+            serve.run(
+                build_sampler_router(
+                    self.ray_namespace, pool_id, options, model_id=base_model, api_key=app.args.api_key),
+                name=app.name,
+                route_prefix=app.route_prefix,
+            )
 
     def _deploy_application(self, app_spec: ApplicationSpec) -> None:
-        """Model declarations go to the training controller; other apps deploy here."""
+        """Deploy an app that doesn't need a resource-pool controller."""
         if app_spec.import_path == 'model':
-            return
-        if app_spec.import_path == 'sampler':
-            self._deploy_sampler(app_spec)
             return
         if app_spec.import_path == 'server' and app_spec.name in self._existing_applications:
             logger.info('Reusing gateway %s with its existing listener, authentication and session settings.',
@@ -617,8 +618,9 @@ class ServerLauncher:
         try:
             self._start_serve()
             for app in self.config.applications:
-                if app.import_path != 'server':
+                if app.import_path not in ('server', 'sampler'):
                     self._deploy_application(app)
+            self._deploy_samplers([app for app in self.config.applications if app.import_path == 'sampler'])
             if self.config.training_config.models:
                 self._deploy_training()
             # The gateway health endpoint announces readiness to clients. Publish

@@ -97,6 +97,8 @@ applications:
       task_type: causal_lm
       language_model_only: true
       mixed_precision: bf16
+      # The MoE LoRA optimizer clips many gradients in a single Transformer Engine call.
+      env_vars: {NVTE_TENSOR_HANDLE_POOL_SIZE_MB: "128"}
       min_replicas: 1
       max_replicas: 1
       adapter_config: *lora_lifetime
@@ -128,6 +130,7 @@ applications:
       queue_config: {rps_limit: 20, max_input_tokens: 32768, tps_limit: 65536, concurrent_task_limit: 8}
       engine_args: &resident_sampler_engine
         tensor_parallel_size: 2
+        safetensors_load_strategy: prefetch
         dtype: bfloat16
         language_model_only: true
         # Includes prompt and generated tokens in each sequence.
@@ -260,7 +263,7 @@ applications:
       device_group: {name: model, ranks: 2, device_type: cuda}
       device_mesh: {device_type: cuda, dp_size: 2}
 
-  # One on-demand vLLM sampler for the 4B model, including LoRA GRPO rollouts.
+  # One resident vLLM sampler for the 4B model, including LoRA GRPO rollouts.
   - name: sample-qwen35-4b
     import_path: sampler
     route_prefix: /api/v1/sampler/Qwen/Qwen3.5-4B
@@ -268,9 +271,8 @@ applications:
       model_id: ms://Qwen/Qwen3.5-4B
       node_selector: {twinkle-node: c}
       sampler_type: vllm
-      min_replicas: 0
+      min_replicas: 1
       max_replicas: 1
-      idle_timeout_s: 600
       target_ongoing_requests: 8
       queue_config: *sampler_queue
       nproc_per_node: 1
@@ -278,6 +280,7 @@ applications:
       device_mesh: {device_type: cuda, dp_size: 1}
       engine_args:
         tensor_parallel_size: 1
+        safetensors_load_strategy: prefetch
         dtype: bfloat16
         language_model_only: true
         max_model_len: 8192

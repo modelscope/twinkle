@@ -3068,8 +3068,8 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         self.load(checkpoint_dir, adapter_name=adapter_name)
 
+        optimizer_config = self.optimizer_group[adapter_name]
         if resume_only_model:
-            optimizer_config = self.optimizer_group[adapter_name]
             return {
                 'cur_step': 0,
                 'consumed_train_samples': 0,
