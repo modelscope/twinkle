@@ -409,14 +409,58 @@ def jinja_assistant_ranges(tokenizer, messages, selected, expected_text, **kwarg
             chat_options = {**options, 'enable_thinking': False, 'thinking': False}
             chat_before = original.render(**chat_options)
             chat_after = original.render(**{**chat_options, 'add_generation_prompt': True})
-            if chat_before != before or not chat_after.startswith(before):
-                raise ValueError('Jinja history opener cannot be isolated without changing its prefix rendering')
-            chat_opener = chat_after[len(before) :]
-            if not content.startswith(chat_opener):
-                raise ValueError('Jinja assistant opener does not match its generation prefix')
-            cut = len(chat_opener)
+            chat_opener = (chat_after[len(before):]
+                           if chat_before == before and chat_after.startswith(before) else None)
+            if chat_opener is not None and content.startswith(chat_opener):
+                cut = len(chat_opener)
+            else:
+                # Generation-prompt openers are position-independent, but e.g. the Qwen3.5
+                # family inserts (empty) think blocks by turn position relative to the last
+                # user query, so a history turn's opener can match neither thinking mode.
+                # Measure the content offset against the template itself instead.
+                cut = _assistant_content_cut(original, render_kwargs, messages, message_indices[owner], start, end)
         result.append((start + cut, end))
     return result
+
+
+def _assistant_content_cut(original, render_kwargs, messages, index, start, end):
+    """Locate where an assistant message's own content begins inside its rendered span.
+
+    Replaces the owner's content (and reasoning_content, when present) with unique sentinels
+    and re-renders the FULL message list: roles and positions are unchanged, so any
+    position-dependent scaffolding (think blocks, headers) renders identically and the
+    sentinel offset is exactly the content start. Fails loud when the sentinel cannot be
+    located inside the ownership span.
+    """
+    import uuid
+    message = messages[index]
+    sentinel = f'ASSISTANTCONTENT{uuid.uuid4().hex}'
+    probe = [dict(m) for m in messages]
+    content = message.get('content')
+    if isinstance(content, list):
+        blocks = [dict(b) if isinstance(b, dict) else b for b in content]
+        for block in blocks:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                block['text'] = sentinel
+                break
+        else:
+            blocks.append({'type': 'text', 'text': sentinel})
+        probe[index]['content'] = blocks
+    else:
+        probe[index]['content'] = sentinel
+    sentinels = [sentinel]
+    if isinstance(message.get('reasoning_content'), str) and message['reasoning_content'].strip():
+        reasoning_sentinel = f'ASSISTANTREASONING{uuid.uuid4().hex}'
+        probe[index]['reasoning_content'] = reasoning_sentinel
+        sentinels.append(reasoning_sentinel)
+    rendered = original.render(**{**render_kwargs, 'messages': probe})
+    offsets = [rendered.find(item) for item in sentinels]
+    if any(offset < 0 for offset in offsets):
+        raise ValueError('Jinja assistant content cannot be located inside its rendered span')
+    cut = min(offsets) - start
+    if cut < 0 or start + cut > end:
+        raise ValueError('Jinja assistant content offset falls outside its ownership span')
+    return cut
 
 
 class TokenizeByRound:

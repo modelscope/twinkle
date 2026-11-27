@@ -250,7 +250,7 @@ class TransformersSampler(Sampler):
             extra = generation.collate_extra_model_inputs([0], {0: feat}, self.template)
             yield from self._iter_in_loop(
                 self.engine.generate_stream(prompt=prompt, sampling_params=params, lora_request=adapter_uri,
-                                            extra_model_inputs=extra)
+                                            extra_model_inputs=extra, use_base_model=adapter_uri is None)
             )
 
     # ------------------------------------------------------------------ engine passthrough
@@ -343,6 +343,7 @@ class TransformersSampler(Sampler):
                     topk_prompt_logprobs=params.prompt_logprobs or 0,
                     adapter_uri=adapter_uri,
                     extra_model_inputs=extra or None,
+                    use_base_model=adapter_uri is None,
                 )
             )
 

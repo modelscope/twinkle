@@ -143,16 +143,22 @@ class vLLMSampler:
         if not token_only:
             if len(samples) != len(originals):
                 raise RuntimeError('server response count does not match the input batch')
+            restored = []
             for original, result in zip(originals, samples):
+                sequences = []
                 for sequence in result.sequences:
                     if sequence.new_input_feature is None:
                         raise RuntimeError('server omitted a complete trajectory from a normal sample response')
                     # The server never echoes the request's media / user_data back; restore them here.
-                    sequence.new_input_feature = {
+                    # Response models are frozen wire records: rebuild, never mutate in place.
+                    feature = {
                         **copy_trajectory({key: original[key] for key in ('images', 'videos', 'audios', 'user_data')
-                                          if key in original}),
+                                           if key in original}),
                         **copy_trajectory(sequence.new_input_feature),
                     }
+                    sequences.append(sequence.model_copy(update={'new_input_feature': feature}))
+                restored.append(result.model_copy(update={'sequences': sequences}))
+            samples = restored
         return samples
 
     @staticmethod

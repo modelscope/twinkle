@@ -948,9 +948,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     logits.div_(temperature)
                 if loss_require_entropy:
                     outputs['logps'], outputs['entropies'] = selective_log_softmax(
-                        logits, masked_labels, return_entropy=True)
+                        logits, masked_labels, return_entropy=True, vocab_parallel=False)
                 else:
-                    outputs['logps'] = selective_log_softmax(logits, masked_labels)
+                    # HF logits are always FULL vocab (DTensor TP replicates, never
+                    # Megatron-vocab-shards); never let a co-resident Megatron TP>1
+                    # student's global mpu state route them into vocab-parallel CE.
+                    outputs['logps'] = selective_log_softmax(logits, masked_labels, vocab_parallel=False)
                 del logits
         if loss_require_values:
             values = outputs['logits']
@@ -1114,6 +1117,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             inputs: The model inputs. Can be an encoded batch, or a list of `Trajectory`
             **kwargs:
                 adapter_name: Lora adapter name.
+                output_fields: Explicitly request channels (logps/values/entropies/logits/
+                    embeddings/routed_experts), same contract as forward_only: derivation
+                    follows the request instead of the loss's require_* flags, and a field
+                    this forward cannot produce fails loudly.
         Returns:
             The output of the model forward.
         """
@@ -1122,6 +1129,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         temperature = float(kwargs.pop('temperature', 1.0))
         sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
+        # Explicit channel request on the TRAINING path, same contract as forward_only and
+        # MegatronModel.forward_backward: without popping it here the request was a silent
+        # no-op (postprocess/finalize below never saw it) and the kwarg leaked into
+        # forward_kwargs / metric kwargs.
+        output_fields = frozenset(kwargs.pop('output_fields', None) or ())
         task = kwargs.pop('task', 'causal_lm')
         loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
@@ -1220,6 +1232,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return_logits=return_logits,
             loss_instance=loss_instance,
             replay=(replay_loss_mask, replay_masked_labels, replay_metadata) if enable_sampling_replay else None,
+            output_fields=output_fields,
         )
         return self._finalize_forward_outputs(
             inputs,
@@ -1232,6 +1245,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             loss_instance=loss_instance,
             return_logits=return_logits,
             recorded_routing=recorded_routing,
+            output_fields=output_fields,
         )
 
     # lazy_collect follows the global default (True): a caller that reads the output itself calls
@@ -1585,7 +1599,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         lora_ctx = (unwrapped_model.disable_adapter()
                     if use_base_model and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
-        with lora_ctx:
+        with lora_ctx, self._generate_precision_context(generation_target):
             for chunk in generation.chunks(pending, _GENERATION_MAX_BATCH_SIZE):
                 for index, response in zip(
                         chunk, generation.run_chunk(chunk, encoded, call_batch, template=template, strict=strict)):
@@ -1595,6 +1609,33 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         return [
             r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
         ]
+
+    @contextlib.contextmanager
+    def _generate_precision_context(self, model):
+        """Run generate/score in the model's STORAGE precision, matching ``forward_only``.
+
+        ``accelerate.prepare`` wraps ``forward`` in compute-dtype autocast + fp32 output conversion
+        for training. For a model already stored in that compute dtype the wrapper is numerically
+        redundant for native families, but NOT for remote-code families: their vision ops change
+        under autocast (PaddleOCR-VL-1.5 measured up to ~10 nats prompt-score drift vs the same-weight
+        plain HF forward, runs/G42), so rollouts would score a different distribution than the
+        plain-precision eval/KL forward. ``_compute_precision_autocast`` already gates autocast on
+        fp32 storage for exactly this reason; generate must agree. When storage == compute dtype,
+        restore the pre-wrap forward for the call (module hooks -- FSDP all-gather etc. -- still run);
+        fp32 master weights keep the wrapper, since flash-attention rejects fp32.
+        """
+        amp_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(self.mixed_precision)
+        original = getattr(model, '_original_forward', None)
+        param = next(model.parameters(), None)
+        if amp_dtype is None or original is None or param is None or param.dtype != amp_dtype:
+            yield
+            return
+        current = model.forward
+        model.forward = original
+        try:
+            yield
+        finally:
+            model.forward = current
 
     def generate_stream(self, *args, **kwargs):
         """Refuse streaming in-place generation rather than half-build it.
@@ -1802,6 +1843,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         outputs = {}
         for micro_batch_index, indices in enumerate(plan):
             micro_kwargs = loss_instance.micro_batch_kwargs(kwargs, indices, local_batch_size)
+            # Control scalars/tuples never slice with the samples (same guard as the
+            # forward_only micro-batcher): a field tuple whose length happens to equal
+            # the batch size would otherwise be cut by select_batch.
+            for key in ('output_frame', 'output_fields'):
+                if key in kwargs:
+                    micro_kwargs[key] = kwargs[key]
             micro_loss_scale = loss_instance.micro_batch_scale(inputs, indices)
             is_last_micro_batch = micro_batch_index == len(plan) - 1
             outputs = self._forward_backward_micro_batch(
@@ -1884,6 +1931,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         **kwargs,
     ):
         """Run one homogeneous loss RPC and optionally finalize a two-RPC backward transaction."""
+        _, output_fields, _ = self.resolve_output_frame_request(kwargs)
+        if output_fields is not None:
+            # tuple rides dispatch untouched: a list would be sliced as a batch dimension.
+            kwargs['output_fields'] = tuple(output_fields)
         inputs, kwargs = self._rollout_features(inputs, kwargs, lift=True)
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
@@ -3079,6 +3130,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
         from twinkle.model.base import warn_cumulative_metric_state_not_restored
+        # The full-resume path must resolve its own group: optimizer_config above is bound only in
+        # the resume_only_model branch. Resolve it exactly as _restore_training_state does.
+        optimizer_config = self.optimizer_group[adapter_name or self._get_default_group()]
         warn_cumulative_metric_state_not_restored(optimizer_config, 'transformers')
         result = {
             'cur_step': trainer_state['cur_step'],

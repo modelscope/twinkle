@@ -41,6 +41,14 @@ _LOCK_DIR = os.path.abspath(
 # error at store creation, not as silent misbehaviour.
 _COORD_PORT_OFFSET = int(os.environ.get('TWINKLE_COORD_PORT_OFFSET', 10091))
 _COORD_TIMEOUT = timedelta(seconds=int(os.environ.get('TWINKLE_COORD_TIMEOUT', 21600)))
+# Client-side connect grace. A joining rank retries until the master's server is up, but ONLY
+# within this window: when the master's bind failed (port collision on a shared box) it degrades
+# to the file lock and NO server will ever exist, so an unbounded client retry (_COORD_TIMEOUT,
+# hours) deadlocks the group -- the master file-locks and moves on while every client waits for
+# flags it will never set. Bounding the connect makes the degradation symmetric: the client then
+# falls back to the same file lock the master already took. Normal startup skew between ranks of
+# one torchrun/actor group is seconds, so the default grace is generous.
+_COORD_CONNECT_TIMEOUT = timedelta(seconds=int(os.environ.get('TWINKLE_COORD_CONNECT_TIMEOUT', 120)))
 _store = None
 _store_failed = False
 # One sequence per lock name: the same key is locked repeatedly over a run (encode, then check,
@@ -220,14 +228,17 @@ def _get_store():
     try:
         from torch.distributed import TCPStore
         # world_size=None keeps this off the startup path: nobody blocks waiting for peers, and a
-        # client simply retries until rank 0 has its server up.
+        # client retries until rank 0 has its server up -- bounded by _COORD_CONNECT_TIMEOUT, after
+        # which it degrades to the file lock exactly like a master whose bind failed.
         _store = TCPStore(
             os.environ.get('MASTER_ADDR', '127.0.0.1'),
             ## _COORD_PORT_OFFSET 干啥用的
             int(os.environ.get('MASTER_PORT', 29500)) + _COORD_PORT_OFFSET,
             world_size=None,
             is_master=(rank == 0),
-            timeout=_COORD_TIMEOUT,
+            # The master only binds (no peer wait); a client bounds its connect retry so a failed
+            # master bind degrades BOTH sides to the file lock instead of deadlocking the group.
+            timeout=_COORD_TIMEOUT if rank == 0 else _COORD_CONNECT_TIMEOUT,
             wait_for_workers=False)
     except Exception:
         # Port taken, torch too old, no network -- degrade to the file lock rather than fail a run

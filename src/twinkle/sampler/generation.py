@@ -47,7 +47,10 @@ def error_response(feat: dict[str, Any]) -> SampleResponse:
     """
     return SampleResponse(
         sequences=[SampledSequence(stop_reason="error", tokens=[], decoded="", new_input_feature=copy_trajectory(feat))],
-        prompt_token_ids=list(feat.get("input_ids", [])),
+        # ``is_encoded`` classifies by key presence, so a raw row carrying ``input_ids=None`` lands
+        # on this failure placeholder via encode_all's non-strict path. The placeholder must never
+        # raise: tolerate None exactly like a missing key, or one bad row ends the whole run.
+        prompt_token_ids=list(feat.get("input_ids") or []),
     )
 
 

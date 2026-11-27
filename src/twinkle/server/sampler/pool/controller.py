@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 import asyncio
-import hashlib
 import logging
 import math
 import time
@@ -22,6 +21,7 @@ from twinkle.protocol.headers import H_CLIENT_ID, H_REQUEST_ID, H_SAMPLE_IDEMPOT
 from twinkle.server.config.application_spec import SamplerArgs
 from twinkle.server.config.resource_options import ResourceOptions
 from twinkle.server.exceptions import RequestRejectedError, ResourceExhaustedError
+from twinkle.server.identity import sampler_controller_name, sampling_pool_id
 from twinkle.server.resources.instances import InstanceLifecycle
 from twinkle.server.sampler.concurrency import SamplerConcurrency
 from twinkle.server.sampler.submission import SampleSubmission
@@ -34,14 +34,6 @@ _CONTROL_ENDPOINTS = frozenset(
 _SAMPLING_ENDPOINTS = frozenset(
     {"twinkle/sample", "twinkle/sample_stream", "twinkle/sample_to_data_plane", "twinkle/encode", "tinker/asample"}
 )
-
-
-def sampler_controller_name(namespace, pool_id):
-    return f"sampler-controller-{namespace}-{pool_id}"
-
-
-def sampling_pool_id(route):
-    return hashlib.sha256(route.encode()).hexdigest()[:16]
 
 
 @dataclass

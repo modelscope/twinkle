@@ -156,6 +156,13 @@ def _register_processor_routes(app: FastAPI, self_fn: Callable[[], ProcessorMana
         def _do_call():
             try:
                 result = function(**resolved_kwargs)
+                # The HTTP wire carries plain values only: a component method may hand back
+                # remote handles (ObjectRef / LazyCollect) nested anywhere in its result (e.g. a
+                # DataLoader batch whose rows are lazy dataset fetches). Materialise them here,
+                # at the serialization boundary, with the same deep resolution the ray argument
+                # path uses -- a handle can never cross HTTP.
+                from twinkle.infra._ray import RayHelper
+                (result,), _ = RayHelper.do_get_and_collect([result], {})
                 return False, result
             except StopIteration:
                 return True, None

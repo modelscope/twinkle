@@ -1320,8 +1320,12 @@ class MultiTurnRollout:
         if ep.merged_content is not None and ledger is not None and tools_key == ep.tools_key and canonical:
             # A continued turn reaches the agent as several wire messages it merges into ONE
             # assistant message; reconstruct that merged view to recognise what comes back.
+            # The incoming ``canonical`` is built by _canonical, which ALWAYS strips content
+            # boundary whitespace, so the merged view must be canonicalised the same way or a
+            # whitespace-bearing merge reads as a rewrite (58b2b979 dropped this strip; the
+            # harness-gated _fold_merged only models how pieces accumulate, not the wire form).
             merged_view = ep.sent[:ep.split_start] + [
-                ('assistant', ep.merged_content, ep.sent[-1][2], '')]
+                ('assistant', ep.merged_content.strip(), ep.sent[-1][2], '')]
             if (ep.last_reply is not None and ep.last_reply.get('finish_reason') == 'length'
                     and canonical == merged_view):
                 # Still truncated after the merge: continue the same turn again.

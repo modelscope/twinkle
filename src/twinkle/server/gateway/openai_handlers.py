@@ -84,7 +84,7 @@ def _can_wait_for_sampler(gateway: GatewayServer, base_model: str, response: Res
     if isinstance(error, dict) and 'error_code' in error:
         return False
 
-    from twinkle.server.sampler.pool.controller import sampler_controller_name, sampling_pool_id
+    from twinkle.server.identity import sampler_controller_name, sampling_pool_id
 
     namespace = os.environ.get('TWINKLE_STATE_RAY_NAMESPACE', 'twinkle_cluster')
     pool_id = sampling_pool_id(f"{gateway.route_prefix.rstrip('/')}/sampler/{base_model}")

@@ -69,6 +69,15 @@ class TrainingArguments(BaseModel):
     # sampler-exported routed_experts. Forwarded verbatim to the model ctor (transformers/
     # megatron kwargs.pop('enable_router_replay')); the sampler must export routed_experts.
     enable_router_replay: bool = Field(default=False, strict=True)
+    # Attention backend / storage dtype for the served transformers model. Forwarded verbatim to
+    # the model ctor (TransformersModel -> from_pretrained), mirroring the local ModelConfig
+    # ``attn_impl`` / ``torch_dtype`` knobs. A remote packed/padding_free token-level readout (value)
+    # NEEDS this: the processor's packed-batch guard refuses any non-FlashAttention backend, so a
+    # remote value host must be able to request ``flash_attention_2`` (and fp32 storage for the
+    # bf16-autocast precision regime). Without the knob the served model defaults to sdpa and every
+    # packed/padding_free value forward fails (G43 B4).
+    attn_implementation: str | None = None
+    torch_dtype: str | None = None
 
     @field_validator("template")
     @classmethod
@@ -112,6 +121,10 @@ class TrainingArguments(BaseModel):
             raise ValueError("model_cls requires a transformers LoRA/full deployment")
         if self.model_loader is not None and backend == "mock":
             raise ValueError("model_loader requires the transformers or megatron backend")
+        if self.attn_implementation is not None and backend != "transformers":
+            raise ValueError("attn_implementation requires the transformers backend")
+        if self.torch_dtype is not None and backend != "transformers":
+            raise ValueError("torch_dtype requires the transformers backend")
 
 
 class LoraArguments(BaseModel):

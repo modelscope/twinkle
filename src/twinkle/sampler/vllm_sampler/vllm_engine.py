@@ -550,12 +550,20 @@ class VLLMEngine(BaseSamplerEngine):
 
             stop_reason: StopReason = _map_finish_reason(output.finish_reason)
 
+            # vLLM's detokenizer already applied the stop-string trim to ``output.text`` (an excluded
+            # stop is cut from the text, while ``output.token_ids`` keeps every sampled id). Carry that
+            # trimmed text as ``decoded`` so the excluded stop is honoured decoded-only -- the complete
+            # trajectory's token ids stay intact. When nothing forced detokenization (no stop/bad_words)
+            # ``output.text`` is empty and the template decodes the tokens downstream instead.
+            decoded_text = output.text if getattr(vllm_params, 'detokenize', False) else None
+
             routed_experts = getattr(output, 'routed_experts', None)
             sequences.append(
                 SampledSequence(
                     stop_reason=stop_reason,
                     tokens=token_ids,
                     logprobs=seq_logprobs,
+                    decoded=decoded_text,
                     routed_experts=routed_experts,
                     sampling_masks=sampling_mask,
                 ))
