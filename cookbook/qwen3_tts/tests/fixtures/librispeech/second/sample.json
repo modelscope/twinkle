@@ -1,0 +1,15 @@
+{
+  "id": "1272-128104-0001",
+  "text": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+  "audio": "1272-128104-0001.flac",
+  "sha256": "46a9d58622b4675b29564da2d9ba73e702241c5fa969f12c387cad4aa984276a",
+  "source": "https://huggingface.co/datasets/hf-internal-testing/librispeech_asr_dummy",
+  "source_revision": "5be91486e11a2d616f4ec5db8d3fd248585ac07a",
+  "source_split": "clean/validation",
+  "source_row": 1,
+  "corpus": "LibriSpeech dev-clean",
+  "license": "CC-BY-4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "corpus_url": "https://www.openslr.org/12",
+  "changes": "HF viewer audio export; no local trimming or text edits. Runtime resamples 16 kHz to 24 kHz."
+}
