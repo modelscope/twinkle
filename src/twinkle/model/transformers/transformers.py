@@ -416,6 +416,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         if model_id is not None:
             model_id = HubOperation.download_model(model_id, revision=kwargs.get('revision'))
         self.model_id = model_id
+        self._model_loader = model_loader
         # pop: tokenizer_id is not a from_pretrained argument, so it must not leak into the model
         # construction kwargs below.
         self.tokenizer_id = kwargs.pop('tokenizer_id', self.model_id)
@@ -766,6 +767,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
+            # Tuning has established requires_grad; placement must finish before EP/FSDP captures state.
+            prepare = getattr(getattr(self, '_model_loader', None), 'prepare_model_for_training', None)
+            if prepare is not None:
+                prepare(self.strategy.unwrap_model(self.model), self.strategy)
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]
             self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=self._enable_expert_parallel)
             self._maybe_apply_expert_parallel()

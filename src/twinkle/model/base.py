@@ -268,6 +268,10 @@ class ModelLoaderProtocol(Protocol):
     def process_model(self, model: 'PreTrainedModel') -> 'PreTrainedModel':
         ...
 
+    def prepare_model_for_training(self, model: 'PreTrainedModel', strategy: Any) -> None:
+        """Optional post-tuning hook, executed on the worker before strategy wrapping."""
+        ...
+
 
 def _collect_temperatures(results, device_mesh):
     values = [value for value in results if value is not None]

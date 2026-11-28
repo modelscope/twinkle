@@ -346,9 +346,6 @@ class NPU(Platform):
 
     @staticmethod
     def configure_model_config(config) -> None:
-        # MindSpeed's patched TE attention needs use_flash_attn to synthesize its own
-        # compressed causal mask; unset aborts the first 8-card forward.
-        config.use_flash_attn = True
         from twinkle.model.megatron.utils import _mindspeed_runtime
         _mindspeed_runtime.configure_mindspeed_runtime_args(config)
 

@@ -28,7 +28,7 @@ from twinkle.utils.safetensors import load_state_dict, save_state_dict
 from ..base import ModelLoaderProtocol
 from ..multi_lora import MultiLora, MultiLoraTaskHeadSlots
 from ..tasks import get_task_spec_obj
-from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
+from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched, finalize_megatron_npu_patches
 from .megatron import MegatronModel
 from .mtp.mtp import MtpTrainingState
 from .strategy import MegatronStrategy
@@ -127,6 +127,8 @@ class MultiLoraMegatronModel(MegatronModel):
         self._try_init_process_group(force=True)
         ensure_mindspeed_adaptor_patched()
         requires('mcore_bridge')
+        import mcore_bridge  # noqa: F401
+        finalize_megatron_npu_patches()
 
         kwargs.update({
             'recompute_granularity': recompute_granularity,

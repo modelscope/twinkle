@@ -129,6 +129,7 @@ def _iter_qwen35_gated_delta_net_classes():
     class_specs = (
         ('transformers.models.qwen3_5.modeling_qwen3_5', 'Qwen3_5GatedDeltaNet'),
         ('transformers.models.qwen3_5_moe.modeling_qwen3_5_moe', 'Qwen3_5MoeGatedDeltaNet'),
+        ('transformers.models.qwen4_exp.modeling_qwen4_exp', 'Qwen4ExpTextGatedDeltaNet'),
     )
     for module_name, class_name in class_specs:
         try:

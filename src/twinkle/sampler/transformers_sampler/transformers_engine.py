@@ -51,6 +51,7 @@ class TransformersEngine(BaseSamplerEngine):
         attn_implementation: Optional[str] = None,
         trust_remote_code: bool = False,
         model_cls: Any = None,
+        model_loader: Any = None,
         model: Any = None,
         tokenizer: Any = None,
         **model_kwargs,
@@ -71,6 +72,8 @@ class TransformersEngine(BaseSamplerEngine):
                 bare ``transformers`` name). Defaults to ``AutoModelForCausalLM``; a vision-language
                 checkpoint needs its own ``...ForConditionalGeneration`` class (see
                 :func:`_resolve_model_cls`).
+            model_loader: Optional family loader class name with ``from_model_dir``; its config,
+                processor and model hooks run in this worker. Mutually exclusive with ``model_cls``.
             model: A pre-built model, for callers that already loaded one. Skips ``from_pretrained``.
             tokenizer: A pre-built tokenizer/processor, likewise.
             **model_kwargs: Forwarded to ``from_pretrained``.
@@ -93,6 +96,19 @@ class TransformersEngine(BaseSamplerEngine):
         self._lora_lock = threading.Lock()
         self._active_adapter: Optional[str] = None
 
+        if model_loader is not None and model_cls is not None:
+            raise ValueError('Pass model_loader or model_cls, not both.')
+        loader = processor = config = None
+        if model is None and model_loader is not None:
+            from twinkle.hub import HubOperation
+
+            model_dir = HubOperation.download_model(model_id, revision=model_kwargs.get('revision'))
+            loader = _resolve_model_cls(model_loader).from_model_dir(model_dir)
+            config = loader.process_config(loader.build_config(model_dir, trust_remote_code=trust_remote_code))
+            processor = loader.process_tokenizer(loader.build_processor(model_dir, config))
+            loader.model_info.config = config
+            if tokenizer is None:
+                tokenizer = getattr(processor, 'tokenizer', processor)
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
         self.tokenizer = tokenizer
@@ -102,7 +118,7 @@ class TransformersEngine(BaseSamplerEngine):
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         if model is None:
-            model_cls_resolved = _resolve_model_cls(model_cls)
+            model_cls_resolved = loader.resolve_model_cls(config) if loader is not None else _resolve_model_cls(model_cls)
             load_kwargs: Dict[str, Any] = {
                 'dtype': dtype if dtype is not None else 'auto',
                 'trust_remote_code': trust_remote_code,
@@ -112,7 +128,10 @@ class TransformersEngine(BaseSamplerEngine):
                 load_kwargs['attn_implementation'] = attn_implementation
             load_kwargs['device_map'] = device_map if device_map is not None else torch_util.get_device(None)
             logger.info(f'TransformersEngine loading {model_id} with {model_cls_resolved.__name__} and {load_kwargs}')
-            model = model_cls_resolved.from_pretrained(model_id, **load_kwargs)
+            if loader is not None:
+                model = loader.process_model(loader.build_model(model_dir, config, processor, **load_kwargs))
+            else:
+                model = model_cls_resolved.from_pretrained(model_id, **load_kwargs)
         self.model = model
         self.model.eval()
         # transformers' `_keep_in_fp32_modules_strict` contract (modeling_utils dtype plan): when a

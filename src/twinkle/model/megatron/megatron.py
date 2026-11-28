@@ -49,7 +49,7 @@ from twinkle.utils import construct_class, get_logger, pad_and_stack_tensors, se
 from twinkle.utils.storage import Storage, is_remote_url, to_local
 from .moe.router_replay import RouterReplay
 from .mtp.mtp import MtpTrainingState
-from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
+from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched, finalize_megatron_npu_patches
 from .utils.utils import _find_embedding, _find_layers
 from .strategy import MegatronStrategy
 
@@ -231,6 +231,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
         # mcore_bridge pulls in megatron.core/TE too early on NPU.
         ensure_mindspeed_adaptor_patched()
         requires('mcore_bridge')
+        import mcore_bridge  # noqa: F401
+        finalize_megatron_npu_patches()
         # Route batched pipeline P2P through the WORLD group to avoid subgroup-P2P PP hangs.
         from twinkle.patch.megatron_p2p import MegatronBatchedP2PGroupPatch
         apply_patch(None, MegatronBatchedP2PGroupPatch())

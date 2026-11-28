@@ -93,6 +93,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         if model_id is not None:
             model_id = HubOperation.download_model(model_id)
         self.model_id = model_id
+        self._model_loader = model_loader
         self._default_tokenizer = None
         if config is not None:
             self.hf_config = config

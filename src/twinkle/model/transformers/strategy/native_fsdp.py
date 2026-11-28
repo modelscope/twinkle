@@ -489,8 +489,12 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         if self.device_mesh is not None:
             from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
+            from twinkle.model.host_embedding import HostEmbedding
             from twinkle.model.state_dict_utils import with_tied_weight_aliases
-            aligned = with_tied_weight_aliases(self.unwrap_model(model), state_dict)
+
+            unwrapped = self.unwrap_model(model)
+            device_state = HostEmbedding.load_host_state(unwrapped, state_dict)
+            aligned = with_tied_weight_aliases(unwrapped, device_state)
             self._probe_load_precision(model, state_dict, after=False)
             set_model_state_dict(
                 model,

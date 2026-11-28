@@ -95,7 +95,9 @@ def apply_qwen3_5_fla(model=None) -> int:
     #    fail to install the kernel, HF transformers would route Qwen3.5 onto
     #    a FLA fast path whose kernel is missing -> runtime failure on NPU.
     try:
+        from fla.modules import FusedRMSNormGated  # noqa: F401
         from fla.modules.convolution import causal_conv1d as _fla_causal_conv1d  # noqa: F401
+        from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule  # noqa: F401
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_chunk_gated_delta_rule
     except ImportError as exc:
         logger.warning('[NPU] [FLA] fla native operators unavailable: %s', exc)
@@ -115,6 +117,7 @@ def apply_qwen3_5_fla(model=None) -> int:
     fla_target_modules = [
         'transformers.models.qwen3_5.modeling_qwen3_5',
         'transformers.models.qwen3_5_moe.modeling_qwen3_5_moe',
+        'transformers.models.qwen4_exp.modeling_qwen4_exp',
     ]
     for module_name in fla_target_modules:
         module = _import_optional(module_name)
@@ -125,6 +128,16 @@ def apply_qwen3_5_fla(model=None) -> int:
         if hasattr(module, 'FusedRMSNormGated'):
             setattr(module, 'FusedRMSNormGated', None)
         setattr(module, 'chunk_gated_delta_rule', fla_chunk_gated_delta_rule)
+        if hasattr(module, 'torch_chunk_gated_delta_rule'):
+            # Newer native forwards resolve kernels from globals instead of instance attributes.
+            def native_conv(x, weight, bias=None, activation=None, **kwargs):
+                return npu_causal_conv1d_fn(
+                    x=x, weight=weight, bias=bias, activation=activation,
+                    cu_seqlens=kwargs.get('cu_seq_lens_q', kwargs.get('cu_seqlens')),
+                )
+
+            module.causal_conv1d_fn = native_conv
+            module.torch_chunk_gated_delta_rule = fla_chunk_gated_delta_rule
 
     # 4. Traverse model and patch per-layer attributes
     if model is None:
@@ -136,6 +149,11 @@ def apply_qwen3_5_fla(model=None) -> int:
 
     patched_instances = 0
     for _name, _module in root.named_modules():
+        if type(_module).__name__ in ('Qwen3_5GatedDeltaNet', 'Qwen3_5MoeGatedDeltaNet', 'Qwen4ExpTextGatedDeltaNet'):
+            _module.chunk_gated_delta_rule = fla_chunk_gated_delta_rule
+            _module.causal_conv1d_fn = npu_causal_conv1d_fn
+            _module._twinkle_npu_patched = True
+            patched_instances += 1
         if hasattr(_module, 'chunk_gated_delta_rule') and callable(getattr(_module, 'chunk_gated_delta_rule')):
             if _module.chunk_gated_delta_rule is not fla_chunk_gated_delta_rule:
                 _module.chunk_gated_delta_rule = fla_chunk_gated_delta_rule

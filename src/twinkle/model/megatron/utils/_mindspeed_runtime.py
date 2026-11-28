@@ -7,6 +7,7 @@ This module deliberately keeps two phases separate:
 """
 
 import argparse
+import importlib.util
 import json
 import torch
 from typing import Any, Dict
@@ -17,6 +18,7 @@ from twinkle.utils import get_logger
 logger = get_logger()
 
 _MINDSPEED_IMPORTED = False
+_MEGATRON_ADAPTOR_IMPORTED = False
 _LAST_RUNTIME_SIGNATURE = None
 
 
@@ -25,20 +27,39 @@ def _is_npu() -> bool:
 
 
 def ensure_mindspeed_adaptor_patched() -> None:
-    """Import MindSpeed's official adaptor before any mcore/TE import on NPU.
+    """Import the installed MegatronAdaptor or legacy MindSpeed stack before mcore/TE.
 
     ``mcore_bridge.__init__`` immediately imports its patcher, and that patcher
     pulls in ``megatron.core`` and TE symbols at module import time. MindSpeed's
     patch stack must land before that import chain, otherwise TE symbols and
     ``torch.compile``-related hooks are bound too early.
     """
-    global _MINDSPEED_IMPORTED
-    if not _is_npu() or _MINDSPEED_IMPORTED:
+    global _MINDSPEED_IMPORTED, _MEGATRON_ADAPTOR_IMPORTED
+    if not _is_npu() or _MINDSPEED_IMPORTED or _MEGATRON_ADAPTOR_IMPORTED:
+        return
+    if importlib.util.find_spec('megatron_adaptor') is not None:
+        import megatron_adaptor  # noqa: F401
+        from twinkle.patch.megatron_moe_npu import patch_megatron_moe
+        from twinkle.patch.megatron_norm_npu import patch_megatron_norm
+        from twinkle.patch.megatron_optimizer_npu import patch_megatron_optimizer
+
+        patch_megatron_optimizer()
+        patch_megatron_norm()
+        patch_megatron_moe()
+        _MEGATRON_ADAPTOR_IMPORTED = True
         return
     from twinkle.utils.import_utils import requires
     requires('mindspeed')
     import mindspeed.megatron_adaptor  # noqa: F401
     _MINDSPEED_IMPORTED = True
+
+
+def finalize_megatron_npu_patches() -> None:
+    """Refresh packed GDN fallback aliases after the bridge has loaded its consumers."""
+    if _MEGATRON_ADAPTOR_IMPORTED:
+        from twinkle.patch.megatron_gdn_npu import patch_megatron_gdn
+
+        patch_megatron_gdn()
 
 
 def _jsonable(value: Any) -> Any:
@@ -196,6 +217,10 @@ def configure_mindspeed_runtime_args(config: Any) -> argparse.Namespace:
         return argparse.Namespace()
 
     ensure_mindspeed_adaptor_patched()
+    if _MEGATRON_ADAPTOR_IMPORTED:
+        return argparse.Namespace()
+    # MindSpeed's TE attention builds its compressed causal mask through this flag.
+    config.use_flash_attn = True
 
     from mindspeed import args_utils
     from mindspeed.megatron_adaptor import repatch

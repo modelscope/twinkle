@@ -51,7 +51,12 @@ def collect_local_state(module: torch.nn.Module, *, include_buffers: bool = Fals
     for name, param in module.named_parameters():
         state[name] = param
     if include_buffers:
+        from .host_embedding import HostEmbedding
+
         for module_name, submodule in module.named_modules():
+            if isinstance(submodule, HostEmbedding):
+                key = f'{module_name}.weight' if module_name else 'weight'
+                state[key] = submodule.weight
             for buffer_name, buffer in submodule.named_buffers(recurse=False):
                 if buffer_name in submodule._non_persistent_buffers_set:
                     continue

@@ -10,7 +10,7 @@ from twinkle.utils.utils import call_with_supported_kwargs
 def _find_gdn_class_pairs(module: Optional[torch.nn.Module], enable_sp: bool):
     if module is None or enable_sp:
         return ()
-    supported_names = {'Qwen3_5GatedDeltaNet', 'Qwen3_5MoeGatedDeltaNet'}
+    supported_names = {'Qwen3_5GatedDeltaNet', 'Qwen3_5MoeGatedDeltaNet', 'Qwen4ExpTextGatedDeltaNet'}
     class_pairs = []
     for layer in module.modules():
         gdn = getattr(layer, 'linear_attn', None)
@@ -20,7 +20,9 @@ def _find_gdn_class_pairs(module: Optional[torch.nn.Module], enable_sp: bool):
             continue
         # Match concrete class names without inheriting support through the MRO.
         # No Transformers internal import path is needed.
-        pair = (type(layer), type(gdn))
+        # Qwen4Exp forwards varlen kwargs natively; its decoder also owns PLE and hyper-connections.
+        decoder_cls = None if type(gdn).__name__ == 'Qwen4ExpTextGatedDeltaNet' else type(layer)
+        pair = (decoder_cls, type(gdn))
         if pair not in class_pairs:
             class_pairs.append(pair)
     return tuple(class_pairs)
@@ -55,8 +57,12 @@ def _patch_gdn_kernels_for_cu_seqlens(
     # Older Transformers stores callables on the instance; newer versions call
     # modeling globals. Prefer instance attributes, including a None conv fallback.
     modeling_globals = unwrap(origin_forward).__globals__
-    conv_namespace = mod.__dict__ if 'causal_conv1d_fn' in mod.__dict__ else modeling_globals
-    chunk_namespace = mod.__dict__ if 'chunk_gated_delta_rule' in mod.__dict__ else modeling_globals
+    from dis import get_instructions
+
+    native_globals = any(instruction.opname == 'LOAD_GLOBAL' and instruction.argval == 'causal_conv1d_fn'
+                         for instruction in get_instructions(unwrap(origin_forward)))
+    conv_namespace = mod.__dict__ if 'causal_conv1d_fn' in mod.__dict__ and not native_globals else modeling_globals
+    chunk_namespace = mod.__dict__ if 'chunk_gated_delta_rule' in mod.__dict__ and not native_globals else modeling_globals
     chunk_name = 'chunk_gated_delta_rule' if chunk_namespace is mod.__dict__ else 'torch_chunk_gated_delta_rule'
     old_conv_fn = conv_namespace['causal_conv1d_fn']
     old_chunk_rule = chunk_namespace[chunk_name]
@@ -108,6 +114,9 @@ def _patch_gdn_kernels_for_cu_seqlens(
     conv_namespace['causal_conv1d_fn'] = causal_conv1d_wrapper
     chunk_namespace[chunk_name] = chunk_gated_delta_rule_wrapper
     try:
+        # Bound kernel wrappers own sequence boundaries; native forwards must not leak FA metadata to FLA.
+        forward_kwargs = {key: value for key, value in forward_kwargs.items()
+                          if key not in {'cu_seq_lens_q', 'cu_seq_lens_k', 'max_length_q', 'max_length_k'}}
         return call_with_supported_kwargs(origin_forward, mod, *forward_args, **forward_kwargs)
     finally:
         conv_namespace['causal_conv1d_fn'] = old_conv_fn
@@ -135,7 +144,8 @@ class GatedDeltaNetPaddingFreePatch(Patch):
             if getattr(gated_delta_net_cls, '_twinkle_sp_linear_patched', False):
                 continue
 
-            if not getattr(decoder_layer_cls, '_twinkle_padding_free_cu_seqlens_patched', False):
+            if decoder_layer_cls is not None and not getattr(
+                    decoder_layer_cls, '_twinkle_padding_free_cu_seqlens_patched', False):
                 origin_decoder_forward = decoder_layer_cls.forward
 
                 def decoder_forward(
