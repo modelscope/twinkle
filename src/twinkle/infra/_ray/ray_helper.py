@@ -607,8 +607,14 @@ class RayHelper:
         if is_dataclass(value) and not isinstance(value, type):
             result = copy(value)
             for field in fields(value):
+                try:
+                    fv = getattr(value, field.name)
+                except Exception:
+                    # A field whose access raises (e.g. transformers heterogeneous per-layer
+                    # config attributes) cannot carry a usable handle; keep it untouched.
+                    continue
                 object.__setattr__(result, field.name,
-                                   RayHelper._resolve_arg_refs(getattr(value, field.name), resolved))
+                                   RayHelper._resolve_arg_refs(fv, resolved))
             return result
         return value
 
@@ -630,7 +636,12 @@ class RayHelper:
                 RayHelper._collect_arg_refs(item, refs)
         elif is_dataclass(value) and not isinstance(value, type):
             for field in fields(value):
-                RayHelper._collect_arg_refs(getattr(value, field.name), refs)
+                try:
+                    fv = getattr(value, field.name)
+                except Exception:
+                    # A field whose access raises cannot carry a usable handle; skip it.
+                    continue
+                RayHelper._collect_arg_refs(fv, refs)
 
     @staticmethod
     def anchor_refs(value: Any):
@@ -693,7 +704,17 @@ class RayHelper:
             if isinstance(value, dict):
                 return any(_carries_ref(item) for item in value.values())
             if is_dataclass(value) and not isinstance(value, type):
-                return any(_carries_ref(getattr(value, field.name)) for field in fields(value))
+                for field in fields(value):
+                    try:
+                        fv = getattr(value, field.name)
+                    except Exception:
+                        # A field whose access raises (e.g. transformers heterogeneous per-layer
+                        # config attributes such as gemma4 head_dim) cannot carry a usable
+                        # handle; the ref scan must not trigger such getters.
+                        continue
+                    if _carries_ref(fv):
+                        return True
+                return False
             return False
 
         return any(_carries_ref(arg) for arg in args) or any(_carries_ref(value) for value in kwargs.values())

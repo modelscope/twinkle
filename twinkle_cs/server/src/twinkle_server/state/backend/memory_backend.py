@@ -10,6 +10,10 @@ from .base import StateBackend
 
 _ACTOR_NAME_PREFIX = 'twinkle_state_actor'
 
+#: Protocol version of the detached state actor. Bump it whenever the actor's call contract changes
+#: incompatibly; ``RayActorBackend`` replaces any resolved actor that does not report this version.
+_STATE_PROTOCOL_VERSION = 1
+
 
 def _actor_name(key_prefix: str) -> str:
     """Namespace the detached actor by ``key_prefix`` so multiple Twinkle
@@ -112,6 +116,15 @@ class _StateActor:
     async def health_check(self) -> bool:
         return True
 
+    def protocol_version(self) -> int:
+        """Compatibility handshake for ``RayActorBackend``.
+
+        Takes no arguments and returns a plain int, so it succeeds even on a worker that cannot
+        import the caller's modules -- an actor that predates this method (or cannot answer it)
+        is from an incompatible twinkle version and must be replaced, not reused.
+        """
+        return _STATE_PROTOCOL_VERSION
+
 
 class RayActorBackend(StateBackend):
     """Cross-process state backend backed by a detached Ray actor.
@@ -129,20 +142,51 @@ class RayActorBackend(StateBackend):
                                'ray.init() first, switch persistence to "redis", or rely on '
                                'the deployment launcher to start Ray.')
         name = _actor_name(key_prefix)
-        try:
-            self._actor = ray.get_actor(name, namespace=namespace)
-        except ValueError:
+        self._actor = self._resolve_compatible_actor(name, namespace)
+
+    @classmethod
+    def _resolve_compatible_actor(cls, name: str, namespace: str | None):
+        """Resolve the detached state actor, replacing an incompatible leftover.
+
+        The actor is detached and named, so it outlives every launcher -- including a twinkle
+        upgrade in place. An actor started by an older version (e.g. before the package split)
+        runs in a worker whose ``sys.path`` predates the new modules: it cannot deserialize the
+        objects the current code sends, and EVERY state call fails with
+        ``ModuleNotFoundError`` -> HTTP 500 while the actor still "exists" and answers pings.
+        Reusing it by name alone is therefore unsafe; handshake on ``protocol_version`` (no
+        arguments, plain-int reply, so even a foreign worker can answer it) and replace any actor
+        that does not report the current version. Bounded retries cover the create/kill race
+        between concurrent workers.
+        """
+        for _ in range(3):
             try:
-                self._actor = _StateActor.options(
-                    name=name,
-                    namespace=namespace,
-                    lifetime='detached',
-                    max_restarts=-1 if namespace else 0,
-                    max_task_retries=0).remote()
+                actor = ray.get_actor(name, namespace=namespace)
             except ValueError:
-                # Lost the create race against another worker — the actor is
-                # now resolvable.
-                self._actor = ray.get_actor(name, namespace=namespace)
+                try:
+                    actor = _StateActor.options(
+                        name=name,
+                        namespace=namespace,
+                        lifetime='detached',
+                        max_restarts=-1 if namespace else 0,
+                        max_task_retries=0).remote()
+                except ValueError:
+                    # Lost the create race against another worker — the actor is
+                    # now resolvable.
+                    actor = ray.get_actor(name, namespace=namespace)
+            try:
+                version = ray.get(actor.protocol_version.remote(), timeout=30)
+            except Exception:
+                version = None
+            if version == _STATE_PROTOCOL_VERSION:
+                return actor
+            # Incompatible (or unresponsive) leftover: kill it WITHOUT restart (max_restarts=-1
+            # would otherwise resurrect the same old code) and loop to create/resolve a fresh one.
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                pass
+        raise RuntimeError(f'Could not resolve a compatible twinkle state actor {name!r} '
+                           f'in namespace {namespace!r} after repeated replacement attempts.')
 
     async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
         await self._actor.set.remote(key, value, ttl)

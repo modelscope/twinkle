@@ -959,6 +959,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             values = outputs['logits']
             outputs['values'] = values.squeeze(-1) if values.dim() == 3 and values.shape[-1] == 1 else values
         outputs['past_key_values'] = None
+        # Raw encoder-tower features (gemma3/4-style HF ``image_hidden_states`` /
+        # ``audio_hidden_states``) are token-axis intermediates, not per-sample channels: dim 0
+        # is the image/audio-token count, so the forward_only micro-batch merger -- which
+        # restores SAMPLE order -- cannot carry them (it raised "expected a sample dimension
+        # matching the plan"). No twinkle consumer reads them (the declared ModelOutput channels
+        # do not include them); reclaim them here like past_key_values. Unconditional so every
+        # micro-batch's output key set agrees even when only some micro-batches contain media
+        # (HF ModelOutput drops None fields).
+        outputs['image_hidden_states'] = None
+        outputs['audio_hidden_states'] = None
         if not (return_logits or loss_require_logits):
             outputs['logits'] = None
 
