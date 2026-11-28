@@ -108,15 +108,22 @@ def align_rollout_topk(topk_ids, topk_logps, mask: torch.Tensor, expected_topk: 
         raise ValueError('score_centering top-k batch size does not match the training batch.')
     aligned_ids, aligned_logps = [], []
     for index, (ids, logps) in enumerate(zip(topk_ids, topk_logps, strict=True)):
-        ids = torch.as_tensor(ids, dtype=torch.long, device=mask.device)
-        logps = torch.as_tensor(logps, dtype=torch.float32, device=mask.device)
         n_pos = int(mask[index].sum().item())
-        if ids.shape[0] != n_pos or logps.shape != ids.shape or ids.shape[1] < expected_topk:
-            raise ValueError(f'score_centering top-k/mask mismatch at sample {index}: expected '
-                             f'({n_pos}, >= {expected_topk}), got ids={tuple(ids.shape)}, '
-                             f'logps={tuple(logps.shape)}.')
-        aligned_ids.append(ids[:, :expected_topk])
-        aligned_logps.append(logps[:, :expected_topk])
+        if len(ids) != n_pos or len(logps) != n_pos:
+            raise ValueError(f'score_centering top-k/mask mismatch at sample {index}: expected {n_pos} rows, '
+                             f'got ids={len(ids)}, logps={len(logps)}.')
+        # The sampler head is ragged (k, or k+1 when the sampled token sits outside the top-k) and
+        # is not sorted; keep the k most likely candidates so both sides compare the same ids.
+        rows_ids, rows_logps = [], []
+        for row_ids, row_logps in zip(ids, logps, strict=True):
+            pairs = sorted(zip(map(int, row_ids), map(float, row_logps)), key=lambda pair: -pair[1])
+            if len(pairs) < expected_topk:
+                raise ValueError(f'score_centering needs >= {expected_topk} sampler head entries, '
+                                 f'got {len(pairs)} at sample {index}.')
+            rows_ids.append([token for token, _ in pairs[:expected_topk]])
+            rows_logps.append([value for _, value in pairs[:expected_topk]])
+        aligned_ids.append(torch.tensor(rows_ids, dtype=torch.long, device=mask.device))
+        aligned_logps.append(torch.tensor(rows_logps, dtype=torch.float32, device=mask.device))
     return torch.cat(aligned_ids), torch.cat(aligned_logps)
 
 
