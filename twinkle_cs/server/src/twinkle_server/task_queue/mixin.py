@@ -10,7 +10,7 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from typing import TYPE_CHECKING, Any
 
 from twinkle.protocol.types.errors import QueueState
@@ -71,6 +71,8 @@ class TaskQueueMixin:
         on_backend_timeout: Callable[[], Coroutine[Any, Any, None]] | None = None,
         collect_width: int = 1,
         telemetry_base_model: str | None = None,
+        compute_node: str | None = None,
+        gpu_devices: Sequence[str] = (),
     ) -> None:
         """Initialise the task queue, rate limiter, and compute worker.
 
@@ -127,12 +129,15 @@ class TaskQueueMixin:
             task_metrics=self._task_metrics,
             deployment_name=deployment_name,
             on_backend_timeout=on_backend_timeout,
+            compute_node=compute_node,
+            gpu_devices=gpu_devices,
         )
 
         self._backend_gate = BackendGate(enable_admission_gate=enable_admission_gate)
         #: Strong references to in-flight fire-and-forget background tasks (see schedule_background_task).
         self._background_tasks: set = set()
         self._event_loop: asyncio.AbstractEventLoop | None = None
+        self._submitting_request_ids: set[str] = set()
         self._queue_tasks: set[asyncio.Task] = set()
 
     @property
@@ -249,17 +254,20 @@ class TaskQueueMixin:
             trace_context=get_trace_context(),
             created_at=time.monotonic(),
             training_id=model_id)
-        await self._prepare_queued_task(task)
-
-        if self._event_loop is None:
-            self._event_loop = asyncio.get_running_loop()
-
+        # The training controller can reconcile its admission ticket before the
+        # Redis future and local queue entry have been written.
+        self._submitting_request_ids.add(request_id)
         try:
+            await self._prepare_queued_task(task)
+            if self._event_loop is None:
+                self._event_loop = asyncio.get_running_loop()
             await self._enqueue_prepared_task(task)
         except BaseException:
             if task.on_finished is not None and await self.state.get_future(request_id) is None:
                 await self._compute_worker.finish_task(task, False)
             raise
+        finally:
+            self._submitting_request_ids.discard(request_id)
         return {'request_id': request_id, 'model_id': model_id}
 
     async def _prepare_queued_task(self, task: QueuedTask) -> None:

@@ -39,6 +39,7 @@ class RayInstanceDriver:
                 "application_name": allocation.name,
                 "placement_group_id": allocation.placement_group_id,
                 "node_id": allocation.node_id,
+                "node_name": allocation.node_name,
                 "devices": list(allocation.devices),
             }
         finally:
@@ -89,6 +90,7 @@ class RayInstanceDriver:
             training_context=context,
             placement_group=await asyncio.to_thread(get_placement_group, name),
             allocation_devices=list(instance.devices),
+            allocation_node=instance.node_name,
             **kwargs,
         )
         await self.runtime.deploy(

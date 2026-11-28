@@ -219,6 +219,6 @@ class TrainingRuntime:
     async def verify_operation(self, request_id):
         if self._model_unhealthy:
             return {"state": "unsafe"}
-        if self._compute_worker.has_task(request_id):
+        if request_id in self._submitting_request_ids or self._compute_worker.has_task(request_id):
             return {"state": "pending"}
         return self._compute_worker.get_task_outcome(request_id) or {"state": "missing"}

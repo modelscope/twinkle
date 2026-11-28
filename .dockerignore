@@ -1,6 +1,7 @@
 **
 !Dockerfile
 !pyproject.toml
+!VERSION
 !README.md
 !LICENSE
 !src/

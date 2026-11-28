@@ -163,7 +163,7 @@ def test_launch_preserves_blocking_policy_and_deploys_on_demand_training(monkeyp
     monkeypatch.setattr(launcher, '_wait_for_shutdown', lambda: calls.append('wait'))
     monkeypatch.setattr(launcher, '_shutdown', lambda **kwargs: calls.append('shutdown'))
     launcher.launch(blocking=blocking)
-    expected = ['environment', 'ray', 'serve', 'gateway', 'train', 'training']
+    expected = ['environment', 'ray', 'serve', 'train', 'training', 'gateway']
     assert calls == expected + (['wait', 'shutdown'] if blocking else [])
 
 
@@ -182,6 +182,42 @@ def test_start_serve_reuses_existing_instance_without_restart(monkeypatch):
     start.assert_not_called()
     shutdown.assert_not_called()
     assert launcher._serve_started
+
+
+def test_sampler_warmups_are_submitted_together_before_routes_are_published(monkeypatch):
+    config = ServerConfig.model_validate({'applications': [
+        {'name': 'gateway', 'import_path': 'server', 'route_prefix': '/api/v1', 'args': {'api_key': 'gateway-key'}},
+        {'name': 'sample-a', 'import_path': 'sampler', 'route_prefix': '/api/v1/sampler/a',
+         'args': {'model_id': 'a', 'device_group': {}, 'device_mesh': {}, 'sampler_type': 'mock'}},
+        {'name': 'sample-b', 'import_path': 'sampler', 'route_prefix': '/api/v1/sampler/b',
+         'args': {'model_id': 'b', 'device_group': {}, 'device_mesh': {}, 'sampler_type': 'mock',
+                  'api_key': 'sampler-key'}},
+    ]})
+    launcher = ServerLauncher(config)
+    factory = Mock()
+    first = Mock()
+    second = Mock()
+    first.initialize.remote.return_value = 'warming-a'
+    second.initialize.remote.return_value = 'warming-b'
+    factory.side_effect = [(first, {}, 'a'), (second, {}, 'b')]
+    monkeypatch.setattr('twinkle_server.sampler.pool.actor.create_sampler_controller', factory)
+    router = Mock(side_effect=['router-a', 'router-b'])
+    monkeypatch.setattr('twinkle_server.sampler.pool.router.build_sampler_router', router)
+    run = Mock()
+    monkeypatch.setattr('ray.serve.run', run)
+
+    def wait_for_warmups(pending):
+        assert pending == ['warming-a', 'warming-b']
+        assert launcher._sampler_controllers == [first, second]
+        run.assert_not_called()
+
+    monkeypatch.setattr(ray, 'get', wait_for_warmups)
+    samplers = config.applications[1:]
+    launcher._deploy_samplers(samplers)
+
+    assert [app.args.api_key for app in samplers] == ['gateway-key', 'sampler-key']
+    assert [call.kwargs['api_key'] for call in router.call_args_list] == ['gateway-key', 'sampler-key']
+    assert [call.kwargs['name'] for call in run.call_args_list] == ['sample-a', 'sample-b']
 
 
 def test_start_serve_starts_missing_instance_with_configured_listener(monkeypatch):
