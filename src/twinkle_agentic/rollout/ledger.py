@@ -34,7 +34,7 @@ from twinkle.data_format import Trajectory, copy_trajectory
 from twinkle.data_format import last_assistant_text as _traj_last_assistant_text
 from twinkle.data_format import turn_token_spans, validate_trajectory
 from twinkle.data_format.trajectory import _trainable_positions
-from twinkle.data_format.sampling import SampledSequence, SamplingMask, sampled_token_logprobs
+from twinkle.data_format.sampling import SampledSequence, SamplingMask, sampled_token_logprobs, topk_head
 from twinkle.template.base import Template
 from twinkle.template.contract import coerce_tool_call_arguments, engine_input_ids
 from twinkle_agentic.utils.token_utils import append_ids
@@ -399,6 +399,8 @@ class TurnLedger(_TrajectoryLedger):
             # ``validate_trajectory`` rejects it, while an absent field is the documented signal that
             # this trajectory simply carries no sampling logps.
             out["rollout_logps"] = sampled_token_logprobs(out["response_token_ids"], self._logprobs)
+            out["rollout_topk_ids"], out["rollout_topk_logps"] = topk_head(out["response_token_ids"],
+                                                                              self._logprobs)
         if "routed_experts" in self._trajectory:
             out["replay_mask"] = (
                 list(completion_mask) if completion_mask is not None else [int(label != -100) for label in labels]
