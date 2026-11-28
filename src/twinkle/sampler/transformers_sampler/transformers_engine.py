@@ -414,13 +414,29 @@ class TransformersEngine(BaseSamplerEngine):
             if adapter_path in self._adapters:
                 return self._adapters[adapter_path]
             requires('peft')
-            from peft import PeftModel
+            from peft import PeftModel, PeftConfig
 
             name = adapter_name or f'adapter_{len(self._adapters)}'
+            # This is an inference-only load: the sampler freezes the adapter and calls eval() below.
+            # Dropout is identity under eval(), but peft's lora.ParamWrapper -- dispatched for fused MoE
+            # expert nn.Parameter targets (e.g. Qwen3-Next) once peft's transformers-v5 conversion folds
+            # the per-expert LoRA into fused target_parameters -- hard-rejects lora_dropout != 0 even in
+            # inference_mode. A megatron LoRA trained with the swift default dropout (0.05) and saved in
+            # peft format therefore cannot be reloaded by the product (or by plain peft). Normalize the
+            # dropout to 0 for this frozen inference load: computation-preserving (eval disables dropout,
+            # so outputs are identical), and neither training-time dropout nor the on-disk artifact is
+            # touched -- the checkpoint's args.json keeps the true training value.
+            config = PeftConfig.from_pretrained(adapter_path)
+            if getattr(config, 'lora_dropout', 0):
+                config.lora_dropout = 0.0
+            config.inference_mode = True
             if isinstance(self.model, PeftModel):
+                if name not in self.model.peft_config:
+                    self.model.add_adapter(name, config)
                 self.model.load_adapter(adapter_path, adapter_name=name)
             else:
-                self.model = PeftModel.from_pretrained(self.model, adapter_path, adapter_name=name)
+                self.model = PeftModel.from_pretrained(
+                    self.model, adapter_path, adapter_name=name, config=config, is_trainable=False)
             self.model.eval()
             self._adapters[adapter_path] = name
             logger.info(f'TransformersEngine loaded LoRA {adapter_path} as {name!r}')

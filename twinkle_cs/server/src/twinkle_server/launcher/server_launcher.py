@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import signal
 import threading
+import time
 from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
@@ -587,7 +588,29 @@ class ServerLauncher:
         """
         if not self._serve_instance_owner:
             return
-        if self._application_details():
+        # ``serve.delete()`` is asynchronous: the applications this launcher just deleted linger in
+        # the route table (status DELETING, or a stale RUNNING snapshot) until their replicas stop.
+        # Reading the table once right after the delete calls raced that teardown -- the dying apps
+        # counted as "still deployed", the owner skipped ``serve.shutdown()``, and the zombie listener
+        # silently pinned every later deployment's port. Wait until the table is free of in-flight
+        # deletions AND stable (two consecutive identical snapshots) before deciding whether anything
+        # remains; a bounded wait keeps a stuck deletion from hanging teardown. A genuinely coexisting
+        # deployment's apps are stable immediately, so this does not delay the shared-listener case.
+        deadline = time.monotonic() + 60.0
+        previous = None
+        while time.monotonic() < deadline:
+            details = self._application_details()
+            keys = set(details)
+            deleting = any(
+                getattr(app.get('status'), 'value', app.get('status')) == 'DELETING'
+                for app in details.values())
+            if not deleting and keys == previous:
+                break
+            previous = keys
+            time.sleep(0.5)
+        remaining = self._application_details()
+        if remaining:
+            logger.info('Retaining shared Serve instance; applications still deployed: %s', sorted(remaining))
             return
         from ray import serve
         serve.shutdown()

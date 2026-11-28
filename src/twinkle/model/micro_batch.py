@@ -345,6 +345,57 @@ def agree_micro_batch_count(
                              'make the input batch divisible by the model data-parallel size')
 
 
+def equalize_packed_micro_batch_plan(
+    row_count: int,
+    micro_batch_size: int,
+    *,
+    dp_group,
+    packed: bool,
+    variable_length_ok: bool,
+) -> list[list[int]] | None:
+    """Equalize the fixed-stride micro-batch count of a (possibly packed) batch across model DP ranks.
+
+    Packing flattens a content-dependent number of rows per rank, so the fixed-stride
+    ``ceil(rows / micro_batch_size)`` split can leave ranks with different micro-batch counts.
+    Every per-micro-batch collective (MoE token dispatch, the grad all-reduce) then deadlocks:
+    the short rank finishes its schedule and waits in grad finalization while the long rank is
+    still dispatching tokens.
+
+    Returns ``None`` when every rank already agrees (the caller keeps its fixed-stride split,
+    unchanged), or a balanced contiguous plan of ``max(counts)`` groups when they differ and the
+    rows may be regrouped (packed / padding-free / variable-length batches). The plan covers
+    every row exactly once, keeps input order, and never exceeds ``micro_batch_size`` rows per
+    group -- no dummy micro-batches, so every forward contributes real gradient. When the counts
+    cannot be equalized without dummy data, every rank raises the same error: the decision is
+    made from the gathered state, never rank-locally, so no rank proceeds into the schedule alone.
+    """
+    local_count = math.ceil(row_count / micro_batch_size)
+    state = {'count': local_count, 'rows': row_count, 'packed': bool(packed)}
+    states = [None] * dist.get_world_size(dp_group)
+    dist.all_gather_object(states, state, group=dp_group)
+    counts = [gathered['count'] for gathered in states]
+    if all(count == counts[0] for count in counts):
+        return None
+    target = max(counts)
+    if not (variable_length_ok or any(gathered['packed'] for gathered in states)):
+        raise ValueError(
+            f'fixed micro-batch counts differ across model DP ranks ({counts}); distribute inputs so '
+            'all ranks execute the same number of non-empty micro-batches.')
+    if any(target > gathered['rows'] for gathered in states):
+        raise ValueError(
+            f'packed micro-batch counts {counts} cannot be equalized to {target} without dummy '
+            f'micro-batches (rank row counts {[gathered["rows"] for gathered in states]}); make the '
+            'packed input distribution divisible by the model data-parallel size.')
+    base, extra = divmod(row_count, target)
+    plan = []
+    start = 0
+    for index in range(target):
+        size = base + (1 if index < extra else 0)
+        plan.append(list(range(start, start + size)))
+        start += size
+    return plan
+
+
 def select_batch(value: Any, indices: list[int], batch_size: int) -> Any:
     if isinstance(value, dict):
         return {key: select_batch(item, indices, batch_size) for key, item in value.items()}

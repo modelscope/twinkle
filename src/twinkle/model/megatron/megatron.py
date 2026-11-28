@@ -35,6 +35,7 @@ from twinkle.metric import LossMetric, Metric, TrainMetric
 from twinkle.model.base import (ModelLoaderProtocol, TrainableModel, rotate_checkpoints,
                                  stage_checkpoint_args)
 from twinkle.model.micro_batch import (MicroBatchConfig, agree_micro_batch_count,
+                                       equalize_packed_micro_batch_plan,
                                        plan_micro_batches_contiguous, sequence_length)
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.tasks import _generative_reranker_score, get_task_spec_obj
@@ -755,6 +756,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             if key in kwargs
         }
         micro_batch_plan = None
+        plan_batch_size = local_batch_size
         if mb_options.get('dynamic_batching'):
             if 'packing_algorithm' in mb_options:
                 logger.warning(
@@ -767,6 +769,28 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                 max_tokens_per_micro_batch=mb_options.get('max_tokens_per_micro_batch'),
             )
             micro_batch_plan = self._build_micro_batch_plan(inputs, micro_batch_config, processor, mpu)
+        elif micro_batch_size is not None and get_task_spec(task).token_level_labels:
+            # Packing flattens a content-dependent number of rows per DP rank, so the fixed-stride
+            # micro-batch split can disagree across ranks and the per-micro-batch MoE token dispatch
+            # / grad all-reduce deadlocks. Agree on one count here -- every DP rank enters this
+            # collective (the gate is config-only, never content-dependent) -- and ride the same
+            # micro_batch_plan seam as dynamic batching. Equal counts return None and keep the
+            # fixed-stride split below byte-identical.
+            dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            if dist.get_world_size(dp_group) > 1:
+                flat_rows = [
+                    row for item in inputs for row in (item if isinstance(item, (list, tuple)) else [item])
+                ]
+                packed = (processor.padding_free
+                          or any(isinstance(item, (list, tuple)) for item in inputs)
+                          or processor._any_packing(flat_rows))
+                micro_batch_plan = equalize_packed_micro_batch_plan(
+                    len(flat_rows), micro_batch_size, dp_group=dp_group, packed=packed,
+                    variable_length_ok=processor.padding_free or self.variable_seq_lengths)
+                if micro_batch_plan is not None:
+                    # The plan indexes the FLATTENED rows the processor's collate sees, not the
+                    # packed groups `inputs` still holds here.
+                    plan_batch_size = len(flat_rows)
         inputs = processor(
             inputs,
             micro_batch_size=micro_batch_size,
@@ -819,7 +843,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
             # kwargs by each plan group (contiguous, input-ordered), mirroring the fixed
             # stride split below.
             loss_extra_kwargs_per_mb = [
-                loss_instance.micro_batch_kwargs(kwargs, indices, local_batch_size)
+                loss_instance.micro_batch_kwargs(kwargs, indices, plan_batch_size)
                 for indices in micro_batch_plan
             ]
         elif num_microbatches <= 1:

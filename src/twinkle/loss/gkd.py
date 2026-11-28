@@ -7,6 +7,136 @@ from twinkle.loss.base import Loss
 if TYPE_CHECKING:
     import torch
 
+# Lazily-built singleton autograd.Function, mirroring chunked_cross_entropy.py: neither pay the
+# class-construction cost on every forward nor force a top-level torch import.
+_CHUNKED_JSD_FUNC = None
+
+
+def _get_chunked_jsd_func():
+    global _CHUNKED_JSD_FUNC
+    if _CHUNKED_JSD_FUNC is not None:
+        return _CHUNKED_JSD_FUNC
+
+    import torch
+    import torch.nn.functional as F
+
+    def _chunk_jsd_sum(s_chunk, t_chunk, beta, beta_t, log_beta, log_1_minus_beta):
+        """One chunk of the beta-JSD, summed. Identical ops in forward and backward recompute."""
+        s_log_probs = F.log_softmax(s_chunk, dim=-1)
+        t_log_probs = F.log_softmax(t_chunk, dim=-1)
+        if beta == 0:
+            # Forward KL: KL(T || S)
+            jsd_chunk = F.kl_div(s_log_probs, t_log_probs, reduction='none', log_target=True)
+        elif beta == 1:
+            # Reverse KL: KL(S || T)
+            jsd_chunk = F.kl_div(t_log_probs, s_log_probs, reduction='none', log_target=True)
+        else:
+            # Generalised JSD: β·KL(T||M) + (1-β)·KL(S||M)
+            mixture_log_probs = torch.logsumexp(
+                torch.stack([s_log_probs + log_1_minus_beta, t_log_probs + log_beta]),
+                dim=0,
+            )
+            kl_teacher = F.kl_div(mixture_log_probs, t_log_probs, reduction='none', log_target=True)
+            kl_student = F.kl_div(mixture_log_probs, s_log_probs, reduction='none', log_target=True)
+            jsd_chunk = beta_t * kl_teacher + (1 - beta_t) * kl_student
+        return jsd_chunk.sum()
+
+    class _ChunkedJSDFunc(torch.autograd.Function):
+        """Chunked JSD that keeps only ONE chunk's intermediates alive at a time.
+
+        A plain chunk loop under autograd retains every chunk's saved tensors (log_softmax
+        outputs, the stacked mixture input, the mixture itself) until backward, so peak memory
+        still grows linearly with the number of valid tokens -- on long on-policy GKD rounds
+        (thousands of response tokens x full vocab) that defeats the chunking and OOMs. Like
+        ``ChunkedCrossEntropyLoss`` in this package, forward computes each chunk under no-grad
+        and backward recomputes one chunk at a time, writing gradients into a fresh buffer.
+        ``grad_outputs=scale`` reproduces the exact scalar the old single-graph backward
+        propagated, so gradients match the naive loop bit-for-bit; ``chunk_size`` only controls
+        the memory/throughput trade-off.
+        """
+
+        @staticmethod
+        def forward(ctx, student_logits, teacher_logits, chunk_size, beta, num_valid):
+            if torch.is_tensor(num_valid):
+                ctx.save_for_backward(student_logits, teacher_logits, num_valid)
+                ctx.num_valid = None
+            else:
+                ctx.save_for_backward(student_logits, teacher_logits)
+                ctx.num_valid = num_valid
+            ctx.chunk_size = chunk_size
+            ctx.beta = beta
+
+            n = student_logits.shape[0]
+            if beta not in (0, 1):
+                beta_t = torch.tensor(beta, dtype=student_logits.dtype, device=student_logits.device)
+                log_beta = torch.log(beta_t)
+                log_1_minus_beta = torch.log1p(-beta_t)
+            else:
+                beta_t = log_beta = log_1_minus_beta = None
+
+            total_loss = student_logits.new_zeros(())
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                total_loss = total_loss + _chunk_jsd_sum(
+                    student_logits[start:end], teacher_logits[start:end], beta, beta_t, log_beta,
+                    log_1_minus_beta)
+            # Divide by the ORIGINAL num_valid object (int tensor under a label mask, python int
+            # otherwise): tensor/tensor division casts the divisor to the logits dtype while
+            # tensor/scalar keeps it exact -- switching forms would shift bf16 results by 1 ulp.
+            return total_loss / num_valid
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            saved = ctx.saved_tensors
+            student_logits, teacher_logits = saved[0], saved[1]
+            num_valid = saved[2] if len(saved) > 2 else ctx.num_valid
+            chunk_size = ctx.chunk_size
+            beta = ctx.beta
+
+            n = student_logits.shape[0]
+            # Same scalar the single-graph backward propagated through the final division.
+            scale = grad_output / num_valid
+            need_s = student_logits.requires_grad
+            need_t = teacher_logits.requires_grad
+            if not (need_s or need_t):
+                return None, None, None, None, None
+            grad_student = torch.empty_like(student_logits) if need_s else None
+            grad_teacher = torch.empty_like(teacher_logits) if need_t else None
+
+            if beta not in (0, 1):
+                beta_t = torch.tensor(beta, dtype=student_logits.dtype, device=student_logits.device)
+                log_beta = torch.log(beta_t)
+                log_1_minus_beta = torch.log1p(-beta_t)
+            else:
+                beta_t = log_beta = log_1_minus_beta = None
+
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                s_chunk = student_logits[start:end]
+                t_chunk = teacher_logits[start:end]
+                inputs = []
+                if need_s:
+                    s_chunk = s_chunk.detach().requires_grad_(True)
+                    inputs.append(s_chunk)
+                if need_t:
+                    t_chunk = t_chunk.detach().requires_grad_(True)
+                    inputs.append(t_chunk)
+                with torch.enable_grad():
+                    loss_chunk = _chunk_jsd_sum(s_chunk, t_chunk, beta, beta_t, log_beta, log_1_minus_beta)
+                grads = torch.autograd.grad(loss_chunk, inputs, grad_outputs=scale, retain_graph=False)
+                gi = 0
+                if need_s:
+                    grad_student[start:end] = grads[gi]
+                    gi += 1
+                if need_t:
+                    grad_teacher[start:end] = grads[gi]
+
+            # student_logits, teacher_logits, chunk_size, beta, num_valid
+            return grad_student, grad_teacher, None, None, None
+
+    _CHUNKED_JSD_FUNC = _ChunkedJSDFunc
+    return _CHUNKED_JSD_FUNC
+
 
 class GKDLoss(Loss):
     """Generalized Knowledge Distillation (GKD) loss based on Jensen-Shannon Divergence.
@@ -222,46 +352,8 @@ class GKDLoss(Loss):
             # Keep the empty partition connected to the graph so its backward is a no-op, not an error.
             return student_logits.sum()
 
-        num_valid_int = int(num_valid) if isinstance(num_valid, int) else num_valid.item()
-        total_loss = student_logits.new_zeros(())
-
-        # Pre-compute log(beta) / log(1-beta) once for the mixture
-        if beta not in (0, 1):
-            beta_t = torch.tensor(beta, dtype=student_logits.dtype, device=student_logits.device)
-            log_beta = torch.log(beta_t)
-            log_1_minus_beta = torch.log1p(-beta_t)
-        else:
-            beta_t = log_beta = log_1_minus_beta = None
-
-        # ── Chunked loss accumulation ─────────────────────────────────────────
-        for start in range(0, num_valid_int, chunk_size):
-            end = min(start + chunk_size, num_valid_int)
-            s_chunk = student_logits[start:end]
-            t_chunk = teacher_logits[start:end]
-
-            s_log_probs = F.log_softmax(s_chunk, dim=-1)
-            t_log_probs = F.log_softmax(t_chunk, dim=-1)
-            del s_chunk, t_chunk
-
-            if beta == 0:
-                # Forward KL: KL(T || S)
-                jsd_chunk = F.kl_div(s_log_probs, t_log_probs, reduction='none', log_target=True)
-            elif beta == 1:
-                # Reverse KL: KL(S || T)
-                jsd_chunk = F.kl_div(t_log_probs, s_log_probs, reduction='none', log_target=True)
-            else:
-                # Generalised JSD: β·KL(T||M) + (1-β)·KL(S||M)
-                mixture_log_probs = torch.logsumexp(
-                    torch.stack([s_log_probs + log_1_minus_beta, t_log_probs + log_beta]),
-                    dim=0,
-                )
-                kl_teacher = F.kl_div(mixture_log_probs, t_log_probs, reduction='none', log_target=True)
-                kl_student = F.kl_div(mixture_log_probs, s_log_probs, reduction='none', log_target=True)
-                del mixture_log_probs
-                jsd_chunk = beta_t * kl_teacher + (1 - beta_t) * kl_student
-                del kl_teacher, kl_student
-
-            total_loss = total_loss + jsd_chunk.sum()
-            del jsd_chunk, s_log_probs, t_log_probs
-
-        return total_loss / num_valid
+        # Chunked accumulation with per-chunk backward (see _ChunkedJSDFunc): a plain loop here
+        # would retain every chunk's [chunk, V] intermediates in the autograd graph until backward,
+        # which OOMs on long on-policy rounds (full vocab x thousands of response tokens).
+        func = _get_chunked_jsd_func()
+        return func.apply(student_logits, teacher_logits, chunk_size, beta, num_valid)

@@ -23,6 +23,11 @@ class TrainingHarness:
     # collaborator too. It is a ``staticmethod`` on ``TrainableModel``, and a bare assignment would
     # rebind it as an instance method and hand ``self`` to the ``inputs`` parameter.
     _rollout_features = staticmethod(TransformersModel._rollout_features)
+    # ``forward_backward`` validates the output_frame/output_fields request riding kwargs before it
+    # splits the rollout (transformers.py:1934, added by 45cefb4e). A harness that borrows
+    # ``forward_backward`` must borrow this collaborator too; like ``_rollout_features`` it is a
+    # ``staticmethod`` on ``TrainableModel``, so re-wrap it to avoid binding ``self`` into ``kwargs``.
+    resolve_output_frame_request = staticmethod(TransformersModel.resolve_output_frame_request)
     _not_encoded = staticmethod(lambda _: False)
 
     def __init__(self, loss):

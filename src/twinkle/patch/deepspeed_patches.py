@@ -91,9 +91,16 @@ class DeepSpeedLeafModulesPatch(Patch):
             module_path, class_name = entry
             try:
                 mod = importlib.import_module(module_path)
-                return [getattr(mod, class_name)]
+                leaf_cls = getattr(mod, class_name)
             except (ImportError, AttributeError):
                 pass
+            else:
+                # A mapped family may have dense variants without the MoE class
+                # (e.g. gemma4 with text_config.enable_moe_block=False has no
+                # Gemma4TextExperts). Only mark leaf modules that actually exist,
+                # otherwise set_z3_leaf_modules raises ValueError on dense models.
+                if any(isinstance(sub, leaf_cls) for sub in model.modules()):
+                    return [leaf_cls]
 
         # trust_remote_code fallback: scan for MoE block by class name
         for sub in model.modules():
