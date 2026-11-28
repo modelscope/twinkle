@@ -149,6 +149,14 @@ class Qwen3_5Template(Template):
         self._init_vision_config()
 
     @property
+    def placeholder_tokens(self):
+        media = tuple(value for kind in ('image', 'video', 'audio')
+                      if (value := getattr(self.processor, f'{kind}_token_id', None)) is not None)
+        boundaries = tuple(value for name in ('vision_start_token_id', 'vision_end_token_id')
+                           if (value := getattr(self.config, name, None)) is not None)
+        return media + boundaries
+
+    @property
     def tool_call_stop(self) -> str | None:
         # Qwen writes Hermes markup, which closes every call, so stopping here
         # leaves exactly one in the reply.
@@ -270,9 +278,8 @@ class Qwen3_5Template(Template):
         return self._concat_text_position_ids(position_ids)
 
     def _engine_input_ids(self, input_ids):
-        """Collapse each <vision_start> <image_pad>... <vision_end> group
-        into <vision_start> <image_pad> <vision_end> (single pad token)."""
-        image_token_id = self.config.image_token_id
+        """Collapse each vision block to one image or video placeholder for serving."""
+        media_token_ids = {self.config.image_token_id, self.config.video_token_id}
         vision_start_id = self.config.vision_start_token_id
         vision_end_id = self.config.vision_end_token_id
 
@@ -282,11 +289,11 @@ class Qwen3_5Template(Template):
             if input_ids[i] == vision_start_id:
                 result.append(vision_start_id)
                 i += 1
-                # Skip all consecutive image_pad tokens, keep only one
+                # Keep one placeholder from the expanded image or video block.
                 found_pad = False
-                while i < len(input_ids) and input_ids[i] == image_token_id:
+                while i < len(input_ids) and input_ids[i] in media_token_ids:
                     if not found_pad:
-                        result.append(image_token_id)
+                        result.append(int(input_ids[i]))
                         found_pad = True
                     i += 1
                 # Append vision_end if present

@@ -18,7 +18,7 @@ import torch
 
 from twinkle.sampler import generation
 from twinkle.sampler.base import Sampler
-from twinkle.template.contract import MediaBundle, PromptEncoding, RolloutState
+from twinkle.template.contract import engine_input_ids
 
 
 class _ConcreteSampler(Sampler):
@@ -49,38 +49,32 @@ class _FakeTemplate:
         self.encode_calls = []
         self.decode_calls = []
 
-    def encode(self, trajectory, add_generation_prompt=True):
+    def encode_prompt(self, trajectory, *, backend, add_generation_prompt=True):
         self.encode_calls.append((trajectory, add_generation_prompt))
-        return dict(self._encoded)
+        return {**trajectory, **self._encoded}
 
     def decode(self, token_ids):
         self.decode_calls.append(token_ids)
         return self._decoded
 
 
-def test_generation_uses_rollout_state_engine_ids():
+def test_generation_preserves_model_and_engine_ids():
 
     class Template:
         def encode_prompt(self, trajectory, *, backend, add_generation_prompt):
-            state = RolloutState(
-                feature={"input_ids": [1, 2]},
-                engine_input_ids=(8, 9),
-                messages=tuple(trajectory["messages"]),
-                tools=(),
-                reasoning_started=False,
-                media=MediaBundle(),
-            )
-            return PromptEncoding(state)
+            return {**trajectory, "input_ids": [1, 2], "engine_input_ids": [8, 9], "images": ["image"]}
 
-    encoded, states, failures = generation.encode_all(
+    encoded, failures = generation.encode_all(
         Template(), [{"messages": [{"role": "user", "content": "q"}]}], logprobs_only=False, strict=True
     )
     assert failures == {}
-    assert generation.prompt_ids(encoded[0], states[0]) == [8, 9]
+    assert generation.prompt_ids(encoded[0]) == [1, 2]
+    assert engine_input_ids(encoded[0]) == [8, 9]
+    assert encoded[0]["messages"] == [{"role": "user", "content": "q"}]
 
 
 def test_generation_rejects_feature_only_multimodal_input():
-    with pytest.raises(NotImplementedError, match="Trajectory or RolloutState"):
+    with pytest.raises(ValueError, match="engine_input_ids and original media"):
         generation.encode_all(
             None, [{"input_ids": [1], "pixel_values": torch.ones(1)}], logprobs_only=False, strict=True
         )
@@ -147,17 +141,15 @@ class TestEncodeTrajectory:
         with pytest.raises(ValueError, match="Template not set"):
             sampler.encode_trajectory({"messages": []})
 
-    def test_builds_input_feature_and_filters_keys(self):
+    def test_builds_input_feature_and_preserves_keys(self):
         sampler = _ConcreteSampler()
         template = _FakeTemplate()
         sampler.template = template
         result = sampler.encode_trajectory({"messages": []})
-        # input_ids came back as a tensor and must be converted to a plain list.
-        assert result["input_ids"] == [1, 2, 3]
-        assert isinstance(result["input_ids"], list)
-        # 'labels' is deliberately not carried into the sampler InputFeature.
-        assert "labels" not in result
-        # Extra multimodal / mask keys are copied through untouched.
+        # The template's numerical fields and conversation are retained, not projected by the sampler.
+        assert torch.equal(result["input_ids"], torch.tensor([1, 2, 3]))
+        assert torch.equal(result["labels"], torch.tensor([-100, -100, 3]))
+        assert result["messages"] == []
         assert result["attention_mask"] == [1, 1, 1]
         assert result["images"] == ["pic"]
 

@@ -32,9 +32,11 @@ class GateSampler(Sampler):
 
 
 def receiver_stub(flags):
+    # 58b2b979: receivers are local CudaDeltaReceiver objects whose next_flush/send_flush are sync
+    # callables offloaded to threads (asyncio.to_thread), not Ray actor .remote() handles.
     return SimpleNamespace(
-        next_flush=SimpleNamespace(remote=AsyncMock(side_effect=flags)),
-        send_flush=SimpleNamespace(remote=AsyncMock()),
+        next_flush=Mock(side_effect=flags),
+        send_flush=Mock(),
     )
 
 
@@ -70,7 +72,7 @@ def test_sampler_coordinates_native_update_and_gpu_local_senders():
     assert [call.args[0] for call in sampler._delta_rpc.await_args_list] == [
         'init_weight_transfer_engine', 'start_weight_update', 'update_twinkle_delta_weights', 'finish_weight_update']
     for receiver in sampler._delta_receivers:
-        receiver.send_flush.remote.assert_awaited_once()
+        receiver.send_flush.assert_called_once()
     sampler.engine.engine.reset_prefix_cache.assert_awaited_once_with(reset_connector=True)
     sampler.engine.engine.reset_mm_cache.assert_awaited_once()
     sampler.engine.engine.reset_encoder_cache.assert_awaited_once()
@@ -129,6 +131,8 @@ def test_checkpoint_receiver_keeps_flush_on_local_gpu_until_ipc(monkeypatch):
     receiver = CudaDeltaReceiver(config, {'world_size': 3, 'master_metadata': 'master'},
                                  {'rank': 2, 'device_uuid': 'GPU-test', 'cuda_visible_device': '3',
                                   'zmq_handle': 'ipc:///tmp/rank2.sock'})
+    # 58b2b979: the process group is joined lazily in ready() (the rendezvous barrier), not in __init__.
+    receiver.ready()
     engine.init_process_group.assert_called_once_with(2, 3, 'master')
     assert receiver.next_flush() == {'is_last': True}
     receiver.send_flush()
@@ -167,51 +171,54 @@ def test_receiver_rejects_gpu_mismatch_before_joining_group(monkeypatch):
 
 @pytest.mark.parametrize('use_worker_selector', [False, True])
 def test_topology_places_one_receiver_on_each_vllm_gpu(monkeypatch, use_worker_selector):
-    import ray
+    # 58b2b979: receivers are local CudaDeltaReceiver participants bound to a DeviceGroup (node_addresses
+    # + visible_devices), not Ray actor handles scheduled by node_id. Assert the placement each receiver
+    # is constructed with: one per vLLM GPU, global rank, and the worker selector overriding the UUID.
+    from twinkle.checkpoint_engine.delta.rollout import mixin as rollout_mixin
     metadata = [dict(node_ip='10.0.0.1', device_uuid=f'GPU-{rank}', zmq_handle=f'ipc:///tmp/rank{rank}.sock')
                 for rank in range(2)]
     if use_worker_selector:
         for rank, worker in enumerate(metadata):
             worker['cuda_visible_device'] = str(rank + 2)
     created = []
+    groups = []
 
-    class Actor:
-        def options(self, **options):
-            self.options_for_rank = options
-            return self
+    class FakeGroup:
+        def __init__(self, **kwargs):
+            groups.append(kwargs)
 
-        def remote(self, config, endpoint, placement):
-            created.append((self.options_for_rank, placement['rank'], placement['zmq_handle']))
-            return SimpleNamespace(ready=SimpleNamespace(remote=lambda: placement['rank']))
+    class FakeReceiver:
+        def __init__(self, config, endpoint, placement, remote_group=None, instance_id=None, call_timeout=None):
+            created.append((placement['rank'], placement['zmq_handle'], remote_group))
 
-    remote = Mock(return_value=lambda cls: Actor())
-    monkeypatch.setattr(ray, 'remote', remote)
-    monkeypatch.setattr(ray, 'nodes', lambda: [dict(Alive=True, NodeManagerAddress='10.0.0.1', NodeID='ab' * 28)])
-    monkeypatch.setattr(ray, 'get', lambda refs, **kwargs: refs)
+        def ready(self):
+            return 0
+
+    monkeypatch.setattr(rollout_mixin, 'DeviceGroup', FakeGroup)
+    monkeypatch.setattr(rollout_mixin, 'CudaDeltaReceiver', FakeReceiver)
     sampler = LocalCudaSampler()
     sampler._delta_rpc = AsyncMock(return_value=metadata)
     sampler._delta_config = SimpleNamespace(timeout_seconds=1)
     sampler.init_delta_sampler_transport({'world_size': 3, 'master_metadata': 'master',
                                               'rollout_workers': metadata})
-    assert [item[1:] for item in created] == [(1, 'ipc:///tmp/rank0.sock'), (2, 'ipc:///tmp/rank1.sock')]
+    assert [item[:2] for item in created] == [(1, 'ipc:///tmp/rank0.sock'), (2, 'ipc:///tmp/rank1.sock')]
     expected_selectors = ['2', '3'] if use_worker_selector else ['GPU-0', 'GPU-1']
-    assert [item[0]['runtime_env']['env_vars']['CUDA_VISIBLE_DEVICES'] for item in created] == expected_selectors
-    assert all(item[0]['scheduling_strategy'].node_id == 'ab' * 28 for item in created)
-    assert remote.call_args.kwargs == {'num_cpus': 0, 'num_gpus': 0}
+    assert [g['visible_devices'] for g in groups] == [[s] for s in expected_selectors]
+    assert all(g['node_addresses'] == ['10.0.0.1'] for g in groups)
+    assert all(g['device_type'] == 'GPU' and g['ranks'] == 1 for g in groups)
 
 
 def test_replica_receivers_use_global_ranks_across_nodes(monkeypatch):
-    import ray
     workers = [dict(node_ip=f'10.0.0.{rank // 2 + 1}', device_uuid=f'GPU-{rank}',
                     zmq_handle=f'ipc:///rank{rank}') for rank in range(4)]
-    monkeypatch.setattr(ray, 'nodes', lambda: [
-        dict(Alive=True, NodeManagerAddress=f'10.0.0.{rank + 1}', NodeID=str(rank)) for rank in range(2)])
     endpoint = dict(world_size=5, master_metadata='master', rollout_workers=workers)
     sampler = LocalCudaSampler()
     placements = [sampler._delta_receiver_placements(workers[:2], endpoint),
                   sampler._delta_receiver_placements(workers[2:], endpoint)]
     assert [[item['rank'] for item in replica] for replica in placements] == [[1, 2], [3, 4]]
-    assert [[item['node_id'] for item in replica] for replica in placements] == [['0', '0'], ['1', '1']]
+    # 58b2b979: placements carry node_ip (DeviceGroup node_addresses), not a resolved Ray node_id.
+    assert [[item['node_ip'] for item in replica] for replica in placements] == [
+        ['10.0.0.1', '10.0.0.1'], ['10.0.0.2', '10.0.0.2']]
 
 
 def test_sampler_dp_allows_independent_rollout_replicas():

@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import numpy as np
 import sys
-from typing import TYPE_CHECKING, Any, List, Union
+from typing import Any, List, Union
 
 if sys.version_info[:2] <= (3, 11):
     # Pydantic requirements.
@@ -25,11 +25,7 @@ class InputFeature(TypedDict, total=False):
         channel: Optional sample group used for per-channel loss metrics.
         length: The length of input_ids.
 
-    Multimodal fields (raw data, processed by engine/model):
-        images: List of images (PIL.Image, file paths, or URLs).
-            These are raw images before model-specific processing.
-        videos: List of videos (file paths or list of frames).
-            These are raw videos before model-specific processing.
+    Multimodal model tensors use model-specific numerical fields such as pixel_values and input_features.
     """
     # Text-related fields
     input_ids: InputType

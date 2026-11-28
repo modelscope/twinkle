@@ -59,8 +59,8 @@ class CheckpointEngineManager:
     * ``colocate`` connects Ray model and sampler actors sharing GPUs through CUDA IPC.
     * ``standalone`` connects disaggregated Ray actors through NCCL/HCCL.
 
-    ``auto`` resolves local objects to ``naive`` and Ray actor handlers to ``standalone``. It never
-    guesses ``colocate`` because actor placement cannot be inferred reliably from the driver.
+    ``auto`` uses ``naive`` only when both endpoints share the caller's direct-stream execution
+    context; otherwise it uses ``standalone``. ``colocate`` remains an explicit allocation choice.
 
     The manager owns the policy version: every completed :meth:`sync_weights` adds one, and
     :meth:`version` reads it without waiting for a sync in progress. Built with a ``remote_group``
@@ -127,7 +127,18 @@ class CheckpointEngineManager:
         self.model = model
         self.sampler = sampler
         self.requested_mode = mode
-        self.mode = self._resolve_mode(mode, model, sampler)
+        model_capabilities = model.checkpoint_transfer_capabilities()
+        sampler_capabilities = sampler.checkpoint_transfer_capabilities()
+        self.mode = self._resolve_mode(mode, model_capabilities, sampler_capabilities)
+        if platform is None and self.mode != 'naive':
+            endpoints = (model_capabilities, sampler_capabilities)
+            capabilities = [_wait(item)
+                            for endpoint in endpoints
+                            for item in (endpoint if isinstance(endpoint, list) else [endpoint])]
+            devices = {item['device_type'] for item in capabilities}
+            if len(devices) != 1:
+                raise ValueError(f'Checkpoint endpoints require one compatible device platform, got {sorted(devices)}.')
+            platform = devices.pop()
         self.backend_cls = self.decide_backend_engine(platform, self.mode)
         if sync_backend not in ('full', 'delta_sharded'):
             raise ValueError(f'Unknown weight sync backend: {sync_backend}')
@@ -194,26 +205,29 @@ class CheckpointEngineManager:
     @staticmethod
     def _resolve_mode(
         mode: CheckpointEngineMode,
-        model: 'CheckpointEngineMixin',
-        sampler: 'CheckpointEngineMixin',
+        model_capabilities: Any,
+        sampler_capabilities: Any,
     ) -> Literal['naive', 'colocate', 'standalone']:
         if mode not in _VALID_MODES:
             valid = ', '.join(sorted(_VALID_MODES))
             raise ValueError(f'Unknown checkpoint engine mode {mode!r}; expected one of: {valid}.')
 
-        model_has_actors = bool(getattr(model, '_actors', None))
-        sampler_has_actors = bool(getattr(sampler, '_actors', None))
-        if model_has_actors != sampler_has_actors:
-            raise ValueError(
-                'CheckpointEngineManager requires model and sampler to use the same deployment shape: '
-                'both must be local objects or both must be Ray actor handlers.')
-
+        senders = model_capabilities if isinstance(model_capabilities, list) else [model_capabilities]
+        receivers = sampler_capabilities if isinstance(sampler_capabilities, list) else [sampler_capabilities]
+        if not senders or not receivers:
+            raise ValueError('Checkpoint synchronization requires at least one sender and receiver.')
+        # A lazy-collected capability answers with the plain dict ONLY when the call ran in
+        # THIS process; a remote endpoint answers with a pending handle. That shape -- chosen
+        # entirely by the infra transport, never by an identity embedded in the declaration --
+        # is the co-execution test: direct streaming needs both roles as local objects here,
+        # each declaring its half of the capability.
+        direct = (len(senders) == len(receivers) == 1
+                  and isinstance(senders[0], dict) and isinstance(receivers[0], dict)
+                  and bool(senders[0].get('direct_stream')) and bool(receivers[0].get('direct_stream')))
         if mode == 'auto':
-            return 'standalone' if model_has_actors else 'naive'
-        if mode == 'naive' and model_has_actors:
-            raise ValueError("mode='naive' requires local model and sampler objects without Ray actors.")
-        if mode in ('colocate', 'standalone') and not model_has_actors:
-            raise ValueError(f"mode={mode!r} requires model and sampler to be Ray actor handlers.")
+            return 'naive' if direct else 'standalone'
+        if mode == 'naive' and not direct:
+            raise ValueError("mode='naive' requires a shared direct-stream execution context.")
         return mode
 
     @staticmethod
@@ -475,10 +489,10 @@ class CheckpointEngineManager:
         receiver_devices = [t['device_uuid'] for t in targets]
         if len(set(receiver_devices)) != len(receiver_devices):
             return False
-        return all(devices.count(d) == 1 for d in receiver_devices)
+        return bool(receiver_devices) and all(devices.count(d) == 1 for d in receiver_devices)
 
     def _warm_colocated_ipc(self, sub: Any, channel: str) -> bool:
-        """Warm colocated new replicas via direct IPC; return False to fall through to NCCL.
+        """Warm colocated new replicas via direct IPC; return False to use checkpoint-engine sync.
 
         Lend grows sampler replicas onto the trainer's GPUs while the trainer is offloaded
         (defect118). The NCCL checkpoint PG would assign trainer rank 0 and the new replica
@@ -495,7 +509,11 @@ class CheckpointEngineManager:
             return False
         targets = [t for r in replicas for t in (r if isinstance(r, list) else [r])]
         self._ensure_model_keys()
-        steps = (False, True) if (not self._merge_and_sync and self.base_sync_done) else (False,)
+        if not self._merge_and_sync and self.base_sync_done:
+            steps = (False, True)
+        else:
+            # A merged publication after training must include the learned adapters.
+            steps = (self.base_sync_done and self._merge_and_sync,)
         for base_sync_done in steps:
             peft_config = self._adapter_config(base_sync_done, self._merge_and_sync)
             _together(
@@ -509,6 +527,22 @@ class CheckpointEngineManager:
         return True
 
     # ── New replicas ─────────────────────────────────────────────────────────
+
+    @remote_function(collect='first', lazy_collect=False)
+    def prepare_for_lending(self) -> None:
+        """Prepare merged publication while the trainer still owns its devices."""
+        with self._sync_lock:
+            prepare = getattr(self.model, 'prepare_for_lending', None)
+            if self._merge_and_sync and prepare is not None:
+                prepare()
+
+    @remote_function(collect='first', lazy_collect=False)
+    def restore_after_lending(self) -> None:
+        """Undo publication preparation after the trainer has reloaded its parameters."""
+        with self._sync_lock:
+            restore = getattr(self.model, 'restore_after_lending', None)
+            if restore is not None:
+                restore()
 
     @remote_function(collect='first', lazy_collect=False)
     def warm(self, sub) -> None:
@@ -533,8 +567,10 @@ class CheckpointEngineManager:
                 return
             try:
                 count = len(self._activate_checkpoint_channel(sub, channel))
+                # A merged publication must include learned adapters, not just the initial base.
+                base_sync_done = self.base_sync_done and self._merge_and_sync
+                self._transfer(sub, count, self._merge_and_sync, base_sync_done)
                 # LoRA-only syncs need the base first, then the current adapter on top of it.
-                self._transfer(sub, count, self._merge_and_sync, False)
                 if not self._merge_and_sync and self.base_sync_done:
                     self._transfer(sub, count, self._merge_and_sync, True)
             finally:

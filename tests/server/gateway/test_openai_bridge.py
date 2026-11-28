@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle.server.gateway.openai_bridge import (make_error, translate_chat_request, translate_response,
+from twinkle_server.gateway.openai_bridge import (make_error, translate_chat_request, translate_response,
                                                   translate_stream_chunk)
 
 # ---------- translate_chat_request ----------------------------------------- #
@@ -22,7 +22,7 @@ class TestTranslateChatRequest:
         }
         req, model = translate_chat_request(body)
         assert model == 'lora-abc'
-        assert req['adapter_name'] == 'lora-abc'
+        assert 'adapter_name' not in req
         assert req['inputs'] == {'messages': [{'role': 'user', 'content': 'Hello'}]}
         assert req['sampling_params'] is None
 

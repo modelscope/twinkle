@@ -1,6 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Unit tests for the pure helpers in twinkle.sampler.generation."""
-from types import SimpleNamespace
+"""Unit tests for the pure helpers in twinkle.sampler.generation.
+
+Harness migrated to the 012aff34/8314e88d/c94096a4 complete-Trajectory contract:
+the per-index RolloutState dict argument is gone from attach_features/run_chunk,
+append_completion returns the Trajectory dict directly, and per-token companions
+must align with the row's prompt input_ids.
+"""
 
 import pytest
 import torch
@@ -64,15 +69,42 @@ class TestCollateExtraModelInputs:
         assert collated['pixel_values'].shape == (3, 3)
 
     def test_per_token_companions_are_left_padded_and_stacked(self):
+        # 012aff34: per-token companions must align with the row's prompt input_ids
+        # (ValueError otherwise); fixture lengths updated, padding assertions unchanged.
         encoded = {
-            0: {'input_ids': [1], 'mm_token_type_ids': torch.tensor([1., 2., 3., 4.])},
-            1: {'input_ids': [2], 'mm_token_type_ids': torch.tensor([5., 6.])},
+            0: {'input_ids': [1, 2, 3, 4], 'mm_token_type_ids': torch.tensor([1., 2., 3., 4.])},
+            1: {'input_ids': [2, 3], 'mm_token_type_ids': torch.tensor([5., 6.])},
         }
         collated = collate_extra_model_inputs([0, 1], encoded)
         stacked = collated['mm_token_type_ids']
         assert stacked.shape == (2, 4)
         # The narrower row is LEFT-padded to the batch width (engine builds left-padded ids).
         assert torch.equal(stacked[1], torch.tensor([0., 0., 5., 6.]))
+
+    def test_per_token_companion_with_leading_batch_dim_is_squeezed(self):
+        # Qwen3_5Template emits mm_token_type_ids as [1, L]; stacking must yield [B, L],
+        # not [B, 1, L] (HF generate's per-step update cats a 2-D extension).
+        # 012aff34: companion length must equal the row's prompt input_ids length.
+        encoded = {
+            0: {'input_ids': [1, 2, 3], 'mm_token_type_ids': torch.tensor([[0, 0, 0]])},
+            1: {'input_ids': [2, 3], 'mm_token_type_ids': torch.tensor([[0, 0]])},
+        }
+        collated = collate_extra_model_inputs([0, 1], encoded)
+        assert collated['mm_token_type_ids'].shape == (2, 3)
+        assert torch.equal(collated['mm_token_type_ids'][1], torch.tensor([0, 0, 0]))
+
+    def test_mrope_position_ids_batch_on_dim_one_with_left_pad(self):
+        # M-RoPE position_ids are [sections, 1, L] per row: batch on dim 1, left-pad on L.
+        encoded = {
+            0: {'input_ids': [1, 2], 'position_ids': torch.arange(6).reshape(3, 1, 2)},
+            1: {'input_ids': [3], 'position_ids': torch.arange(3).reshape(3, 1, 1)},
+        }
+        collated = collate_extra_model_inputs([0, 1], encoded)
+        pos = collated['position_ids']
+        assert pos.shape == (3, 2, 2)
+        assert torch.equal(pos[:, 0, :], torch.arange(6).reshape(3, 2))
+        assert torch.equal(pos[:, 1, 0], torch.zeros(3, dtype=pos.dtype))  # left pad
+        assert torch.equal(pos[:, 1, 1], torch.arange(3))
 
 
 class TestAttachFeatures:
@@ -84,7 +116,9 @@ class TestAttachFeatures:
 
         def append_completion(self, feat, tokens):
             self.calls.append((feat, tokens))
-            return SimpleNamespace(state=SimpleNamespace(feature={'feature_of': tuple(tokens)}))
+            # 012aff34: append_completion returns the complete Trajectory (dict) directly;
+            # the old RolloutState/.state.feature wrapper is gone.
+            return {'feature_of': tuple(tokens)}
 
     def _response(self, tokens):
         return SampleResponse(
@@ -93,23 +127,45 @@ class TestAttachFeatures:
         )
 
     def test_none_template_is_a_no_op(self):
+        # 012aff34/8314e88d: normal sampling REQUIRES a template (ValueError); the
+        # template-free lane is token_only engine primitives, which stay a no-op.
         template = self._Template()
-        attach_features(None, [self._response([3])], {0: {'input_ids': [1]}}, {0: None})
+        response = self._response([3])
+        with pytest.raises(ValueError, match='normal sampling requires a template'):
+            attach_features(None, [response], {0: {'input_ids': [1]}})
+        attach_features(None, [response], {0: {'input_ids': [1]}}, token_only=True)
         assert template.calls == []
+        assert response.sequences[0].new_input_feature is None
 
     def test_feature_is_attached_through_append_completion(self):
         template = self._Template()
         response = self._response([3, 4])
         feat = {'input_ids': [1]}
-        attach_features(template, [response], {0: feat}, {0: None})
+        attach_features(template, [response], {0: feat})
         assert template.calls == [(feat, [3, 4])]
         assert response.sequences[0].new_input_feature == {'feature_of': (3, 4)}
 
-    def test_empty_tokens_missing_feature_and_none_response_are_skipped(self):
+    def test_unusable_rows_skip_the_template(self):
+        # 012aff34/c94096a4 contract: None responses and None features are skipped; an
+        # error placeholder with empty tokens keeps the prompt feature WITHOUT a template
+        # call. An empty-token 'stop' sequence is a valid (immediate-EOS) completion and
+        # DOES go through append_completion under the new contract.
         template = self._Template()
-        response = self._response([])
-        attach_features(template, [response, None], {0: {}, 1: {'input_ids': [9]}}, {0: None, 1: None})
+        feat = {'input_ids': [1]}
+
+        def _error():
+            return SampleResponse(
+                prompt_token_ids=[1],
+                sequences=[SampledSequence(stop_reason='error', tokens=[], decoded='')],
+            )
+
+        error_with_feat, error_no_feat = _error(), _error()
+        attach_features(template, [None, error_with_feat, error_no_feat], {0: feat, 1: feat, 2: {}})
         assert template.calls == []
+        assert error_with_feat.sequences[0].new_input_feature == feat
+        empty_stop = self._response([])
+        attach_features(template, [empty_stop], {0: feat})
+        assert template.calls == [(feat, [])]
 
 
 class TestGroupByAdapter:
@@ -136,7 +192,7 @@ class TestRunChunk:
             seen.update(prompts=prompts, extra=extra)
             return ['r0', 'r1']
 
-        assert run_chunk([0, 1], encoded, {0: None, 1: None}, call_batch) == ['r0', 'r1']
+        assert run_chunk([0, 1], encoded, call_batch) == ['r0', 'r1']
         assert seen['prompts'] == [[10], [20, 21]]
         assert seen['extra'] == {}
 
@@ -145,14 +201,26 @@ class TestRunChunk:
             raise RuntimeError('boom')
 
         with pytest.raises(RuntimeError, match='boom'):
-            run_chunk([0, 1], {0: {'input_ids': [1]}, 1: {'input_ids': [2]}}, {0: None, 1: None}, call_batch)
+            run_chunk([0, 1], {0: {'input_ids': [1]}, 1: {'input_ids': [2]}}, call_batch)
 
-    def test_single_item_failure_raises_even_when_not_strict(self):
+    def test_single_item_failure_drops_when_not_strict(self):
+        # The non-strict contract ("one bad row cannot discard a long run") must not depend
+        # on how inputs are chunked: a row alone in a chunk (batch_size=1 or a tail of 1)
+        # gets the same error placeholder as a row isolated from a bigger batch.
+        def call_batch(prompts, extra):
+            raise RuntimeError('boom')
+
+        results = run_chunk([0], {0: {'input_ids': [1]}}, call_batch, strict=False)
+        assert results[0].sequences[0].stop_reason == 'error'
+        assert results[0].sequences[0].tokens == []
+        assert results[0].prompt_token_ids == [1]
+
+    def test_single_item_failure_still_raises_when_strict(self):
         def call_batch(prompts, extra):
             raise RuntimeError('boom')
 
         with pytest.raises(RuntimeError, match='boom'):
-            run_chunk([0], {0: {'input_ids': [1]}}, {0: None}, call_batch, strict=False)
+            run_chunk([0], {0: {'input_ids': [1]}}, call_batch, strict=True)
 
     def test_non_strict_failure_isolates_the_bad_input(self):
         encoded = {0: {'input_ids': [1]}, 1: {'input_ids': [2]}, 2: {'input_ids': [3]}}
@@ -169,7 +237,7 @@ class TestRunChunk:
                 sequences=[SampledSequence(stop_reason='stop', tokens=[7], decoded='')],
             )]
 
-        results = run_chunk([0, 1, 2], encoded, {0: None, 1: None, 2: None}, call_batch, strict=False)
+        results = run_chunk([0, 1, 2], encoded, call_batch, strict=False)
         # One batch attempt, then one call per input to isolate the failure.
         assert attempts == [[[1], [2], [3]], [[1]], [[2]], [[3]]]
         assert results[0].sequences[0].tokens == [7]

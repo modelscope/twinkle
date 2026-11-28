@@ -76,9 +76,104 @@ def batch_summary(trajs: Sequence[Trajectory]) -> Dict[str, Any]:
 class TrajectoryUpdate:
     """The remote carrier for field write-back: scored rewards and identity onto the trajectories."""
 
-    @remote_function(execute='first', collect='first', stash=(0,))
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=True)
+    def expand_prompts(self, batch, *, num_generations: int = 1, sampling_params=None):
+        """Expand prompt groups at the data boundary, with distinct identities for every episode."""
+        import uuid
+        from twinkle.data_format import attach_user_data
+
+        rows = batch.get('rows', []) if isinstance(batch, dict) else batch
+        if not isinstance(rows, list) or not rows:
+            raise ValueError('Generation requires a non-empty list of prompt rows.')
+        if num_generations < 1:
+            raise ValueError('num_generations must be positive.')
+        expanded = []
+        for prompt in rows:
+            group_key = uuid.uuid4().int
+            for sample_index in range(num_generations):
+                row = dict(prompt)
+                row.update(episode_id=uuid.uuid4().hex, group_key=group_key, sample_index=sample_index)
+                if sampling_params:
+                    row = attach_user_data(row, sampling_params=sampling_params)
+                expanded.append(row)
+        return expanded
+
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=True)
+    def pad_rows(self, template: Trajectory, *, pad_count: int) -> List[Trajectory]:
+        """Inert DP pad rows: marked copies of one real row for the remainder slots.
+
+        A rollout batch's row count carries no divisibility invariant, while the fixed
+        micro-batch forward lanes require equal per-rank counts. Each pad row copies a real
+        row's encoded features so the lanes can process it; the marker fields let the
+        advantage (excluded from group stats) and the training-side strip drop these rows
+        without inspecting content. Stashed element-wise, the pad rows stay object
+        references end to end.
+        """
+        if pad_count < 1:
+            raise ValueError('pad_rows requires a positive pad count.')
+        rows = []
+        for index in range(pad_count):
+            row = dict(template)
+            row['episode_id'] = f'__dp_pad_{index}'
+            row['group_key'] = f'__dp_pad_{index}'
+            row['_dp_pad'] = True
+            row.pop('advantages', None)
+            row.pop('returns', None)
+            rows.append(row)
+        return rows
+
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=(0, 1))
+    def score(self, trajs: List[Trajectory], *, scorers: Sequence[Tuple[str, Callable]]):
+        """Score named columns once and publish trajectories, score rows, and light metrics."""
+        from concurrent.futures import Future
+
+        if not trajs:
+            raise ValueError('Scoring requires a non-empty trajectory batch.')
+        if not scorers:
+            raise ValueError('Scoring requires at least one named scorer.')
+        rows = [dict(traj) for traj in trajs]
+        values = {}
+        invalid = 0
+        names = [str(name) for name, _ in scorers]
+        if len(names) != len(set(names)):
+            raise ValueError('Scorer column names must be unique.')
+        for name, (_, scorer) in zip(names, scorers):
+            if not callable(scorer):
+                raise TypeError(f'Scorer {name!r} is not callable.')
+            has_column = [name in ((traj.get('rewards') or {}).get('orm') or {}) for traj in trajs]
+            if all(has_column):
+                column = [traj['rewards']['orm'][name] for traj in trajs]
+            elif any(has_column):
+                raise ValueError(f'Scorer {name!r} has scored only part of the batch.')
+            else:
+                result = scorer(trajs)
+                if isinstance(result, Future):
+                    result = result.result()
+                column = list(result)
+                if len(column) != len(trajs):
+                    raise ValueError(f'Scorer {name!r} returned {len(column)} scores for {len(trajs)} rows.')
+            for row, value in zip(rows, column):
+                rewards = dict(row.get('rewards') or {})
+                orm = dict(rewards.get('orm') or {})
+                orm[name] = value
+                rewards['orm'] = orm
+                row['rewards'] = rewards
+            finite = [float(value) for value in column if value is not None and value == value]
+            invalid += len(column) - len(finite)
+            values[name] = sum(finite) / len(finite) if finite else None
+        scores = self.score_rows(rows)
+        return rows, scores, {'values': values, 'invalid_count': invalid}
+
+    @staticmethod
+    def score_rows(trajs: Sequence[Trajectory]) -> List[Dict[str, Any]]:
+        """Extract the estimator's score-row contract at the data compute boundary."""
+        return [{'rewards': dict(traj.get('rewards') or {}), 'prm_segments': traj.get('prm_segments')}
+                for traj in trajs]
+
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=(0,))
     def update(self, trajs: List[Trajectory], *,
-               updates: List[Dict[str, Any]]) -> Tuple[List[Trajectory], Dict[str, Any]]:
+               updates: List[Dict[str, Any]], merge_fields: Sequence[str] = ()
+               ) -> Tuple[List[Trajectory], Dict[str, Any]]:
         """Write fields onto copies of ``trajs`` and return ``(new_trajs, summary)``.
 
         ``updates`` aligns row for row with ``trajs``; a mismatched count or a field update that
@@ -92,6 +187,8 @@ class TrajectoryUpdate:
         for traj, row_updates in zip(trajs, updates):
             merged = dict(traj)
             for key, value in (row_updates or {}).items():
+                if key in merge_fields:
+                    value = {**(merged.get(key) or {}), **(value or {})}
                 merged[key] = value
             validate_trajectory(merged)
             new_trajs.append(merged)
@@ -102,7 +199,62 @@ class TrajectoryUpdate:
 class TrajectoryFilter:
     """The remote carrier for row selection: one caller-supplied rule picks the rows that train."""
 
-    @remote_function(execute='first', collect='first', stash=(0,))
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=(0, 1, 2))
+    def select_scored(self, trajs: List[Trajectory], *, mode: str = 'threshold',
+                      num_generations: int = 8, top_k: int = 1, threshold: float = 0.0,
+                      signals: Sequence[Tuple[str, Any]] = (), scores: Optional[List[Dict[str, Any]]] = None):
+        """Apply one score-based selection to trajectories, model channels, and score rows."""
+        from twinkle.data_format.output import select_model_output
+
+        if not trajs:
+            raise ValueError('Selection requires a non-empty trajectory batch.')
+        column_sets = {tuple(sorted((traj.get('rewards') or {}).get('orm') or {})) for traj in trajs}
+        if len(column_sets) != 1 or len(next(iter(column_sets))) != 1:
+            raise ValueError('Selection requires exactly one consistent named ORM column.')
+        name = next(iter(column_sets))[0]
+        rewards = [traj['rewards']['orm'][name] for traj in trajs]
+        # Collected segments of one episode are selected together, never ranked as independent samples.
+        episodes = {}
+        for index, traj in enumerate(trajs):
+            episode_id = traj.get('episode_id')
+            key = ('episode', episode_id) if episode_id is not None else ('row', index)
+            episodes.setdefault(key, []).append(index)
+        units = list(episodes.values())
+        unit_rewards = []
+        for indices in units:
+            values = [rewards[index] for index in indices]
+            finite = [float(value) for value in values if value is not None and np.isfinite(float(value))]
+            if finite and (len(finite) != len(values) or any(value != finite[0] for value in finite)):
+                raise ValueError('Collected segments of an episode must carry the same outcome score.')
+            unit_rewards.append(finite[0] if finite else None)
+        if mode in ('best_of_n', 'top_k'):
+            count = 1 if mode == 'best_of_n' else top_k
+            if num_generations < 1 or count < 1:
+                raise ValueError('Selection group width and top_k must be positive.')
+            groups = {}
+            for index, indices in enumerate(units):
+                group_key = trajs[indices[0]].get('group_key')
+                key = ('group', group_key) if group_key is not None else ('block', index // num_generations)
+                groups.setdefault(key, []).append(index)
+            selected = []
+            for group in groups.values():
+                valid = [index for index in group if unit_rewards[index] is not None]
+                selected.extend(sorted(valid, key=lambda index: -unit_rewards[index])[:count])
+        elif mode == 'threshold':
+            selected = [index for index, value in enumerate(unit_rewards) if value is not None and value >= threshold]
+        else:
+            raise ValueError(f'Unknown selection mode {mode!r}.')
+        keep = sorted(index for unit in selected for index in units[unit])
+        rows = [trajs[index] for index in keep]
+        if scores is None:
+            scores = TrajectoryUpdate.score_rows(trajs)
+        if len(scores) != len(trajs):
+            raise ValueError('Score rows must align with the trajectory batch before selection.')
+        lanes = [select_model_output(value, keep, len(trajs)) for _, value in signals]
+        summary = {'values': {'kept': len(keep), 'dropped': len(trajs) - len(keep)}, 'invalid_count': 0}
+        return rows, lanes, [scores[index] for index in keep], summary
+
+    @remote_function(execute='first', collect='first', lazy_collect=False, stash=(0,))
     def select(self, trajs: List[Trajectory], *,
                indices: Optional[List[int]] = None,
                where: Optional[Callable[[Trajectory], bool]] = None

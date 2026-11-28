@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from twinkle.template.base import Template
 from twinkle.template.utils import (
     TokenizeByPlaceHolder,
     TokenizeByRound,
@@ -126,17 +127,30 @@ class TestTransferToStandardMessage:
 
 
 class TestConstructTemplateSpecPath:
+    # 8314e88d: construct_template validates template_cls as a Template instance,
+    # subclass or registered name BEFORE the template_spec dispatch; the spec factory
+    # path therefore applies to Template subclasses, and unregistered bare names raise
+    # the 'not registered in this worker' ValueError.
 
     def test_extra_kwargs_with_spec_are_rejected(self):
+
+        class SpecTemplate(Template):
+            pass
+
         with pytest.raises(TypeError, match='Unexpected TemplateSpec construction arguments'):
-            construct_template(object, template_spec=object(), anything=1)
+            construct_template(SpecTemplate, template_spec=object(), anything=1)
 
     def test_undotted_factory_path_is_rejected(self):
-        with pytest.raises(ValueError, match='dotted class path'):
+        with pytest.raises(ValueError, match='is not registered in this worker'):
             construct_template('NotDotted', template_spec=object())
 
+    def test_non_template_class_is_rejected(self):
+        with pytest.raises(TypeError, match='must be a Template instance, subclass or registered name'):
+            construct_template(object, template_spec=object())
+
     def test_class_without_from_spec_is_rejected(self):
-        class NoFromSpec:
+
+        class NoFromSpec(Template):
             pass
 
         with pytest.raises(TypeError, match='does not implement from_spec'):
@@ -145,7 +159,7 @@ class TestConstructTemplateSpecPath:
     def test_from_spec_factory_receives_the_spec(self):
         marker = object()
 
-        class WithFromSpec:
+        class WithFromSpec(Template):
 
             @classmethod
             def from_spec(cls, spec):

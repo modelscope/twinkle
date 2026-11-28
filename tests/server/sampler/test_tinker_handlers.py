@@ -5,8 +5,9 @@ from starlette.requests import Request
 from tinker import types
 
 from twinkle.data_format import SampledSequence, SampleResponse
-from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
-from twinkle.server.sampler.concurrency import SamplerConcurrency
+from twinkle_server.exceptions import RequestRejectedError
+from twinkle_server.sampler.tinker_handlers import _register_tinker_sampler_routes
+from twinkle_server.sampler.concurrency import SamplerConcurrency
 
 
 class _DummyState:
@@ -107,3 +108,20 @@ async def test_tinker_encoded_prompts_do_not_set_template_or_reset_prefix_cache(
 
     assert management.sampler.calls == []
     assert len(management.sampler.adapter_paths) == 3
+
+
+@pytest.mark.asyncio
+async def test_tinker_rejects_a_base_model_that_conflicts_with_the_session():
+    management = _DummyManagement()
+    app = FastAPI()
+    _register_tinker_sampler_routes(app, lambda: management)
+    route = next(route for route in app.routes if getattr(route, 'path', None) == '/tinker/asample')
+    body = types.SampleRequest(
+        prompt=types.ModelInput.from_ints([1]),
+        sampling_params=types.SamplingParams(max_tokens=1),
+        sampling_session_id='base-session',
+        base_model='different-model',
+    )
+    with pytest.raises(RequestRejectedError, match='base_model conflicts with the sampling session'):
+        await route.endpoint(Request({'type': 'http', 'headers': []}), body, management)
+    assert not management.sampler.adapter_paths

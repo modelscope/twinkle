@@ -19,9 +19,9 @@ from __future__ import annotations
 import ast
 import pathlib
 
-import twinkle
+import twinkle_server
 
-_HANDLERS = pathlib.Path(twinkle.__file__).resolve().parent / 'server' / 'model' / 'twinkle_handlers.py'
+_HANDLERS = pathlib.Path(twinkle_server.__file__).resolve().parent / 'model' / 'twinkle_handlers.py'
 
 
 def _is_call_backend(func: ast.AST) -> bool:

@@ -558,10 +558,18 @@ class TestAlignLogpsToMask:
         assert got[0, 3].item() == 0.0  # row 0's 4th position is unmasked anyway
 
     def test_row_shorter_than_farthest_masked_position_stays_zero(self):
-        """比最远 mask 位置还短的行：两侧都不猜测，metric 侧保持零。"""
+        """比最远 mask 位置还短的行：两侧都不猜测。
+
+        58b2b979 起默认 strict=True（ratio/advantage 消费侧）直接拒绝，与
+        GRPOLoss._pad_and_align_to_batch 一致；保持零覆盖的职责移到 sampler 对账
+        lane（strict=False, broadcast_scalar=False，见 metric/grpo.py 的
+        sampler_token_delta），由它报告缺口而不是杀死面板。
+        """
         mask = torch.tensor([[True, True, True, True]])
         short = [torch.tensor([1.0, 2.0])]  # needs positions up to 3
-        result = align_logps_to_mask(short, mask, torch.float32)
+        with pytest.raises(AssertionError, match='data/mask length mismatch'):
+            align_logps_to_mask(short, mask, torch.float32)
+        result = align_logps_to_mask(short, mask, torch.float32, strict=False, broadcast_scalar=False)
         assert result.abs().sum().item() == 0.0
 
     def test_2d_row_count_mismatch_raises(self):

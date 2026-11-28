@@ -1,0 +1,31 @@
+server:
+  http_listen_port: 3200
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+compactor:
+  compaction:
+    block_retention: 720h
+metrics_generator:
+  storage:
+    path: /var/tempo/generator/wal
+  traces_storage:
+    path: /var/tempo/generator/traces
+  processor:
+    local_blocks:
+      filter_server_spans: false
+      flush_to_storage: true
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [local-blocks]
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal

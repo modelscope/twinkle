@@ -21,16 +21,16 @@ import pytest_asyncio
 import uuid
 from typing import Any
 
-from twinkle.server.deployment import twinkle_server_error_handler
-from twinkle.server.state.backend.base import ConcurrencyError
-from twinkle.server.state.backend.memory_backend import RayActorBackend
+from twinkle_server.deployment import twinkle_server_error_handler
+from twinkle_server.state.backend.base import ConcurrencyError
+from twinkle_server.state.backend.memory_backend import RayActorBackend
 
 REDIS_URL = os.environ.get('TWINKLE_TEST_REDIS_URL', 'redis://localhost:6379/0')
 
 
 def _can_reach_redis() -> bool:
     try:
-        from twinkle.server.state.backend.redis_backend import RedisBackend
+        from twinkle_server.state.backend.redis_backend import RedisBackend
     except ImportError:
         return False
 
@@ -72,7 +72,7 @@ def _replace_with(current: Any | None, *, value: Any) -> Any:
 
 
 def _redis_backend():
-    from twinkle.server.state.backend.redis_backend import RedisBackend
+    from twinkle_server.state.backend.redis_backend import RedisBackend
 
     return RedisBackend(REDIS_URL, key_prefix=f'twinkle-test-{uuid.uuid4().hex[:8]}::')
 
@@ -98,7 +98,7 @@ async def backend_pair(request):
     if request.param == 'redis':
         if not _REDIS_AVAILABLE_AT_COLLECTION:
             pytest.skip(f'Redis at {REDIS_URL} unreachable')
-        from twinkle.server.state.backend.redis_backend import RedisBackend
+        from twinkle_server.state.backend.redis_backend import RedisBackend
         first = RedisBackend(REDIS_URL, key_prefix=prefix)
         second = RedisBackend(REDIS_URL, key_prefix=prefix)
     else:
@@ -141,7 +141,7 @@ async def test_atomic_update_reports_this_call_not_the_existing_value(backend_pa
 
 @pytest.mark.asyncio
 async def test_future_execution_is_claimed_once_across_backend_handles(backend_pair):
-    from twinkle.server.state.future_manager import FutureManager
+    from twinkle_server.state.future_manager import FutureManager
     first, second = [FutureManager(backend, 300) for backend in backend_pair]
     await first.store_status('start', 'pending', 'm')
     starts = await asyncio.gather(*(manager.try_start('start') for manager in [first, second] * 8))
@@ -154,7 +154,7 @@ async def test_future_execution_is_claimed_once_across_backend_handles(backend_p
 @pytest.mark.asyncio
 @pytest.mark.parametrize('cancel_first', [False, True])
 async def test_future_start_cancel_race_across_backend_handles(backend_pair, cancel_first):
-    from twinkle.server.state.future_manager import FutureManager
+    from twinkle_server.state.future_manager import FutureManager
     first, second = [FutureManager(backend, 300) for backend in backend_pair]
     await first.store_status('start', 'queued', 'm')
     calls = [first.try_start('start'), second.cancel_if_pending('start')]
@@ -299,8 +299,8 @@ async def test_redis_retry_exhaustion_maps_to_http_503(redis_backend) -> None:
 
 @pytest.mark.asyncio
 async def test_future_owner_is_shared_with_result_and_removed_with_it(backend_pair):
-    from twinkle.server.exceptions import ResourceNotFoundError
-    from twinkle.server.state import ServerState
+    from twinkle_server.exceptions import ResourceNotFoundError
+    from twinkle_server.state import ServerState
     first, second = (ServerState(backend=backend) for backend in backend_pair)
     await first.store_future_status('owned', 'pending', None, owner_token='owner')
     await second.store_future_status('owned', 'completed', None, result=42)

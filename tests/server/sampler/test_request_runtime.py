@@ -7,16 +7,16 @@ from types import SimpleNamespace
 import pytest
 
 from tests.server.task_queue.helpers import _DummyQueue
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.sampler.concurrency import SamplerConcurrency
-from twinkle.server.task_queue.types import ExecutionScope
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.sampler.concurrency import SamplerConcurrency
+from twinkle_server.task_queue.types import ExecutionScope
 
 
 @pytest.mark.asyncio
 async def test_encode_retains_execution_ownership_and_blocks_weight_mutation():
     import json
     from unittest.mock import AsyncMock
-    from twinkle.server.sampler.runtime import SamplerRuntime
+    from twinkle_server.sampler.runtime import SamplerRuntime
 
     entered, release, mutated = asyncio.Event(), asyncio.Event(), asyncio.Event()
     owner = _DummyQueue()
@@ -75,8 +75,8 @@ async def test_allocated_sampler_initializes_with_typed_owner_context(monkeypatc
     from unittest.mock import Mock
     from twinkle.infra._ray.ray_helper import RayHelper
     from twinkle.infra._ray.resource_manager import ResourceManager
-    from twinkle.server.sampler import app as module
-    from twinkle.server.state.models import RuntimeContext
+    from twinkle_server.sampler import app as module
+    from twinkle_server.state.models import RuntimeContext
 
     context = RuntimeContext(namespace='owned', registry_name='registry', instance_id='sampler-owned')
     allocation = object()
@@ -143,13 +143,13 @@ async def test_worker_exports_actual_completion_handle_without_private_task_look
 
 @pytest.mark.asyncio
 async def test_runtime_does_not_certify_an_unconfirmed_cancel_ack():
-    from twinkle.server.sampler.runtime import SamplerRuntime
-    from twinkle.server.exceptions import BackendBusyError
+    from twinkle_server.sampler.runtime import SamplerRuntime
+    from twinkle_server.exceptions import BackendBusyError
     guard = SamplerConcurrency()
     runtime = SamplerRuntime(SimpleNamespace(sampling_guard=guard))
     task = asyncio.create_task(asyncio.sleep(0))
     await task
-    from twinkle.server.sampler.runtime import SamplingOperation
+    from twinkle_server.sampler.runtime import SamplingOperation
     runtime._operations['cancelled'] = SamplingOperation(ExecutionScope(), task)
     guard.invalidate_weights(RuntimeError('cancel ACK preceded actual generation exit'))
     with pytest.raises(BackendBusyError):
@@ -161,7 +161,7 @@ async def test_runtime_does_not_certify_an_unconfirmed_cancel_ack():
 async def test_cold_lora_config_does_not_block_sampler_health(monkeypatch):
     import json
     import sys
-    from twinkle.server.sampler.runtime import SamplerRuntime
+    from twinkle_server.sampler.runtime import SamplerRuntime
     entered, release = threading.Event(), threading.Event()
     calls = []
 
@@ -216,8 +216,8 @@ async def test_cold_lora_config_does_not_block_sampler_health(monkeypatch):
 async def test_managed_compute_http_cannot_bypass_pool_admission(monkeypatch):
     import httpx
     from fastapi import FastAPI
-    from twinkle.server.exceptions import RequestRejectedError
-    from twinkle.server.sampler import app as module
+    from twinkle_server.exceptions import RequestRejectedError
+    from twinkle_server.sampler import app as module
 
     def scaffold(title, register_routes, **kwargs):
         app = FastAPI()

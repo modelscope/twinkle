@@ -48,6 +48,19 @@ pytestmark = [
                        reason='30B MoE weights not cached (or SKIP_MODEL_DOWNLOAD set)'),
 ]
 
+
+@pytest.fixture(autouse=True)
+def _twinkle_ray_isolation():
+    # twinkle.initialize is once-per-process: RayHelper caches the ResourceManager from the FIRST
+    # call and the shared registry's group config is first-write-wins. When the tiered suite runs
+    # several ray-mode weight-sync tests in one pytest process, a later test's different topology
+    # is silently ignored (it inherits this test's groups/placements) and leaked actors keep GPU
+    # memory. Release everything after each test so the next initialize builds its own topology.
+    yield
+    import twinkle
+    twinkle.shutdown()
+
+
 # For MoE models, vLLM does not support LoRA on expert layers.
 # Only target attention QKV + output projection.
 LORA_TARGET_MODULES = ['q_proj', 'k_proj', 'v_proj', 'o_proj']
@@ -165,9 +178,14 @@ def test_weight_sync(model_gpus: int = 2, sampler_gpus: int = 1, vllm_tp: int = 
 
     # Base model sync
     sync_start = time.time()
-    manager.sync_weights()
-    # lora
-    manager.sync_weights()
+    # Current contract (same as test_weight_sync.py, re-anchored in 139cfed5): an enable_lora
+    # receiver takes merge_and_sync=False -- the first call syncs the base (renamed to vLLM's
+    # .base_layer params), later calls sync only the LoRA delta of the auto-detected default
+    # adapter. The default merge_and_sync=True sends canonical names the LoRA-wrapped receiver
+    # does not expose (embed_tokens.weight vs embed_tokens.base_layer.weight).
+    manager.sync_weights(merge_and_sync=False)
+    # lora-only incremental
+    manager.sync_weights(merge_and_sync=False)
     base_time = time.time() - sync_start
     log(f'  Base weight sync completed in {base_time:.2f}s')
 

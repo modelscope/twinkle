@@ -5,9 +5,9 @@ import uuid
 
 import pytest
 
-from twinkle.server.state.backend.memory_backend import RayActorBackend
-from twinkle.server.state.backend.redis_backend import RedisBackend
-from twinkle.server.model.pool.controller import TrainingController
+from twinkle_server.state.backend.memory_backend import RayActorBackend
+from twinkle_server.state.backend.redis_backend import RedisBackend
+from twinkle_server.model.pool.controller import TrainingController
 from tests.server.training.helpers import create, request, setup
 
 

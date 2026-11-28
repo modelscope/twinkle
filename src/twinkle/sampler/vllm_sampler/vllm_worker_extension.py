@@ -58,28 +58,13 @@ def _cuda_visible_device(device: torch.device) -> str:
     return selectors[device_index]
 
 
-def _ray_node_manager_address() -> str:
-    """The ray node address of the worker's node, as ``ray.nodes()`` reports it.
-
-    The delta receiver placement (``checkpoint_engine/delta/rollout/mixin.py``) looks the
-    worker's node up by ``ray.nodes()[...]['NodeManagerAddress']``. Reporting an independently
-    discovered interface IP (``find_node_ip`` picks the alphabetically-first non-virtual NIC)
-    diverges from ray's address on multi-NIC hosts -- ray binds the default-route NIC -- and the
-    lookup raises ``KeyError`` (defect111). Use ray's own address so the two sides always agree;
-    fall back to ``find_node_ip`` only when ray is not initialized (local single-process mode).
-    """
-    import ray
-    try:
-        # Ray actor/worker processes connect via the raylet without calling ray.init(), so
-        # ray.is_initialized() is False there even though the runtime context and GCS client
-        # are live. Use the runtime context directly; fall back only if it is unavailable.
-        ctx = ray.get_runtime_context()
-        node_id = ctx.get_node_id() if hasattr(ctx, 'get_node_id') else ctx.node_id
-        for node in ray.nodes():
-            if node.get('NodeID') == node_id and node.get('Alive'):
-                return node['NodeManagerAddress']
-    except Exception:
-        pass
+def _worker_node_address() -> str:
+    """Use this process's initialization address; standalone engines discover their local interface."""
+    address = os.environ.get('TWINKLE_NODE_IP')
+    if address:
+        return address
+    if os.environ.get('WORKER_NAME'):
+        raise RuntimeError('Distributed workers require TWINKLE_NODE_IP from their initialization context.')
     from twinkle.utils import find_node_ip
     return find_node_ip()
 
@@ -179,7 +164,7 @@ class TwinkleWorkerExtension:
 
     def delta_receiver_metadata(self) -> 'DeltaWorkerMetadata':
         return {
-            'node_ip': _ray_node_manager_address(),
+            'node_ip': _worker_node_address(),
             'device_uuid': str(torch.cuda.get_device_properties(self.device).uuid),
             'cuda_visible_device': _cuda_visible_device(self.device),
             'zmq_handle': self.delta_ipc_endpoint(),
@@ -737,9 +722,102 @@ class TwinkleWorkerExtension:
             if not converted:
                 return
 
-            self.model_runner.model.load_weights(converted)
+            # vLLM's LoRA MoE wrapper (FusedMoEWithLoRA) exposes no load_weights, so the
+            # model-level AutoWeightsLoader cannot resolve expert tensors against it.
+            # Dispatch that slice straight to the wrapped runner's fused/per-expert loader.
+            remaining = self._load_lora_wrapped_moe_experts(converted)
+            self.model_runner.model.load_weights(remaining)
             self._load_drafter_weights(converted)
+            self._repack_derived_weights(self.model_runner.model)
             logger.info(f'Loaded {len(converted)} base weights')
+
+    def _load_lora_wrapped_moe_experts(self, weights: List[Tuple[str, torch.Tensor]]) -> List[Tuple[str, torch.Tensor]]:
+        """Load expert tensors of LoRA-wrapped MoE layers via the wrapped runner.
+
+        vLLM 0.27.1 wraps ``experts`` as ``FusedMoEWithLoRA`` when ``enable_lora`` is on.
+        The wrapper has no ``load_weights``, so ``AutoWeightsLoader`` recurses into its
+        children and rejects every expert name (fused HF ``experts.gate_up_proj`` /
+        ``experts.down_proj`` 3-D tensors from transformers>=5 fused-MoE checkpoints, or
+        per-expert ``experts.{i}.gate_proj.weight`` from Megatron) with ValueError — the
+        only child is ``base_layer``. The wrapped ``MoERunner`` DOES carry the proper
+        loader (``RoutedExperts.load_weights``: fused-3D orientation, per-expert mapping,
+        TP/EP sharding), so route the expert slice of the stream to it directly.
+
+        ``routed_experts.lora_base_layer_prefix`` ('base_layer.', set by the wrapper)
+        targets the legacy full-checkpoint-name mapping; in this runner-relative dispatch
+        it would bake 'base_layer.' into the resolved param attribute and break the
+        getattr lookup, so it is cleared for the load and restored afterwards.
+
+        Returns the weights NOT consumed here (everything outside the wrapped experts),
+        which continue through the normal model-level loader. Non-LoRA engines and
+        non-MoE models are untouched (no wrapped modules -> identity).
+        """
+        try:
+            from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
+        except ImportError:
+            return weights
+        wrapped = {
+            name: module
+            for name, module in self.model_runner.model.named_modules()
+            if isinstance(module, FusedMoEWithLoRA)
+        }
+        if not wrapped:
+            return weights
+        groups: Dict[str, List[Tuple[str, torch.Tensor]]] = {}
+        remaining: List[Tuple[str, torch.Tensor]] = []
+        for name, tensor in weights:
+            for prefix in wrapped:
+                if name.startswith(prefix + '.'):
+                    groups.setdefault(prefix, []).append((name[len(prefix) + 1:], tensor))
+                    break
+            else:
+                remaining.append((name, tensor))
+        for prefix, items in groups.items():
+            routed_experts = wrapped[prefix].base_layer.routed_experts
+            saved_prefix = routed_experts.lora_base_layer_prefix
+            routed_experts.lora_base_layer_prefix = ''
+            try:
+                list(wrapped[prefix].base_layer.load_weights(items))
+            finally:
+                routed_experts.lora_base_layer_prefix = saved_prefix
+        return remaining
+
+    @staticmethod
+    def _repack_derived_weights(root: torch.nn.Module) -> int:
+        """Recompute parameters that a backend derives from a *source* weight at load time.
+
+        ``load_weights`` only writes the tensors the training side sends; whatever the model
+        computed from them during ``process_weights_after_loading`` keeps the values it saw when
+        the model was built. On Ascend that is not a rounding detail: vllm-ascend's GDN kernel
+        reads ``conv1d.ascend_conv1d_weight``, a kernel-layout copy of ``conv1d.weight`` that only
+        a repack refreshes ("Register the packed weight and repack it after every source load" --
+        ``vllm_ascend/ops/gdn.py``), and its own repack is wired to ``process_weights_after_loading``.
+        A full-sync therefore leaves every hybrid layer convolving with its initial random weights
+        while all other tensors match the trainer bit for bit. CUDA models expose no such hook, so
+        the walk finds nothing there and costs one pass over ``modules()``.
+
+        Two passes, on purpose. The hook is backend-private and optional, so a backend that renames
+        or drops it would be repaired silently by the second pass, which keys off the packed
+        *parameter* (``refresh_derived_weights``, already used by the delta path) and validates the
+        layout instead of silently skipping modules it does not recognise. Neither pass hides a
+        failure: a sync that cannot repack must fail, because the alternative is a rollout that
+        looks healthy and emits garbage.
+        """
+        from twinkle.sampler.vllm_sampler.delta.weight_update_utils import refresh_derived_weights
+
+        repacked = 0
+        for module in root.modules():
+            pack = getattr(module, '_pack_conv_weights', None)
+            if not callable(pack):
+                continue
+            # Deliberately unguarded: a hook that raises leaves the kernel reading its build-time
+            # copy, and only this exception can tell the trainer the sync did not take effect.
+            pack()
+            repacked += 1
+        refreshed = refresh_derived_weights(root)
+        if repacked or refreshed:
+            logger.info(f'Repacked derived weights for {max(repacked, refreshed)} modules')
+        return max(repacked, refreshed)
 
     def _drafter_model(self):
         """The speculative-decoding draft model, or None when there is no weight-bearing drafter.
@@ -781,6 +859,7 @@ class TwinkleWorkerExtension:
         if drafter_model is None:
             return
         drafter_model.load_weights(weights)
+        self._repack_derived_weights(drafter_model)
 
     def get_state_keys(self):
         """Return internal parameter names; each loader adapts its own input names."""

@@ -7,9 +7,9 @@ import pytest
 from pydantic import ValidationError
 
 from tests.server.integration.cs_tasks.task_models import _mcore_native_key, encoded_batch
-from twinkle.server.config import ServerConfig
-from twinkle.server.config.training import TrainingArguments
-from twinkle.server.model.app import _validate_model_task
+from twinkle_server.config import ServerConfig
+from twinkle_server.config.training import TrainingArguments
+from twinkle_server.model.app import _validate_model_task
 
 TASK_CONFIGS = Path(__file__).resolve().parents[1] / 'integration' / 'cs_tasks'
 
@@ -108,8 +108,8 @@ def test_task_batches_match_the_wire_contract(task):
 def test_transformers_backend_preserves_validated_head_contract(monkeypatch, task, width, mode):
     from transformers import AutoConfig
     from twinkle.hub import HubOperation
-    from twinkle.server.model import app
-    from twinkle.server.model.backends import transformers_model
+    from twinkle_server.model import app
+    from twinkle_server.model.backends import transformers_model
 
     monkeypatch.setattr(HubOperation, 'download_model', lambda path: path)
     monkeypatch.setattr(AutoConfig, 'from_pretrained', lambda *a, **kw: SimpleNamespace(
@@ -124,8 +124,8 @@ def test_transformers_backend_preserves_validated_head_contract(monkeypatch, tas
 
 
 def test_full_persisted_head_does_not_forward_num_labels_to_hf(monkeypatch):
-    from twinkle.server.model import app
-    from twinkle.server.model.backends import transformers_model
+    from twinkle_server.model import app
+    from twinkle_server.model.backends import transformers_model
 
     received = {}
     monkeypatch.setattr(transformers_model, 'TwinkleCompatFullTransformersModel',
@@ -140,7 +140,7 @@ def test_full_model_attaches_head_and_preserves_device_mesh(monkeypatch):
 
     from twinkle import DeviceMesh
     from twinkle.infra.dispatch import _get_device_mesh_param_name
-    from twinkle.server.model.backends import transformers_model
+    from twinkle_server.model.backends import transformers_model
 
     mesh = DeviceMesh.from_sizes(dp_size=2, device_type='cpu')
     received = {}
@@ -159,7 +159,7 @@ def test_full_model_attaches_head_and_preserves_device_mesh(monkeypatch):
 
 
 def test_full_custom_model_class_uses_compat_dispatch(monkeypatch):
-    from twinkle.server.model import app
+    from twinkle_server.model import app
 
     marker = type('CustomModel', (), {})
     received = {}
@@ -195,8 +195,8 @@ def test_decision_requires_a_family_head_factory():
 
 @pytest.mark.parametrize('mode', ['lora', 'full'])
 def test_transformers_decision_uses_loader_architecture(monkeypatch, mode):
-    from twinkle.server.model import app
-    from twinkle.server.model.backends import transformers_model
+    from twinkle_server.model import app
+    from twinkle_server.model.backends import transformers_model
 
     received = {}
     for name in ('TwinkleCompatFullTransformersModel', 'TwinkleCompatTransformersModel'):

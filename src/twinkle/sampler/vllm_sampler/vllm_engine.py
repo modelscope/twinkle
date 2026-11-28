@@ -289,13 +289,14 @@ class VLLMEngine(BaseSamplerEngine):
         # The sender owns the reusable bucket and IPC handle across updates.
         self._weight_sender = None
 
+        # defect58 part②: a parent-death pipe keeps every EngineCore subprocess tied to this
+        # process -- the kernel closes the write end when THIS process dies (even SIGKILL) and the
+        # child exits on EOF, so a dead raylet can no longer strand the GPU's memory.
+        from .engine_core_reaper import install_engine_core_parent_watch
+        install_engine_core_parent_watch()
+
         # Initialize engine
         self.engine = self._create_engine()
-
-        # defect58 part②: record EngineCore subprocess PIDs so the driver can reap them directly if
-        # the raylet dies first and sampler.shutdown() (a ray RPC) can no longer reach this actor.
-        from .engine_core_reaper import record_engine_core_pids
-        record_engine_core_pids(self.engine)
 
         # Tokenizer is lazy loaded via get_tokenizer()
         self._tokenizer = None
@@ -534,19 +535,27 @@ class VLLMEngine(BaseSamplerEngine):
                 seq_logprobs = []
                 for i, lp in enumerate(output.logprobs):
                     if i < len(token_ids):
-                        if logprobs == 1:
-                            # Single logprob mode: return the sampled token's logprob
-                            # in the same [(tid, logprob)] format as multi-logprob mode
-                            tid = token_ids[i]
-                            assert tid in lp, (f'Sampled token {tid} not found in logprobs at position {i}. '
-                                               f'Available tokens: {list(lp.keys())}')
-                            seq_logprobs.append([(tid, lp[tid].logprob)])
-                        else:
-                            # Multiple logprobs mode: return top-k logprobs
+                        tid = token_ids[i]
+                        assert tid in lp, (
+                            f'Sampled token {tid} not found in logprobs at position {i}. '
+                            f'Available tokens: {list(lp.keys())}'
+                        )
+                        entries = [(tid, lp[tid].logprob)]
+                        if logprobs != 1:
                             sorted_items = sorted(lp.items(), key=lambda x: -(x[1].logprob))[:logprobs]
-                            seq_logprobs.append([(tid, lp_obj.logprob) for tid, lp_obj in sorted_items])
+                            entries.extend(
+                                (candidate, item.logprob) for candidate, item in sorted_items if candidate != tid
+                            )
+                        seq_logprobs.append(entries)
 
             stop_reason: StopReason = _map_finish_reason(output.finish_reason)
+
+            # vLLM's detokenizer already applied the stop-string trim to ``output.text`` (an excluded
+            # stop is cut from the text, while ``output.token_ids`` keeps every sampled id). Carry that
+            # trimmed text as ``decoded`` so the excluded stop is honoured decoded-only -- the complete
+            # trajectory's token ids stay intact. When nothing forced detokenization (no stop/bad_words)
+            # ``output.text`` is empty and the template decodes the tokens downstream instead.
+            decoded_text = output.text if getattr(vllm_params, 'detokenize', False) else None
 
             routed_experts = getattr(output, 'routed_experts', None)
             sequences.append(
@@ -554,6 +563,7 @@ class VLLMEngine(BaseSamplerEngine):
                     stop_reason=stop_reason,
                     tokens=token_ids,
                     logprobs=seq_logprobs,
+                    decoded=decoded_text,
                     routed_experts=routed_experts,
                     sampling_masks=sampling_mask,
                 ))
@@ -561,7 +571,7 @@ class VLLMEngine(BaseSamplerEngine):
         # Extract prompt logprobs if requested
         result_prompt_logprobs = None
         result_topk_prompt_logprobs = None
-        if prompt_logprobs_k > 0 and result.prompt_logprobs is not None:
+        if sampling_params.prompt_logprobs is not None and result.prompt_logprobs is not None:
             result_prompt_logprobs = []
             result_topk_prompt_logprobs = []
 
@@ -591,6 +601,17 @@ class VLLMEngine(BaseSamplerEngine):
             prompt_logprobs=result_prompt_logprobs,
             topk_prompt_logprobs=result_topk_prompt_logprobs,
         )
+
+    async def _supported_pooling_tasks(self):
+        """Pooling tasks this engine's model supports, or None when the engine cannot report them.
+
+        vLLM v1 AsyncLLM exposes the cached ``get_supported_tasks``; older engines lack it, so the
+        caller leaves the request task untouched rather than guessing a backend mapping.
+        """
+        getter = getattr(self.engine, 'get_supported_tasks', None)
+        if getter is None:
+            return None
+        return await getter()
 
     async def encode(self,
                      prompt: Union[List[int], str],
@@ -624,7 +645,16 @@ class VLLMEngine(BaseSamplerEngine):
             pooling_params = PoolingParams()
         elif isinstance(pooling_params, dict):
             pooling_params = PoolingParams.from_dict(pooling_params)
-        vllm_pooling = pooling_params.to_vllm(**kwargs)
+        # Some reward architectures (e.g. vLLM's native InternLM2ForRewardModel) build a
+        # token_classify pooler and reject task='classify' ("Unsupported task: 'classify'"). Map the
+        # classify request onto token_classify for such engines and read the reward off the last
+        # prompt token's row below; engines that support classify natively are left untouched.
+        backend_task = None
+        if pooling_params.task == "classify":
+            supported = await self._supported_pooling_tasks()
+            if supported is not None and "classify" not in supported and "token_classify" in supported:
+                backend_task = "token_classify"
+        vllm_pooling = pooling_params.to_vllm(task=backend_task, **kwargs)
 
         if request_id is None:
             request_id = uuid.uuid4().hex
@@ -660,7 +690,12 @@ class VLLMEngine(BaseSamplerEngine):
         if result is None:
             raise RuntimeError('Pooling encode did not produce a result')
 
-        data = pooling_to_list(result.outputs.data, normalize=pooling_params.normalize)
+        raw = result.outputs.data
+        if backend_task == "token_classify":
+            # token_classify returns one row per prompt token ([T, C]); the classify/reward readout
+            # is the LAST prompt token's row -- the position a sequence-classification head scores.
+            raw = raw[-1]
+        data = pooling_to_list(raw, normalize=pooling_params.normalize)
         return PoolingResponse(data=data, task=pooling_params.task, prompt_token_ids=prompt_token_ids)
 
     async def generate_stream(self,

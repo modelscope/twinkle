@@ -40,6 +40,16 @@ All feature development is conducted on GitHub using a Fork-then-PR workflow.
 
 5. Review: We want the merged code to be clean and efficient, so we may raise some questions for discussion. Please note that any questions raised during review are about the code itself, not about you personally. Once all issues have been discussed and resolved, your code will be approved
 
+### Development Environment
+
+Install the three packages in editable mode from the repository root (Python 3.11–3.13):
+
+```shell
+pip install -e '.[test]' -e ./twinkle_cs/client -e ./twinkle_cs/server
+```
+
+All dependency ranges live in `pyproject.toml` (twinkle-client and twinkle-server each have their own under `twinkle_cs/<name>/pyproject.toml`); the `test` extra includes pytest and the ruff version pinned by CI. CI installs the same sources with `pip install --no-deps -e . -e ./twinkle_cs/client -e ./twinkle_cs/server` and runs `pytest`.
+
 ### Code Standards and Development Practices
 
 twinkle has established conventions for variable naming and development practices. Please try to follow these conventions during development.
@@ -54,14 +64,14 @@ twinkle uses [ruff](https://docs.astral.sh/ruff/) for both linting and formattin
 - **Target version**: Python 3.11
 - **Lint rules**: `B`, `E`, `F`, `W`, `I`, `UP`, `T` (bugbear, pycodestyle, pyflakes, isort, pyupgrade, flake8-print)
 - **Format style**: double quotes (`quote-style = "double"`)
-- **Excluded paths**: `examples/`, `cookbook/`, `client_tools/`, `src/twinkle_client/`, `tests/`, `docs/src`
+- **Excluded paths**: `cookbook/`, `twinkle_cs/client/src/twinkle_client/`, `tests/`
 
 twinkle runs two types of tests after a PR is submitted:
 
 - Code Lint Tests: Static code analysis tests. To ensure this test passes, please run Code lint locally beforehand. Here's how:
 
   ```shell
-  pip install pre-commit ruff
+  pip install pre-commit ruff==0.13.0  # ruff is pinned to the CI/pre-commit version
   pre-commit run --all-files
   # Or run ruff directly:
   ruff check .              # Check lint issues (read-only)
@@ -74,6 +84,6 @@ twinkle runs two types of tests after a PR is submitted:
 
 ### Running CI Tests
 
-Before submitting a PR, please ensure your development code is protected by test cases. For example, smoke tests for new features, or unit tests for various edge cases. Reviewers will also pay attention to this during code review. Additionally, a dedicated service will run CI Tests, executing all test cases. Code can only be merged after all test cases pass.
+Before submitting a PR, please ensure your development code is protected by test cases. For example, smoke tests for new features, or unit tests for various edge cases. Reviewers will also pay attention to this during code review. CI runs `pytest -m "not slow"` on PRs; the scheduled run drops the `-m` filter and adds the `slow` cases. Code can only be merged after all test cases pass.
 
 Please ensure these tests pass successfully.

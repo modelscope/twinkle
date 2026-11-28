@@ -7,10 +7,12 @@ from types import SimpleNamespace
 import pytest
 from starlette.requests import Request
 
-from twinkle.server.config.application_spec import SamplerArgs
-from twinkle.server.lifecycle.submit import resolve_twinkle_adapter_name
-from twinkle.server.middleware.auth import verify_request_token
-from twinkle.server.sampler.pool.controller import SamplerController
+from twinkle_server.config.application_spec import SamplerArgs
+from twinkle_server.exceptions import RequestRejectedError
+from twinkle_server.lifecycle.submit import resolve_twinkle_adapter_name
+from twinkle_server.middleware.auth import verify_request_token
+from twinkle_server.sampler.pool.controller import SamplerController
+from twinkle_server.sampler.submission import SampleSubmission
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -97,6 +99,58 @@ async def settle_starts(pool):
 
 async def settle_jobs(pool):
     await asyncio.gather(*tuple(pool.lifecycle.jobs), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cold_sample_retry_joins_disconnected_submission(monkeypatch):
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from twinkle_server.telemetry import tracing
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(tracing.trace, 'get_tracer', provider.get_tracer)
+
+    def forwarded_request():
+        payload = request()
+        carrier = {}
+        tracing.inject_context(carrier)
+        payload['headers'].extend((key.encode(), value.encode()) for key, value in carrier.items())
+        return payload
+
+    pool, driver, _ = setup(minimum=0, maximum=1)
+    driver.start_gate.clear()
+    submission = SampleSubmission('req_same', 'original')
+    try:
+        with tracing.traced_operation('sampler.forward') as forwarding:
+            original = asyncio.create_task(pool.request(forwarded_request(), submission=submission))
+            while not driver.started:
+                await asyncio.sleep(0)
+            original.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await original
+        with pytest.raises(RequestRejectedError, match='different submission'):
+            await pool.request(request(), submission=SampleSubmission('req_same', 'changed'))
+        with tracing.traced_operation('sampler.forward.retry'):
+            retry = asyncio.create_task(pool.request(forwarded_request(), submission=submission))
+            await asyncio.sleep(0)
+            driver.start_gate.set()
+            assert (await retry)['status'] == 200
+        assert len(driver.calls) == len(driver.started) == 1
+        wait, = [span for span in exporter.get_finished_spans() if span.name == 'sampler.wait_for_replica']
+        assert wait.parent.trace_id == forwarding.get_span_context().trace_id
+        assert wait.parent.span_id == forwarding.get_span_context().span_id
+        assert wait.parent.is_remote
+        original_span, = [span for span in exporter.get_finished_spans() if span.name == 'sampler.forward']
+        assert wait.start_time < original_span.end_time < wait.end_time
+    finally:
+        driver.start_gate.set()
+        driver.finish.set()
+        await pool.shutdown()
+        provider.shutdown()
 
 
 @pytest.mark.asyncio
@@ -278,6 +332,50 @@ async def test_partial_control_broadcast_fences_all_participants(fault):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('fault_at,expect_fence', [(1, False), (2, True)])
+async def test_user_error_rejection_fences_only_after_partial_apply(fault_at, expect_fence):
+    """A 4xx Decision_Boundary-left rejection leaves replica state unchanged (RequestRejectedError).
+
+    When the FIRST replica rejects, nothing was applied anywhere and the pool is still
+    homogeneous -- the healthy replicas must NOT be fenced (they keep serving). When a LATER
+    replica rejects after an earlier one already applied, pool state diverged and fencing is
+    still required. Regression gate for the gateway-hang root cause: a pinned-template
+    set_template 400 used to fence the whole pool on every OpenAI chat.
+    """
+    pool, driver, _ = setup()
+    driver.finish.set()
+    await pool.initialize()
+    invoke = driver.invoke
+    changed = []
+
+    async def update(instance, ticket, payload, queue=None):
+        changed.append(instance.identity)
+        if len(changed) == fault_at:
+            return {'status': 400, 'headers': [], 'body': b'{"error":"rejected"}'}
+        return await invoke(instance, ticket, payload, queue)
+
+    driver.invoke = update
+    try:
+        reply = await pool.request(request('twinkle/set_template'))
+        assert reply['status'] == 400
+        await settle_jobs(pool)
+        if expect_fence:
+            assert len(driver.stopped) == 2
+            assert not pool._ready_instances() and not pool._actions
+        else:
+            assert not driver.stopped
+            assert len(pool._ready_instances()) == 2
+            assert not pool._actions  # a rejection commits nothing
+            # The healthy pool must keep serving immediately after the rejection
+            # (the gateway-hang defect fenced it into an engine restart instead).
+            driver.invoke = invoke
+            reply = await pool.request(request())
+            assert reply['status'] == 200
+    finally:
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_unknown_generation_exit_keeps_quarantined_capacity_reserved():
     pool, driver, clock = setup(minimum=1, maximum=1)
     await pool.initialize()
@@ -380,6 +478,31 @@ async def test_control_deadline_fences_all_participants(stage):
     finally:
         resume.set()
         await asyncio.gather(task, return_exceptions=True)
+        await pool.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('endpoint', ['twinkle/sample', 'twinkle/sample_stream', 'twinkle/encode', 'tinker/asample'])
+async def test_original_weights_restored_before_ordinary_request(endpoint):
+    pool, driver, _ = setup(minimum=1, maximum=1)
+    ordinary = None
+    try:
+        await pool.request(request(), full_path='checkpoint')
+        ordinary = asyncio.create_task(pool.request(request(endpoint)))
+        await asyncio.sleep(0)
+        assert not ordinary.done()
+        assert [payload['base_path'] for _, payload in driver.calls if 'base_path' in payload] == ['checkpoint']
+
+        driver.finish.set()
+        assert (await ordinary)['status'] == 200
+        await settle_jobs(pool)
+        assert driver.calls[-2][1] == {'base_path': None}
+        assert driver.calls[-1][1]['endpoint'] == endpoint
+        assert not pool._actions
+    finally:
+        driver.finish.set()
+        if ordinary is not None:
+            await asyncio.gather(ordinary, return_exceptions=True)
         await pool.shutdown()
 
 

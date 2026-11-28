@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Typer CLI tests.
 
-Pins the behaviour of the launcher CLI (``twinkle.server.cli.app``): config
+Pins the behaviour of the launcher CLI (``twinkle_server.cli.app``): config
 loading and env-var overrides.
 """
 from __future__ import annotations
@@ -11,8 +11,8 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from tests.server.fixtures import MOCK_SERVER_CONFIG
-from twinkle.server.cli.app import app
-from twinkle.server.config import ServerConfig
+from twinkle_server.cli.app import app
+from twinkle_server.config import ServerConfig
 
 EXAMPLE = MOCK_SERVER_CONFIG
 MOCK_CFG = MOCK_SERVER_CONFIG

@@ -1,0 +1,294 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""Per-deployment ``ApplicationSpec`` and typed argument schemas.
+
+Each deployment kind (``server | model | sampler | processor | data_plane``) carries its
+own ``args`` block with strict field validation. ``ApplicationSpec`` holds
+the routing metadata plus the deployment kind and validates ``args`` against
+the matching ``*Args`` schema in a model validator.
+
+The schemas use ``extra='forbid'`` so unknown args (typos, copy-paste from
+other deployments) fail at load time instead of being silently dropped.
+"""
+from __future__ import annotations
+import os
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .task_queue import TaskQueueConfig
+from .training import ModelArgs
+
+# ---------- shared helpers ------------------------------------------------- #
+
+
+class _ArgsBase(BaseModel):
+    """Base class for every per-deployment args schema (extra='forbid')."""
+
+    model_config = ConfigDict(extra='forbid')
+
+
+class HttpOptions(BaseModel):
+    """HTTP listener settings (host/port, optional TLS).
+
+    Re-exported from ``server_config`` for convenience and so that
+    ``ServerArgs`` can carry it without importing the aggregate root. The
+    ``ssl_*`` pair is forwarded verbatim to Ray Serve's ``HTTPOptions``; both
+    must be set together to serve HTTPS, and leaving them ``None`` keeps the
+    listener on plain HTTP.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    host: str = 'localhost'
+    port: int = 8000
+    ssl_keyfile: str | None = None
+    ssl_certfile: str | None = None
+
+    @model_validator(mode='after')
+    def _ssl_pair_set_together(self) -> HttpOptions:
+        if (self.ssl_keyfile is None) != (self.ssl_certfile is None):
+            raise ValueError('ssl_keyfile and ssl_certfile must be set together to serve HTTPS')
+        return self
+
+
+# ---------- per-deployment args schemas ------------------------------------ #
+
+
+class SamplerArgs(_ArgsBase):
+    """Args for the ``sampler`` deployment.
+
+    ``sampler_type`` selects the sampler implementation. ``template`` optionally
+    pins the chat template at construction time: a dict of ``{'template_cls':
+    <name>, **kwargs}`` handed to ``sampler.set_template`` when the replica
+    starts. Setting it here means the deployment serves with a known template
+    from its first request and is not left to the gateway's name-based fallback
+    (``get_template_for_model``); a pinned template also wins over any later
+    ``/twinkle/set_template`` call. Leave it ``None`` to keep that fallback.
+    """
+
+    model_id: str
+    nproc_per_node: int = 1
+    device_group: dict[str, Any]
+    device_mesh: dict[str, Any]
+    sampler_type: Literal['mock', 'vllm', 'vllm_async', 'sglang', 'sglang_async', 'torch']
+    engine_args: dict[str, Any] | None = None
+    #:
+    #: Bearer credential required on the sampler's own public routes (the router mounted at
+    #: ``{route_prefix}/sampler/{name}``). ``None`` leaves them unauthenticated, matching a
+    #: gateway deployed without ``ServerArgs.api_key``; set it to the SAME key as the gateway
+    #: so direct sampler calls cannot bypass the gateway's auth boundary.
+    api_key: str | None = None
+    queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
+    node_selector: dict[str, str] = Field(default_factory=dict)
+    data_plane_url: str | None = None
+    template: dict[str, Any] | None = None
+    #:
+    #: Deployed LoRA adapters as ``{public name: adapter path}``: requests whose
+    #: ``adapter_name`` hits a key get that path resolved as their ``adapter_uri``
+    #: (paths must be readable on the sampler worker node). Leave ``None`` for a
+    #: plain base-model deployment.
+    adapters: dict[str, str] | None = None
+    min_replicas: int = Field(default=1, ge=0, strict=True)
+    max_replicas: int = Field(default=1, gt=0, strict=True)
+    idle_timeout_s: float = Field(default=600, gt=0, allow_inf_nan=False)
+    target_ongoing_requests: int = Field(default=16, gt=0, strict=True)
+
+    @model_validator(mode='after')
+    def _validate_pool(self):
+        if self.min_replicas > self.max_replicas:
+            raise ValueError('sampler min_replicas must not exceed max_replicas')
+        ranks = self.device_group.get('ranks', self.nproc_per_node)
+        width = self.device_group.get('gpus_per_worker', 1)
+        if type(ranks) is not int or ranks <= 0 or type(width) is not int or width <= 0 or ranks % width:
+            raise ValueError('sampler device_group requires a positive device count divisible by gpus_per_worker')
+        if self.sampler_type != 'mock':
+            from twinkle.utils.device_mesh import DeviceMesh
+            if DeviceMesh.from_sizes(**self.device_mesh).world_size != ranks:
+                raise ValueError('sampler device_mesh world_size must equal its device count')
+            tp = (self.engine_args or {}).get('tensor_parallel_size', width)
+            if tp != width:
+                raise ValueError('sampler tensor_parallel_size must equal gpus_per_worker')
+        return self
+
+
+class ServerStateArgs(_ArgsBase):
+    """Typed args for the gateway's ``ServerState`` configuration.
+
+    Replaces the former untyped ``server_config: dict[str, Any] | None`` so a
+    misspelled key fails validation (``extra='forbid'``) instead of being
+    silently forwarded. Named ``ServerStateArgs`` to avoid colliding with the
+    ``ServerConfig`` aggregate root. All fields are optional (default ``None``)
+    so unset values fall back to ``ServerState``'s own defaults; the
+    operator-facing YAML key stays ``server_config``.
+    """
+
+    expiration_timeout: float | None = None
+    cleanup_interval: float | None = None
+    per_token_model_limit: int | None = None
+    metrics_update_interval: float | None = None
+    actor_name: str | None = None
+
+    def to_env_vars(self) -> dict[str, str]:
+        """Serialize the policy fields to env vars for Ray-worker propagation.
+
+        Mirrors :meth:`PersistenceConfig.to_env_vars`. Only the four policy
+        fields are emitted (``actor_name`` is a per-process cache key, not a
+        policy); unset (``None``) fields are skipped so the worker falls back to
+        ``ServerState``'s own defaults.
+        """
+        env: dict[str, str] = {}
+        if self.expiration_timeout is not None:
+            env['TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT'] = str(self.expiration_timeout)
+        if self.cleanup_interval is not None:
+            env['TWINKLE_SERVER_STATE_CLEANUP_INTERVAL'] = str(self.cleanup_interval)
+        if self.per_token_model_limit is not None:
+            env['TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT'] = str(self.per_token_model_limit)
+        if self.metrics_update_interval is not None:
+            env['TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL'] = str(self.metrics_update_interval)
+        return env
+
+    @classmethod
+    def from_env(cls) -> ServerStateArgs | None:
+        """Reconstruct policy fields from launcher-set env vars.
+
+        Returns ``None`` when no ``TWINKLE_SERVER_STATE_*`` key is set, so a
+        caller can distinguish "no env-configured policy" from "explicitly
+        configured to a default value". Only policy fields are populated;
+        ``actor_name`` stays ``None``.
+        """
+        exp = os.environ.get('TWINKLE_SERVER_STATE_EXPIRATION_TIMEOUT')
+        clean = os.environ.get('TWINKLE_SERVER_STATE_CLEANUP_INTERVAL')
+        limit = os.environ.get('TWINKLE_SERVER_STATE_PER_TOKEN_MODEL_LIMIT')
+        interval = os.environ.get('TWINKLE_SERVER_STATE_METRICS_UPDATE_INTERVAL')
+        if exp is None and clean is None and limit is None and interval is None:
+            return None
+        return cls(
+            expiration_timeout=float(exp) if exp is not None else None,
+            cleanup_interval=float(clean) if clean is not None else None,
+            per_token_model_limit=int(limit) if limit is not None else None,
+            metrics_update_interval=float(interval) if interval is not None else None,
+        )
+
+
+class ServerArgs(_ArgsBase):
+    """Args for the gateway ``server`` deployment.
+
+    ``api_key``, when set, makes the gateway require ``Authorization: Bearer
+    <key>`` on every route (the OpenAI-compatible generation endpoints, the
+    tinker training endpoints and the /twinkle task surface alike); only the
+    liveness probes (/health, /ping, /twinkle/healthz*) and /models stay open
+    so load balancers can do their job. ``owned_by`` is the ``owned_by``
+    field the ``/models`` listing reports for every served model.
+    """
+
+    server_config: ServerStateArgs = Field(default_factory=ServerStateArgs)
+    supported_models: list[Any] | None = None
+    openai_model_aliases: dict[str, str] = Field(
+        default_factory=dict, description='Explicit OpenAI request aliases for served base model names.')
+    http_options: HttpOptions | None = None
+    route_prefix: str | None = None
+    api_key: str | None = None
+    owned_by: str = 'twinkle'
+
+
+class ProcessorArgs(_ArgsBase):
+    """Args for the ``processor`` deployment.
+
+    A processor deployment has no task queue, so there is deliberately no
+    ``queue_config`` field here: with ``extra='forbid'`` a YAML that sets
+    ``processor.args.queue_config`` now fails validation with the offending path
+    instead of being silently ignored.
+    """
+
+    ncpu_proc_per_node: int | None = None
+    device_group: dict[str, Any] | None = None
+    device_mesh: dict[str, Any] | None = None
+
+
+class DataPlaneArgs(_ArgsBase):
+    """Args for the TransferQueue-backed client data plane."""
+
+    config: dict[str, Any] | None = None
+
+
+_ARGS_SCHEMA: dict[str, type[_ArgsBase]] = {
+    'server': ServerArgs,
+    'model': ModelArgs,
+    'sampler': SamplerArgs,
+    'processor': ProcessorArgs,
+    'data_plane': DataPlaneArgs,
+}
+
+# ---------- ApplicationSpec ------------------------------------------------ #
+
+
+def validate_processor_replicas(options: dict[str, Any]) -> None:
+    """Ensure locally stored Processor objects always have one owning replica."""
+    replicas = options.get('num_replicas')
+    autoscaling = options.get('autoscaling_config')
+    if replicas is not None and (type(replicas) is not int or replicas != 1):
+        raise ValueError('Processor requires num_replicas: 1')
+    if autoscaling is not None:
+        if isinstance(autoscaling, BaseModel):
+            autoscaling = autoscaling.model_dump()
+        if (replicas is not None or not isinstance(autoscaling, dict)
+                or autoscaling.get('min_replicas', 1) != 1
+                or autoscaling.get('max_replicas', 1) != 1
+                or autoscaling.get('initial_replicas') not in (None, 1)):
+            raise ValueError('Processor autoscaling_config must keep exactly one replica and omit num_replicas')
+
+
+class ApplicationSpec(BaseModel):
+    """One application entry under ``ServerConfig.applications``.
+
+    The ``args`` block is validated against the schema selected by
+    ``import_path``: ``server`` → ``ServerArgs``, ``model`` → ``ModelArgs``,
+    etc. Unknown keys at this level (or inside ``args``) are rejected. A
+    missing ``args`` block is treated as ``{}`` and validated against the
+    matching schema, so any required field (e.g. ``backend`` on a model
+    deployment) raises with the offending field path instead of silently
+    falling back to a different schema's default.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    name: str
+    route_prefix: str = '/'
+    import_path: Literal['server', 'model', 'sampler', 'processor', 'data_plane']
+    # ``args`` is always populated by the ``mode='before'`` validator below
+    # (which validates the raw block against the schema selected by
+    # ``import_path`` and defaults a missing block to ``{}``), so the field is
+    # required here — the validator runs first and fills it.
+    args: ServerArgs | ModelArgs | SamplerArgs | ProcessorArgs | DataPlaneArgs
+    deployments: list[dict[str, Any]] = Field(default_factory=list, max_length=1)
+
+    @model_validator(mode='after')
+    def _validate_processor_deployment(self) -> ApplicationSpec:
+        if self.import_path == 'processor' and self.deployments:
+            validate_processor_replicas(self.deployments[0])
+        return self
+
+    @model_validator(mode='before')
+    @classmethod
+    def _coerce_args_to_schema(cls, data: Any) -> Any:
+        """Validate the raw ``args`` block against the schema for ``import_path``.
+
+        Keying off ``import_path`` makes the failure messages point at the
+        right schema and avoids the ambiguity Pydantic's structural Union
+        resolution would introduce when two schemas share field names.
+        """
+        if not isinstance(data, dict):
+            return data
+        import_path = data.get('import_path')
+        if import_path not in _ARGS_SCHEMA:
+            # Let Pydantic's Literal validator handle bad import_path values.
+            return data
+        schema = _ARGS_SCHEMA[import_path]
+        raw_args = data.get('args')
+        if isinstance(raw_args, schema):
+            return data
+        if raw_args is None:
+            raw_args = {}
+        # ``schema.model_validate`` rejects a non-dict itself with a clean
+        # error, so no separate non-dict guard is needed here.
+        return {**data, 'args': schema.model_validate(raw_args)}

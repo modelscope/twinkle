@@ -1,0 +1,262 @@
+import asyncio
+import uuid
+from requests.exceptions import Timeout
+from dataclasses import asdict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+from twinkle.data_format import InputFeature, SamplingParams, Trajectory, copy_trajectory
+from twinkle.protocol.headers import H_SAMPLE_IDEMPOTENCY_KEY, H_SAMPLE_IDEMPOTENCY_SUPPORTED
+from twinkle.protocol.json_utils import wire_trajectory
+from twinkle.protocol.types.component import DataPlaneSampleRequest, DataRef, UnloadAdapterPathsRequest
+from twinkle.protocol.types.sampler import (SamplerAddAdapterRequest, SamplerAddAdapterResponse, SampleRequest,
+                                            SampleResponseModel, SampleResponseModelList, SamplerApplyPatchRequest,
+                                            SamplerSetTemplateRequest,
+                                            SamplerSetTemplateResponse)
+from twinkle_client._request_builder import build_request
+from twinkle_client.exceptions import TwinkleClientValidationError
+from twinkle_client.http import ClientTransport
+from twinkle_client.http.context import capture_transport
+from twinkle_client.operations import _guarded_operation
+
+if TYPE_CHECKING:
+    from peft import PeftConfig
+
+
+# Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
+# that base pulls ``twinkle.sampler.__init__`` → ``VLLMEngine`` → torch + zmq,
+# which the mock / CPU-only client environments don't have.
+def _json_safe(obj: Any) -> Any:
+    """Recursively coerce numpy arrays / torch tensors to JSON-serialisable lists.
+
+    ``sample()`` accepts pre-encoded ``InputFeature`` dicts (e.g. from a multi-turn
+    rollout's ``template.encode``) whose values are numpy arrays or torch tensors;
+    these are not JSON-serialisable and would break the HTTP POST. Detection is by
+    duck-typing (``.tolist()``) so this stays free of a hard torch/numpy import,
+    honouring the CPU-only client contract noted above.
+    """
+    return wire_trajectory(obj)
+
+
+class vLLMSampler:
+    """Client wrapper for Sampler that calls server HTTP endpoints.
+
+    This client manages sampling operations and adapter synchronization with the sampler server.
+    The server-side session (managed by TwinkleClient) keeps the sampler alive.
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        transport: ClientTransport | None = None,
+        **kwargs,
+    ):
+        """Create the sampler instance on server with one captured transport."""
+        self._transport = capture_transport(transport)
+        from twinkle_client.data_plane import DataPlaneClient
+        self.data_plane = DataPlaneClient(kwargs.pop('data_plane_url', None), transport=self._transport)
+
+        self.adapter_name = None
+        if '://' in model_id:
+            model_id = model_id.split('://')[1]
+        self.model_id = model_id
+        self.server_url = f'{self._transport.context.base_url}/sampler/{model_id}/twinkle'
+        response = self._transport.post(f'{self.server_url}/create', json_data=kwargs)
+        self._sample_idempotency = getattr(response, 'headers', {}).get(H_SAMPLE_IDEMPOTENCY_SUPPORTED) == '1'
+
+    def _await_task(self, response, model_cls):
+        """Resolve a Submit_Endpoint response through the Client_Future_Layer."""
+        from twinkle_client._future import resolve_response
+        return resolve_response(response, model_cls, transport=self._transport)
+
+    @_guarded_operation
+    def add_adapter_to_sampler(self, adapter_name: str, config: 'PeftConfig', **kwargs) -> SamplerAddAdapterResponse:
+        """Add a new adapter to the sampler."""
+        # peft pulls torch; keep it out of the module import surface (CPU-only client contract).
+        from peft import PeftConfig
+        if isinstance(config, PeftConfig):
+            config = config.__dict__
+        body = build_request(SamplerAddAdapterRequest, adapter_name=adapter_name, config=config, **kwargs)
+        response = self._transport.post_model(f'{self.server_url}/add_adapter_to_sampler', body)
+        self.adapter_name = adapter_name
+        return SamplerAddAdapterResponse(**response.json())
+
+    def sample(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        adapter_path: Optional[str] = None,
+        session_id: Optional[str] = None,
+        num_samples: int = 1,
+        token_only: bool = False,
+        *,
+        idempotency_key: str | None = None,
+    ) -> List[SampleResponseModel]:
+        """Sample from the model.
+
+        Args:
+            inputs: List of Trajectory or InputFeature to sample from.
+            sampling_params: Sampling parameters mapping or Twinkle ``SamplingParams``.
+            adapter_name: Adapter name for LoRA inference.
+            adapter_uri: Adapter URI (twinkle:// path or local path) for LoRA inference; ``None`` falls
+                back to the URI the weight-sync engine last stamped on this sampler
+                (``self.adapter_uri``), so a rollout that never names an adapter samples with the
+                freshest synced weights.
+            adapter_path: Alias of ``adapter_uri`` (the LOCAL sampler's spelling): the multi-turn
+                rollout passes its per-call adapter through this name, so the client face mirrors
+                the local one and the rollout stays mode-blind.
+            session_id: Accepted for signature parity with the local sampler and ignored: replica
+                routing is a server-side concern (the served engine routes sessions itself).
+            num_samples: Number of completions to generate per prompt.
+            token_only: Return the sampled tokens and logprobs only (no ``new_input_feature``); the
+                inputs are the ids the engine runs on, with their media alongside.
+            idempotency_key: Reuse this key and the same inputs when retrying this call after a
+                timeout. The server replays the existing receipt within its retention period.
+
+        Returns:
+            SampleResponseModel with 'sequences' list, each containing tokens, logprobs, stop_reason.
+        """
+        if adapter_uri is None:
+            adapter_uri = adapter_path if adapter_path is not None else getattr(self, 'adapter_uri', None)
+        originals = [copy_trajectory(item) for item in (inputs if isinstance(inputs, list) else [inputs])]
+        request = build_request(
+            SampleRequest,
+            inputs=_json_safe(originals),
+            sampling_params=self._sampling_params(sampling_params, num_samples),
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            token_only=token_only)
+        if getattr(self, '_sample_idempotency', False):
+            key = uuid.uuid4().hex if idempotency_key is None else idempotency_key
+            headers = {H_SAMPLE_IDEMPOTENCY_KEY: key}
+            try:
+                response = self._transport.post_model(f'{self.server_url}/sample', request, headers=headers)
+            except Timeout:
+                response = self._transport.post_model(f'{self.server_url}/sample', request, headers=headers)
+        else:
+            if idempotency_key is not None:
+                raise TwinkleClientValidationError('This server does not support sample idempotency')
+            response = self._transport.post_model(f'{self.server_url}/sample', request)
+        samples = self._await_task(response, SampleResponseModelList).samples
+        if not token_only:
+            if len(samples) != len(originals):
+                raise RuntimeError('server response count does not match the input batch')
+            restored = []
+            for original, result in zip(originals, samples):
+                sequences = []
+                for sequence in result.sequences:
+                    if sequence.new_input_feature is None:
+                        raise RuntimeError('server omitted a complete trajectory from a normal sample response')
+                    # The server never echoes the request's media / user_data back; restore them here.
+                    # Response models are frozen wire records: rebuild, never mutate in place.
+                    feature = {
+                        **copy_trajectory({key: original[key] for key in ('images', 'videos', 'audios', 'user_data')
+                                           if key in original}),
+                        **copy_trajectory(sequence.new_input_feature),
+                    }
+                    sequences.append(sequence.model_copy(update={'new_input_feature': feature}))
+                restored.append(result.model_copy(update={'sequences': sequences}))
+            samples = restored
+        return samples
+
+    @staticmethod
+    def _sampling_params(sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]],
+                         num_samples: int) -> Dict[str, Any]:
+        """Normalise sampling parameters into the single dict the server builds from."""
+        if isinstance(sampling_params, SamplingParams):
+            sampling_params = asdict(sampling_params)
+        else:
+            sampling_params = dict(sampling_params or {})
+        if num_samples != 1 and sampling_params.setdefault('num_samples', num_samples) != num_samples:
+            raise ValueError('num_samples conflicts with sampling_params.num_samples')
+        return _json_safe(sampling_params)
+
+    def sample_to_data_plane(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature], DataRef],
+        sampling_params: Optional[Dict[str, Any]] = None,
+        *,
+        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        policy_version: int | None = None,
+        group_ids: list[str] | None = None,
+        num_samples: int = 1,
+    ) -> DataRef:
+        """Generate complete prompt groups and keep their rows in the server DataPlane."""
+        source = ({'input_ref': inputs.model_dump()} if isinstance(inputs, DataRef) else {'inputs': _json_safe(inputs)})
+        body = build_request(
+            DataPlaneSampleRequest,
+            sampling_params=_json_safe(sampling_params) if sampling_params else None,
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            policy_version=policy_version,
+            group_ids=group_ids,
+            num_samples=num_samples,
+            **source)
+        response = self._transport.post_model(f'{self.server_url}/sample_to_data_plane', body)
+        return self._await_task(response, DataRef)
+
+    async def asample(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature]],
+        sampling_params: Optional[Dict[str, Any]] = None,
+        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        num_samples: int = 1,
+        *,
+        idempotency_key: str | None = None,
+    ) -> List[SampleResponseModel]:
+        """Asynchronous convenience wrapper for the materialized sample API."""
+        return await asyncio.to_thread(
+            self.sample,
+            inputs,
+            sampling_params,
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            num_samples=num_samples,
+            idempotency_key=idempotency_key,
+        )
+
+    async def asample_to_data_plane(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature], DataRef],
+        sampling_params: Optional[Dict[str, Any]] = None,
+        *,
+        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        policy_version: int | None = None,
+        group_ids: list[str] | None = None,
+        num_samples: int = 1,
+    ) -> DataRef:
+        """Asynchronously sample and return the opaque server-side result reference."""
+        return await asyncio.to_thread(
+            self.sample_to_data_plane,
+            inputs,
+            sampling_params,
+            adapter_name=adapter_name,
+            adapter_uri=adapter_uri,
+            policy_version=policy_version,
+            group_ids=group_ids,
+            num_samples=num_samples,
+        )
+
+    @_guarded_operation
+    def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
+        """Evict policy snapshots that are no longer referenced by this client."""
+        self._transport.post_model(f'{self.server_url}/unload_adapter_paths',
+                                   build_request(UnloadAdapterPathsRequest, adapter_paths=adapter_paths))
+
+    @_guarded_operation
+    def set_template(self, template_cls: str, adapter_name: str = '', **kwargs) -> SamplerSetTemplateResponse:
+        """Set the template for encoding trajectories."""
+        body = build_request(SamplerSetTemplateRequest, template_cls=template_cls, adapter_name=adapter_name, **kwargs)
+        response = self._transport.post_model(f'{self.server_url}/set_template', body)
+        return SamplerSetTemplateResponse(**response.json())
+
+    @_guarded_operation
+    def apply_patch(self, patch_cls: str, **kwargs) -> None:
+        """Apply a patch to the sampler instance."""
+        body = build_request(SamplerApplyPatchRequest, patch_cls=patch_cls, **kwargs)
+        self._transport.post_model(f'{self.server_url}/apply_patch', body)

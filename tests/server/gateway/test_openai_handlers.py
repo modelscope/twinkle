@@ -5,16 +5,18 @@ Uses a minimal FastAPI app with the OpenAI routes directly registered
 (bypassing the full app_scaffold middleware stack) to test handler logic.
 """
 from __future__ import annotations
-
 import asyncio
-import json
-import httpx
-import pytest
-from fastapi import FastAPI, Request
-from fastapi.testclient import TestClient
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
-from twinkle.server.gateway.openai_bridge import translate_response
+import httpx
+import json
+import pytest
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+
+from twinkle_server.gateway.openai_bridge import translate_response
 
 # ---------- Fixtures ------------------------------------------------------- #
 
@@ -23,7 +25,7 @@ from twinkle.server.gateway.openai_bridge import translate_response
 def mock_gateway():
     """Build a minimal FastAPI app with OpenAI routes and a mock GatewayServer."""
     import twinkle.protocol.types as types
-    from twinkle.server.gateway.openai_handlers import _register_openai_routes
+    from twinkle_server.gateway.openai_handlers import _register_openai_routes
 
     mock_state = AsyncMock()
     mock_state.get_model_metadata = AsyncMock(return_value=None)
@@ -37,6 +39,7 @@ def mock_gateway():
     mock_self.proxy = mock_proxy
     mock_self.supported_models = [types.SupportedModel(model_name='Qwen/Qwen3.5-4B')]
     mock_self.supported_model_names = frozenset(['Qwen/Qwen3.5-4B'])
+    mock_self.openai_model_aliases = {}
     # Per-instance template cache; a fresh mock per test isolates it, so the
     # former module-global clear fixture is no longer needed.
     mock_self._template_initialized = set()
@@ -114,6 +117,41 @@ class TestChatCompletions:
         assert data['choices'][0]['finish_reason'] == 'stop'
         assert 'usage' in data
 
+    @pytest.mark.parametrize('adapter_missing', [False, True])
+    def test_only_missing_routes_wait_for_a_starting_pool(self, mock_gateway, monkeypatch, adapter_missing):
+        import ray
+
+        from twinkle.protocol.types import SupportedModel
+        from twinkle_server.gateway import openai_handlers
+        from twinkle_server.sampler.pool.controller import sampler_controller_name, sampling_pool_id
+
+        gateway, app = mock_gateway
+        base = next(iter(gateway.supported_model_names))
+        gateway.route_prefix = '/v1'
+        gateway._template_initialized.add(base)
+        gateway.supported_models.append(SupportedModel(model_name='adapter', base_model=base))
+        get_actor = MagicMock(return_value=object())
+        monkeypatch.setattr(ray, 'is_initialized', lambda: True)
+        monkeypatch.setattr(ray, 'get_actor', get_actor)
+        monkeypatch.setenv('TWINKLE_STATE_RAY_NAMESPACE', 'test')
+        monkeypatch.setattr(openai_handlers, '_ROUTE_MOUNT_POLL_INTERVAL', 0)
+
+        missing = JSONResponse({'error_code': 404} if adapter_missing else {'detail': 'Not Found'}, status_code=404)
+        gateway.proxy.proxy_request.side_effect = [missing, self._make_sample_response()]
+        response = TestClient(app).post('/chat/completions', json={
+            'model': 'adapter', 'messages': [{'role': 'user', 'content': 'Hello'}],
+        })
+        if adapter_missing:
+            assert response.status_code == 404
+            get_actor.assert_not_called()
+            gateway.proxy.proxy_request.assert_awaited_once()
+        else:
+            assert response.status_code == 200
+            assert response.json()['model'] == 'adapter'
+            get_actor.assert_called_once_with(
+                sampler_controller_name('test', sampling_pool_id(f'/v1/sampler/{base}')), namespace='test')
+            assert gateway.proxy.proxy_request.await_count == 2
+
     def test_missing_model_returns_400(self, mock_gateway):
         _, app = mock_gateway
         client = TestClient(app)
@@ -158,6 +196,30 @@ class TestChatCompletions:
         )
         assert resp.status_code == 404
         assert resp.json()['error']['type'] == 'model_not_found'
+
+    @pytest.mark.parametrize(('endpoint', 'body'), [
+        ('/chat/completions', {'messages': [{'role': 'user', 'content': 'Hello'}]}),
+        ('/chat/completions', {'messages': [{'role': 'user', 'content': 'Hello'}], 'stream': True}),
+        ('/completions', {'prompt': 'Hello'}),
+        ('/completions', {'prompt': 'Hello', 'stream': True}),
+        ('/embeddings', {'input': 'Hello'}),
+        ('/infer', {'infer_requests': [{'model': 'stopped-model', 'messages': [{'role': 'user', 'content': 'Hi'}]}]}),
+    ])
+    def test_only_remaining_model_cannot_take_another_models_requests(self, mock_gateway, endpoint, body):
+        gateway, app = mock_gateway
+        response = TestClient(app).post(endpoint, json={'model': 'stopped-model', **body})
+        assert response.status_code == 404
+        assert response.json()['error']['code'] == 'model_not_found'
+        gateway.proxy.proxy_request.assert_not_called()
+        gateway.proxy.proxy_request_stream.assert_not_called()
+
+    def test_alias_to_removed_model_is_not_rebound(self, mock_gateway):
+        gateway, app = mock_gateway
+        gateway.openai_model_aliases = {'default': 'stopped-model'}
+        response = TestClient(app).post(
+            '/chat/completions', json={'model': 'default', 'messages': [{'role': 'user', 'content': 'Hello'}]})
+        assert response.status_code == 404
+        gateway.proxy.proxy_request.assert_not_called()
 
     @pytest.mark.parametrize('has_request_id', [False, True])
     def test_sampler_forwards_request_and_client_identity(self, mock_gateway, has_request_id):
@@ -211,32 +273,49 @@ class TestChatCompletions:
         body_bytes = call_kwargs.kwargs.get('body_override')
         assert body_bytes is not None
         body = json.loads(body_bytes)
-        assert body['adapter_name'] == 'Qwen/Qwen3.5-4B'
+        assert body['adapter_name'] == ''
         assert body['inputs'] == {'messages': [{'role': 'user', 'content': 'Hello'}]}
         assert body['sampling_params']['temperature'] == 0.5
 
-    def test_adapter_resolves_via_metadata(self, mock_gateway):
+    def test_training_metadata_requires_explicit_checkpoint(self, mock_gateway):
         mock_self, app = mock_gateway
         mock_self.state.get_model_metadata.return_value = {'base_model': 'Qwen/Qwen3.5-4B'}
         mock_self.proxy.proxy_request.return_value = self._make_sample_response()
 
         client = TestClient(app)
-        resp = client.post(
-            '/chat/completions',
-            json={
-                'model': 'my-fine-tuned-adapter',
-                'messages': [{
-                    'role': 'user',
-                    'content': 'Hello'
-                }],
-            },
-            headers={'Authorization': 'Bearer key'},
-        )
+        body = {
+            'model': 'my-fine-tuned-adapter',
+            'messages': [{'role': 'user', 'content': 'Hello'}],
+        }
+        assert client.post('/chat/completions', json=body).status_code == 404
+        mock_self.proxy.proxy_request.assert_not_called()
+        resp = client.post('/chat/completions', json={**body, 'adapter_uri': 'twinkle://checkpoint'})
         assert resp.status_code == 200
+        forwarded = mock_self.proxy.proxy_request.call_args.kwargs
+        assert forwarded['base_model'] == 'Qwen/Qwen3.5-4B'
+        assert json.loads(forwarded['body_override'])['adapter_uri'] == 'twinkle://checkpoint'
 
-        # Verify proxy was called with the correct base_model
-        call_kwargs = mock_self.proxy.proxy_request.call_args
-        assert call_kwargs.kwargs.get('base_model') or call_kwargs.args[2] == 'Qwen/Qwen3.5-4B'
+    @pytest.mark.parametrize(('name', 'response_model', 'adapter_name'), [
+        ('default', 'Qwen/Qwen3.5-4B', ''),
+        ('served-lora', 'served-lora', 'served-lora'),
+    ])
+    def test_resolved_name_controls_response_and_adapter(self, mock_gateway, name, response_model, adapter_name):
+        from twinkle.protocol.types import SupportedModel
+
+        gateway, app = mock_gateway
+        gateway.openai_model_aliases = {'default': 'Qwen/Qwen3.5-4B'}
+        gateway.supported_models.append(SupportedModel(model_name='served-lora', base_model='Qwen/Qwen3.5-4B'))
+        gateway.proxy.proxy_request.return_value = self._make_sample_response()
+        response = TestClient(app).post(
+            '/chat/completions', json={'model': name, 'messages': [{'role': 'user', 'content': 'Hello'}]})
+
+        assert response.status_code == 200
+        assert response.json()['model'] == response_model
+        forwarded = gateway.proxy.proxy_request.call_args.kwargs
+        assert forwarded['base_model'] == 'Qwen/Qwen3.5-4B'
+        sampler_body = json.loads(forwarded['body_override'])
+        assert sampler_body['adapter_name'] == adapter_name
+        assert sampler_body.get('require_deployed_adapter', False) == bool(adapter_name)
 
     def test_non_stream_polls_queued_task_to_completion(self, mock_gateway):
         """A queued sampler envelope is polled until completed, then translated."""
@@ -326,7 +405,7 @@ class TestChatCompletions:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('blocked_step', ['disconnect_check', 'initial_read', 'long_poll'])
     async def test_non_stream_timeout_covers_each_wait_step(self, mock_gateway, monkeypatch, blocked_step):
-        from twinkle.server.gateway import openai_handlers
+        from twinkle_server.gateway import openai_handlers
 
         monkeypatch.setenv('TWINKLE_OPENAI_SAMPLE_TIMEOUT', '0.01')
         mock_self, app = mock_gateway
@@ -364,8 +443,8 @@ class TestChatCompletions:
 
     @pytest.mark.asyncio
     async def test_non_stream_polls_share_one_total_budget(self, mock_gateway, monkeypatch):
-        from twinkle.server.gateway import openai_handlers
-        from twinkle.server.gateway.use_cases import FuturePollResult
+        from twinkle_server.gateway import openai_handlers
+        from twinkle_server.gateway.use_cases import FuturePollResult
 
         monkeypatch.setenv('TWINKLE_OPENAI_SAMPLE_TIMEOUT', '0.05')
         mock_self, app = mock_gateway
@@ -508,26 +587,31 @@ class TestChatCompletions:
 
 class TestChatCompletionsStreaming:
 
-    def test_stream_request_uses_sample_stream_endpoint(self, mock_gateway):
+    @pytest.mark.parametrize('endpoint, input_body', [
+        ('/chat/completions', {'messages': [{'role': 'user', 'content': 'Hi'}]}),
+        ('/completions', {'prompt': 'Hi'}),
+    ])
+    def test_stream_request_uses_sample_stream_endpoint(self, mock_gateway, endpoint, input_body):
         mock_self, app = mock_gateway
+        mock_self.openai_model_aliases = {'default': 'Qwen/Qwen3.5-4B'}
+        mock_self.proxy.proxy_request.return_value = Response(status_code=200)
 
+        @asynccontextmanager
         async def fake_stream(*args, **kwargs):
-            yield json.dumps({'delta': 'Hello', 'finish_reason': None})
-            yield json.dumps({'delta': ' world', 'finish_reason': 'stop'})
+            assert kwargs['endpoint'] == 'twinkle/sample_stream'
+            assert kwargs['base_model'] == 'Qwen/Qwen3.5-4B'
+            assert json.loads(kwargs['body_override'])['adapter_name'] == ''
+            yield httpx.Response(200, content='\n'.join([
+                json.dumps({'delta': 'Hello', 'finish_reason': None}),
+                json.dumps({'delta': ' world', 'finish_reason': 'stop'}),
+            ]).encode())
 
         mock_self.proxy.proxy_request_stream = fake_stream
 
         client = TestClient(app)
         resp = client.post(
-            '/chat/completions',
-            json={
-                'model': 'Qwen/Qwen3.5-4B',
-                'messages': [{
-                    'role': 'user',
-                    'content': 'Hi'
-                }],
-                'stream': True,
-            },
+            endpoint,
+            json={**input_body, 'model': 'default', 'stream': True},
             headers={'Authorization': 'Bearer key'},
         )
         assert resp.status_code == 200
@@ -538,16 +622,91 @@ class TestChatCompletionsStreaming:
         assert len(lines) == 3  # 2 chunks + [DONE]
         assert lines[-1] == 'data: [DONE]'
 
-        # First chunk should have role
         chunk1 = json.loads(lines[0].removeprefix('data: '))
-        assert chunk1['object'] == 'chat.completion.chunk'
-        assert chunk1['choices'][0]['delta']['role'] == 'assistant'
-        assert chunk1['choices'][0]['delta']['content'] == 'Hello'
-
-        # Second chunk
         chunk2 = json.loads(lines[1].removeprefix('data: '))
-        assert chunk2['choices'][0]['delta']['content'] == ' world'
+        assert chunk1['model'] == chunk2['model'] == 'Qwen/Qwen3.5-4B'
+        if endpoint == '/chat/completions':
+            assert chunk1['object'] == 'chat.completion.chunk'
+            assert chunk1['choices'][0]['delta'] == {'role': 'assistant', 'content': 'Hello'}
+            assert chunk2['choices'][0]['delta']['content'] == ' world'
+        else:
+            assert chunk1['object'] == 'text_completion.chunk'
+            assert chunk1['choices'][0]['text'] == 'Hello'
+            assert chunk2['choices'][0]['text'] == ' world'
         assert chunk2['choices'][0]['finish_reason'] == 'stop'
+
+    @pytest.mark.parametrize('stream', [False, True])
+    def test_missing_sampler_returns_http_404(self, mock_gateway, stream):
+        gateway, app = mock_gateway
+        gateway.proxy.proxy_request.return_value = Response(status_code=404)
+
+        @asynccontextmanager
+        async def missing_stream(*args, **kwargs):
+            yield httpx.Response(404)
+
+        gateway.proxy.proxy_request_stream = missing_stream
+        response = TestClient(app).post('/chat/completions', json={
+            'model': 'Qwen/Qwen3.5-4B', 'messages': [{'role': 'user', 'content': 'Hello'}], 'stream': stream,
+        })
+        assert response.status_code == 404
+        assert response.json()['error']['code'] == 'model_not_found'
+
+class TestInfer:
+
+    @pytest.fixture
+    def infer_gateway(self, mock_gateway):
+        gateway, app = mock_gateway
+        model = next(iter(gateway.supported_model_names))
+        gateway._template_initialized.add(model)
+        gateway.proxy.proxy_request.return_value = JSONResponse({
+            'request_id': 'infer-request',
+            'status': 'completed',
+            'result': {'samples': [
+                {'sequences': [{'tokens': [token], 'stop_reason': 'stop'}]} for token in (11, 22)
+            ]},
+        })
+        return gateway, TestClient(app), model
+
+    @pytest.mark.parametrize('batch_model', [False, True])
+    def test_conflicting_model_names_return_400_before_proxying(self, infer_gateway, batch_model):
+        gateway, client, model = infer_gateway
+        entries = [
+            {'model': model, 'messages': [{'role': 'user', 'content': 'First'}]},
+            {'model': 'another-model', 'messages': [{'role': 'user', 'content': 'Second'}]},
+        ]
+        if batch_model:
+            body = {'request_config': {'model': model}, 'infer_requests': entries[1:]}
+        else:
+            body = entries
+        response = client.post('/infer', json=body)
+
+        assert response.status_code == 400
+        error = response.json()['error']
+        assert error['param'] == 'model'
+        assert 'conflicting model names' in error['message'].lower()
+        gateway.proxy.proxy_request.assert_not_called()
+
+    @pytest.mark.parametrize('mode', ['entries', 'batch', 'both', 'first_entry'])
+    def test_same_model_batch_reaches_one_sampler(self, infer_gateway, mode):
+        gateway, client, model = infer_gateway
+        entries = [
+            {'messages': [{'role': 'user', 'content': 'First'}]},
+            {'messages': [{'role': 'user', 'content': 'Second'}]},
+        ]
+        if mode in ('entries', 'both', 'first_entry'):
+            entries[0]['model'] = model
+        if mode in ('entries', 'both'):
+            entries[1]['model'] = model
+        body = {'request_config': {'model': model}, 'infer_requests': entries} if mode in ('batch', 'both') else entries
+        response = client.post('/infer', json=body)
+
+        assert response.status_code == 200
+        assert [row['sequences'][0]['tokens'] for row in response.json()] == [[11], [22]]
+        gateway.proxy.proxy_request.assert_awaited_once()
+        forwarded = gateway.proxy.proxy_request.call_args.kwargs
+        assert forwarded['base_model'] == model
+        assert forwarded['endpoint'] == 'twinkle/sample'
+        assert len(json.loads(forwarded['body_override'])['inputs']) == 2
 
 
 # ---------- /models tests -------------------------------------------------- #
@@ -565,3 +724,30 @@ class TestListModels:
         assert len(data['data']) == 1
         assert data['data'][0]['id'] == 'Qwen/Qwen3.5-4B'
         assert data['data'][0]['object'] == 'model'
+
+    def test_alias_cannot_reuse_a_registered_name(self, monkeypatch):
+        from twinkle_server.gateway import app as gateway_app
+
+        monkeypatch.setattr(gateway_app, 'get_server_state', MagicMock())
+        with pytest.raises(ValueError, match='conflict with registered model names: model-a'):
+            gateway_app.GatewayServer(
+                supported_models=['model-a', 'model-b'], openai_model_aliases={'model-a': 'model-b'})
+
+    def test_reconfigure_keeps_adapters_and_updates_aliases(self, monkeypatch):
+        from twinkle_server.gateway import app as gateway_app
+
+        monkeypatch.setattr(gateway_app, 'get_server_state', MagicMock())
+        gateway = gateway_app.GatewayServer(
+            supported_models=['model-a', 'model-b'], openai_model_aliases={'alias-a': 'model-a'})
+        gateway._template_initialized.update(['model-a', 'model-b'])
+        adapter = {'model_name': 'adapter-b', 'base_model': 'model-b'}
+        gateway.reconfigure({
+            'supported_models': ['model-b', adapter],
+            'openai_model_aliases': {'alias-b': 'model-b'},
+        })
+        assert gateway.supported_model_names == {'model-b'}
+        assert gateway._template_initialized == {'model-b'}
+        assert gateway.get_openai_model_catalog() == {
+            'models': [{'model_name': 'model-b'}, adapter],
+            'aliases': {'alias-b': 'model-b'},
+        }

@@ -198,6 +198,11 @@ class Env(ABC):
     ``_step(state, tool_name, arguments)``, ``_run_script(state, source, interpreter, timeout, cap_memory)``,
     ``_close(state)`` and ``_workspace(state)``; plus :meth:`tools`.
     """
+    # ``close(episode_id)`` is a per-episode BUSINESS call (it returns that episode's
+    # reward and frees one session), NOT instance teardown -- wrapping it with ownership
+    # release would destroy the whole pool on every episode end. Only ``shutdown`` (close
+    # every session) is the destruction entry that releases the owned workers.
+    _lifecycle = ('shutdown',)
 
     #: What :meth:`snapshot` shows of the workspace: how many files to name, how
     #: many bytes of each body, how many bytes of bodies in total, and which

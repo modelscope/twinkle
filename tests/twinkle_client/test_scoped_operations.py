@@ -50,7 +50,12 @@ class Session:
             result = {'training_id': 'training-1', 'adapter_name': 'slot'}
         if endpoint == 'sample':
             self.sample_barrier.wait(timeout=5)
-            result = {'samples': []}
+            # 012aff34 complete-Trajectory contract: one response per input, each sequence
+            # carrying a complete new_input_feature.
+            inputs = json.loads(kwargs['data'])['inputs']
+            result = {'samples': [
+                {'sequences': [{'stop_reason': 'stop', 'tokens': [], 'new_input_feature': dict(item)}]}
+                for item in inputs]}
         if endpoint in ('forward_backward', 'calculate_metric'):
             result = {'result': {'loss': 0.1}}
         if endpoint == 'save':
@@ -247,7 +252,11 @@ def test_sampling_remains_concurrent_while_a_guarded_training_call_is_blocked():
             try:
                 assert session.step_started.wait(timeout=5)
                 samples = [pool.submit(sampler.sample, [{'input_ids': [1]}]) for _ in range(2)]
-                assert [future.result(timeout=5) for future in samples] == [[], []]
+                results = [future.result(timeout=5) for future in samples]
+                # 012aff34: one complete-Trajectory response per input; both calls must have
+                # completed (the barrier above) while the guarded step is still blocked.
+                assert [[seq.new_input_feature['input_ids'] for response in result for seq in response.sequences]
+                        for result in results] == [[[1]], [[1]]]
                 assert not train.done()
             finally:
                 session.step_release.set()
@@ -520,7 +529,9 @@ def signal_scenario(endpoint):
                 elif endpoint == 'sampler_create':
                     client.sampler('model')
                 elif endpoint == 'sampler_template':
-                    sampler.set_template('unit-template')
+                    # 8314e88d: the wire contract validates template_cls as a registered class
+                    # name (identifier), not a source path; the stub server accepts any name.
+                    sampler.set_template('UnitTemplate')
                 else:
                     model.clip_grad_and_step()
                 assert endpoint == 'legacy', 'expected KeyboardInterrupt after remote success'

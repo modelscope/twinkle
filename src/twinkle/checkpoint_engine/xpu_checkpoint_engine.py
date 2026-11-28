@@ -68,6 +68,13 @@ def _sock_recv_tensor(sock, device: torch.device) -> torch.Tensor:
     return flat.view(dtype).reshape(shape).to(device)
 
 
+def _pg_broadcast(pg, tensor: torch.Tensor, src: int = 0) -> None:
+    """Broadcast through an unregistered group's raw ``broadcast([tensor], opts)`` API."""
+    opts = dist.BroadcastOptions()
+    opts.rootRank = src
+    pg.broadcast([tensor], opts).wait()
+
+
 class _DoneWork:
     """Already-completed work object (our collectives are synchronous)."""
 
@@ -240,10 +247,11 @@ class _RelayPG:
 class XCCLCheckpointEngine(NCCLCheckpointEngine):
     """NCCL-checkpoint-engine drop-in for Kunlunxin XPU (BKCL as 'nccl').
 
-    Replaces the direct ``ProcessGroupNCCL`` construction (which deadlocks
-    when two ranks share a local device index, see module docstring) with a
-    stateless ``ProcessGroupXCCL`` plus a relay fallback. Everything else
-    (bucketing, ZMQ metadata, double buffering) is inherited unchanged.
+    Replaces the NCCL communicator (which deadlocks when two ranks share a
+    local device index, see module docstring) with a stateless
+    ``ProcessGroupXCCL`` plus a relay fallback, wired in through
+    ``_group_broadcast``. Everything else (bucketing, ZMQ metadata, double
+    buffering) is inherited unchanged.
     """
 
     # Distinct from the inherited 'nccl': the mixin keys persistent engine
@@ -253,6 +261,11 @@ class XCCLCheckpointEngine(NCCLCheckpointEngine):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._relay: Optional[_RelayPG] = None
+        self._pg = None
+        self._store: Optional[dist.Store] = None
+
+    def _group_broadcast(self, tensor: torch.Tensor) -> None:
+        _pg_broadcast(self._pg, tensor)
 
     def _init_xccl_pg(self) -> None:
         store = self._store
@@ -366,4 +379,7 @@ class XCCLCheckpointEngine(NCCLCheckpointEngine):
         if self._relay is not None:
             self._relay.close()
             self._relay = None
+        if self.rebuild_group:
+            self._pg = None
+            self._store = None
         super().finalize()

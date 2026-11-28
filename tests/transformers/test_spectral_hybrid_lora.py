@@ -450,7 +450,7 @@ def test_load_fixed_server_allocation_only_requires_fft(tmp_path):
 
 def test_server_hybrid_config_is_strict():
     from pydantic import ValidationError
-    from twinkle.server.config.application_spec import ModelArgs
+    from twinkle_server.config.application_spec import ModelArgs
 
     base = {
         'model_id': 'tiny',
@@ -512,8 +512,8 @@ def test_hybrid_rejects_client_owned_fft_and_target_parameter_config():
 
 
 def test_transformers_server_selects_hybrid_model_only_for_hybrid_train_mode(monkeypatch):
-    from twinkle.server.model import app
-    from twinkle.server.model.backends import transformers_model
+    from twinkle_server.model import app
+    from twinkle_server.model.backends import transformers_model
 
     class Regular:
 
@@ -540,7 +540,7 @@ def test_transformers_server_selects_hybrid_model_only_for_hybrid_train_mode(mon
 
 def test_hybrid_server_model_exposes_device_mesh_to_remote_class():
     from twinkle.infra import _get_device_mesh_param_name
-    from twinkle.server.model.backends.transformers_model import TwinkleCompatSpectralHybridTransformersModel
+    from twinkle_server.model.backends.transformers_model import TwinkleCompatSpectralHybridTransformersModel
 
     assert _get_device_mesh_param_name(TwinkleCompatSpectralHybridTransformersModel.__init__) == 'device_mesh'
 

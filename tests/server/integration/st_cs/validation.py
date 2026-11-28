@@ -53,7 +53,7 @@ def reference(args):
 
 
 def validate_http(base_url, controller, args):
-    from twinkle import init_twinkle_client
+    from twinkle_client import init_twinkle_client
     import ray
     from tests.server.integration.on_demand_training.acceptance_support import wait_until
 
@@ -171,8 +171,8 @@ def main():
         return
     import ray
     from ray import serve
-    from twinkle.server.config import ServerConfig
-    from twinkle.server.launcher.server_launcher import ServerLauncher
+    from twinkle_server.config import ServerConfig
+    from twinkle_server.launcher.server_launcher import ServerLauncher
     root = Path(__file__).resolve().parents[4]
     config = ServerConfig.from_yaml(root / 'cookbook/client/swift_model/sentence_transformer_config.yaml')
     with socket.socket() as sock:

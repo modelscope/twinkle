@@ -3,10 +3,10 @@ import asyncio
 import pytest
 import pytest_asyncio
 
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.task_queue.mixin import TaskQueueMixin
-from twinkle.server.exceptions import RequestRejectedError
-from twinkle.server.task_queue.worker import ComputeWorker, _exception_summary
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.task_queue.mixin import TaskQueueMixin
+from twinkle_server.exceptions import RequestRejectedError
+from twinkle_server.task_queue.worker import ComputeWorker, _exception_summary
 
 
 def test_exception_summary_prefers_the_wrapped_cause():
@@ -105,7 +105,7 @@ async def test_idle_worker_stop_is_terminal_for_its_replica():
         await worker.ensure_started()
         await asyncio.sleep(0)  # Let the idle worker wait for new work.
         await asyncio.wait_for(worker.stop(), timeout=1)
-        from twinkle.server.exceptions import ResourceExhaustedError
+        from twinkle_server.exceptions import ResourceExhaustedError
         with pytest.raises(ResourceExhaustedError):
             await queue.submit_and_peek(work, model_id='model1', token='token1')
         assert not queue.state.records
@@ -140,7 +140,7 @@ async def test_worker_stop_cancels_running_task():
 @pytest.mark.asyncio
 async def test_preflight_rejects_batch_without_per_dp_multiple():
     queue = _DummyQueue()
-    from twinkle.server.exceptions import BatchSizeError
+    from twinkle_server.exceptions import BatchSizeError
 
     with pytest.raises(BatchSizeError, match='must be divisible by 4'):
         await queue._perform_preflight_checks(
@@ -300,7 +300,7 @@ async def test_user_task_error_is_stored_as_user_failure():
 @pytest.mark.asyncio
 async def test_typed_server_error_keeps_its_domain_reason_and_attribution():
     """A typed user failure must retain its domain meaning in persisted state."""
-    from twinkle.server.exceptions import ResourceNotFoundError
+    from twinkle_server.exceptions import ResourceNotFoundError
 
     queue = _DummyQueue()
     queue.enable_compute_worker()
@@ -326,7 +326,7 @@ async def test_typed_server_error_keeps_its_domain_reason_and_attribution():
 
 @pytest.mark.asyncio
 async def test_submit_and_peek_preflight_rejection_raises_without_writing_or_queuing():
-    from twinkle.server.exceptions import BatchSizeError
+    from twinkle_server.exceptions import BatchSizeError
     queue = _DummyQueue()
     queue.enable_compute_worker()
 
@@ -432,7 +432,7 @@ async def test_concurrent_task_keeps_queue_failure_mapping(make_concurrent_queue
 
 @pytest.mark.asyncio
 async def test_concurrent_task_preflight_rejection_raises_without_writing(make_concurrent_queue):
-    from twinkle.server.exceptions import InputTokensExceededError
+    from twinkle_server.exceptions import InputTokensExceededError
     queue = make_concurrent_queue()
 
     async def work():
@@ -468,7 +468,7 @@ async def test_worker_stop_cancels_concurrent_task(make_concurrent_queue):
 
 @pytest.mark.asyncio
 async def test_concurrent_capacity_rejects_before_future_write_and_is_reusable(make_concurrent_queue):
-    from twinkle.server.exceptions import ResourceExhaustedError
+    from twinkle_server.exceptions import ResourceExhaustedError
     queue = make_concurrent_queue(TaskQueueConfig(concurrent_task_limit=1))
     release = asyncio.Event()
 
@@ -508,7 +508,7 @@ async def test_concurrent_reservation_is_released_when_state_write_fails(make_co
 
 @pytest.mark.asyncio
 async def test_stop_between_future_write_and_start_leaves_terminal_record(make_concurrent_queue):
-    from twinkle.server.exceptions import ResourceExhaustedError
+    from twinkle_server.exceptions import ResourceExhaustedError
     queue = make_concurrent_queue()
     original = queue.state.store_future_status
 
@@ -576,7 +576,7 @@ async def test_cancel_during_running_status_write_leaves_failed_future(make_conc
 
 @pytest.mark.asyncio
 async def test_background_capacity_and_shutdown_are_supervised(make_concurrent_queue):
-    from twinkle.server.exceptions import ResourceExhaustedError
+    from twinkle_server.exceptions import ResourceExhaustedError
     queue = make_concurrent_queue(TaskQueueConfig(concurrent_task_limit=1))
     entered, exited = asyncio.Event(), asyncio.Event()
 
@@ -600,7 +600,7 @@ async def test_background_capacity_and_shutdown_are_supervised(make_concurrent_q
 
 @pytest.mark.asyncio
 async def test_stopped_replica_rejects_serial_submission_without_a_future():
-    from twinkle.server.exceptions import ResourceExhaustedError
+    from twinkle_server.exceptions import ResourceExhaustedError
     queue = _DummyQueue()
     queue.enable_compute_worker()
     await queue._compute_worker.stop()
@@ -612,7 +612,7 @@ async def test_stopped_replica_rejects_serial_submission_without_a_future():
 
 @pytest.mark.asyncio
 async def test_stop_during_pending_write_cannot_restart_the_serial_worker():
-    from twinkle.server.exceptions import ResourceExhaustedError
+    from twinkle_server.exceptions import ResourceExhaustedError
     queue = _DummyQueue()
     queue.enable_compute_worker()
     original = queue.state.store_future_status
@@ -650,23 +650,21 @@ async def test_shutdown_drains_serial_tasks_that_never_started():
 @pytest.mark.asyncio
 async def test_unknown_start_ack_never_executes_backend(make_concurrent_queue, monkeypatch):
     from tests.server.state.fake_backend import FakeBackend
-    from twinkle.server.state.server_state import ServerState
+    from twinkle_server.state.server_state import ServerState
     queue = make_concurrent_queue()
     backend = FakeBackend()
     queue.state = queue._compute_worker._state = ServerState(backend=backend)
-    original = backend.update_atomic
+    original = queue.state.try_start_future
     executed = []
 
-    async def lost_ack(*args, **kwargs):
-        result = await original(*args, **kwargs)
-        if kwargs.get('return_changed'):
-            raise ConnectionError('start acknowledgement lost')
-        return result
+    async def lost_ack(request_id):
+        assert await original(request_id)
+        raise ConnectionError('start acknowledgement lost')
 
     async def work():
         executed.append(True)
 
-    monkeypatch.setattr(backend, 'update_atomic', lost_ack)
+    monkeypatch.setattr(queue.state, 'try_start_future', lost_ack)
     ref = await queue.schedule_concurrent_task(work)
     for _ in range(100):
         if not queue._compute_worker._detached_tasks:
@@ -711,7 +709,7 @@ async def test_cancel_winning_running_write_race_skips_execution(make_concurrent
 @pytest.mark.parametrize('method', ['schedule_task', 'schedule_concurrent_task', 'schedule_background_task'])
 async def test_admission_persists_future_and_owner_together(method):
     from tests.server.state.fake_backend import FakeBackend
-    from twinkle.server.state import ServerState
+    from twinkle_server.state import ServerState
     queue = TaskQueueMixin()
     queue.state = ServerState(backend=FakeBackend())
     queue.replica_id = 'ownership-test'
@@ -729,7 +727,7 @@ async def test_admission_persists_future_and_owner_together(method):
         assert record['owner_token'] == 'owner'
         assert not await queue.state._backend.keys('future_owner::*')
         await asyncio.wait_for(entered.wait(), 1)
-        from twinkle.server.exceptions import ResourceNotFoundError
+        from twinkle_server.exceptions import ResourceNotFoundError
         with pytest.raises(ResourceNotFoundError):
             await queue.state.assert_future_owner(ref['request_id'], 'other')
     finally:
@@ -739,8 +737,8 @@ async def test_admission_persists_future_and_owner_together(method):
 
 @pytest.mark.asyncio
 async def test_backend_cancellation_is_an_explicit_server_failure(make_concurrent_queue):
-    from twinkle.server.lifecycle.envelope import envelope_from_record
-    from twinkle.server.task_queue.types import ExecutionScope
+    from twinkle_server.lifecycle.envelope import envelope_from_record
+    from twinkle_server.task_queue.types import ExecutionScope
     queue = make_concurrent_queue()
     scope = ExecutionScope()
 

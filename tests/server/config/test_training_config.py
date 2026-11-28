@@ -7,9 +7,9 @@ import math
 import pytest
 from pydantic import ValidationError
 
-from twinkle.server.config import ServerConfig
-from twinkle.server.config.training import TrainingConfig
-from twinkle.server.exceptions import RequestRejectedError
+from twinkle_server.config import ServerConfig
+from twinkle_server.config.training import TrainingConfig
+from twinkle_server.exceptions import RequestRejectedError
 
 
 def model_config(mode='lora'):
@@ -35,10 +35,10 @@ def model_application():
 async def test_custom_model_specs_survive_catalog_roundtrip_and_worker_construction(monkeypatch, mode):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
-    from twinkle.server.config.training import TrainingModelConfig
-    from twinkle.server.model import app as model_app
-    from twinkle.server.model.pool.driver import RayInstanceDriver
-    from twinkle.server.state.training_records import InstanceRecord
+    from twinkle_server.config.training import TrainingModelConfig
+    from twinkle_server.model import app as model_app
+    from twinkle_server.model.pool.driver import RayInstanceDriver
+    from twinkle_server.state.training_records import InstanceRecord
 
     app = model_application()
     # These modules deliberately do not exist on the gateway. Resolution belongs to workers.
@@ -100,7 +100,13 @@ def test_catalog_defaults_and_mode_selection():
         catalog.get('not-in-catalog', 'lora')
 
 
-def test_existing_yaml_uses_explicit_instance_limits_and_business_idle():
+@pytest.fixture
+def deployment_endpoints(monkeypatch):
+    monkeypatch.setenv('TWINKLE_REDIS_URL', 'redis://127.0.0.1:6380/0')
+    monkeypatch.setenv('TWINKLE_OTLP_ENDPOINT', 'http://127.0.0.1:4317')
+
+
+def test_existing_yaml_uses_explicit_instance_limits_and_business_idle(deployment_endpoints):
     from pathlib import Path
     paths = sorted(Path('cookbook/client/server').glob('**/server_config*.yaml'))
     assert paths
@@ -178,7 +184,7 @@ def test_training_namespace_conflicts_are_rejected():
         ServerConfig(training={'models': [model_config()]})
 
 
-def test_existing_yaml_examples_keep_their_model_entries(monkeypatch):
+def test_existing_yaml_examples_keep_their_model_entries(monkeypatch, deployment_endpoints):
     from pathlib import Path
     monkeypatch.setenv('TWINKLE_LOCAL_MODEL_PATH', '/tmp/model-cache')
     paths = list(Path('cookbook/client/server').rglob('server_config*.yaml'))
@@ -194,6 +200,7 @@ def test_existing_yaml_examples_keep_their_model_entries(monkeypatch):
             assert model.model_id == original.args.model_id
             assert model.route_prefix == original.route_prefix
             assert model.config.min_replicas == original.args.min_replicas
+            assert model.config.node_selector == original.args.node_selector
         assert ServerConfig.model_validate(config.to_yaml_dict()).training_config == config.training_config
 
 
@@ -225,15 +232,20 @@ def test_separate_model_applications_select_lora_and_full():
     assert ServerConfig.model_validate(config.to_yaml_dict()).training_config == config.training_config
 
 
-def test_launcher_keeps_training_and_sampling_capabilities_separate(monkeypatch):
+@pytest.mark.parametrize('with_training', [False, True])
+def test_launcher_keeps_training_and_sampling_capabilities_separate(monkeypatch, with_training):
     from ray import serve
-    from twinkle.server.launcher.server_launcher import ServerLauncher
-    config = ServerConfig(applications=[model_application(), {
+    from twinkle_server.launcher.server_launcher import ServerLauncher
+    applications = [{
         'name': 'gateway', 'import_path': 'server', 'route_prefix': '/api/v1',
+        'args': {'openai_model_aliases': {'default': 'teacher'}},
     }, {
         'name': 'sampler', 'import_path': 'sampler', 'route_prefix': '/api/v1/sampler/teacher',
         'args': {'model_id': 'teacher', 'device_group': {}, 'device_mesh': {}, 'sampler_type': 'mock'},
-    }])
+    }]
+    if with_training:
+        applications.append(model_application())
+    config = ServerConfig(applications=applications)
     captured = {}
     def builder(**kwargs):
         captured.update(kwargs)
@@ -241,9 +253,10 @@ def test_launcher_keeps_training_and_sampling_capabilities_separate(monkeypatch)
     launcher = ServerLauncher(config)
     monkeypatch.setattr(launcher, '_resolve_builder', lambda path: builder)
     monkeypatch.setattr(serve, 'run', lambda *args, **kwargs: None)
-    launcher._deploy_application(config.applications[1])
-    assert captured['training_models'] == ['Qwen/small']
+    launcher._deploy_application(config.applications[0])
+    assert captured['training_models'] == (['Qwen/small'] if with_training else [])
     assert captured['supported_models'] == ['teacher']
+    assert captured['openai_model_aliases'] == {'default': 'teacher'}
 
 
 def configured_application():
@@ -298,8 +311,8 @@ def test_invalid_adapter_lifecycle_is_rejected_before_allocation(policy):
 
 def test_configured_options_reach_cpu_router_without_changing_yaml(monkeypatch):
     from types import SimpleNamespace
-    from twinkle.server.launcher.server_launcher import ServerLauncher
-    from twinkle.server.model.pool.actor import TrainingControllerActor
+    from twinkle_server.launcher.server_launcher import ServerLauncher
+    from twinkle_server.model.pool.actor import TrainingControllerActor
     import ray
     from ray import serve
     config = ServerConfig(applications=[configured_application()])
@@ -313,7 +326,7 @@ def test_configured_options_reach_cpu_router_without_changing_yaml(monkeypatch):
         captured.update(args[-1])
         return 'app'
 
-    monkeypatch.setattr('twinkle.server.model.pool.router.build_training_router', router)
+    monkeypatch.setattr('twinkle_server.model.pool.router.build_training_router', router)
     monkeypatch.setattr(serve, 'run', lambda *args, **kwargs: None)
     ServerLauncher(config)._deploy_training()
     assert captured['max_ongoing_requests'] == 17
@@ -328,8 +341,8 @@ def test_configured_options_reach_cpu_router_without_changing_yaml(monkeypatch):
 @pytest.mark.asyncio
 async def test_configured_options_reach_runtime_with_one_controller_owned_replica(monkeypatch):
     import importlib
-    from twinkle.server.state.training_records import InstanceRecord
-    from twinkle.server.model.pool.driver import RayInstanceDriver
+    from twinkle_server.state.training_records import InstanceRecord
+    from twinkle_server.model.pool.driver import RayInstanceDriver
     from ray import serve
     config = ServerConfig(applications=[configured_application()])
     model = config.training_config.models[0]
@@ -342,10 +355,12 @@ async def test_configured_options_reach_runtime_with_one_controller_owned_replic
         captured.update(kwargs)
         return 'app'
 
-    monkeypatch.setattr('twinkle.server.model.app.build_model_app', builder)
+    monkeypatch.setattr('twinkle_server.model.app.build_model_app', builder)
     monkeypatch.setattr(importlib.import_module('ray.util.placement_group'), 'get_placement_group', lambda name: 'pg')
     monkeypatch.setattr(serve, 'run', lambda *args, **kwargs: None)
     await driver.deploy(instance, driver.config.get(model.name, 'lora'))
+    assert captured['model_id'] == model.model_id
+    assert captured['telemetry_base_model'] == model.name
     options = captured['deploy_options']
     assert options['num_replicas'] == 1 and 'autoscaling_config' not in options
     assert options['max_ongoing_requests'] == 17

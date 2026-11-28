@@ -22,7 +22,7 @@ import time
 from contextlib import closing
 
 from tests.server.fixtures import MOCK_SERVER_CONFIG, MOCK_SERVER_CONFIG_REDIS
-from twinkle.server.config import ServerConfig
+from twinkle_server.config import ServerConfig
 
 pytestmark = pytest.mark.skipif(
     os.environ.get('TWINKLE_TEST_INTEGRATION', '0') != '1',
@@ -44,7 +44,7 @@ RAY_NODE_CPUS = 8
 def ray_cluster():
     """Start a fresh local Ray head node for the duration of the module.
 
-    Bypasses ``twinkle.server.launcher`` (which would normally inject
+    Bypasses ``twinkle_server.launcher`` (which would normally inject
     ``TWINKLE_PERSISTENCE_*`` into the cluster), so we mirror that injection
     by hand into both ``os.environ`` and ``ray.init(runtime_env=...)``.
     Without it, each replica defaults to ``RayActorBackend`` and the tinker
@@ -53,7 +53,7 @@ def ray_cluster():
     import ray
     from ray import serve
 
-    from twinkle.server.config import ServerConfig
+    from twinkle_server.config import ServerConfig
     cfg = ServerConfig.from_yaml(SELECTED_CONFIG)
 
     persistence_env: dict[str, str] = {}
@@ -99,7 +99,7 @@ def _http(url: str, method: str = 'GET', json: dict | None = None) -> httpx.Resp
 def test_mock_mode_reaches_ready_and_is_deterministic(ray_cluster, monkeypatch) -> None:
     import ray
     from ray import serve
-    from twinkle.server.launcher.server_launcher import ServerLauncher
+    from twinkle_server.launcher.server_launcher import ServerLauncher
 
     cfg = ServerConfig.from_yaml(SELECTED_CONFIG)
 
@@ -161,7 +161,7 @@ def test_mock_mode_reaches_ready_and_is_deterministic(ray_cluster, monkeypatch) 
 
 
 def _exercise_twinkle_clients(base: str) -> None:
-    from twinkle import init_twinkle_client
+    from twinkle_client import init_twinkle_client
     from twinkle_client.resources import RolloutResources
 
     with RolloutResources(init_twinkle_client, base_url=base, api_key='EMPTY_TOKEN') as resources:
@@ -262,7 +262,7 @@ def _exercise_tinker_client(base: str) -> None:
 
     from tinker import ServiceClient
 
-    from twinkle import init_tinker_client
+    from twinkle_client import init_tinker_client
 
     # patch_tinker injects Twinkle's authentication and request ID headers and
     # lifts tinker's ``tml-`` api-key prefix check so EMPTY_TOKEN passes.
@@ -300,7 +300,7 @@ def _exercise_tinker_session(client) -> None:
     assert sampler_ckpt.path is not None
     from pathlib import Path
     from peft import LoraConfig
-    from twinkle.server.checkpoint import create_checkpoint_manager
+    from twinkle_server.checkpoint import create_checkpoint_manager
     checkpoint_manager = create_checkpoint_manager('EMPTY_TOKEN', client_type='tinker')
     sampler_dir = Path(checkpoint_manager.resolve_checkpoint_dir(sampler_ckpt.path)).resolve()
     LoraConfig(r=4, target_modules='all-linear').save_pretrained(sampler_dir)

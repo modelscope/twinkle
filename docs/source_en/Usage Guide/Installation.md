@@ -1,27 +1,32 @@
 # Twinkle Installation
 
-## Wheel Package Installation
-
-You can install using pip:
-
-```shell
-pip install 'twinkle-kit'
-```
+| What you want to do | Install |
+| --- | --- |
+| Train or run inference on your own GPU | `pip install twinkle-kit` |
+| Use the Python SDK against a remote service | see the source installation below |
+| Run the HTTP service yourself | see the source installation below |
 
 ## Installation from Source
 
 ```shell
 git clone https://github.com/modelscope/twinkle.git
 cd twinkle
-pip install -e .
+pip install -e .                                                        # local training and inference
+pip install -e . -e ./twinkle_cs/client                                 # Python SDK, provides twinkle-auto
+pip install -e . -e ./twinkle_cs/server                                 # HTTP service, provides twinkle-server
+pip install -e '.[test]' -e ./twinkle_cs/client -e ./twinkle_cs/server  # work on all three
 ```
+
+Install a matching `ms-swift` when you use Swift templates or model loaders.
+
+
 
 ## Docker Image
 
 You can also use our pre-built Docker image:
 
 ```text
-modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.3.0
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-1.0.0.dev
 ```
 
 ## Client Installation

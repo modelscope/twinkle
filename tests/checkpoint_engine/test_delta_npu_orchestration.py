@@ -184,6 +184,8 @@ def test_npu_close_then_new_seed():
 def test_gpu_manager_still_uses_worker_metadata():
     model = Mock(_actors=[1], device_mesh=SimpleNamespace(world_size=1))
     sampler = Mock(_actors=[2], device_mesh=SimpleNamespace(data_world_size=1))
+    model.checkpoint_transfer_capabilities.return_value = lambda: {'direct_stream': True, 'device_type': 'GPU'}
+    sampler.checkpoint_transfer_capabilities.return_value = lambda: {'direct_stream': True, 'device_type': 'GPU'}
     model.prepare_delta_sync.return_value = dict(device='cuda', master_metadata=object())
     sampler.validate_delta_sampler.return_value = dict(device='cuda', tp=1)
     sampler.delta_sampler_metadata.return_value = [dict(node_ip='n', device_uuid='g0', zmq_handle='h')]

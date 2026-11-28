@@ -18,10 +18,10 @@ from hypothesis import strategies as st
 from pathlib import Path
 from pydantic import ValidationError
 
-from twinkle.server.config import ApplicationSpec, ServerConfig
-from twinkle.server.exceptions import ConfigParseError
-from twinkle.server.launcher import ServerLauncher
-from twinkle.server.sampler.app import SAMPLER_SELECTOR, build_sampler_app
+from twinkle_server.config import ApplicationSpec, ServerConfig
+from twinkle_server.exceptions import ConfigParseError
+from twinkle_server.launcher import ServerLauncher
+from twinkle_server.sampler.app import SAMPLER_SELECTOR, build_sampler_app
 
 # ---------- minimal valid config strategy ---------------------------------- #
 

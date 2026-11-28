@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle.server.task_queue.rate_limiter import RateLimiter
+from twinkle_server.task_queue.rate_limiter import RateLimiter
 
 
 class _RecordingGauge:
@@ -11,8 +11,8 @@ class _RecordingGauge:
     def __init__(self) -> None:
         self.calls: list[tuple[int, dict[str, str]]] = []
 
-    def set(self, value: int, *, tags: dict[str, str]) -> None:
-        self.calls.append((value, tags))
+    def set(self, value: int, *, attributes: dict[str, str]) -> None:
+        self.calls.append((value, attributes))
 
 
 @pytest.mark.asyncio

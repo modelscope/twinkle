@@ -1,0 +1,36 @@
+[project]
+name = "twinkle-client"
+# Version comes from the repository-root VERSION file; setup.py copies it next to this pyproject.
+dynamic = ["version"]
+description = "Python SDK for Twinkle services."
+readme = "README.md"
+authors = [{ name = "ModelScope", email = "contact@modelscope.cn" }]
+requires-python = ">=3.11,<3.14"
+license = {file = "LICENSE"}
+dependencies = [
+  "twinkle-kit>=1.0.0.dev0,<2.0",
+  "requests>=2.31",
+  "urllib3>=2",
+  "typer>=0.9.0",
+  "textual>=1.0.0",
+  "plotext>=5.2.0",
+  "openai>=1.0.0",
+  "httpx>=0.25.0",
+  "tinker==0.16.1",
+  "pyyaml>=6",
+]
+
+[project.scripts]
+twinkle-auto = "twinkle_client.auto:main"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["twinkle_client", "twinkle_client.*"]
+
+[tool.setuptools.package-data]
+"twinkle_client" = ["py.typed"]
+"twinkle_client.skills.bundled" = ["*.md"]

@@ -6,13 +6,15 @@ These pin the contract that replaced the scattered
 class provides the CUDA-like default and each platform overrides only what
 actually differs.
 """
+import os
+
 import pytest
 
 from types import SimpleNamespace
 
 from twinkle.checkpoint_engine import (CheckpointEngineManager, HCCLCheckpointEngine, NCCLCheckpointEngine,
                                        XCCLCheckpointEngine)
-from twinkle.utils.platforms import GPU, Metax, MPS, NPU, Platform, XPU
+from twinkle.utils.platforms import GPU, HCCL_SOCKET_ENV_KEYS, Metax, MPS, NPU, Platform, XPU, hccl_socket_env_scope
 
 
 def test_gpu_uses_base_defaults():
@@ -142,3 +144,27 @@ def test_manager_and_worker_agree_on_engine():
     engine even on XPU/NPU, while the workers built the XCCL/HCCL one.
     """
     assert CheckpointEngineManager.decide_backend_engine() is Platform.get_platform().checkpoint_engine()[0]
+
+
+def test_hccl_socket_env_scope_applies_the_layout_then_restores_the_environment(monkeypatch):
+    """HCCL reads its socket layout when it builds a communicator, not when the group is created.
+
+    So the layout has to stay applied until one collective has run, and it must not survive the
+    group: the next group in the same process may need a different one.
+    """
+    for key in HCCL_SOCKET_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    layout = dict(zip(HCCL_SOCKET_ENV_KEYS, ('23456', '41000-41511', '51000-51511'), strict=True))
+    with hccl_socket_env_scope(dict(layout, UNRELATED='x')):
+        assert {key: os.environ[key] for key in HCCL_SOCKET_ENV_KEYS} == layout
+        # Only the layout keys are touched, and a stale value does not get merged in.
+        assert 'UNRELATED' not in os.environ
+    assert all(key not in os.environ for key in HCCL_SOCKET_ENV_KEYS)
+
+
+def test_hccl_socket_env_scope_restores_an_existing_layout(monkeypatch):
+    monkeypatch.setenv('HCCL_IF_BASE_PORT', '11111')
+    layout = dict(zip(HCCL_SOCKET_ENV_KEYS, ('22222', '42000-42511', '52000-52511'), strict=True))
+    with hccl_socket_env_scope(layout):
+        assert os.environ['HCCL_IF_BASE_PORT'] == '22222'
+    assert os.environ['HCCL_IF_BASE_PORT'] == '11111'

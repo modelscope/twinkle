@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 
 from twinkle.template.base import Template
-from twinkle.template.contract import MediaBundle, RolloutState
+from twinkle.template.contract import engine_input_ids
 from twinkle_agentic.rollout.ledger import TurnLedger
 from twinkle_agentic.utils.token_utils import append_ids, extend_with_bridge
 
@@ -132,10 +132,14 @@ class FakeTemplate:
     model_id = 'qwen-fake'
     truncation_strategy = 'right'
     enable_thinking = False
+    # 8314e88d/ef063fc2: Template.render_delta gates the enable_thinking kwarg on this flag
+    # (Template class default False, base.py). Mirror it so the borrowed render_delta works.
+    _explicit_enable_thinking = False
     render_delta = Template.render_delta
     _collapse_system_messages = staticmethod(Template._collapse_system_messages)
     decode_tool_calls = staticmethod(Template.decode_tool_calls)
-    _collapse_system_messages = staticmethod(Template._collapse_system_messages)
+    _reasoning_started = staticmethod(lambda input_ids: False)
+    _engine_input_ids = staticmethod(lambda input_ids: input_ids)
 
     def __init__(self, tokenizer: FakeTokenizer) -> None:
         self.tokenizer = tokenizer
@@ -148,6 +152,10 @@ class FakeTemplate:
         pif['input_ids'] = input_ids
         pif['labels'] = [-100] * len(input_ids)
         return self._invoke_post_pipeline([pif])[0]
+
+    def encode_prompt(self, trajectory, *, backend='vllm', add_generation_prompt=True):
+        # 012aff34: ledger.open / token-only rollout encode via the public encode_prompt contract.
+        return self.encode(trajectory, add_generation_prompt=add_generation_prompt)
 
     def finalize_appended_features(self, inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return self._invoke_post_pipeline(inputs)
@@ -166,6 +174,7 @@ class FakeTemplate:
                 labels = labels[1:] + labels[:1]
             pif['input_ids'] = input_ids
             pif['labels'] = labels
+            pif['completion_mask'] = [0 if label == -100 else 1 for label in labels]
             pif['attention_mask'] = [1] * len(input_ids)
             pif['position_ids'] = list(range(len(input_ids)))
             pif['length'] = len(input_ids)
@@ -239,7 +248,7 @@ def test_append_ids_extends_batched_token_type_ids_on_token_axis():
     result = append_ids(pif, [4, 5], template, trainable=False)
 
     assert result is not None
-    assert result['mm_token_type_ids'] == [[0, 0, 0, 0, 0]]
+    assert result['mm_token_type_ids'].tolist() == [[0, 0, 0, 0, 0]]
     assert len(result['mm_token_type_ids'][0]) == len(result['input_ids'])
     # The caller's wire-shaped feature remains untouched.
     assert pif['mm_token_type_ids'] == [[0, 0, 0]]
@@ -301,22 +310,13 @@ def test_turn_ledger_advances_feature_and_engine_bridges_independently():
     messages = [{'role': 'user', 'content': 'q'}, {'role': 'assistant', 'content': 'a'}]
     template = DualBridgeTemplate(FakeTokenizer())
     feature = template.encode({'messages': messages})
-    state = RolloutState(
-        feature=feature,
-        engine_input_ids=(11, 12),
-        messages=tuple(messages),
-        tools=(),
-        reasoning_started=False,
-        media=MediaBundle(),
-    )
+    feature.update(engine_input_ids=[11, 12], reasoning_started=False, tools=[])
     ledger = TurnLedger(template, backend='sglang')
-    ledger._pif = feature
-    ledger._state = state
+    ledger.adopt(feature)
 
     appended = [{'role': 'user', 'content': 'next'}]
     assert ledger.observe(appended)
-    assert ledger.state is not None
     assert ledger.input_feature['input_ids'] == feature['input_ids'] + [31]
-    assert ledger.state.engine_input_ids == (11, 12, 41, 42)
-    assert ledger.state.messages == tuple(messages + appended)
+    assert engine_input_ids(ledger.input_feature) == [11, 12, 41, 42]
+    assert ledger.messages == messages + appended
     assert template.calls == [(False, 'vllm'), (True, 'sglang')]

@@ -13,8 +13,10 @@ from twinkle.utils.grad_clip import normalize_and_clip_grad_norm
 
 
 def _free_port() -> int:
+    # TCPStore's server socket binds the wildcard address, so the probe must bind the same scope:
+    # a loopback-only probe can return a port occupied on another interface (EADDRINUSE at init).
     with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0))
+        sock.bind(('', 0))
         return sock.getsockname()[1]
 
 

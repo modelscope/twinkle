@@ -218,15 +218,15 @@ def _query_mimir_instant(promql: str,
 @pytest.mark.asyncio
 async def test_active_sessions_no_4x_inflation() -> None:
     """Four ``ServerState`` instances + 5 sessions ⇒ Mimir reads 5, not 20."""
-    from twinkle.server.state import ServerState
-    from twinkle.server.state.backend.memory_backend import RayActorBackend
-    from twinkle.server.telemetry import MetricsRegistry
+    from twinkle_server.state import ServerState
+    from twinkle_server.state.backend.memory_backend import RayActorBackend
+    from twinkle_server.telemetry import MetricsRegistry
 
-    MetricsRegistry.reset()
+    MetricsRegistry._instance = None
     service = f'twinkle-test-inflation-{uuid.uuid4().hex[:6]}'
     with _telemetry_session(service, export_interval_ms=500):
         # Re-create the registry under the fresh meter provider.
-        MetricsRegistry.reset()
+        MetricsRegistry._instance = None
         backend = RayActorBackend()
         instances = [
             ServerState(backend=backend, cleanup_interval=600.0, metrics_update_interval=0.2) for _ in range(4)
@@ -253,7 +253,7 @@ async def test_active_sessions_no_4x_inflation() -> None:
         finally:
             for s in instances:
                 await s.stop_cleanup_task()
-            MetricsRegistry.reset()
+            MetricsRegistry._instance = None
 
 
 # ---------- trace correlation visible end-to-end ------------------------- #
@@ -265,8 +265,8 @@ def test_business_span_with_correlation_visible_e2e() -> None:
     """
     from opentelemetry import trace
 
-    from twinkle.server.telemetry.correlation import MODEL_ID, SESSION_ID
-    from twinkle.server.telemetry.tracing import traced_operation
+    from twinkle_server.telemetry.correlation import MODEL_ID, SESSION_ID
+    from twinkle_server.telemetry.tracing import traced_operation
 
     service = f'twinkle-test-trace-{uuid.uuid4().hex[:6]}'
     session_id = f'sess-{uuid.uuid4().hex[:8]}'

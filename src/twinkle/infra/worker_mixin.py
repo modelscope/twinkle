@@ -55,26 +55,36 @@ class WorkerMixin:
         actors = RayHelper.create_workers(
             cls, group, 'all', *args, instance_id=uuid.uuid4().hex, extra_torch_kwargs=torch_kwargs,
             max_concurrency=self._max_concurrency, placements=placements, **kwargs)
+        from .dispatch import _owner_identity
+        owner = _owner_identity()
+        if self.__dict__.get('_pool_actor_owner') != owner:
+            self._pool_actor_owner = owner
+            self._owned_pool_actors = []
+        self._owned_pool_actors.extend(actors)
         worker_ids = [worker_id_of(actor) for actor in actors]
         key = self._pool_key
-        RayHelper.pool_put(key, {
-            worker_id: {'actor': actor, 'state': 'WARMING', 'group': group, 'slot': slot,
-                        'ranks': tuple(placement.get('ranks', ()))}
-            for worker_id, actor, slot, placement in zip(worker_ids, actors, slots, placements)
-        })
         try:
+            RayHelper.pool_put(key, {
+                worker_id: {'actor': actor, 'state': 'WARMING', 'group': group, 'slot': slot,
+                            'ranks': tuple(placement.get('ranks', ()))}
+                for worker_id, actor, slot, placement in zip(worker_ids, actors, slots, placements)
+            })
             if warmup is not None:
                 sub = copy.copy(self)
                 sub._actors = list(actors)
                 sub._pool_key = None
                 warmup(sub)
+            RayHelper.pool_set_state(key, worker_ids, 'ACTIVE')
+            _pool_view(self).refresh(force=True)
         except BaseException:
-            RayHelper.pool_remove(key, worker_ids)
-            for actor in actors:
-                ray.kill(actor, no_restart=True)
+            try:
+                RayHelper.release_workers(actors)
+            except BaseException:
+                logger.exception('Pool-growth rollback is incomplete.')
+            finally:
+                self._owned_pool_actors[:] = [actor for actor in self._owned_pool_actors
+                                             if actor in RayHelper._created_actors]
             raise
-        RayHelper.pool_set_state(key, worker_ids, 'ACTIVE')
-        _pool_view(self).refresh(force=True)
         return worker_ids
 
     def remove_workers(self, k: int = 0, ranks: Optional[List[int]] = None) -> List[int]:
@@ -107,7 +117,7 @@ class WorkerMixin:
         actors = [members[worker_id]['actor'] for worker_id in targets]
         for ref in [actor._twinkle_drain.remote() for actor in actors]:
             try:
-                ray.get(ref)
+                ray.get(ref, timeout=_SHUTDOWN_TIMEOUT)
             except Exception:  # noqa
                 logger.warning('A replica failed while draining.', exc_info=True)
         if hasattr(type(self), 'shutdown'):
@@ -116,13 +126,25 @@ class WorkerMixin:
                     ray.get(ref, timeout=_SHUTDOWN_TIMEOUT)
                 except Exception:  # noqa
                     logger.warning('A replica failed to shut down cleanly.', exc_info=True)
-        for actor in actors:
+        released = []
+        failures = []
+        for worker_id, actor in zip(targets, actors):
             try:
-                ray.kill(actor, no_restart=True)
-            except Exception:  # noqa
-                pass
-        RayHelper.pool_remove(key, targets)
-        return sorted(rank for worker_id in targets for rank in members[worker_id].get('ranks') or ())
+                with RayHelper._actor_lifecycle_lock:
+                    ray.kill(actor, no_restart=True)
+                    if actor in RayHelper._created_actors:
+                        RayHelper._created_actors.remove(actor)
+                    RayHelper._released_worker_ids.add(worker_id)
+                released.append(worker_id)
+            except BaseException as error:
+                failures.append(error)
+        try:
+            RayHelper.release_workers([])
+        except BaseException as error:
+            failures.append(error)
+        if failures:
+            raise BaseExceptionGroup('Pool retirement is incomplete', failures)
+        return sorted(rank for worker_id in released for rank in members[worker_id].get('ranks') or ())
 
     def pressure(self) -> float:
         """Mean load of the ACTIVE replicas, as each reports through ``_pressure``."""

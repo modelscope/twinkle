@@ -4,6 +4,41 @@
 import torch
 
 
+class GaLoreOptimizerStateMixin:
+    """Serialize projector state as tensors and primitives for weights-only checkpoint loading."""
+
+    def state_dict(self):
+        state_dict = super().state_dict()
+        # Copy entries before substituting snapshots: Optimizer exposes live state dictionaries.
+        state_dict['state'] = {
+            pid: {**state, 'projector': state['projector'].state_dict()}
+            if isinstance(state.get('projector'), GaLoreProjector) else state
+            for pid, state in state_dict['state'].items()
+        }
+        return state_dict
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        state = {}
+        for pid, entry in state_dict['state'].items():
+            projector = entry.get('projector')
+            if isinstance(projector, dict) and projector.get('__galore_projector__'):
+                entry = {**entry, 'projector': GaLoreProjector.from_state_dict(projector)}
+            state[pid] = entry
+        # Rebuild before Optimizer recursively casts dictionaries to the parameter dtype.
+        super().load_state_dict({**state_dict, 'state': state}, *args, **kwargs)
+        # bnb's Optimizer2State.load_state_dict has a real move_to_device flag: with False the
+        # caller wants state kept on its SAVED device, so the projector must not be moved either.
+        if not (args[0] if args else kwargs.get('move_to_device', True)):
+            return
+        for param, entry in self.state.items():
+            projector = entry.get('projector')
+            if isinstance(projector, GaLoreProjector) and projector.ortho_matrix is not None:
+                # Keep the optimizer's computation dtype, which may differ from the parameter dtype.
+                matrix = projector.ortho_matrix
+                projector.ortho_matrix = ([tensor.to(device=param.device) for tensor in matrix]
+                                          if isinstance(matrix, (list, tuple)) else matrix.to(device=param.device))
+
+
 class GaLoreProjector:
 
     def __init__(self, rank, verbose=False, update_proj_gap=200, scale=1.0, proj_type='std'):
@@ -13,6 +48,19 @@ class GaLoreProjector:
         self.scale = scale
         self.ortho_matrix = None
         self.proj_type = proj_type
+
+    def state_dict(self):
+        """A plain-container snapshot, including the projection's computation dtype."""
+        return {'__galore_projector__': True, 'rank': self.rank, 'verbose': self.verbose,
+                'update_proj_gap': self.update_proj_gap, 'scale': self.scale,
+                'proj_type': self.proj_type, 'ortho_matrix': self.ortho_matrix}
+
+    @classmethod
+    def from_state_dict(cls, state):
+        projector = cls(state['rank'], verbose=state['verbose'], update_proj_gap=state['update_proj_gap'],
+                        scale=state['scale'], proj_type=state['proj_type'])
+        projector.ortho_matrix = state['ortho_matrix']
+        return projector
 
     def project(self, full_rank_grad, iter):
 

@@ -126,8 +126,10 @@ def test_manager_npu_resolves_when_engine_available(monkeypatch):
 
 def test_manager_non_standalone_still_rejected(monkeypatch):
     fake_platform(monkeypatch, 'NPU')
+    local = lambda: SimpleNamespace(
+        checkpoint_transfer_capabilities=lambda: {'direct_stream': True, 'device_type': 'NPU'})
     with pytest.raises(ValueError, match='standalone'):
-        CheckpointEngineManager(SimpleNamespace(), SimpleNamespace(), platform='NPU', sync_backend='delta_sharded')
+        CheckpointEngineManager(local(), local(), platform='NPU', sync_backend='delta_sharded')
 
 
 def test_manager_unknown_platform(monkeypatch):

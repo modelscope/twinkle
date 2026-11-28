@@ -5,8 +5,8 @@ import pytest
 from pydantic import ValidationError
 
 from twinkle.protocol.types.model import ForwardOnlyRequest
-from twinkle.server.config.training import TrainingArguments
-from twinkle.server.model.backends.common import TwinkleCompatModelBase
+from twinkle_server.config.training import TrainingArguments
+from twinkle_server.model.backends.common import TwinkleCompatModelBase
 from twinkle_client._request_builder import build_request
 
 
@@ -18,16 +18,21 @@ def test_training_template_requires_class_before_model_allocation():
 
 
 class TextTemplate:
+    """012aff34 complete-Trajectory contract: encode_prompt/append_completion exchange plain
+    dict features (input_ids + output-order labels), not .state wrappers."""
+
     tokenizer = range(100)
     truncation_strategy = 'left'
 
-    def encode_prompt(self, row):
+    def encode_prompt(self, row, **kwargs):
         assert self.truncation_strategy == 'delete'
-        return SimpleNamespace(state=[12] * len(row['messages'][-1]['content']))
+        ids = [12] * len(row['messages'][-1]['content'])
+        return {'input_ids': ids, 'labels': [-100] * len(ids)}
 
-    def append_completion(self, prefix, tokens):
-        feature = {'input_ids': prefix + tokens, 'labels': [-100] * (len(prefix) - 1) + tokens + [-100]}
-        return SimpleNamespace(state=SimpleNamespace(feature=feature))
+    def append_completion(self, prompt, tokens, **kwargs):
+        prefix = list(prompt['input_ids'])
+        return {'input_ids': prefix + list(tokens),
+                'labels': [-100] * (len(prefix) - 1) + list(tokens) + [-100]}
 
 
 def test_continuation_is_encoded_once_and_keeps_row_identity():

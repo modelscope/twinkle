@@ -418,10 +418,22 @@ class StreamingDriver:
         lending = None
         if self.cluster_adapter is not None and short:
             lending = threading.Thread(target=self._lend, args=(waited,), name='twinkle-cluster-lend', daemon=True)
-            lending.start()
         #: mirrors ``lending`` from its start until the reclaim below completes -- an ``adjust``
-        #: queued behind that cycle is not stuck, so the watchdog stays quiet while it runs
-        self._lending = lending
+        #: queued behind that cycle is not stuck, so the watchdog stays quiet while it runs.
+        #: Published under the lock BEFORE the thread starts (and cleared under it after the
+        #: reclaim) so ``close`` can never read a settled driver while a delivery is mid-cycle:
+        #: it drains this mirror before returning, and the component lifecycle release kills the
+        #: actor right after close -- a kill mid-reclaim would strand the trainer merged/offloaded.
+        with self._lock:
+            self._lending = lending
+        if lending is not None:
+            try:
+                lending.start()
+            except BaseException:
+                with self._lock:
+                    self._lending = None
+                    self._lock.notify_all()
+                raise
         try:
             with self._lock:
                 if not self._wait_for_batch():
@@ -429,11 +441,17 @@ class StreamingDriver:
         finally:
             if self.cluster_adapter is not None:
                 settle = time.monotonic()
-                if lending is not None:
-                    lending.join()
-                self.cluster_adapter.reclaim()
-                self._reclaim_cost = time.monotonic() - settle
-                self._lending = None
+                try:
+                    if lending is not None:
+                        lending.join()
+                    self.cluster_adapter.reclaim()
+                finally:
+                    # clear even when reclaim raises: reclaim's own finally restores the trainer,
+                    # and a stuck mirror would make close wait on a cycle that already settled.
+                    self._reclaim_cost = time.monotonic() - settle
+                    with self._lock:
+                        self._lending = None
+                        self._lock.notify_all()
         # ONE locked section: collect the batch and build its light facts. The rows are handed
         # out exactly as they travel (a reference under ray, a dict in-process) -- the driver
         # never opens one; the score columns ride the facts instead, aligned row for row, and
@@ -721,8 +739,10 @@ class StreamingDriver:
                 self._skip_prompts = self._prompt_seq + len(self._pending_rows)
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
-    def close(self, timeout: float = 30.0) -> None:
+    def close(self, timeout: float = 30.0) -> dict:
         """Wait up to timeout seconds for cleanup; retry close to confirm settlement.
+
+        Returns the terminal statistics once cleanup settles.
 
         Raises:
             TimeoutError: Cleanup did not settle before the deadline.
@@ -747,6 +767,7 @@ class StreamingDriver:
                 drain.result()
             else:
                 raise TimeoutError(f'StreamingDriver.close timed out waiting for {self._close_waiting_on}') from None
+        return self.stats()
 
     def _drain_on_close(self, drain: Future) -> None:
         try:
@@ -761,6 +782,16 @@ class StreamingDriver:
             self._lock.notify_all()
         if self._thread is not None:
             self._thread.join()
+        # A delivery in flight may be mid-lend: its finally joins the lend thread and reclaims the
+        # trainer (reload + unmerge). The caller's lifecycle release kills this actor as soon as
+        # close returns, so returning before that cycle settles would truncate the reclaim and
+        # leave the trainer merged and CPU-offloaded (the next forward dies on the device mix).
+        # Drain the in-flight cycle before declaring cleanup settled; the outer close(timeout)
+        # still bounds the wait and reports what it was waiting on.
+        self._close_waiting_on = 'in-flight lend/reclaim'
+        with self._lock:
+            while self._lending is not None:
+                self._lock.wait(0.5)
 
         self._drain_episode_calls()
         with self._lock:

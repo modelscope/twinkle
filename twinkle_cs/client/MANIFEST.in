@@ -1,0 +1,2 @@
+# Copy of the repository-root VERSION made by setup.py at build time; the sdist must carry it.
+include VERSION

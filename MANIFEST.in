@@ -1,0 +1,2 @@
+# Single version source for every distribution in this repository; twinkle-kit reads it from pyproject.toml.
+include VERSION

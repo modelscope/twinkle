@@ -153,7 +153,8 @@ def test_native_megatron_mean_losses_keep_existing_micro_batch_reduction(
         def unpack_inputs(self, inputs, **kwargs):
             return inputs
 
-        def unpack_packed_sequences(self, inputs, outputs):
+        def unpack_packed_sequences(self, inputs, outputs=None, task='causal_lm'):
+            # ec901187: the megatron forward seam now forwards task= to the unpack hook.
             return inputs, outputs
 
     class Chunk(torch.nn.Module):

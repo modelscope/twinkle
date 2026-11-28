@@ -32,9 +32,11 @@ import re
 from pathlib import Path
 from typing import List, Tuple
 
+import numpy as np
+
 import twinkle
 from twinkle.data_format import Message, Trajectory
-from twinkle.server.utils.template_utils import DEFAULT_TEMPLATE, get_template_for_model
+from twinkle.template.mapping import DEFAULT_TEMPLATE, get_template_for_model
 
 twinkle.initialize(mode='local')
 
@@ -305,13 +307,26 @@ class TestEncodeMatchesApplyChatTemplate:
 
     @staticmethod
     def _reference_text(template, messages, tools=None, add_generation_prompt=False) -> str:
-        """Mirror the kwargs ``Template._apply_chat_template`` passes through."""
+        """Mirror the kwargs ``Template._apply_chat_template`` passes through.
+
+        Since 8314e88d ``enable_thinking`` is only forwarded when the caller set it
+        explicitly (``_explicit_enable_thinking``); otherwise the checkpoint's own
+        chat-template default applies, so the reference must not force the class default.
+        ``_encode_one`` also defaults ``preserve_thinking`` to the labelled intent
+        (True for training encodes, False for generation-prompt encodes), which keeps
+        history think blocks in the rendered training text.
+        """
+        kwargs = {}
+        if template._explicit_enable_thinking:
+            kwargs['enable_thinking'] = template.enable_thinking
+        kwargs['preserve_thinking'] = (template.preserve_thinking
+                                       if template.preserve_thinking is not None else not add_generation_prompt)
         return template.processor.apply_chat_template(
             messages,
             tools=list(tools or []),
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
-            enable_thinking=template.enable_thinking,
+            **kwargs,
         )
 
     @pytest.mark.parametrize('case', sorted(_PLAIN_CASES), ids=sorted(_PLAIN_CASES))
@@ -386,5 +401,7 @@ class TestEncodeMatchesApplyChatTemplate:
         trajectory = Trajectory(messages=[Message(**m) for m in _PLAIN_CASES['single_turn']])
         encoded = template.encode(trajectory)
         assert len(encoded['labels']) == len(encoded['input_ids'])
-        assert (encoded['labels'] == -100).sum() > 0
-        assert (encoded['labels'] != -100).sum() > 0
+        # 8314e88d normalize_token_fields: encode returns plain lists, not ndarrays.
+        labels = np.asarray(encoded['labels'])
+        assert (labels == -100).sum() > 0
+        assert (labels != -100).sum() > 0

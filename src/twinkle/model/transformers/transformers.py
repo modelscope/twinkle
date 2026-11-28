@@ -731,7 +731,18 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 from .vision_keepalive import VisionKeepAlive
 
                 base_model = self.model.get_base_model() if isinstance(self.model, PeftModel) else self.model
-                self._vision_keepalive = VisionKeepAlive(base_model, self.model, self.model_arch['aligner'])
+                # Text-only checkpoints (e.g. JEV-9B qwen3_5_text) can carry a multimodal model_arch
+                # declaration yet have no visual tower; only keep alive aligners that actually exist
+                # so the wrap does not raise on get_submodule('visual').
+                aligners = []
+                for path in self.model_arch['aligner']:
+                    try:
+                        base_model.get_submodule(path)
+                    except AttributeError:
+                        continue
+                    aligners.append(path)
+                if aligners:
+                    self._vision_keepalive = VisionKeepAlive(base_model, self.model, aligners)
 
             if optimizer_groups:
                 result = self.strategy.wrap_model(self.model, *(group.optimizer for group in optimizer_groups))
@@ -861,8 +872,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         after the forward to gather recorded indices (RECORD) and clear global state.
         """
         from .moe.router_replay import RouterReplay
-        if not getattr(self, '_router_replay_enabled', False) or action is None:
+        if action is None:
             return RouterReplay(action=None)
+        if not getattr(self, '_router_replay_enabled', False):
+            raise ValueError('Routing replay was requested, but the model was built with enable_router_replay=False. '
+                             'Set enable_router_replay=True when constructing the model '
+                             '(in the model application args for a remote deployment).')
         self._maybe_apply_router_replay()
         return RouterReplay(
             action=action,
@@ -933,9 +948,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                     logits.div_(temperature)
                 if loss_require_entropy:
                     outputs['logps'], outputs['entropies'] = selective_log_softmax(
-                        logits, masked_labels, return_entropy=True)
+                        logits, masked_labels, return_entropy=True, vocab_parallel=False)
                 else:
-                    outputs['logps'] = selective_log_softmax(logits, masked_labels)
+                    # HF logits are always FULL vocab (DTensor TP replicates, never
+                    # Megatron-vocab-shards); never let a co-resident Megatron TP>1
+                    # student's global mpu state route them into vocab-parallel CE.
+                    outputs['logps'] = selective_log_softmax(logits, masked_labels, vocab_parallel=False)
                 del logits
         if loss_require_values:
             values = outputs['logits']
@@ -1008,6 +1026,32 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return inputs
         return {k: v for k, v in inputs.items() if k != 'position_ids'}
 
+    def _compute_precision_autocast(self):
+        """Run a full-parameter fp32 actor's forward in the mixed-precision compute dtype.
+
+        RL's trainable actors pin float32 parameter storage (master weights) while compute follows
+        ``mixed_precision``. A LoRA policy (``PeftModel``) already gets bf16 compute from the strategy's
+        autocast / FSDP cast, so it must be left untouched (adding autocast would upcast its softmax /
+        layernorm to fp32 and drift the curve). PPO's FULL-PARAMETER critic, however, reaches the
+        eval/forward_only path (``model.eval()`` + ``no_grad``) without that cast and runs fp32 into
+        flash_attention_2 (fp16/bf16 only), which raises. Gate on full-parameter fp32 storage so only that
+        broken case gets the autocast; LoRA policies and already-bf16 models are untouched.
+        """
+        amp_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(self.mixed_precision)
+        if amp_dtype is None:
+            return contextlib.nullcontext()
+        param = next(self.model.parameters(), None)
+        if param is None or param.dtype != torch.float32:
+            return contextlib.nullcontext()
+        base = self.strategy.unwrap_model(self.model)
+        if isinstance(base, PeftModel):
+            return contextlib.nullcontext()
+        if not getattr(self, '_precision_autocast_logged', False):
+            self._precision_autocast_logged = True
+            logger.info('compute_precision_autocast: full-param fp32 storage -> %s compute (strategy=%s, mixed_precision=%s)',
+                        amp_dtype, type(self.strategy).__name__, self.mixed_precision)
+        return torch.autocast(device_type=param.device.type, dtype=amp_dtype)
+
     def _forward_with_task_readout(self, unwrapped_model, task, inputs, adapter_name=None):
         """Model call for tasks whose registry row carries a readout kind (``TaskSpec.readout``).
 
@@ -1073,6 +1117,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             inputs: The model inputs. Can be an encoded batch, or a list of `Trajectory`
             **kwargs:
                 adapter_name: Lora adapter name.
+                output_fields: Explicitly request channels (logps/values/entropies/logits/
+                    embeddings/routed_experts), same contract as forward_only: derivation
+                    follows the request instead of the loss's require_* flags, and a field
+                    this forward cannot produce fails loudly.
         Returns:
             The output of the model forward.
         """
@@ -1081,6 +1129,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         temperature = float(kwargs.pop('temperature', 1.0))
         sampling_masks = kwargs.pop('sampling_masks', None)
         return_logits = kwargs.pop('return_logits', False)
+        # Explicit channel request on the TRAINING path, same contract as forward_only and
+        # MegatronModel.forward_backward: without popping it here the request was a silent
+        # no-op (postprocess/finalize below never saw it) and the kwarg leaked into
+        # forward_kwargs / metric kwargs.
+        output_fields = frozenset(kwargs.pop('output_fields', None) or ())
         task = kwargs.pop('task', 'causal_lm')
         loss_key = kwargs.pop('loss_key', None)
         optimizer_config = self.optimizer_group[adapter_name]
@@ -1159,7 +1212,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # processes every forward with the wrong template.
         with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), \
                 _resolve_mm_graph_context(unwrapped_model, optimizer_config.template), \
-                self._mm_forward_context(optimizer_config):
+                self._mm_forward_context(optimizer_config), self._compute_precision_autocast():
             with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                 # Without gradient checkpointing use_cache stays True, and Transformers skips
                 # detecting padding-free packed sequences whenever a KV cache exists.
@@ -1179,6 +1232,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             return_logits=return_logits,
             loss_instance=loss_instance,
             replay=(replay_loss_mask, replay_masked_labels, replay_metadata) if enable_sampling_replay else None,
+            output_fields=output_fields,
         )
         return self._finalize_forward_outputs(
             inputs,
@@ -1191,6 +1245,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             loss_instance=loss_instance,
             return_logits=return_logits,
             recorded_routing=recorded_routing,
+            output_fields=output_fields,
         )
 
     # lazy_collect follows the global default (True): a caller that reads the output itself calls
@@ -1269,8 +1324,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         own micro-batch scales. Parallel-list kwargs (``ref_logps`` and friends) are sliced by
         ``select_batch`` alongside the inputs, so per-feature alignment survives the split.
         """
-        if get_task_spec(kwargs.get('task', 'causal_lm')).readout:
-            # Readout tasks organize labels / decision meta per RECORD, not per sample: the
+        spec = get_task_spec(kwargs.get('task', 'causal_lm'))
+        if spec.readout and not spec.token_level_labels:
+            # Record-level readouts organize labels / decision meta per RECORD, not per sample: the
             # sample-level split here would desynchronize them from the micro-batch logits.
             # Decision always reads out (its task_forward families included); the seq_cls
             # family only when the model carries an attached head -- its legacy in-model
@@ -1384,7 +1440,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # See ``forward``: the per-group multimodal hook needs to know which group this call
             # selected, and the forward-only path resolves it from ``adapter_name`` just the same.
             with get_task_spec_obj(task).transformers_context(unwrapped_model, template=optimizer_config.template), \
-                    lora_ctx, self._mm_forward_context(optimizer_config):
+                    lora_ctx, self._mm_forward_context(optimizer_config), self._compute_precision_autocast():
                 with self.sp_strategy.context() if self.sp_strategy is not None else contextlib.nullcontext():
                     # In eval mode use_cache defaults to True, and Transformers skips detecting
                     # padding-free packed sequences whenever a KV cache exists.
@@ -1520,7 +1576,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         generation_target = self.model if hasattr(self.model, 'generate') else unwrapped_model
         engine = TransformersEngine(self.tokenizer_id, model=generation_target, tokenizer=template.tokenizer)
 
-        encoded, states, failures = generation.encode_all(
+        encoded, failures = generation.encode_all(
             template, inputs_list, logprobs_only=logprobs_only, strict=strict)
         results: List[Optional[SampleResponse]] = [None] * len(inputs_list)
         for index, response in failures.items():
@@ -1532,22 +1588,54 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             # responsive and Ray forbids asyncio.run, so there is nothing to gain from batch_sample's
             # loop-and-thread hop (and its lock, which would be bound to the wrong loop).
             return engine.generate_batch(
-                prompts, params, num_samples=params.num_samples, logprobs=params.logprobs is not None,
-                extra_model_inputs=extra or None)
+                prompts,
+                params,
+                num_samples=params.num_samples,
+                logprobs=params.logprobs is not None,
+                include_prompt_logprobs=params.prompt_logprobs is not None,
+                topk_prompt_logprobs=params.prompt_logprobs or 0,
+                extra_model_inputs=extra or None,
+            )
 
         lora_ctx = (unwrapped_model.disable_adapter()
                     if use_base_model and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
-        with lora_ctx:
+        with lora_ctx, self._generate_precision_context(generation_target):
             for chunk in generation.chunks(pending, _GENERATION_MAX_BATCH_SIZE):
                 for index, response in zip(
-                        chunk, generation.run_chunk(chunk, encoded, states, call_batch, strict=strict)):
+                        chunk, generation.run_chunk(chunk, encoded, call_batch, template=template, strict=strict)):
                     results[index] = response
 
-        if not logprobs_only:
-            generation.attach_features(template, results, encoded, states)
+        generation.attach_features(template, results, encoded, logprobs_only=logprobs_only)
         return [
             r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
         ]
+
+    @contextlib.contextmanager
+    def _generate_precision_context(self, model):
+        """Run generate/score in the model's STORAGE precision, matching ``forward_only``.
+
+        ``accelerate.prepare`` wraps ``forward`` in compute-dtype autocast + fp32 output conversion
+        for training. For a model already stored in that compute dtype the wrapper is numerically
+        redundant for native families, but NOT for remote-code families: their vision ops change
+        under autocast (PaddleOCR-VL-1.5 measured up to ~10 nats prompt-score drift vs the same-weight
+        plain HF forward, runs/G42), so rollouts would score a different distribution than the
+        plain-precision eval/KL forward. ``_compute_precision_autocast`` already gates autocast on
+        fp32 storage for exactly this reason; generate must agree. When storage == compute dtype,
+        restore the pre-wrap forward for the call (module hooks -- FSDP all-gather etc. -- still run);
+        fp32 master weights keep the wrapper, since flash-attention rejects fp32.
+        """
+        amp_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(self.mixed_precision)
+        original = getattr(model, '_original_forward', None)
+        param = next(model.parameters(), None)
+        if amp_dtype is None or original is None or param is None or param.dtype != amp_dtype:
+            yield
+            return
+        current = model.forward
+        model.forward = original
+        try:
+            yield
+        finally:
+            model.forward = current
 
     def generate_stream(self, *args, **kwargs):
         """Refuse streaming in-place generation rather than half-build it.
@@ -1645,8 +1733,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
 
         router_replay_mode = kwargs.pop('router_replay_mode', None)
         rr = None
-        if router_replay_mode is not None:
+        if router_replay_mode not in (None, 'disabled'):
             from .moe.router_replay import RouterReplay, RouterReplayAction
+            RouterReplay.resolve_router_replay_mode(router_replay_mode)
             rr = self._router_replay(RouterReplayAction.REPLAY_BACKWARD)
 
         with no_sync_ctx:
@@ -1754,6 +1843,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         outputs = {}
         for micro_batch_index, indices in enumerate(plan):
             micro_kwargs = loss_instance.micro_batch_kwargs(kwargs, indices, local_batch_size)
+            # Control scalars/tuples never slice with the samples (same guard as the
+            # forward_only micro-batcher): a field tuple whose length happens to equal
+            # the batch size would otherwise be cut by select_batch.
+            for key in ('output_frame', 'output_fields'):
+                if key in kwargs:
+                    micro_kwargs[key] = kwargs[key]
             micro_loss_scale = loss_instance.micro_batch_scale(inputs, indices)
             is_last_micro_batch = micro_batch_index == len(plan) - 1
             outputs = self._forward_backward_micro_batch(
@@ -1836,6 +1931,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         **kwargs,
     ):
         """Run one homogeneous loss RPC and optionally finalize a two-RPC backward transaction."""
+        _, output_fields, _ = self.resolve_output_frame_request(kwargs)
+        if output_fields is not None:
+            # tuple rides dispatch untouched: a list would be sliced as a batch dimension.
+            kwargs['output_fields'] = tuple(output_fields)
         inputs, kwargs = self._rollout_features(inputs, kwargs, lift=True)
         adapter_name = kwargs.get('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
@@ -3030,6 +3129,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             }
 
         trainer_state = self._restore_training_state(checkpoint_dir, adapter_name=adapter_name)
+        from twinkle.model.base import warn_cumulative_metric_state_not_restored
+        # The full-resume path must resolve its own group: optimizer_config above is bound only in
+        # the resume_only_model branch. Resolve it exactly as _restore_training_state does.
+        optimizer_config = self.optimizer_group[adapter_name or self._get_default_group()]
+        warn_cumulative_metric_state_not_restored(optimizer_config, 'transformers')
         result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
@@ -3156,6 +3260,29 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     def _task_head_is_master(self) -> bool:
         return Platform.is_master()
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def save_scoring_head_sidecar(self, checkpoint_dir: str, save_weights: bool = True) -> bool:
+        """Persist the attached decision scoring head beside a checkpoint, worker-side.
+
+        The decision_checkpoint callback binds the driver's Ray proxy, which has no
+        ``_modules`` tree (the head lives on the workers), so head discovery and
+        ``head.save_pretrained`` must run here rather than on the stub. Only the master
+        rank writes the sidecar, matching the checkpoint save's ``Platform.is_master``
+        guard; the single-head decision readout is replicated, not a LoRA target.
+        """
+        if not self._task_head_is_master():
+            return False
+        host = self._task_head_host()
+        head = None
+        for name, module in host.named_modules():
+            if name in ('scoring_head', 'task_head') or name.endswith(('.scoring_head', '.task_head')):
+                head = module
+                break
+        if head is None:
+            return False
+        head.save_pretrained(checkpoint_dir, save_weights=save_weights)
+        return True
+
     def _add_task_head(self, adapter_name: str, task, task_head_loader=None, num_labels=None) -> None:
         """Build one task head worker-side and register it per adapter.
 
@@ -3194,78 +3321,26 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         base_model = model
         while isinstance(base_model, PeftModel):
             base_model = base_model.get_base_model()
+        amp_dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}.get(self.mixed_precision)
         for prefix in prefixes:
             tower = deep_getattr(base_model, prefix)
             if isinstance(tower, torch.nn.Module) and not any(p.requires_grad for p in tower.parameters()):
-                patch_frozen_module(tower)
+                patch_frozen_module(tower, amp_dtype=amp_dtype)
 
     def _expand_multimodal_lora_target(self, config, model, *, freeze_llm: bool, freeze_vit: bool,
                                        freeze_aligner: bool) -> None:
-        """Rewrite a multimodal ``'all-linear'`` LoRA target into the freeze_*-aware regex, in place.
-
-        PEFT expands ``'all-linear'`` to every linear in the model, which on a multimodal model would
-        also adapt the vision tower and the aligner -- but legacy swift targets only the *unfrozen*
-        towers (by default the language model alone), and that partition is what ``freeze_*`` express.
-        The expansion needs the real modules, so it runs here on the worker, not on the driver's PROXY.
-
-        Left untouched (so PEFT's own behaviour stands) when the target is not ``'all-linear'`` -- an
-        explicit user regex or name list is respected verbatim -- or when ``model_arch`` declares no
-        vision tower / aligner, i.e. a plain LLM where ``'all-linear'`` already means the right thing.
-        """
-        target = getattr(config, 'target_modules', None)
-        is_all_linear = target == 'all-linear' or (isinstance(target, (list, tuple, set)) and 'all-linear' in target)
-        if not is_all_linear:
-            return
-        if not (self.model_arch.get('vision_tower') or self.model_arch.get('aligner')):
-            return
-        from twinkle.model.transformers.target_modules import get_multimodal_target_regex
-        # Walk the base model: target prefixes in model_arch are base-relative, and when an adapter is
-        # added to an already-peft model the towers live under the wrapped base, not the PeftModel.
-        base_model = model
-        while isinstance(base_model, PeftModel):
-            base_model = base_model.get_base_model()
-        include_embedding = isinstance(target, (list, tuple, set)) and 'all-embedding' in target
-        config.target_modules = get_multimodal_target_regex(
-            base_model,
+        from twinkle.model.transformers.target_modules import expand_multimodal_lora_target
+        expand_multimodal_lora_target(
+            model,
+            config,
             self.model_arch,
             freeze_llm=freeze_llm,
             freeze_vit=freeze_vit,
-            freeze_aligner=freeze_aligner,
-            include_embedding=include_embedding)
+            freeze_aligner=freeze_aligner)
 
     def _expand_modules_to_save(self, config, model) -> None:
-        """Expand the ``'all-norm'`` / ``'all-embedding'`` shorthands in ``modules_to_save``, in place.
-
-        PEFT keeps ``modules_to_save`` entries as full-precision trainable copies and matches each by
-        ``name.endswith(entry)`` -- a shorthand like ``'all-norm'`` matches no module and is silently
-        ignored (``_set_trainable``, ``strict_module_check=False``), so it has to be resolved to concrete
-        module names here first. The expansion needs the real modules, so it runs on the worker, not the
-        driver's PROXY -- the same reason the ``'all-linear'`` target expansion lives here. Unlike that
-        target expansion, ``modules_to_save`` is NOT tower / freeze filtered: every norm / embedding the
-        shorthand names is saved, regardless of which towers are LoRA-adapted (legacy does the same).
-        """
-        modules_to_save = getattr(config, 'modules_to_save', None)
-        if not modules_to_save:
-            return
-        shorthands = ('all-norm', 'all-embedding')
-        if not any(name in shorthands for name in modules_to_save):
-            return
-        from twinkle.model.transformers.target_modules import find_embedding, find_norm
-        # Walk to the base model: when an adapter is added to an already-peft model the real modules
-        # live under the wrapped base, not the PeftModel.
-        base_model = model
-        while isinstance(base_model, PeftModel):
-            base_model = base_model.get_base_model()
-        expanded = [name for name in modules_to_save if name not in shorthands]
-        for shorthand, finder in (('all-embedding', find_embedding), ('all-norm', find_norm)):
-            if shorthand not in modules_to_save:
-                continue
-            found = finder(base_model)
-            if not found:
-                logger.warning(f'modules_to_save {shorthand!r} matched no module on this model; ignored.')
-            expanded += found
-        # de-dup while preserving order (a shorthand may overlap an explicitly-named module).
-        config.modules_to_save = list(dict.fromkeys(expanded))
+        from twinkle.model.transformers.target_modules import expand_modules_to_save
+        expand_modules_to_save(model, config)
 
     @remote_function()
     @timed
@@ -3295,9 +3370,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        if 'template_spec' not in kwargs:
-            kwargs['model_id'] = self.tokenizer_id
-        optimizer_config.template = construct_template(template_cls, **kwargs)
+        optimizer_config.template = construct_template(template_cls, _default_model_id=self.tokenizer_id, **kwargs)
 
     @remote_function()
     @timed
@@ -3444,6 +3517,27 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
     # finalize_checkpoint_engine are inherited from CheckpointEngineMixin.
     # The weight generator is shared by direct and checkpoint-engine sync.
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def prepare_for_lending(self) -> None:
+        """Merge FSDP adapters before their shards leave the accelerator for device lending."""
+        if not isinstance(self.strategy, NativeFSDPStrategy) or getattr(self, '_lent_merged_model', None) is not None:
+            return
+        self._lazy_wrap_model()
+        model = self.strategy.unwrap_model(self.model)
+        if isinstance(model, PeftModel):
+            # Record ownership before merging so a partially failed merge can be undone
+            # on every rank by the lending controller's rollback.
+            self._lent_merged_model = model
+            model.merge_adapter()
+
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def restore_after_lending(self) -> None:
+        """Unmerge only after the trainer's shards are back on their original device."""
+        model = getattr(self, '_lent_merged_model', None)
+        if model is not None:
+            model.unmerge_adapter()
+            self._lent_merged_model = None
+
     def _get_weight_generator(
         self,
         adapter_name: str = None,
@@ -3492,19 +3586,24 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 # merge and skip lora weigts(already merged)
                 # trim prefix(base_model.model.) and suffix(.base_layer)
                 def weight_generator():
-                    if isinstance(model, PeftModel):
-                        model.merge_adapter()
-                    names = []
-                    for name, tensor in model.state_dict().items():
-                        if is_lora_key(name) or name in _tied_duplicates:
-                            continue
-                        tensor = _checkpoint_tensor(tensor)
-                        name = normalize_param_name(name, keep_base_layer=False)
-                        names.append(name)
-                        yield name, tensor
-                    print_weight_example(names)
-                    if isinstance(model, PeftModel):
-                        model.unmerge_adapter()
+                    merge_here = isinstance(model, PeftModel) and getattr(self, '_lent_merged_model', None) is not model
+                    try:
+                        if merge_here:
+                            model.merge_adapter()
+                        names = []
+                        for name, tensor in model.state_dict().items():
+                            if is_lora_key(name) or name in _tied_duplicates:
+                                continue
+                            tensor = _checkpoint_tensor(tensor)
+                            name = normalize_param_name(name, keep_base_layer=False)
+                            names.append(name)
+                            yield name, tensor
+                        print_weight_example(names)
+                    finally:
+                        # A borrowed-device publication stays merged on CPU until reclaim.
+                        # Ordinary exports still own their temporary merge/unmerge pair.
+                        if merge_here:
+                            model.unmerge_adapter()
             else:
                 # LoRA-only mode: send only adapter weights.
                 # Use PEFT's get_peft_model_state_dict for clean LoRA extraction

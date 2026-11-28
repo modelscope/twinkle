@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import FastAPI
 
-from twinkle.server.sampler.app import SamplerManagement
-from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes, _stream_queue
+from twinkle_server.sampler.app import SamplerManagement
+from twinkle_server.sampler.twinkle_handlers import _register_twinkle_sampler_routes, _stream_queue
 
 
 class _BlockingQueue:
@@ -35,12 +35,15 @@ class _BlockingQueue:
 async def test_sampler_request_refreshes_replica_liveness():
     service = SamplerManagement.__new__(SamplerManagement)
     service.replica_id = 'sampler-replica'
+    service.model_id = '/weights/local-model'
+    service._telemetry_base_model = 'sampling-model'
     service.state = SimpleNamespace(touch_replica_last_seen=AsyncMock())
     service._ensure_state_cleanup_started = AsyncMock()
     request = SimpleNamespace(
         headers={'Authorization': 'Bearer token'}, state=SimpleNamespace(token='token'))
 
     assert await service._on_request_start(request) == 'token'
+    assert request.state.base_model == 'sampling-model'
     service.state.touch_replica_last_seen.assert_awaited_once_with('sampler-replica')
 
 
@@ -55,7 +58,8 @@ async def test_stream_without_actor_returns_structured_error():
     _register_twinkle_sampler_routes(app, lambda: service)
     route = next(route for route in app.routes if getattr(route, 'path', None) == '/twinkle/sample_stream')
     request = SimpleNamespace(state=SimpleNamespace(request_id='request'))
-    body = SimpleNamespace(adapter_name='', adapter_uri=None, inputs={'input_ids': [1]}, sampling_params=None)
+    body = SimpleNamespace(adapter_name='', adapter_uri=None, require_deployed_adapter=False,
+                           inputs={'input_ids': [1]}, sampling_params=None)
 
     response = await route.endpoint(request, body, service)
     chunks = [chunk async for chunk in response.body_iterator]

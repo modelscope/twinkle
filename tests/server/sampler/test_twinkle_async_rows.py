@@ -9,7 +9,7 @@ from starlette.requests import Request
 
 import twinkle.protocol.types as types
 from twinkle.data_format import SampledSequence, SampleResponse
-from twinkle.server.sampler.twinkle_handlers import (
+from twinkle_server.sampler.twinkle_handlers import (
     _register_twinkle_sampler_routes,
     _build_rollout_rows_and_tags,
 )
@@ -65,7 +65,7 @@ def test_async_sampler_rejects_group_id_count_mismatch() -> None:
 class _SamplerManagement:
 
     def __init__(self):
-        from twinkle.server.sampler.concurrency import SamplerConcurrency
+        from twinkle_server.sampler.concurrency import SamplerConcurrency
         self.sampling_guard = SamplerConcurrency()
         # sample_to_data_plane admits only the *_async sampler types (the deployment contract
         # its guard enforces); this fake stands in for one.
@@ -143,6 +143,9 @@ async def test_sample_to_data_plane_returns_ref_after_short_admission() -> None:
         'tokens': [7],
         'decoded': 'answer',
         'stop_reason': 'stop',
+        # 012aff34: every TQ row carries the token-only routing/mask exports (None here).
+        'routed_experts': None,
+        'sampling_masks': None,
         'prompt_logprobs': None,
         'topk_prompt_logprobs': None,
     }]

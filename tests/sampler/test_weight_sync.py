@@ -45,6 +45,18 @@ logger = logging.getLogger(__name__)
 pytestmark = [pytest.mark.slow, pytest.mark.accel(2)]
 
 
+@pytest.fixture(autouse=True)
+def _twinkle_ray_isolation():
+    # twinkle.initialize is once-per-process: RayHelper caches the ResourceManager from the FIRST
+    # call and the shared registry's group config is first-write-wins. When the tiered suite runs
+    # several ray-mode weight-sync tests in one pytest process, a later test's different topology
+    # is silently ignored (it inherits this test's groups/placements) and leaked actors keep GPU
+    # memory. Release everything after each test so the next initialize builds its own topology.
+    yield
+    import twinkle
+    twinkle.shutdown()
+
+
 def log(msg):
     """Print message with timestamp."""
     import datetime

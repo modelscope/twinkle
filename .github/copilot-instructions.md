@@ -11,7 +11,7 @@ These instructions help AI agents work productively in this repo. Focus on concr
   - Sampler (vLLM integration): [src/twinkle/sampler/vllm_sampler/vllm_sampler.py](../src/twinkle/sampler/vllm_sampler/vllm_sampler.py)
   - Losses & metrics: [src/twinkle/loss](../src/twinkle/loss), [src/twinkle/metric](../src/twinkle/metric)
   - Templates & preprocessing: [src/twinkle/template](../src/twinkle/template), [src/twinkle/preprocessor](../src/twinkle/preprocessor)
-  - Model/Processor HTTP services via Ray Serve: [src/twinkle/server](../src/twinkle/server)
+  - Model/Processor HTTP services via Ray Serve: [twinkle_cs/server/src/twinkle_server](../twinkle_cs/server/src/twinkle_server)
   - Hub integrations (ModelScope/HF): [src/twinkle/hub/hub.py](../src/twinkle/hub/hub.py)
 
 ## Architecture & Patterns
@@ -31,11 +31,10 @@ These instructions help AI agents work productively in this repo. Focus on concr
   - Adapter ops are routed through remote functions and grouped by DP process groups.
 
 ## Developer Workflows
-- **Install:** Python 3.11+. Install with Poetry or pip.
-  - Poetry: `poetry install --with transformers,ray`
-  - Pip (editable): `pip install -e .[transformers,ray]`
+- **Install:** Python 3.11–3.13. Install from the repository root with pip (editable):
+  - `pip install -e '.[test]' -e ./twinkle_cs/client -e ./twinkle_cs/server` (the `test` extra includes pytest and the CI-pinned ruff)
 - **Run tests:**
-  - Unit tests: `python -m unittest tests/infra/test_infra_graph.py`
+  - `pytest tests/infra/test_infra_graph.py`; CI runs `pytest -m "not slow"` on PRs and the full suite (including `slow`) on the schedule
 - **Local single-process dev:**
   - Initialize infra: `twinkle.initialize(mode='local', seed=42)`
   - Inspect device placement: call `twinkle.infra.get_device_placement()`.
@@ -45,19 +44,19 @@ These instructions help AI agents work productively in this repo. Focus on concr
     - `cd cookbook/client/server/megatron`
     - `twinkle-server launch -c server_config.yaml`
     - Check `http_options` in the YAML for the listening address and port.
-  - Model app binds `MultiLoraTransformersModel` and exposes routes like `/add_adapter_to_model`, `/forward`, `/calculate_loss`, etc. See [src/twinkle/server/model/twinkle_handlers.py](../src/twinkle/server/model/twinkle_handlers.py).
+  - Model app binds `MultiLoraTransformersModel` and exposes routes like `/add_adapter_to_model`, `/forward`, `/calculate_loss`, etc. See [twinkle_cs/server/src/twinkle_server/model/twinkle_handlers.py](../twinkle_cs/server/src/twinkle_server/model/twinkle_handlers.py).
 - **vLLM inference:** Use `VLLMEngine` with engine args; LoRA weight sync via `patch.vllm_lora_weights`. See [src/twinkle/sampler/vllm_sampler/vllm_engine.py](../src/twinkle/sampler/vllm_sampler/vllm_engine.py).
 
 ## Conventions & Gotchas
 - **Safety:** Remote plugin code requires `trust_remote_code()` true; avoid loading arbitrary strings into adapter configs (enforced in Multi-LoRA).
 - **Env-driven ranks:** Many utilities read ranks/world size from env; set `WORLD_SIZE`, `RANK`, `LOCAL_RANK` when using torchrun.
 - **Determinism:** `seed_everything(seed, full_determinism)` controls CUDA/NPU determinism; may set envs like `CUDA_LAUNCH_BLOCKING`.
-- **Adapter lifecycle:** Server auto-removes inactive adapters (heartbeat required); per-token adapter limits are enforced. See cleanup in [src/twinkle/server/model/pool/controller.py](../src/twinkle/server/model/pool/controller.py).
+- **Adapter lifecycle:** Server auto-removes inactive adapters (heartbeat required); per-token adapter limits are enforced. See cleanup in [twinkle_cs/server/src/twinkle_server/model/pool/controller.py](../twinkle_cs/server/src/twinkle_server/model/pool/controller.py).
 - **Templates:** Tokenization/encode via `Template` (e.g., `Qwen3Template`), producing `InputFeature` for model forward. See [src/twinkle/template/base.py](../src/twinkle/template/base.py).
 
 ## Examples
 - **Visualize a custom mesh:** create `DeviceMesh` and call `get_device_placement()`; example in [tests/infra/test_infra_graph.py](../tests/infra/test_infra_graph.py).
-- **Add LoRA adapter via HTTP:** POST to `/add_adapter_to_model` with serialized `LoraConfig`; see server routes in [src/twinkle/server/model/twinkle_handlers.py](../src/twinkle/server/model/twinkle_handlers.py).
+- **Add LoRA adapter via HTTP:** POST to `/add_adapter_to_model` with serialized `LoraConfig`; see server routes in [twinkle_cs/server/src/twinkle_server/model/twinkle_handlers.py](../twinkle_cs/server/src/twinkle_server/model/twinkle_handlers.py).
 - **Sample with vLLM:** Configure `vLLMSampler`, set `Template`/`Processor`, then `sample()` on `Trajectory` list; see [src/twinkle/sampler/vllm_sampler/vllm_sampler.py](../src/twinkle/sampler/vllm_sampler/vllm_sampler.py).
 
 ---

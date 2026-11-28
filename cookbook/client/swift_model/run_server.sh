@@ -16,7 +16,7 @@ if ! command -v ray >/dev/null 2>&1; then
   exit 1
 fi
 if ! command -v twinkle-server >/dev/null 2>&1; then
-  echo "twinkle-server is not installed; run: pip install -e '.[client,server]'" >&2
+  echo "twinkle-server is not installed; from the Twinkle repository root run: pip install -e . -e ./twinkle_cs/server" >&2
   exit 1
 fi
 # The model app imports swift.dev.model.loader at actor startup, so ms-swift must

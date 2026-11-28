@@ -6,10 +6,10 @@ import torch
 from torch.optim import Optimizer
 from transformers.utils.versions import require_version
 
-from .galore_projector import GaLoreProjector
+from .galore_projector import GaLoreOptimizerStateMixin, GaLoreProjector
 
 
-class GaLoreAdafactor(Optimizer):
+class GaLoreAdafactor(GaLoreOptimizerStateMixin, Optimizer):
     """
     AdaFactor pytorch implementation can be used as a drop in replacement for Adam original fairseq code:
     https://github.com/pytorch/fairseq/blob/master/fairseq/optim/adafactor.py

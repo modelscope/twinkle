@@ -6,11 +6,11 @@ Twinkle Server provides full observability through OpenTelemetry, covering trace
 
 ### 1. Start the Observability Stack
 
-The project includes a one-command Docker Compose setup based on the `grafana/otel-lgtm` image (bundles OTel Collector, Mimir, Tempo, Loki, and Grafana):
+For local development, Docker Compose builds a standalone LGTM image with OTel Collector, Prometheus, Tempo, Loki, Grafana, and the Twinkle Server Overview dashboard.
 
 ```bash
 cd cookbook/observability
-docker compose up -d
+docker compose up -d --build
 ```
 
 Available services after startup:
@@ -95,11 +95,7 @@ In Grafana, switch the datasource to Tempo to search traces by service name or s
 
 ## Production Deployment
 
-The LGTM all-in-one image in `cookbook/observability` is **for local development and demos only**. For production:
-
-- Deploy Mimir / Tempo / Loki / Grafana separately with persistent storage and replicas
-- Place an independent OTel Collector tier in front for sampling and routing
-- The `telemetry` config and metric names in `server_config.yaml` transfer without changes
+The [multitenant operations guide](Multitenant-Operations.md) describes a Compose example with Collector, Mimir, Tempo, Loki, and Grafana on persistent storage. Set `telemetry.otlp_endpoint` to the Collector endpoint reachable from Runtime. The Megatron entrypoint accepts the Runtime configuration through `--server-config`.
 
 ## Troubleshooting
 

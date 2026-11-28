@@ -1,8 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Architecture check (F007 / P006): no module imports its own package root.
 
-A module under ``twinkle.server`` must not import one of its own *ancestor*
-sub-packages (e.g. ``checkpoint/tinker.py`` importing ``twinkle.server.checkpoint``).
+A module under ``twinkle_server`` must not import one of its own *ancestor*
+sub-packages (e.g. ``checkpoint/tinker.py`` importing ``twinkle_server.checkpoint``).
 Such an import is a package-initialisation-order dependency: it re-enters the
 ancestor's ``__init__`` while that ``__init__`` is still importing the child,
 which is the module-level cycle this check forbids. Importing a *sibling* module
@@ -21,10 +21,10 @@ import pytest
 
 grimp = pytest.importorskip('grimp', reason='grimp is required for the package-root import architecture check')
 
-import twinkle  # noqa: E402
+import twinkle_server  # noqa: E402
 
-_PACKAGE = 'twinkle.server'
-_SRC = str(pathlib.Path(twinkle.__file__).resolve().parent.parent)
+_PACKAGE = 'twinkle_server'
+_SRC = str(pathlib.Path(twinkle_server.__file__).resolve().parent.parent)
 
 
 def _package_root_imports() -> list[dict]:
@@ -32,7 +32,7 @@ def _package_root_imports() -> list[dict]:
     import sys
     if _SRC not in sys.path:
         sys.path.insert(0, _SRC)
-    graph = grimp.build_graph('twinkle', include_external_packages=False)
+    graph = grimp.build_graph('twinkle_server', include_external_packages=False)
     offenders: list[dict] = []
     for module in sorted(graph.modules):
         if not module.startswith(_PACKAGE + '.'):

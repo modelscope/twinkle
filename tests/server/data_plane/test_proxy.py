@@ -4,7 +4,7 @@ import uuid
 
 import pytest
 
-from twinkle.server.data_plane.proxy import DataPlaneProxy
+from twinkle_server.data_plane.proxy import DataPlaneProxy
 from twinkle.protocol.headers import H_AUTH, H_AUTH_TWINKLE, H_REQUEST_ID
 from twinkle.protocol.types import DataRef
 

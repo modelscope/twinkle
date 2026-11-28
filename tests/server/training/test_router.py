@@ -12,12 +12,12 @@ from starlette.requests import Request
 from tests.server.state.fake_backend import FakeBackend
 from tests.server.training.helpers import create, settle, setup
 from twinkle.hub import HubOperation
-from twinkle.server.checkpoint import create_checkpoint_manager
-from twinkle.server.config.training import TrainingConfig
-from twinkle.server.exceptions import RequestRejectedError, ResourceNotFoundError
-from twinkle.server.gateway.use_cases import poll_future
-from twinkle.server.model.pool.router import TrainingRouter
-from twinkle.server.state import ServerState
+from twinkle_server.checkpoint import create_checkpoint_manager
+from twinkle_server.config.training import TrainingConfig
+from twinkle_server.exceptions import RequestRejectedError, ResourceNotFoundError
+from twinkle_server.gateway.use_cases import poll_future
+from twinkle_server.model.pool.router import TrainingRouter
+from twinkle_server.state import ServerState
 
 
 def http_request(body, token='owner'):
@@ -32,11 +32,12 @@ def http_request(body, token='owner'):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('owned', [True, False], ids=['owned', 'outside-tenant-directory'])
 async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(monkeypatch, tmp_path, owned):
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     manager = create_checkpoint_manager('owner', client_type='twinkle')
     checkpoint = (manager.training_run_manager.get_base_dir() if owned else tmp_path) / 'checkpoint'
     checkpoint.mkdir(parents=True)
     router = TrainingRouter.__new__(TrainingRouter)
+    router.model = SimpleNamespace(name='public-model')
     router.state = ServerState(backend=FakeBackend())
     router.store = router.state.create_training_store('upload-test')
     router.replica_id = 'router'
@@ -87,10 +88,11 @@ async def test_upload_after_recycle_is_cpu_only_and_preserves_future_ownership(m
 @pytest.mark.asyncio
 @pytest.mark.parametrize('failed_stage', ['preparing', 'batch_committed'])
 async def test_upload_keeps_its_receipt_when_progress_cannot_be_written(monkeypatch, tmp_path, failed_stage):
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     checkpoint = create_checkpoint_manager('owner', client_type='twinkle').training_run_manager.get_base_dir() / 'saved'
     checkpoint.mkdir(parents=True)
     router = TrainingRouter.__new__(TrainingRouter)
+    router.model = SimpleNamespace(name='public-model')
     router.state = ServerState(backend=FakeBackend())
     router.store = router.state.create_training_store('upload-test')
     router.replica_id = 'router'
@@ -128,7 +130,7 @@ async def test_upload_keeps_its_receipt_when_progress_cannot_be_written(monkeypa
 
 @pytest.mark.asyncio
 async def test_keyed_upload_reconnects_to_original_task(monkeypatch, tmp_path):
-    monkeypatch.setattr('twinkle.server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
+    monkeypatch.setattr('twinkle_server.checkpoint.training_run_manager.TWINKLE_DEFAULT_SAVE_DIR', str(tmp_path))
     checkpoint = create_checkpoint_manager('owner', client_type='twinkle').training_run_manager.get_base_dir() / 'saved'
     checkpoint.mkdir(parents=True)
     first_claim, allow_first_claim = asyncio.Event(), asyncio.Event()
@@ -147,6 +149,7 @@ async def test_keyed_upload_reconnects_to_original_task(monkeypatch, tmp_path):
             return created
 
     router = TrainingRouter.__new__(TrainingRouter)
+    router.model = SimpleNamespace(name='public-model')
     router.state = ServerState(backend=PausedBackend())
     router.replica_id = 'router'
     router._init_task_queue()
@@ -303,9 +306,9 @@ async def test_owner_can_retry_release_after_the_first_response_is_lost():
 def test_router_schemas_match_model_runtime_routes():
     from fastapi import FastAPI
 
-    from twinkle.server.model.pool.router import NATIVE_REQUESTS, TINKER_REQUESTS
-    from twinkle.server.model.tinker_handlers import _register_model_tinker_routes
-    from twinkle.server.model.twinkle_handlers import _register_model_twinkle_routes
+    from twinkle_server.model.pool.router import NATIVE_REQUESTS, TINKER_REQUESTS
+    from twinkle_server.model.tinker_handlers import _register_model_tinker_routes
+    from twinkle_server.model.twinkle_handlers import _register_model_twinkle_routes
 
     app = FastAPI()
     _register_model_tinker_routes(app, lambda: None)

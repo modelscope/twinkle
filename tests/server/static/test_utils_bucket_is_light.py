@@ -1,16 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""The ``twinkle.server.utils`` bucket must re-export only the two
+"""The ``twinkle_server.utils`` bucket must re-export only the two
 dependency-light helpers, not the queue / session-resource machinery.
 
-The original intent was to assert ``import twinkle.server.utils`` pulls no
+The original intent was to assert ``import twinkle_server.utils`` pulls no
 OpenTelemetry. That side-effect is dominated by the parent package's eager
-``twinkle.server.__init__`` -> ``launcher`` -> ``application_spec`` -> ``task_queue.config``
+``twinkle_server.__init__`` -> ``launcher`` -> ``application_spec`` -> ``task_queue.config``
 chain (which triggers ``task_queue/__init__`` -> ``mixin`` -> telemetry) and is out of
 this Requirement's scope, so we assert the directly-controlled property instead: the
 bucket's re-export surface. Re-exporting the mixins is what used to make every one of the
 five light callers drag in the OpenTelemetry SDK.
 """
-import twinkle.server.utils as bucket
+import twinkle_server.utils as bucket
 
 # The two genuinely dependency-free helpers the five call sites actually use.
 _LIGHT_EXPORTS = ('get_template_for_model', 'wrap_builder_with_device_group_env')

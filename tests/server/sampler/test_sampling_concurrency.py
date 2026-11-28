@@ -15,16 +15,16 @@ from starlette.requests import Request
 from tinker import types as tinker_types
 
 from twinkle.data_format import SampledSequence, SampleResponse
-from twinkle.protocol.types import SampleRequest
-from twinkle.server.sampler.app import SamplerManagement
-from twinkle.server.sampler.concurrency import SamplerConcurrency
-from twinkle.server.sampler.tinker_handlers import _register_tinker_sampler_routes
-from twinkle.server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
+from twinkle.protocol.types import EncodeRequest, SampleRequest
+from twinkle_server.sampler.app import SamplerManagement
+from twinkle_server.sampler.concurrency import SamplerConcurrency
+from twinkle_server.sampler.tinker_handlers import _register_tinker_sampler_routes
+from twinkle_server.sampler.twinkle_handlers import _register_twinkle_sampler_routes
 from twinkle.utils import FullWeightLoadError
-from twinkle.server.task_queue.backend_gate import BackendGate
-from twinkle.server.config.task_queue import TaskQueueConfig
-from twinkle.server.exceptions import BackendBusyError
-from twinkle.server.task_queue.worker import ComputeWorker
+from twinkle_server.task_queue.backend_gate import BackendGate
+from twinkle_server.config.task_queue import TaskQueueConfig
+from twinkle_server.exceptions import BackendBusyError, RequestRejectedError, ResourceNotFoundError
+from twinkle_server.task_queue.worker import ComputeWorker
 
 
 async def _until(predicate):
@@ -178,7 +178,7 @@ async def make_service():
 
 @pytest.mark.asyncio
 async def test_standalone_checkpoint_load_waits_for_ordinary_sampling(make_service, tmp_path):
-    from twinkle.server.sampler.weights import resolve_sampler_weights
+    from twinkle_server.sampler.weights import resolve_sampler_weights
     checkpoint = tmp_path / '2'
     checkpoint.mkdir()
     (checkpoint / 'model.safetensors').touch()
@@ -211,6 +211,48 @@ async def test_real_routes_overlap_and_keep_request_results(make_service, dialec
     records = await asyncio.gather(*(service.result(ref) for ref in refs))
     assert [_tokens(record, dialect) for record, dialect in zip(records, jobs)] == [[i + 1] for i in range(count)]
     assert service._compute_worker._worker_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('endpoint', 'request_type'), [
+    ('/twinkle/sample', SampleRequest),
+    ('/twinkle/sample_stream', SampleRequest),
+    ('/twinkle/encode', EncodeRequest),
+])
+@pytest.mark.parametrize('full_checkpoint', [False, True])
+async def test_required_adapter_cannot_fall_back_to_base(
+    make_service, endpoint, request_type, full_checkpoint, tmp_path,
+):
+    service = make_service()
+    request = Request({'type': 'http', 'headers': [], 'state': {'client_id': 'test'}})
+    adapter_name = 'named-lora'
+    if full_checkpoint:
+        (tmp_path / 'model.safetensors').touch()
+        service.deploy_adapters[adapter_name] = str(tmp_path)
+    body = request_type(inputs=[{'input_ids': [7]}], adapter_name=adapter_name, require_deployed_adapter=True)
+    error = RequestRejectedError if full_checkpoint else ResourceNotFoundError
+    with pytest.raises(error, match=adapter_name):
+        await service.endpoints[endpoint](request, body, service)
+    assert not service.state.records
+    assert not service.sampler.loads
+
+
+@pytest.mark.asyncio
+async def test_encode_uses_deployed_adapter_weights(make_service):
+    service = make_service()
+    service.deploy_adapters['pooling-lora'] = 'deployed/adapter'
+
+    def encode(inputs, pooling_params, *, adapter_name, adapter_path):
+        assert adapter_name == 'test-pooling-lora'
+        assert adapter_path == 'deployed/adapter'
+        return [SimpleNamespace(data=[0.5])]
+
+    service.sampler.encode = encode
+    request = Request({'type': 'http', 'headers': [], 'state': {'client_id': 'test'}})
+    body = EncodeRequest(inputs=[{'input_ids': [7]}], adapter_name='pooling-lora', require_deployed_adapter=True)
+    envelope = await service.endpoints['/twinkle/encode'](request, body, service)
+    record = await service.result(envelope.request_id)
+    assert record['result'] == {'data': [[0.5]]}
 
 
 @pytest.mark.asyncio
@@ -346,7 +388,8 @@ async def test_shutdown_cancels_futures_without_freeing_running_backend_early(ma
 
 
 @pytest.mark.asyncio
-async def test_data_plane_generation_blocks_mutations_through_collection(make_service):
+@pytest.mark.parametrize('full_checkpoint', [False, True])
+async def test_data_plane_generation_blocks_mutations_through_collection(make_service, tmp_path, full_checkpoint):
     service = make_service()
     admitted = threading.Event()
     completed = threading.Event()
@@ -356,6 +399,7 @@ async def test_data_plane_generation_blocks_mutations_through_collection(make_se
     pending = Future()
 
     def submit(trajectory, params, adapter_name='', adapter_path=None):
+        assert adapter_path is None
         trajectory['request_id'] = 'req-blocks-mutations'
         admitted.set()
         return pending
@@ -370,7 +414,12 @@ async def test_data_plane_generation_blocks_mutations_through_collection(make_se
     service.data_plane.put = put
     service.submit_concurrent_and_peek = lambda factory, **kwargs: factory()
     from twinkle.protocol.types import DataPlaneSampleRequest
-    body = DataPlaneSampleRequest(inputs=[{'input_ids': [1]}], sampling_params={'max_tokens': 1})
+    checkpoint = tmp_path / '2'
+    if full_checkpoint:
+        checkpoint.mkdir()
+        (checkpoint / 'model.safetensors').touch()
+    body = DataPlaneSampleRequest(inputs=[{'input_ids': [1]}], sampling_params={'max_tokens': 1},
+                                  adapter_uri=str(checkpoint) if full_checkpoint else None)
     request = Request({'type': 'http', 'headers': []})
     generation = asyncio.create_task(service.endpoints['/twinkle/sample_to_data_plane'](request, body, service))
     mutation = None
@@ -382,7 +431,7 @@ async def test_data_plane_generation_blocks_mutations_through_collection(make_se
         completed.set()
         pending.set_result(service.sampler.sample([{'input_ids': [1]}]))
         await asyncio.gather(generation, mutation)
-        assert stored[0]['tokens'] == [1]
+        assert stored[0]['tokens'] == [2 if full_checkpoint else 1]
         assert service.sampler.template_calls == 1
     finally:
         completed.set()
@@ -412,7 +461,7 @@ async def test_partial_checkpoint_failure_quarantines_changed_weights(make_servi
 
 @pytest.mark.asyncio
 async def test_timeout_keeps_job_capacity_and_does_not_overwrite_failed_future(make_service):
-    from twinkle.server.exceptions import ResourceExhaustedError
+    from twinkle_server.exceptions import ResourceExhaustedError
     service = make_service(timeout=0.05, limit=1)
     service.sampler.release.clear()
     ref = await service.submit('tinker')
