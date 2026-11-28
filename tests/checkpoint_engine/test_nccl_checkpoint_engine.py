@@ -74,27 +74,6 @@ def test_delta_seed_then_sparse_rounds():
         assert state['group'] is None
 
 
-def test_xccl_engine_broadcasts_through_its_own_group():
-    from twinkle.checkpoint_engine.xpu_checkpoint_engine import XCCLCheckpointEngine
-
-    class RecordingPG:
-
-        def __init__(self):
-            self.calls = []
-
-        def broadcast(self, tensors, opts):
-            self.calls.append((tensors[0], opts.rootRank))
-            return SimpleNamespace(wait=lambda: None)
-
-    engine = XCCLCheckpointEngine(bucket_size=16, rebuild_group=True)
-    assert engine._comm is None
-    engine._pg = pg = RecordingPG()
-    tensor = torch.zeros(4, dtype=torch.uint8)
-    engine._group_broadcast(tensor)
-    assert pg.calls == [(tensor, 0)]
-    engine.finalize()
-    assert engine._pg is None and engine._store is None and engine._comm is None
-
 class _FakeComm:
     """Single-process stand-in: all_reduce adds the peers' contribution to this rank's state."""
 

@@ -3,8 +3,12 @@
 
 Each case spawns ``world_size`` processes that build groups through ``create_communicator`` and
 run every scenario against them. A backend joins by adding a ``_BACKEND_DEVICE_TYPES`` entry; an
-accelerator backend gets an ``accel(world_size)`` mark, so boxes without enough devices skip it,
-and one device per rank (NCCL-style libraries refuse two ranks on one device).
+accelerator backend gets an ``accel(world_size, backend=...)`` mark, so boxes that cannot run it
+skip it, and one device per rank (NCCL-style libraries refuse two ranks on one device).
+
+The backend in the mark matters as much as the device count: Kunlunxin mounts BKCL under torch's
+``cuda`` namespace, so 'nccl' and 'xccl' claim the same device type and only the box's own
+platform answer tells them apart.
 """
 import json
 import math
@@ -29,6 +33,7 @@ _BACKEND_DEVICE_TYPES = {
     'gloo': 'cpu',
     'hccl': 'npu',
     'nccl': 'cuda',
+    'xccl': 'cuda',
 }
 
 _BROADCAST_DTYPES = (torch.float32, torch.bfloat16, torch.int64, torch.uint8)
@@ -36,21 +41,6 @@ _BROADCAST_DTYPES = (torch.float32, torch.bfloat16, torch.int64, torch.uint8)
 
 def _device_for_rank(device_type: str, rank: int) -> torch.device:
     return torch.device('cpu') if device_type == 'cpu' else torch.device(device_type, rank)
-
-
-def _devices_available(device_type: str, count: int) -> bool:
-    """Whether this box has ``count`` devices of ``device_type``.
-
-    The ``accel`` mark only counts accelerators, whichever kind the box has, so a CUDA box still
-    collects the npu case (and the other way round); each case checks its own device type here.
-    """
-    if device_type == 'npu':
-        try:
-            import torch_npu  # noqa: F401  (registers torch.npu)
-        except ImportError:
-            return False
-    module = getattr(torch, device_type, None)
-    return bool(module is not None and module.is_available() and module.device_count() >= count)
 
 
 def _foreign_device(device: torch.device) -> torch.device:
@@ -246,7 +236,7 @@ def _spawn(backend, device_type, world_size, out_dir):
 def _cases():
     for backend, device_type in sorted(_BACKEND_DEVICE_TYPES.items()):
         for world_size in (2, 4):
-            marks = [] if device_type == 'cpu' else [pytest.mark.accel(world_size)]
+            marks = [] if device_type == 'cpu' else [pytest.mark.accel(world_size, backend=backend)]
             yield pytest.param(backend, device_type, world_size, id=f'{backend}-ws{world_size}', marks=marks)
 
 
@@ -256,8 +246,6 @@ def test_conformance(backend, device_type, world_size, tmp_path):
 
     if backend not in available_backends():
         pytest.skip(f'{backend} communicator is not implemented yet')
-    if device_type != 'cpu' and not _devices_available(device_type, world_size):
-        pytest.skip(f'needs {world_size} {device_type} device(s)')
     for attempt in range(_PORT_RETRIES):
         out_dir = tmp_path / f'attempt{attempt}'
         out_dir.mkdir()

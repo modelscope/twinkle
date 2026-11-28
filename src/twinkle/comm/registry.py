@@ -17,6 +17,7 @@ _BACKENDS: dict[str, str | type[Communicator]] = {
     'gloo': 'twinkle.comm.backends.gloo:GlooCommunicator',
     'hccl': 'twinkle.comm.backends.hccl:HCCLCommunicator',
     'nccl': 'twinkle.comm.backends.nccl:NCCLCommunicator',
+    'xccl': 'twinkle.comm.backends.xccl:XCCLCommunicator',
 }
 
 

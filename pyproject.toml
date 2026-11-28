@@ -61,7 +61,7 @@ pythonpath = ["src", "twinkle_cs/client/src", "twinkle_cs/server/src"]
 testpaths = ["tests"]
 addopts = "--strict-markers -ra"
 markers = [
-  "accel(n): needs n accelerators (CUDA or NPU); defaults to 1",
+  "accel(n, backend=None): needs n accelerators (CUDA or NPU); with backend, a box collectiving over it",
   "slow: downloads real weights or runs a real training loop; daily CI only",
 ]
 
