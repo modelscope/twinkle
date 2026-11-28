@@ -183,6 +183,9 @@ def test_native_megatron_mean_losses_keep_existing_micro_batch_reduction(
         is_pipeline_last_stage=lambda *args: True,
         get_pipeline_model_parallel_world_size=lambda: 1,
         get_tensor_model_parallel_world_size=lambda: 1,
+        # forward_backward reads the DP group before checking its size (DP-count equalization
+        # seam); a faithful single-rank group answers dist.get_world_size(group) == 1.
+        get_data_parallel_group=lambda with_context_parallel=False: SimpleNamespace(size=lambda: 1),
     )
     pipeline = ModuleType("megatron.core.pipeline_parallel")
     pipeline.get_forward_backward_func = lambda: schedule
