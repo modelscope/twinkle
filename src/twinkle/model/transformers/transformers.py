@@ -160,6 +160,52 @@ def _prepare_sampling_replay(
     return loss_mask, masked_labels, metadata
 
 
+def _validate_fused_rl_task(task, labels, loss_instance, return_logits, enable_sampling_replay, parallel_enabled):
+    """task='fused_lm_rl' reads logps from hidden states, so every consumer of the skipped logits
+    (returned logits, value outputs, sampling replay) and every layout that splits the token axis
+    (sequence / context parallel) is rejected before the forward."""
+    if task != 'fused_lm_rl':
+        return
+    supported = (
+        labels is not None and getattr(loss_instance, 'require_logps', True)
+        and not getattr(loss_instance, 'require_logits', False) and not getattr(loss_instance, 'require_values', False)
+        and not return_logits and not enable_sampling_replay and not parallel_enabled)
+    if not supported:
+        raise ValueError("task='fused_lm_rl' requires labels and a logp-only loss; sampling replay, "
+                         'return_logits, value outputs and sequence/context parallelism are not supported')
+
+
+def _check_fused_rl_task(self, task, labels, loss_instance, return_logits, enable_sampling_replay):
+    parallel_enabled = getattr(self, '_enable_sp', False) or (
+        getattr(self, 'device_mesh', None) is not None and self.device_mesh.cp_world_size > 1)
+    _validate_fused_rl_task(task, labels, loss_instance, return_logits, enable_sampling_replay, parallel_enabled)
+
+
+def _fused_rl_logps(outputs, labels, temperature, return_entropy):
+    """Replace the stashed hidden states (``outputs['logits']`` under the fused-CE patch) with the
+    selected log-probabilities, without materialising the full-vocab logits."""
+    from twinkle.kernel.ops.fused_linear_selective_log_softmax import fused_linear_selective_log_softmax
+
+    hidden = outputs['logits']
+    lm_head = outputs.pop('lm_head', None)
+    if lm_head is None:
+        raise RuntimeError("task='fused_lm_rl' requires the lm_head-preserving forward patch")
+    weight = lm_head.weight
+    if getattr(lm_head, 'bias', None) is not None or hasattr(weight, 'full_tensor'):
+        raise NotImplementedError('fused_lm_rl supports only unsharded, bias-free lm_head weights')
+    result = fused_linear_selective_log_softmax(
+        hidden.reshape(-1, hidden.shape[-1]),
+        weight,
+        labels.reshape(-1),
+        temperature=temperature,
+        return_entropy=return_entropy,
+    )
+    if return_entropy:
+        outputs['logps'], outputs['entropies'] = (value.reshape(labels.shape) for value in result)
+    else:
+        outputs['logps'] = result.reshape(labels.shape)
+
+
 def _resolve_mm_graph_context(model, template):
     """Return a context manager that patches the model for multimodal uneven-graph protection.
 
@@ -943,18 +989,21 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             else:
                 loss_mask = (labels != -100).bool()
                 masked_labels = labels.masked_fill(~loss_mask, 0)
-                logits = outputs['logits']
-                if temperature != 1.0:
-                    logits.div_(temperature)
-                if loss_require_entropy:
-                    outputs['logps'], outputs['entropies'] = selective_log_softmax(
-                        logits, masked_labels, return_entropy=True, vocab_parallel=False)
+                if task == 'fused_lm_rl':
+                    _fused_rl_logps(outputs, masked_labels, temperature, loss_require_entropy)
                 else:
-                    # HF logits are always FULL vocab (DTensor TP replicates, never
-                    # Megatron-vocab-shards); never let a co-resident Megatron TP>1
-                    # student's global mpu state route them into vocab-parallel CE.
-                    outputs['logps'] = selective_log_softmax(logits, masked_labels, vocab_parallel=False)
-                del logits
+                    logits = outputs['logits']
+                    if temperature != 1.0:
+                        logits.div_(temperature)
+                    if loss_require_entropy:
+                        outputs['logps'], outputs['entropies'] = selective_log_softmax(
+                            logits, masked_labels, return_entropy=True, vocab_parallel=False)
+                    else:
+                        # HF logits are always FULL vocab (DTensor TP replicates, never
+                        # Megatron-vocab-shards); never let a co-resident Megatron TP>1
+                        # student's global mpu state route them into vocab-parallel CE.
+                        outputs['logps'] = selective_log_softmax(logits, masked_labels, vocab_parallel=False)
+                    del logits
         if loss_require_values:
             values = outputs['logits']
             outputs['values'] = values.squeeze(-1) if values.dim() == 3 and values.shape[-1] == 1 else values
@@ -1185,6 +1234,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         channel = inputs.pop('channel', None)
         # Not a model argument; the loss reads it back off `inputs` further down.
         completion_mask = inputs.pop('completion_mask', None)
+        _check_fused_rl_task(self, task, labels, loss_instance, return_logits, enable_sampling_replay)
         replay_metadata = replay_loss_mask = replay_masked_labels = None
         if enable_sampling_replay:
             replay_loss_mask, replay_masked_labels, replay_metadata = _prepare_sampling_replay(
@@ -1416,6 +1466,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             channel = inputs.pop('channel', None)
             # Not a model argument; the loss reads it back off `inputs` further down.
             completion_mask = inputs.pop('completion_mask', None)
+            _check_fused_rl_task(self, task, labels, loss_instance, return_logits, enable_sampling_replay)
             replay_metadata = replay_loss_mask = replay_masked_labels = None
             if enable_sampling_replay:
                 packed_position_ids = processor._is_packed_position_ids(inputs.get('position_ids'))

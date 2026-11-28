@@ -63,12 +63,12 @@ it.
 from __future__ import annotations
 from typing import Optional
 
+import torch
 import torch.nn.functional as F
 
 from twinkle import get_logger
 from twinkle.data_format import LossOutput, ModelOutput
 from .base import Loss
-from .utils import count_loss_tokens
 
 logger = get_logger()
 
@@ -153,18 +153,12 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
         self._warned = False
 
     def micro_batch_scale(self, inputs, indices):
-        if self.reduction == 'sum':
-            return 1.0
-        token_counts = [count_loss_tokens(model_input, self.ignore_index) for model_input in inputs]
-        total_tokens = sum(token_counts)
-        if total_tokens == 0:
-            return 0.0
-        return sum(token_counts[index] for index in indices) / total_tokens
+        from .cross_entropy import CrossEntropyLoss
+        return CrossEntropyLoss.micro_batch_scale(self, inputs, indices)
 
     def batch_normalizer(self, inputs):
-        if self.reduction != 'sum':
-            return None
-        return sum(count_loss_tokens(model_input, self.ignore_index) for model_input in inputs)
+        from .cross_entropy import CrossEntropyLoss
+        return CrossEntropyLoss.batch_normalizer(self, inputs)
 
     def _ensure_liger(self):
         if self._liger is None:
@@ -188,6 +182,8 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
             bias = bias.full_tensor()
         hidden_flat = _align_hidden_dtype(hidden.reshape(-1, hidden.shape[-1]), weight)
         logits = F.linear(hidden_flat, weight, bias=bias)
+        if self.softcap is not None:
+            logits = self.softcap * torch.tanh(logits / self.softcap)
         out = dict(outputs)
         out['logits'] = logits.view(*hidden.shape[:-1], -1)
         return CrossEntropyLoss(ignore_index=self.ignore_index, reduction=self.reduction)(inputs, out, **kwargs)
@@ -228,6 +224,10 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
                         'on some shapes, CUDA Triton compile failure).', e)
                 self._fused_broken = True
                 return self._materialise_ce(inputs, outputs, lm_head, hidden, **kwargs)
+            if self.reduction == 'mean':
+                # Already a per-token mean: num_tokens=0 tells calculate_loss not to divide again
+                # (same contract as CrossEntropyLoss).
+                return LossOutput(loss=loss, num_tokens=0)
             num_tokens = (labels != self.ignore_index).to(loss.device).sum().clamp(min=1)
             return LossOutput(loss=loss, num_tokens=num_tokens)
 

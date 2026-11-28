@@ -51,7 +51,7 @@ def _get_chunked_ce_func():
                 logps = F.log_softmax(
                     logits_chunk, dim=-1).gather(-1,
                                                  labels_chunk.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-                per_token = -logps * logps.exp() if dft else -logps
+                per_token = -logps * logps.exp().detach() if dft else -logps
 
                 total_loss = total_loss + (per_token * mask).sum()
                 total_count = total_count + mask.sum()
@@ -75,8 +75,9 @@ def _get_chunked_ce_func():
                 scale = grad_output
 
             n = logits.shape[0]
-            # Write gradients to a new buffer: an in-place write would corrupt the saved forward tensor for
-            # any other consumer of the same logits (auxiliary loss, retained-graph second backward).
+            # Gradients go to a fresh buffer: ``logits`` is the model output the caller
+            # keeps (train metrics such as Accuracy read it after backward), so it must not
+            # be overwritten. Only one chunk's fp32 log_softmax is ever live.
             grad_logits = torch.empty_like(logits)
             for start in range(0, n, chunk_size):
                 end = min(start + chunk_size, n)
@@ -88,7 +89,7 @@ def _get_chunked_ce_func():
                     logps = F.log_softmax(
                         logits_chunk, dim=-1).gather(-1,
                                                      labels_chunk.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-                    per_token = -logps * logps.exp() if dft else -logps
+                    per_token = -logps * logps.exp().detach() if dft else -logps
                     loss_chunk = (per_token * mask).sum()
 
                 grad_chunk = torch.autograd.grad(loss_chunk, logits_chunk, retain_graph=False)[0]
@@ -169,7 +170,7 @@ class ChunkedCrossEntropyLoss(Loss):
 
     def _loss_from_logps(self, labels, logps):
         mask = (labels != self.ignore_index).float()
-        per_token = -logps * logps.exp() if self.dft else -logps
+        per_token = -logps * logps.exp().detach() if self.dft else -logps
         if self.reduction == 'mean':
             return LossOutput(loss=(per_token * mask).sum() / mask.sum().clamp(min=1), num_tokens=0)
         return LossOutput(loss=(per_token * mask).sum(), num_tokens=mask.sum().clamp(min=1))

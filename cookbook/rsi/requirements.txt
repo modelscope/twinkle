@@ -1,0 +1,2 @@
+# Optional analysis dependency for agentic/novelty_metric.py.
+scikit-learn

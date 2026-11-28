@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-import torch
 from dataclasses import dataclass, field
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -12,6 +11,7 @@ from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
+from twinkle.utils.framework import Torch
 
 
 @dataclass
@@ -183,8 +183,10 @@ class BaseOptimizerGroup:
         # fetches the failing rank's exception. Releasing the cache first puts every
         # rank above 54 GiB free and the same step completes in 5 ms. The cost is one
         # re-allocation per optimizer step, which is once per iteration here.
-        if status.metrics and torch.cuda.is_available() and torch.cuda.is_initialized():
-            torch.cuda.empty_cache()
+        if status.metrics:
+            # Torch.empty_cache() releases the cache of the accelerator in use
+            # (CUDA, Ascend NPU, ...) and does nothing when there is none.
+            Torch.empty_cache()
         results = {}
         for metric in status.metrics:
             results.update(metric.calculate())

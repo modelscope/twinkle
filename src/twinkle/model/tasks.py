@@ -325,6 +325,17 @@ class FusedCE(TaskSpec):
     # megatron_context stays the base raise: this task is transformers-only.
 
 
+class FusedRL(TaskSpec):
+    """The RL twin of fused_lm_ce: the forward returns hidden states plus the lm_head module, and
+    ``TransformersModel`` derives logps (optionally entropies) with
+    ``fused_linear_selective_log_softmax`` instead of materialising the logits."""
+
+    task_name = 'fused_lm_rl'
+    transformers_context = FusedCE.transformers_context
+
+    # megatron_context stays the base raise: this task is transformers-only.
+
+
 class Value(SeqCls):
     """PPO critic: a num_labels=1 head whose PER-TOKEN output rides the logits channel
     ([b, s]; PPOValueLoss masks to response tokens)."""
@@ -373,7 +384,7 @@ def _resolve_generative_reranker_token_ids(template):
 
 
 TASK_SPECS = {cls.task_name: cls() for cls in (
-    CausalLM, SeqCls, Reranker, Embedding, GenerativeReranker, FusedCE, Value, Decision)}
+    CausalLM, SeqCls, Reranker, Embedding, GenerativeReranker, FusedCE, FusedRL, Value, Decision)}
 
 
 def get_task_spec_obj(task: Optional[str]) -> TaskSpec:

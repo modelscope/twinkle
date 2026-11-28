@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 import socket
 from typing import Optional
 
@@ -43,14 +44,24 @@ def find_free_port(address: str = '', start_port: Optional[int] = None, retry: i
         family = socket.AF_INET6
     if start_port is None:
         start_port = 0
+    # Two socket options are platform-dependent and both changed what this
+    # function returns:
+    #   * SO_REUSEPORT does not exist on Windows, so setting it unconditionally
+    #     made every call raise AttributeError there;
+    #   * on Windows SO_REUSEADDR lets a second socket bind and listen on a
+    #     port another process is already serving, so the probe reported that
+    #     port as free. POSIX rebinds it only for TIME_WAIT, which is what the
+    #     option is for here.
+    reuseport = getattr(socket, 'SO_REUSEPORT', None)
     for port in range(start_port, start_port + retry):
         with socket.socket(family, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if os.name != 'nt':
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if reuseport is not None:
+                sock.setsockopt(socket.SOL_SOCKET, reuseport, 1)
             try:
                 sock.bind(('', port))
-                port = sock.getsockname()[1]
-                break
+                return sock.getsockname()[1]
             except OSError:
                 pass
-    return port
+    raise RuntimeError(f'No free port found in [{start_port}, {start_port + retry})')

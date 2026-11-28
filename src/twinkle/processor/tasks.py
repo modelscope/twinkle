@@ -44,6 +44,9 @@ class TaskSpec:
 TASKS = {
     'causal_lm': TaskSpec(),
     'fused_lm_ce': TaskSpec(),
+    # RL twin of fused_lm_ce: the lm_head GEMM is deferred to the fused linear
+    # selective log-softmax (Ascend kernel, native reference elsewhere).
+    'fused_lm_rl': TaskSpec(),
     # value / seq_cls / reranker are dual-path: a model variant that builds the head itself
     # (HF *ForSequenceClassification / mcore-bridge task_type) runs the legacy path; a model
     # carrying an ATTACHED head (built by the task spec, bound per adapter on multi-LoRA)

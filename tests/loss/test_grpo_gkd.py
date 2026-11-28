@@ -166,6 +166,18 @@ class TestCISPOLoss:
         assert isinstance(result, dict) and 'loss' in result
         assert torch.isfinite(result['loss'])
 
+    @pytest.mark.parametrize('epsilon_high, expected_weight', [(None, 1.2), (4.0, float(torch.e))])
+    def test_cispo_truncates_at_epsilon_high(self, epsilon_high, expected_weight):
+        # every token has ratio e; the stop-gradient weight is min(ratio, 1 + epsilon_high)
+        loss_fn = CISPOLoss(epsilon=0.2, epsilon_high=epsilon_high)
+        labels = torch.tensor([[1, 2, 3, -100]])
+        logps = torch.full((1, 4), -2.0, requires_grad=True)
+        old_logps = torch.full((1, 3), -3.0)  # response-only form
+        result = loss_fn({'labels': labels}, {'logps': logps}, old_logps=old_logps, advantages=[1.0])
+        result['loss'].backward()
+        expected = torch.tensor([[-expected_weight / 3] * 3 + [0.0]])
+        assert torch.allclose(logps.grad, expected, atol=1e-5)
+
 
 class TestBNPOLoss:
 

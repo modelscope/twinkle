@@ -76,7 +76,9 @@ class CrossEntropyLoss(Loss):
             per_token = (1 - self.label_smoothing) * per_token + self.label_smoothing * smooth
         if self.dft:
             # DFT: weight each token's loss by its own probability p = exp(logp), i.e. -p*log(p).
-            per_token = per_token * logps.exp()
+            # The weight is a constant for the gradient: detaching it keeps -log(p) as the only
+            # differentiated factor, the same convention as ChunkedCrossEntropyLoss.
+            per_token = per_token * logps.exp().detach()
         if self.probability_weight == 'p_one_minus_p':
             probability = logps.detach().exp()
             per_token = per_token * probability * (1 - probability)

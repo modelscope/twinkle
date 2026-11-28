@@ -412,8 +412,7 @@ class AgenticChallenger(Challenger):
         # correct reproduction. The reason goes back the way a failed assertion
         # does, since it is the same kind of fault.
         brittle = self._brittle_check_fn(script) if self._brittle_check_fn is not None else None
-        exit_code, output = (1, brittle) if brittle else self.env.run_script(
-            episode_id, script, interpreter=self._check_language)
+        exit_code, output = (1, brittle) if brittle else self._verify_check(state, script)
         if exit_code == 0:
             state['checked'] = True
             return self._problem_followup
@@ -428,6 +427,10 @@ class AgenticChallenger(Challenger):
             )
         state['reject'] = ('check_run_fail', '\n'.join(state['attempts']))
         return None
+
+    def _verify_check(self, state: Dict[str, Any], script: str) -> Tuple[int, str]:
+        """Validate a generated check in its author's environment."""
+        return self.env.run_script(state['episode_id'], script, interpreter=self._check_language)
 
     def _build_query(self, state: Dict[str, Any], explored: Trajectory) -> Optional[Trajectory]:
         if state.get('reject'):
@@ -487,6 +490,10 @@ class AgenticChallenger(Challenger):
         variance = 2.0 * self._pass_rate_width**2
         return math.exp(-(gap * gap) / variance)
 
+    def _proposal_reward(self, proposal: _ProposalResult) -> float:
+        """Score a measured proposal; subclasses may use its task context."""
+        return self.challenger_reward(proposal.n_pass)
+
     def _record_proposals(self, proposals: List[_ProposalResult]) -> None:
         if self._recorder is None:
             return
@@ -538,7 +545,7 @@ class AgenticChallenger(Challenger):
             n_pass = sum(1 for _, passed in proposal.attempts if passed)
             proposal.task = attach_user_data(proposal.task, n_pass=n_pass, n_rollouts=self.num_solver_rollouts)
             proposal.n_pass = n_pass
-            proposal.reward = self.challenger_reward(n_pass)
+            proposal.reward = self._proposal_reward(proposal)
             if low <= n_pass <= high:
                 proposal.outcome = 'kept'
                 kept += 1

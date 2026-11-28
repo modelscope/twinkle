@@ -8,6 +8,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+try:
+    import torch_npu  # noqa: F401
+    _NPU_AVAILABLE = torch.npu.is_available()
+except (ImportError, RuntimeError):
+    _NPU_AVAILABLE = False
+
 from twinkle.utils import (
     deep_getattr,
     is_valid_ipv6_address,
@@ -286,6 +292,115 @@ class TestSelectiveLogSoftmax:
         torch.autograd.backward(list(out_new), [torch.ones_like(o) for o in out_new])
         torch.autograd.backward(list(out_ref), [torch.ones_like(o) for o in out_ref])
         assert torch.allclose(x_new.grad, x_ref.grad, atol=1e-5)
+
+    @pytest.mark.parametrize('return_entropy', [False, True])
+    def test_noncontiguous_logits_and_int32_index_can_backward_twice(self, return_entropy):
+        base = torch.randn(6, 37, requires_grad=True)
+        logits = base[:, ::2]
+        index = torch.randint(0, logits.shape[-1], (6, ), dtype=torch.int32)
+        result = selective_log_softmax(logits, index, return_entropy=return_entropy)
+        outputs = result if return_entropy else (result, )
+        gradients = [torch.randn_like(output) for output in outputs]
+
+        first = torch.autograd.grad(outputs, logits, gradients, retain_graph=True)
+        second = torch.autograd.grad(outputs, logits, gradients)
+        for first_gradient, second_gradient in zip(first, second):
+            torch.testing.assert_close(first_gradient, second_gradient, rtol=0, atol=0)
+
+    def test_npu_cross_entropy_logps_match_log_softmax(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+
+        from twinkle.utils.torch_utils import _npu_cross_entropy_log_probs
+
+        calls = []
+
+        def fake_cross_entropy(logits, index, weight, reduction, ignore_index, label_smoothing):
+            calls.append((weight, reduction, ignore_index, label_smoothing))
+            losses = F.cross_entropy(
+                logits,
+                index,
+                weight=weight,
+                reduction=reduction,
+                ignore_index=ignore_index,
+                label_smoothing=label_smoothing,
+            )
+            return losses, None, None, None
+
+        monkeypatch.setitem(sys.modules, 'torch_npu',
+                            SimpleNamespace(npu_cross_entropy_loss=fake_cross_entropy))
+
+        logits = torch.randn(6, 37, dtype=torch.float32, requires_grad=True)
+        index = torch.randint(0, logits.shape[-1], (6, ))
+        reference_logits = logits.detach().clone().requires_grad_(True)
+        weights = torch.randn(logits.shape[0])
+
+        actual = _npu_cross_entropy_log_probs(logits, index)
+        expected = F.log_softmax(reference_logits, dim=-1).gather(
+            -1, index.unsqueeze(-1)).squeeze(-1)
+        actual_gradient = torch.autograd.grad((actual * weights).sum(), logits)[0]
+        expected_gradient = torch.autograd.grad((expected * weights).sum(), reference_logits)[0]
+
+        assert calls == [(None, 'none', -100, 0.0)]
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-4, atol=1e-5)
+
+    def test_npu_cross_entropy_logps_skip_missing_api(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+
+        from twinkle.utils.torch_utils import _npu_cross_entropy_log_probs
+
+        monkeypatch.setitem(sys.modules, 'torch_npu', SimpleNamespace())
+        logits = torch.randn(2, 7)
+        index = torch.tensor([1, 3])
+
+        assert _npu_cross_entropy_log_probs(logits, index) is None
+
+    def test_npu_cross_entropy_logps_skip_incompatible_api(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+
+        from twinkle.utils.torch_utils import _npu_cross_entropy_log_probs
+
+        def incompatible_cross_entropy(*args):
+            raise TypeError('unexpected signature')
+
+        monkeypatch.setitem(
+            sys.modules,
+            'torch_npu',
+            SimpleNamespace(npu_cross_entropy_loss=incompatible_cross_entropy),
+        )
+        logits = torch.randn(2, 7)
+        index = torch.tensor([1, 3])
+
+        assert _npu_cross_entropy_log_probs(logits, index) is None
+
+    @pytest.mark.skipif(not _NPU_AVAILABLE, reason='requires NPU')
+    def test_npu_fp32_fast_path_matches_log_softmax(self, monkeypatch):
+        import twinkle.utils.torch_utils as torch_utils_module
+
+        logits = torch.randn(64, 151936, device='npu', dtype=torch.float32, requires_grad=True)
+        index = torch.randint(0, logits.shape[-1], (64, ), device='npu')
+        reference_logits = logits.detach().clone().requires_grad_(True)
+
+        vendor_log_probs = torch_utils_module._npu_cross_entropy_log_probs
+
+        def checked_vendor_log_probs(*args, **kwargs):
+            result = vendor_log_probs(*args, **kwargs)
+            assert result is not None, 'test must exercise the real vendor cross-entropy op'
+            return result
+
+        monkeypatch.setattr(torch_utils_module, '_npu_cross_entropy_log_probs', checked_vendor_log_probs)
+        actual = selective_log_softmax(logits, index)
+        expected = reference_logits.log_softmax(-1).gather(
+            -1, index.unsqueeze(-1)).squeeze(-1)
+        grad_logps = torch.randn_like(actual)
+        actual_gradient = torch.autograd.grad(actual, logits, grad_logps)[0]
+        expected_gradient = torch.autograd.grad(expected, reference_logits, grad_logps)[0]
+
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-4, atol=1e-5)
 
 
 class TestPadAndStackTensors:

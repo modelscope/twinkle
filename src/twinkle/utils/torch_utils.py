@@ -111,6 +111,26 @@ def _flash_cross_entropy():
     return cross_entropy_loss
 
 
+def _npu_cross_entropy_log_probs(logits, index):
+    """Return ``log_softmax(logits) -> gather(index)`` with the Ascend CE op, or ``None`` when the
+    installed ``torch_npu`` does not provide the op (the portable path then applies)."""
+    try:
+        import torch_npu
+    except ImportError:
+        return None
+
+    cross_entropy = getattr(torch_npu, 'npu_cross_entropy_loss', None)
+    if cross_entropy is None:
+        return None
+
+    try:
+        losses, _, _, _ = cross_entropy(logits, index, None, 'none', -100, 0.0)
+    except (RuntimeError, TypeError):
+        # Older torch_npu releases expose a different signature.
+        return None
+    return -losses
+
+
 def _chunked_selective_log_softmax_function():
     """Lazily build the autograd function used by :func:`selective_log_softmax`.
 
@@ -291,6 +311,12 @@ def selective_log_softmax(logits, index, return_entropy: bool = False, vocab_par
             return -losses.reshape(index.shape)
     flat_logits = logits.reshape(-1, vocab_size)
     flat_index = index.reshape(-1)
+    if (not return_entropy and flat_logits.device.type == 'npu' and flat_logits.dtype == torch.float32
+            and flat_logits.numel() <= 2_147_483_647):
+        # Ascend's fused CE op replaces the log-softmax + gather round trip for FP32 logps.
+        fused_logps = _npu_cross_entropy_log_probs(flat_logits, flat_index.long())
+        if fused_logps is not None:
+            return fused_logps.reshape(index.shape)
     compute_dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
     element_size = torch.empty((), dtype=compute_dtype).element_size()
     temporary_bytes = 32 << 20 if return_entropy else 64 << 20
