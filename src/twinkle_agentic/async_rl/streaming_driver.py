@@ -31,7 +31,7 @@ import uuid
 from collections import Counter, deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import user_data_get
@@ -48,6 +48,20 @@ __all__ = ['StreamingDriver', 'PRM_SEGMENT_TURNS']
 PRM_SEGMENT_TURNS = 'prm_segment_turns'
 
 _BASELINE = 'baseline'
+
+
+def _nonnegative_component_state_int(
+    state: Dict[str, Any],
+    key: str,
+    *,
+    default: Optional[int],
+) -> Optional[int]:
+    value = state.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f'StreamingDriver state field {key!r} must be a non-negative integer')
+    return value
 
 
 def _record_driver_probe(event: str, episode_id: str = '', **fields: Any) -> None:
@@ -334,6 +348,8 @@ class StreamingDriver:
         self._consumed_batches = 0
         self._version = 0
         self._base_version = 0
+        #: Set by load_state_dict so the first _start keeps the original admission epoch.
+        self._resume_base_version: Optional[int] = None
         self._failures: deque = deque(maxlen=self.FAILURE_WINDOW)
         self._consecutive_failures = 0
         self._counters: Dict[str, int] = {
@@ -584,6 +600,10 @@ class StreamingDriver:
                 'handed': self._handed,
                 'prompts_drawn': self._prompt_seq,
                 'policy_version': self._version,
+                'base_version': self._base_version,
+                'consumed_batches': self._consumed_batches,
+                'live': self._live,
+                'active_live': self._live_for_groups(groups),
                 'loader_state': loader_state,
                 'pending_rows': list(self._pending_rows),
                 'queries': [
@@ -595,6 +615,16 @@ class StreamingDriver:
                 ],
             }
             return encode_component_state(state)
+
+    @staticmethod
+    def _live_for_groups(groups: Sequence[_Group]) -> int:
+        """Member rows currently represented by persisted queries."""
+        return sum(
+            1
+            for group in groups
+            for episode in group.members
+            if episode.role != _BASELINE and not episode.lost
+        )
 
     def _snapshot_groups(self) -> List[_Group]:
         """Collect active and ready queries that have not yet been handed to the trainer."""
@@ -632,10 +662,22 @@ class StreamingDriver:
 
             observed_version = self._read_version()
             self._version = max(int(state.get('policy_version') or 0), observed_version)
-            self._base_version = self._version
             self._handed = int(state.get('handed') or 0)
+            self._consumed_batches = _nonnegative_component_state_int(
+                state, 'consumed_batches', default=0)
             self._prompt_seq = int(state.get('prompts_drawn') or 0)
             self._exhausted = self.max_steps is not None and self._handed >= self.max_steps
+            saved_live = _nonnegative_component_state_int(state, 'live', default=None)
+            active_live = _nonnegative_component_state_int(state, 'active_live', default=None)
+            if active_live is not None and saved_live is not None and active_live > saved_live:
+                raise ValueError(
+                    f'StreamingDriver active_live={active_live} exceeds live={saved_live}')
+            # Successful history is cumulative. The active part is recreated by _start_attempt()
+            # below, so restore only the history first to avoid double counting the queries.
+            self._live = max(0, (saved_live or 0) - (active_live or 0))
+            base_version = _nonnegative_component_state_int(state, 'base_version', default=None)
+            self._base_version = self._version
+            self._resume_base_version = base_version
             pending_rows = state.get('pending_rows') or ()
             if not isinstance(pending_rows, (list, tuple)):
                 raise ValueError('StreamingDriver pending_rows must be a list or tuple')
@@ -829,7 +871,11 @@ class StreamingDriver:
                 return
             self._version = max(self._version, self._read_version())
             # the bound counts versions from here: a manager synced before the run starts above 0
-            self._base_version = self._version
+            if self._resume_base_version is None:
+                self._base_version = self._version
+            else:
+                self._base_version = min(self._resume_base_version, self._version)
+                self._resume_base_version = None
             self._thread = threading.Thread(target=self._run, name='twinkle-streaming-driver', daemon=True)
             self._thread.start()
 

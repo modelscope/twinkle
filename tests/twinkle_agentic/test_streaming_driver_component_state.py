@@ -12,11 +12,16 @@ class _Rollout:
     def __init__(self):
         self.calls = []
         self.futures = []
+        self.futures_by_episode = {}
+        self.trajectories_by_episode = {}
 
-    def step(self, trajectory, **_kwargs):
+    def step(self, trajectory, *, episode_id=None, **_kwargs):
         self.calls.append(copy.deepcopy(trajectory))
         future = Future()
         self.futures.append(future)
+        if episode_id is not None:
+            self.futures_by_episode[episode_id] = future
+            self.trajectories_by_episode[episode_id] = copy.deepcopy(trajectory)
         return future
 
     def stop(self, *_args, **_kwargs):
@@ -28,6 +33,65 @@ def _finish(driver, rollout):
         if not future.done():
             future.set_result(([], RolloutStatus(done=True)))
     driver.close()
+
+
+def _finish_groups(driver, rollout, groups):
+    for group in groups:
+        for episode in group.members:
+            future = rollout.futures_by_episode[episode.episode_id]
+            future.set_result((
+                [rollout.trajectories_by_episode[episode.episode_id]],
+                RolloutStatus(done=True),
+            ))
+            driver._handle(*driver._events.get_nowait())
+
+
+def test_component_state_restores_cumulative_live_admission_history():
+    rollout = _Rollout()
+    driver = StreamingDriver(
+        [_query(str(index)) for index in range(12)],
+        rollout,
+        batch_size=4,
+        num_generations=2,
+        max_steps=2,
+        max_staleness=1,
+    )
+    with driver._lock:
+        driver._admit()
+    groups = list(driver._groups.values())
+    assert len(groups) == 4
+    _finish_groups(driver, rollout, groups[:2])
+
+    rows, _ = driver._next_batch()
+    assert len(rows) == 4
+    assert driver._handed == 1
+    assert driver._live == 8
+
+    state = driver.state_dict()
+    assert state["live"] == 8
+    assert state["active_live"] == 4
+    assert state["base_version"] == driver._base_version
+
+    restored_rollout = _Rollout()
+    restored = StreamingDriver(
+        [],
+        restored_rollout,
+        batch_size=4,
+        num_generations=2,
+        max_steps=2,
+        max_staleness=1,
+    )
+    restored.load_state_dict(state)
+    assert restored._live == 8
+    assert restored._consumed_batches == state["consumed_batches"]
+    restored._start()
+    assert restored._base_version == state["base_version"]
+    # _start() observes the handed-driven policy version too, just like the source would.
+    driver._version = max(driver._version, driver._read_version())
+    assert restored._capacity() == driver._capacity()
+
+    _finish(driver, rollout)
+    _finish(restored, restored_rollout)
 
 
 def test_component_state_persists_raw_query_and_replays_it():
@@ -139,7 +203,8 @@ def test_component_state_persists_multimodal_query_and_replays_it():
     restored.load_state_dict(state)
 
     assert restored._live == 2
-    assert "live" not in state
+    assert state["live"] == 2
+    assert state["active_live"] == 2
     assert torch.equal(restored._groups["0"].row["pixel_values"], query["pixel_values"])
     assert restored._groups["0"].row["images"][0]["bytes"] == b"raw-image"
     assert torch.equal(restored_rollout.calls[0]["pixel_values"], query["pixel_values"])

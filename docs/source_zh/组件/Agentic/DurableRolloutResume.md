@@ -50,6 +50,10 @@ optimizer step 只需同步一次 adapter。示例脚本通过 `warm_policy_weig
 | `handed` | 已交给训练器的 batch 数 |
 | `prompts_drawn` | 已 admit 的 prompt 数，不包含 `pending_rows` |
 | `policy_version` | 快照时 driver 观察到的策略版本 |
+| `base_version` | admission window 的起始策略版本 |
+| `consumed_batches` | 训练器已取走的 batch 确认数 |
+| `live` | 累计已准入且未被淘汰的 member 数，包含成功交付的历史 |
+| `active_live` | 当前持久化 query 已占用的 member 数 |
 | `loader_state` | dataloader 自带的状态；不存在时使用 `prompts_drawn + len(pending_rows)` 恢复 plain iterable 游标 |
 
 上述状态快照不修改 admission、staleness 或采样调度状态。
@@ -72,8 +76,10 @@ checkpoint 恢复时仍会重放该 batch。
 该方案会增加 `trainer_state.json` 的大小，但保持 checkpoint 自包含，不需要额外 sidecar
 协议或改变 `model.save()` 接口。
 
-`_live` 不写入状态。恢复 query 时会重新执行 admission，并按照 `num_generations` 重新计算
-正在运行的 member 数；持久化 `_live` 反而会造成重复计数。
+`live` 是累计 admission 计数，不是只统计当前仍在运行的 episode；成功完成并交付的历史
+member 仍会影响后续准入窗口。恢复时先回到 `live - active_live` 的历史基线，再由
+`load_state_dict()` 重新提交 query 并加回新的 active member，避免历史丢失或重复计数。
+`base_version` 和 `consumed_batches` 同时恢复，保证重启前后的容量窗口口径一致。
 
 ## 恢复
 
