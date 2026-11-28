@@ -31,7 +31,7 @@ import uuid
 from collections import Counter, deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import user_data_get
@@ -51,11 +51,11 @@ _BASELINE = 'baseline'
 
 
 def _nonnegative_component_state_int(
-    state: Dict[str, Any],
+    state: dict[str, Any],
     key: str,
     *,
-    default: Optional[int],
-) -> Optional[int]:
+    default: int | None,
+) -> int | None:
     value = state.get(key)
     if value is None:
         return default
@@ -326,7 +326,7 @@ class StreamingDriver:
         self._close_waiting_on = ''
         self._closing_episodes: dict[str, _Episode] = {}
         self._pending: dict[Any, tuple[str, _Episode]] = {}
-        self._events: 'queue.Queue[Tuple[Any, ...]]' = queue.Queue()
+        self._events: 'queue.Queue[tuple[Any, ...]]' = queue.Queue()
         self._ready: deque = deque()
         self._stale_groups: deque[_Group] = deque()
         self._ready_rows = 0
