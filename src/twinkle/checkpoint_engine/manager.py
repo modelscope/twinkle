@@ -287,6 +287,27 @@ class CheckpointEngineManager:
     # ── Version ──────────────────────────────────────────────────────────────
 
     @remote_function(collect='first', lazy_collect=False)
+    def state_dict(self) -> Dict[str, Any]:
+        """Return the manager's JSON-compatible logical state."""
+        return {
+            'format': 'twinkle.checkpoint-engine-manager.v1',
+            'version': self._version,
+        }
+
+    @remote_function(collect='first', lazy_collect=False)
+    def load_state_dict(self, state: Optional[Dict[str, Any]]) -> None:
+        """Restore the logical version; a new transport still performs its first full sync."""
+        if state is None:
+            return
+        if not isinstance(state, dict) or state.get('format') != 'twinkle.checkpoint-engine-manager.v1':
+            raise ValueError('unsupported CheckpointEngineManager component state')
+        version = state.get('version')
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError('CheckpointEngineManager state version must be a non-negative integer')
+        with self._sync_lock:
+            self._version = version
+
+    @remote_function(collect='first', lazy_collect=False)
     def version(self) -> int:
         """How many syncs have completed; read without waiting for one in progress."""
         return self._version

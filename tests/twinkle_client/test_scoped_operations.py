@@ -344,6 +344,39 @@ def test_a_second_scope_cannot_close_or_stop_an_already_owned_client():
     assert session.closed
 
 
+def test_client_checkpoint_manager_restores_version_and_adapter_path():
+    from twinkle_client.rollout import ClientCheckpointManager
+
+    class _Model:
+        def __init__(self):
+            self.saved = []
+
+        def save(self, name, save_optimizer=False):
+            self.saved.append((name, save_optimizer))
+            return SimpleNamespace(twinkle_path=f'twinkle://{name}')
+
+    source_sampler = SimpleNamespace(adapter_path=None)
+    source = ClientCheckpointManager(_Model(), source_sampler)
+    source.sync_weights()
+    source.sync_weights()
+    state = source.state_dict()
+
+    restored_model = _Model()
+    restored_sampler = SimpleNamespace(adapter_path=None)
+    restored = ClientCheckpointManager(restored_model, restored_sampler)
+    restored.load_state_dict(state)
+
+    assert restored.version() == 2
+    assert restored_sampler.adapter_path == 'twinkle://policy-1'
+    assert restored_model.saved == []
+    restored.sync_weights()
+    assert restored.version() == 3
+    assert restored_sampler.adapter_path == 'twinkle://policy-2'
+    assert restored_model.saved == [('policy-2', False)]
+    with pytest.raises(ValueError, match='state version'):
+        restored.load_state_dict({'format': 'twinkle.client-checkpoint-manager.v1', 'version': -1})
+
+
 def test_recipe_trains_and_publishes_through_real_sdk_methods():
     from cookbook.client.async_rl.streaming_multi_turn_grpo import train_batch
     from twinkle.advantage import GRPOAdvantage

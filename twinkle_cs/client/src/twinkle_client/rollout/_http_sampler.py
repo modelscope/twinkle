@@ -118,6 +118,30 @@ class ClientCheckpointManager:
             self.sampler.adapter_path = saved.twinkle_path
             self._version += 1
 
+    def state_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                'format': 'twinkle.client-checkpoint-manager.v1',
+                'version': self._version,
+                'adapter_path': self.sampler.adapter_path,
+            }
+
+    def load_state_dict(self, state: Optional[Dict[str, Any]]) -> None:
+        if state is None:
+            return
+        if not isinstance(state, dict) or state.get('format') != 'twinkle.client-checkpoint-manager.v1':
+            raise ValueError('unsupported ClientCheckpointManager component state')
+        version = state.get('version')
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError('ClientCheckpointManager state version must be a non-negative integer')
+        adapter_path = state.get('adapter_path')
+        if adapter_path is not None and not isinstance(adapter_path, str):
+            raise ValueError('ClientCheckpointManager adapter_path must be a string or None')
+        with self._lock:
+            self._version = version
+            if 'adapter_path' in state:
+                self.sampler.adapter_path = adapter_path
+
     def version(self) -> int:
         return self._version
 
@@ -130,6 +154,3 @@ def _wire_media(media: Any) -> Dict[str, List[str]]:
         if values:
             out[key] = [_media_ref(value) for value in values]
     return out
-
-
-

@@ -21,7 +21,6 @@ queue when it finishes, and the driver's thread only reads that queue, so its co
 with the number of episodes in flight.
 """
 from __future__ import annotations
-
 import copy
 import math
 import queue
@@ -37,6 +36,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 from twinkle import remote_class, remote_function
 from twinkle.data_format import user_data_get
 from twinkle.utils import get_logger
+from twinkle_agentic.async_rl.component_state_codec import decode_component_state, encode_component_state
 from twinkle_agentic.rollout.multi_turn import EpisodeError, RolloutStatus
 
 logger = get_logger()
@@ -48,6 +48,20 @@ __all__ = ['StreamingDriver', 'PRM_SEGMENT_TURNS']
 PRM_SEGMENT_TURNS = 'prm_segment_turns'
 
 _BASELINE = 'baseline'
+
+
+def _nonnegative_component_state_int(
+    state: dict[str, Any],
+    key: str,
+    *,
+    default: int | None,
+) -> int | None:
+    value = state.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f'StreamingDriver state field {key!r} must be a non-negative integer')
+    return value
 
 
 def _record_driver_probe(event: str, episode_id: str = '', **fields: Any) -> None:
@@ -66,8 +80,9 @@ def _record_driver_probe(event: str, episode_id: str = '', **fields: Any) -> Non
     ordering the slow-injection efficiency oracles assert on, with ``t`` stamps from the same
     monotonic clock.
     """
-    import json
     import os
+
+    import json
     root = os.environ.get('TWINKLE_DRIVER_PROBE')
     if not root:
         return
@@ -311,7 +326,7 @@ class StreamingDriver:
         self._close_waiting_on = ''
         self._closing_episodes: dict[str, _Episode] = {}
         self._pending: dict[Any, tuple[str, _Episode]] = {}
-        self._events: 'queue.Queue[Tuple[Any, ...]]' = queue.Queue()
+        self._events: 'queue.Queue[tuple[Any, ...]]' = queue.Queue()
         self._ready: deque = deque()
         self._stale_groups: deque[_Group] = deque()
         self._ready_rows = 0
@@ -320,7 +335,11 @@ class StreamingDriver:
         self._exhausted = False
         self._error: Optional[BaseException] = None
         self._rows: Optional[Iterator[Any]] = None
+        self._pending_rows: deque[Any] = deque()
         self._prompt_seq = 0
+        self._skip_prompts = 0
+        self._start_epoch = 0
+        self._loader_resumed = False
         self._groups: Dict[str, _Group] = {}
         #: Member rows admitted and not dropped (baselines excluded): what the version bound caps.
         self._live = 0
@@ -329,11 +348,14 @@ class StreamingDriver:
         self._consumed_batches = 0
         self._version = 0
         self._base_version = 0
+        #: Set by load_state_dict so the first _start keeps the original admission epoch.
+        self._resume_base_version: Optional[int] = None
         self._failures: deque = deque(maxlen=self.FAILURE_WINDOW)
         self._consecutive_failures = 0
         self._counters: Dict[str, int] = {
             'admitted': 0, 'dropped_stale': 0, 'dropped_sample': 0, 'dropped_group': 0, 'episode_errors': 0,
-            'stopped': 0, 'regenerated': 0, 'no_slot': 0, 'no_slot_dropped': 0
+            'stopped': 0, 'regenerated': 0, 'no_slot': 0, 'no_slot_dropped': 0,
+            'resumed_queries': 0,
         }
         self._adjusting = False
         #: monotonic stamps: when the running ``adjust`` started, and when its being stuck was last reported.
@@ -581,15 +603,140 @@ class StreamingDriver:
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
     def state_dict(self) -> Dict[str, Any]:
-        """What a resumed run restores: the batches handed out and the prompt rows drawn.
+        """Return the driver state persisted in the model's ``component_states``.
 
-        TODO: resuming re-reads the dataloader from its own saved position, which is ahead of the rows
-        that were drawn but not yet trained (in flight or buffered); up to one buffer of prompts,
-        ``(max_staleness + 1) * sync_interval * batch_size`` rows, is skipped. Keeping them would mean
-        saving the in-flight episodes, which live in the rollout and env sessions.
+        Only original query rows are persisted. Rollout trajectories, environment state and tool
+        results deliberately stay outside this state: after a crash every saved query is replayed
+        from its opening turn. This keeps the checkpoint independent of environment implementations
+        and avoids a second event journal beside the model checkpoint.
         """
         with self._lock:
-            return {'handed': self._handed, 'prompts_drawn': self._prompt_seq}
+            groups = self._snapshot_groups()
+            loader_state = self._loader_state()
+            state = {
+                'format': 'twinkle.streaming-driver.v1',
+                'handed': self._handed,
+                'prompts_drawn': self._prompt_seq,
+                'policy_version': self._version,
+                'base_version': self._base_version,
+                'consumed_batches': self._consumed_batches,
+                'live': self._live,
+                'active_live': self._live_for_groups(groups),
+                'loader_state': loader_state,
+                'pending_rows': list(self._pending_rows),
+                'queries': [
+                    {
+                        'key': group.key,
+                        'row': group.row,
+                    }
+                    for group in groups
+                ],
+            }
+            return encode_component_state(state)
+
+    @staticmethod
+    def _live_for_groups(groups: Sequence[_Group]) -> int:
+        """Member rows currently represented by persisted queries."""
+        return sum(
+            1
+            for group in groups
+            for episode in group.members
+            if episode.role != _BASELINE and not episode.lost
+        )
+
+    def _snapshot_groups(self) -> List[_Group]:
+        """Collect active and ready queries that have not yet been handed to the trainer."""
+        by_key: Dict[str, _Group] = {}
+        for group in self._groups.values():
+            by_key[group.key] = group
+        for members in self._ready:
+            if members:
+                by_key[members[0].group.key] = members[0].group
+        return sorted(by_key.values(), key=lambda group: int(group.key))
+
+    def _loader_state(self) -> Any:
+        getter = getattr(self.dataloader, 'state_dict', None) or getattr(self.dataloader, 'get_state', None)
+        return copy.deepcopy(getter()) if callable(getter) else None
+
+    @remote_function(execute='first', collect='first', lazy_collect=False)
+    def load_state_dict(self, state: Optional[Dict[str, Any]]) -> None:
+        """Restore queries previously returned by :meth:`state_dict`.
+
+        The caller must load the model checkpoint first. Restored groups are submitted as fresh
+        attempts from their original rows, so this method does not depend on resumable Env or
+        MultiTurnRollout internals.
+        """
+        if state is None:
+            return
+        state = decode_component_state(state)
+        if state.get('format') != 'twinkle.streaming-driver.v1':
+            raise ValueError('unsupported StreamingDriver component state')
+        queries = list(state.get('queries') or ())
+        with self._lock:
+            if self._thread is not None or self._iter_started:
+                raise RuntimeError('load_state_dict() must run before the driver starts')
+            if self._groups:
+                raise RuntimeError('load_state_dict() requires a fresh driver')
+
+            observed_version = self._read_version()
+            self._version = max(int(state.get('policy_version') or 0), observed_version)
+            self._handed = int(state.get('handed') or 0)
+            self._consumed_batches = _nonnegative_component_state_int(
+                state, 'consumed_batches', default=0)
+            self._prompt_seq = int(state.get('prompts_drawn') or 0)
+            self._exhausted = self.max_steps is not None and self._handed >= self.max_steps
+            saved_live = _nonnegative_component_state_int(state, 'live', default=None)
+            active_live = _nonnegative_component_state_int(state, 'active_live', default=None)
+            if active_live is not None and saved_live is not None and active_live > saved_live:
+                raise ValueError(
+                    f'StreamingDriver active_live={active_live} exceeds live={saved_live}')
+            # Successful history is cumulative. The active part is recreated by _start_attempt()
+            # below, so restore only the history first to avoid double counting the queries.
+            self._live = max(0, (saved_live or 0) - (active_live or 0))
+            base_version = _nonnegative_component_state_int(state, 'base_version', default=None)
+            self._base_version = self._version
+            self._resume_base_version = base_version
+            pending_rows = state.get('pending_rows') or ()
+            if not isinstance(pending_rows, (list, tuple)):
+                raise ValueError('StreamingDriver pending_rows must be a list or tuple')
+            self._pending_rows = deque(pending_rows)
+
+            seen = set()
+            for query in queries:
+                key = str(query.get('key') or '')
+                if not key or key in seen:
+                    raise ValueError(f'invalid or duplicate StreamingDriver query key {key!r}')
+                seen.add(key)
+                row = query.get('row')
+                group = _Group(key=key, row=row)
+                self._groups[key] = group
+                if not self._exhausted:
+                    # _live is derived from the restored queries; persisting it would double count.
+                    self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
+                    self._counters['resumed_queries'] += 1
+                    logger.info(
+                        'restored rollout query %s at policy version %s',
+                        key,
+                        self._version,
+                    )
+
+            loader_state = state.get('loader_state')
+            loader = (
+                getattr(self.dataloader, 'load_state_dict', None)
+                or getattr(self.dataloader, 'load_state', None)
+                or getattr(self.dataloader, 'set_state', None)
+            )
+            if loader_state is not None:
+                if not callable(loader):
+                    raise ValueError('component state has a dataloader snapshot, but the dataloader cannot load it')
+                loader(loader_state)
+                position = self._loader_state() or loader_state
+                if isinstance(position, dict):
+                    self._start_epoch = int(position.get('epoch') or 0)
+                self._loader_resumed = True
+            else:
+                # A plain iterable has no cursor; skip every row the old iterator already consumed.
+                self._skip_prompts = self._prompt_seq + len(self._pending_rows)
 
     @remote_function(execute='first', collect='first', lazy_collect=False)
     def close(self, timeout: float = 30.0) -> dict:
@@ -753,9 +900,13 @@ class StreamingDriver:
         with self._lock:
             if self._closed or self._thread is not None:
                 return
-            self._version = self._read_version()
+            self._version = max(self._version, self._read_version())
             # the bound counts versions from here: a manager synced before the run starts above 0
-            self._base_version = self._version
+            if self._resume_base_version is None:
+                self._base_version = self._version
+            else:
+                self._base_version = min(self._resume_base_version, self._version)
+                self._resume_base_version = None
             self._thread = threading.Thread(target=self._run, name='twinkle-streaming-driver', daemon=True)
             self._thread.start()
 
@@ -876,21 +1027,29 @@ class StreamingDriver:
             self._start_attempt(group, [copy.deepcopy(row) for _ in range(self.num_generations)])
 
     def _next_row(self) -> Any:
-        # TODO: rows are drawn here, ahead of training; see state_dict for what a resume skips.
         if self._rows is None:
             self._rows = self._iter_rows()
         return next(self._rows, None)
 
     def _iter_rows(self) -> Iterator[Any]:
-        for epoch in range(max(1, math.ceil(self.num_epochs))):
+        while self._pending_rows:
+            yield self._pending_rows.popleft()
+        for epoch in range(self._start_epoch, max(1, math.ceil(self.num_epochs))):
             set_epoch = getattr(self.dataloader, 'set_epoch', None)
-            if set_epoch is not None:
+            if set_epoch is not None and (not self._loader_resumed or epoch != self._start_epoch):
                 set_epoch(epoch)
             for batch in self.dataloader:
                 if isinstance(batch, (list, tuple)):
-                    yield from batch
+                    rows = batch
                 else:
-                    yield batch
+                    rows = (batch,)
+                self._pending_rows.extend(rows)
+                while self._pending_rows:
+                    if self._skip_prompts:
+                        self._pending_rows.popleft()
+                        self._skip_prompts -= 1
+                        continue
+                    yield self._pending_rows.popleft()
 
     def _start_attempt(self, group: _Group, trajectories: List[Any]) -> None:
         """Submit one attempt's trajectories: the non-baseline ones replace the members (under the lock)."""
