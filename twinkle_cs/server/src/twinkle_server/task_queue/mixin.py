@@ -137,6 +137,7 @@ class TaskQueueMixin:
         #: Strong references to in-flight fire-and-forget background tasks (see schedule_background_task).
         self._background_tasks: set = set()
         self._event_loop: asyncio.AbstractEventLoop | None = None
+        self._submitting_request_ids: set[str] = set()
         self._queue_tasks: set[asyncio.Task] = set()
 
     @property
@@ -253,17 +254,20 @@ class TaskQueueMixin:
             trace_context=get_trace_context(),
             created_at=time.monotonic(),
             training_id=model_id)
-        await self._prepare_queued_task(task)
-
-        if self._event_loop is None:
-            self._event_loop = asyncio.get_running_loop()
-
+        # The training controller can reconcile its admission ticket before the
+        # Redis future and local queue entry have been written.
+        self._submitting_request_ids.add(request_id)
         try:
+            await self._prepare_queued_task(task)
+            if self._event_loop is None:
+                self._event_loop = asyncio.get_running_loop()
             await self._enqueue_prepared_task(task)
         except BaseException:
             if task.on_finished is not None and await self.state.get_future(request_id) is None:
                 await self._compute_worker.finish_task(task, False)
             raise
+        finally:
+            self._submitting_request_ids.discard(request_id)
         return {'request_id': request_id, 'model_id': model_id}
 
     async def _prepare_queued_task(self, task: QueuedTask) -> None:
