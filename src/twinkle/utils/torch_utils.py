@@ -237,6 +237,17 @@ def bits_fingerprint(tensor: 'torch.Tensor', block: int = 1 << 24) -> List[int]:
     return [total & mask, squared & mask]
 
 
+def vocab_parallel_group():
+    """The Megatron TP group sharding vocab logits, or None when they are full-vocab."""
+    try:
+        from megatron.core import parallel_state as mpu
+        if mpu.get_tensor_model_parallel_world_size() > 1:
+            return mpu.get_tensor_model_parallel_group()
+    except (ImportError, AssertionError, OSError):
+        pass
+    return None
+
+
 def selective_log_softmax(logits, index, return_entropy: bool = False, vocab_parallel: bool | None = None):
     """
     refer: trl/trainer/utils
@@ -277,11 +288,7 @@ def selective_log_softmax(logits, index, return_entropy: bool = False, vocab_par
     import torch
 
     if vocab_parallel is None:
-        try:
-            from megatron.core import parallel_state as mpu
-            vocab_parallel = mpu.get_tensor_model_parallel_world_size() > 1
-        except (ImportError, AssertionError, OSError):
-            vocab_parallel = False
+        vocab_parallel = vocab_parallel_group() is not None
     if vocab_parallel:
         if return_entropy:
             # Under vocab TP, entropy needs extra all-reduces over softmax*logits;

@@ -390,39 +390,33 @@ class PoolingResponse:
     prompt_token_ids: list[int] | None = None
 
 
-def topk_head(tokens: list[int], logprobs) -> tuple[list[list[int]], list[list[float]]]:
-    """Sampler logprobs as (ids, logps) heads, one row per sampled token."""
-    if logprobs is None:
-        return [], []
-    if len(logprobs) != len(tokens):
-        raise RuntimeError('sampled tokens and logprobs must have the same length')
-    ids: list[list[int]] = []
-    values: list[list[float]] = []
-    for token, position in zip(tokens, logprobs):
-        if isinstance(position, (int, float)):
-            ids.append([int(token)])
-            values.append([float(position)])
-            continue
-        candidates = [(int(token_id), float(value)) for token_id, value in (position or [])]
-        ids.append([token_id for token_id, _ in candidates])
-        values.append([value for _, value in candidates])
-    return ids, values
-
-
-def sampled_token_logprobs(tokens: list[int], logprobs) -> list[float]:
-    """Normalize sampler logprobs to one scalar for each sampled token."""
+def _sampler_candidates(tokens: list[int], logprobs) -> list[list[tuple[int, float]]]:
+    """Per-token ``(token_id, logprob)`` candidates; a scalar logprob means sampled-only."""
     if logprobs is None:
         return []
     if len(logprobs) != len(tokens):
         raise RuntimeError('sampled tokens and logprobs must have the same length')
-    result: list[float] = []
+    rows: list[list[tuple[int, float]]] = []
     for token, position in zip(tokens, logprobs):
         if isinstance(position, (int, float)):
-            result.append(float(position))
-            continue
-        candidates = list(position or [])
-        matched = next((value for token_id, value in candidates if int(token_id) == int(token)), None)
+            rows.append([(int(token), float(position))])
+        else:
+            rows.append([(int(token_id), float(value)) for token_id, value in (position or [])])
+    return rows
+
+
+def topk_head(tokens: list[int], logprobs) -> tuple[list[list[int]], list[list[float]]]:
+    """Sampler logprobs as (ids, logps) heads, one row per sampled token."""
+    rows = _sampler_candidates(tokens, logprobs)
+    return [[token_id for token_id, _ in row] for row in rows], [[value for _, value in row] for row in rows]
+
+
+def sampled_token_logprobs(tokens: list[int], logprobs) -> list[float]:
+    """Normalize sampler logprobs to one scalar for each sampled token."""
+    result: list[float] = []
+    for token, row in zip(tokens, _sampler_candidates(tokens, logprobs)):
+        matched = next((value for token_id, value in row if token_id == int(token)), None)
         if matched is None:
-            raise RuntimeError(f"sampled token {token} is missing from its returned logprobs: {candidates!r}.")
+            raise RuntimeError(f"sampled token {token} is missing from its returned logprobs: {row!r}.")
         result.append(float(matched))
     return result

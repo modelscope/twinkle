@@ -4,23 +4,9 @@ from typing import Optional
 
 import torch
 
-TOPK_LOG_PROB_CHUNK_SIZE = 4096
+from twinkle.utils.torch_utils import vocab_parallel_group
 
-
-def vocab_parallel_group() -> Optional[object]:
-    """The Megatron TP group sharding these logits, or None for full-vocab backends.
-
-    Same provenance rule as ``selective_log_softmax``: only a Megatron model's own TP state
-    describes vocab shards; callers that know their logits are full-vocab pass a group explicitly.
-    """
-    try:
-        from megatron.core import parallel_state
-        if parallel_state.model_parallel_is_initialized() and parallel_state.get_tensor_model_parallel_world_size(
-        ) > 1:
-            return parallel_state.get_tensor_model_parallel_group()
-    except Exception:
-        return None
-    return None
+TOPK_LOG_PROB_WORKSPACE_BYTES = 64 << 20
 
 
 def _vocab_start(vocab_size: int, group) -> int:
@@ -93,10 +79,12 @@ class _TopKLogProbsFromLogits(torch.autograd.Function):
 
 def topk_log_probs_from_logits(logits: torch.Tensor,
                                token_ids: torch.Tensor,
-                               chunk_size: int = TOPK_LOG_PROB_CHUNK_SIZE,
+                               chunk_size: Optional[int] = None,
                                process_group=None) -> torch.Tensor:
     """Full-vocab-normalized log-probs of ``logits`` at ``token_ids``, chunked in fp32."""
     group = process_group if process_group is not None else vocab_parallel_group()
+    if chunk_size is None:
+        chunk_size = max(1, TOPK_LOG_PROB_WORKSPACE_BYTES // (logits.shape[-1] * 4))
     return _TopKLogProbsFromLogits.apply(logits, token_ids.long(), chunk_size, group)
 
 
@@ -107,8 +95,9 @@ def align_rollout_topk(topk_ids, topk_logps, mask: torch.Tensor, expected_topk: 
     if len(topk_ids) != mask.shape[0] or len(topk_logps) != mask.shape[0]:
         raise ValueError('score_centering top-k batch size does not match the training batch.')
     aligned_ids, aligned_logps = [], []
+    counts = mask.sum(-1).tolist()
     for index, (ids, logps) in enumerate(zip(topk_ids, topk_logps, strict=True)):
-        n_pos = int(mask[index].sum().item())
+        n_pos = int(counts[index])
         if len(ids) != n_pos or len(logps) != n_pos:
             raise ValueError(f'score_centering top-k/mask mismatch at sample {index}: expected {n_pos} rows, '
                              f'got ids={len(ids)}, logps={len(logps)}.')

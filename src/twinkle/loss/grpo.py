@@ -58,7 +58,7 @@ class GRPOLoss(Loss):
         sdar_loss_coef: float = 0.0,
         sdar_gate_beta: float = 5.0,
         score_centering: bool = False,
-        score_centering_top_k: int = 8,
+        score_centering_top_k: Optional[int] = None,
         **kwargs,
     ):
         self.epsilon = epsilon
@@ -121,6 +121,8 @@ class GRPOLoss(Loss):
         self.score_centering_top_k = score_centering_top_k
         if score_centering and loss_type != 'gpg':
             raise ValueError('score_centering requires loss_type="gpg" (pure REINFORCE).')
+        if score_centering and score_centering_top_k is None:
+            raise ValueError('score_centering requires score_centering_top_k.')
         if score_centering and self._advanced:
             raise ValueError('score_centering composes only with the base GPG surrogate; drop the advanced controls.')
         self.require_logits = self._distill_wrap or score_centering
