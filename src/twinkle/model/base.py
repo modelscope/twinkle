@@ -140,7 +140,7 @@ def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_
 # Trajectory fields ``TrainableModel._rollout_features`` lifts into loss kwargs on training calls.
 # The names match the loss kwargs exactly; token-level fields are response-framed on both sides.
 _LIFTED_TRAJECTORY_FIELDS = (
-    'rollout_logps', 'sampling_masks', 'advantages', 'returns',
+    'rollout_logps', 'rollout_topk_ids', 'rollout_topk_logps', 'sampling_masks', 'advantages', 'returns',
     'ref_logps', 'teacher_logps', 'old_logps', 'old_values', 'truncated',
 )
 

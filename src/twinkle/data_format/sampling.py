@@ -390,6 +390,25 @@ class PoolingResponse:
     prompt_token_ids: list[int] | None = None
 
 
+def topk_head(tokens: list[int], logprobs) -> tuple[list[list[int]], list[list[float]]]:
+    """Sampler logprobs as (ids, logps) heads, one row per sampled token."""
+    if logprobs is None:
+        return [], []
+    if len(logprobs) != len(tokens):
+        raise RuntimeError('sampled tokens and logprobs must have the same length')
+    ids: list[list[int]] = []
+    values: list[list[float]] = []
+    for token, position in zip(tokens, logprobs):
+        if isinstance(position, (int, float)):
+            ids.append([int(token)])
+            values.append([float(position)])
+            continue
+        candidates = [(int(token_id), float(value)) for token_id, value in (position or [])]
+        ids.append([token_id for token_id, _ in candidates])
+        values.append([value for _, value in candidates])
+    return ids, values
+
+
 def sampled_token_logprobs(tokens: list[int], logprobs) -> list[float]:
     """Normalize sampler logprobs to one scalar for each sampled token."""
     if logprobs is None:

@@ -1132,7 +1132,8 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin, DeltaTrain
                     if unpacked_logits is not None:
                         _outputs['logits'] = unpacked_logits
                     elif getattr(_loss_instance, 'require_logits', False) or 'logits' in output_fields:
-                        _outputs['logits'] = output_tensor
+                        # Logit readers (score centering, SDAR) need the full sequence, like logps above.
+                        _outputs['logits'] = processor.postprocess_tensor_cp(output_tensor, cu_seqlens=cu_seqlens_q)
                     batch, _outputs = processor.unpack_packed_sequences(batch, _outputs, task=task)
                     logps = _outputs['logps']
                     entropies = _outputs.get('entropies')

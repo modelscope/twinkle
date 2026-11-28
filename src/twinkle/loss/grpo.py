@@ -57,6 +57,8 @@ class GRPOLoss(Loss):
         fipo_safety_threshold: Optional[float] = 4.0,
         sdar_loss_coef: float = 0.0,
         sdar_gate_beta: float = 5.0,
+        score_centering: bool = False,
+        score_centering_top_k: int = 8,
         **kwargs,
     ):
         self.epsilon = epsilon
@@ -115,7 +117,13 @@ class GRPOLoss(Loss):
         # Gate the expensive forward paths: entropy for the bonus OR the advanced entropy
         # logging/filtering; logits for the SDAR auxiliary term.
         self.require_entropy = entropy_coef > 0.0 or log_entropy or top_entropy_quantile < 1.0
-        self.require_logits = self._distill_wrap
+        self.score_centering = score_centering
+        self.score_centering_top_k = score_centering_top_k
+        if score_centering and loss_type != 'gpg':
+            raise ValueError('score_centering requires loss_type="gpg" (pure REINFORCE).')
+        if score_centering and self._advanced:
+            raise ValueError('score_centering composes only with the base GPG surrogate; drop the advanced controls.')
+        self.require_logits = self._distill_wrap or score_centering
 
     def micro_batch_scale(self, inputs, indices):
         return len(indices) / len(inputs)
@@ -522,6 +530,8 @@ class GRPOLoss(Loss):
         -- byte-for-byte identical to inlining it at the tail of ``__call__``.
         """
         import torch
+        topk_ids = kwargs.pop('rollout_topk_ids', None)
+        topk_logps = kwargs.pop('rollout_topk_logps', None)
         ratio = torch.exp(log_importance_weights)
 
         per_token_loss = self._compute_per_token_loss(ratio, advantages, logps)
@@ -538,9 +548,40 @@ class GRPOLoss(Loss):
             # so the final per_token_loss stays consistent (bf16 under amp).
             per_token_loss = per_token_loss - self.entropy_coef * entropies.to(per_token_loss.dtype)
 
+        channel_loss = None
+        if self.score_centering:
+            centering, sampler_mass, train_mass = self._score_centering_term(outputs, loss_mask, topk_ids, topk_logps)
+            per_token_loss = per_token_loss + advantages * centering.to(per_token_loss.dtype)
+            count = loss_mask.sum().detach().float()
+            channel_loss = {
+                'score_centering': torch.stack((centering.sum().detach().float(), count)),
+                'score_centering_sampler_head_mass': torch.stack((sampler_mass.sum(), count)),
+                'score_centering_train_head_mass': torch.stack((train_mass.sum(), count)),
+            }
+
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
 
-        return LossOutput(loss=loss, num_tokens=self._loss_num_tokens(loss_mask))
+        result = LossOutput(loss=loss, num_tokens=self._loss_num_tokens(loss_mask))
+        if channel_loss is not None:
+            result['channel_loss'] = channel_loss
+        return result
+
+    def _score_centering_term(self, outputs, loss_mask, topk_ids, topk_logps):
+        import torch
+
+        from .score_centering import align_rollout_topk, score_centering_correction, topk_log_probs_from_logits
+
+        logits = outputs.get('logits')
+        if logits is None:
+            raise RuntimeError('score_centering requires full-vocabulary training logits.')
+        if logits.shape[1] != loss_mask.shape[1]:
+            logits = logits[:, -loss_mask.shape[1]:]
+        ids, sampler_logps = align_rollout_topk(topk_ids, topk_logps, loss_mask, self.score_centering_top_k)
+        train_head_logps = topk_log_probs_from_logits(logits[loss_mask], ids)
+        correction, sampler_mass, train_mass = score_centering_correction(train_head_logps, sampler_logps)
+        centering = torch.zeros(loss_mask.shape, device=correction.device, dtype=correction.dtype)
+        centering[loss_mask] = correction
+        return centering, sampler_mass, train_mass
 
     # ── Advanced on-policy controls ────────────────────────────────────────────
     # A faithful port of the legacy ``GRPOTrainer`` surrogate (carried in dev as ``_ConfiguredGRPOLoss``
@@ -558,6 +599,8 @@ class GRPOLoss(Loss):
         ref_logps: Optional['torch.Tensor'] = None,
         advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
         rollout_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
+        rollout_topk_ids: Optional[List] = None,
+        rollout_topk_logps: Optional[List] = None,
         truncated: Optional[List[bool]] = None,
         teacher_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
         **kwargs,
@@ -572,7 +615,8 @@ class GRPOLoss(Loss):
         """
         if not (self._advanced or self._distill_wrap):
             return self._base_grpo(inputs, outputs, old_logps=old_logps, ref_logps=ref_logps,
-                                   advantages=advantages, **kwargs)
+                                   advantages=advantages, rollout_topk_ids=rollout_topk_ids,
+                                   rollout_topk_logps=rollout_topk_logps, **kwargs)
 
         if self._advanced:
             result = self._configured_grpo(

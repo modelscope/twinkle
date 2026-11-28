@@ -36,6 +36,9 @@ class Trajectory(InputFeature, total=False):
     tokenizer_fingerprint: Optional[str]
     # Sampling: rollout_logps is response-framed; engines without logps leave it absent.
     rollout_logps: List[float]
+    # Sampler head per response token: (n_pos, k) ids and full-vocab-normalized logps.
+    rollout_topk_ids: List[List[int]]
+    rollout_topk_logps: List[List[float]]
     sampling_masks: InputType
     # Rewards: the rollout's own row-level named entries (``env``). The scorer columns
     # (``orm`` / ``baseline``) and the PRM segment facts ride the delivery facts' row-aligned
@@ -63,7 +66,8 @@ CONVERSATION_FIELDS = ('messages', 'tools', 'user_data', 'images', 'videos', 'au
 
 # Token-level fields that always share the response frame; length is asserted, never inferred.
 RESPONSE_FRAME_FIELDS = frozenset({
-    'response_token_ids', 'rollout_logps', 'ref_logps', 'old_logps', 'teacher_logps',
+    'response_token_ids', 'rollout_logps', 'rollout_topk_ids', 'rollout_topk_logps',
+    'ref_logps', 'old_logps', 'teacher_logps',
     'advantages', 'returns', 'old_values', 'sampling_masks',
 })
 
