@@ -15,7 +15,6 @@ from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, S
 from twinkle.utils import FullWeightLoadError
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
-from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
 from twinkle.template.contract import MediaBundle, engine_input_ids
@@ -119,6 +118,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, VLLMDeltaSamplerMixin):
         self._inflight_request_ids: set = set()
 
         from .vllm_engine import VLLMEngine
+        # vLLM-only modules stay lazy so ``import twinkle.sampler`` (and the quant_sync subpackage) works
+        # on hosts without vLLM.
+        from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
         engine_kwargs = engine_args.copy() if engine_args else {}
 
         # Auto-detect tensor_parallel_size from CUDA_VISIBLE_DEVICES
