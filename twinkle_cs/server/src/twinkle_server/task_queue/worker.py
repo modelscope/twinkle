@@ -12,6 +12,7 @@ import logging
 import time
 import traceback
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, Deque
 
@@ -112,11 +113,17 @@ class ComputeWorker:
         task_metrics: MetricsRegistry | None,
         deployment_name: str,
         on_backend_timeout: Callable[[], Any] | None = None,
+        *,
+        compute_node: str | None = None,
+        gpu_devices: Sequence[str] = (),
     ) -> None:
         self._state = state
         self._config = config
         self._task_metrics = task_metrics
         self._deployment_name = deployment_name
+        self._compute_node = compute_node
+        # Ray uses physical GPU indices or UUIDs in CUDA_VISIBLE_DEVICES.
+        self._gpu_selector = '|'.join(gpu_devices)
         # Optional coroutine-returning callback fired on a backend timeout.
         self._on_backend_timeout = on_backend_timeout
 
@@ -489,6 +496,10 @@ class ComputeWorker:
                 binding = current_tenant_fingerprint.set(task.tenant_fingerprint)
                 exec_start = time.monotonic()
                 try:
+                    if self._compute_node:
+                        span.set_attribute('twinkle.compute_node', self._compute_node)
+                        if self._gpu_selector:
+                            span.set_attribute('twinkle.compute_gpus', self._gpu_selector)
                     executed = True
                     result = await asyncio.wait_for(
                         task.coro_factory(), timeout=self._config.effective_execution_timeout)

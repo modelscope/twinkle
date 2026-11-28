@@ -195,6 +195,49 @@ async def test_adapter_expiry_preserves_already_queued_work(reason):
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_waits_for_admitted_task_to_enter_compute_queue(monkeypatch):
+    controller, state, runtime, clock = await setup()
+    identity = await create(controller, state, 'slow-queue-commit')
+    training = controller.trainings[identity]
+    queue = RuntimeQueue(controller, state, controller.instances[training.instance_id])
+    runtime.verify_operation = lambda instance, request_id: queue.verify_operation(request_id)
+    staged, resume = asyncio.Event(), asyncio.Event()
+    original_enqueue = queue._enqueue_prepared_task
+    executed = []
+
+    async def slow_enqueue(task):
+        staged.set()
+        await resume.wait()
+        await original_enqueue(task)
+
+    async def step():
+        executed.append(True)
+
+    monkeypatch.setattr(queue, '_enqueue_prepared_task', slow_enqueue)
+    request_id = 'slow-queue-commit'
+    submission = asyncio.create_task(
+        queue.schedule_task(step, model_id=identity, token='owner', request_id=request_id, task_type='step')
+    )
+    try:
+        await asyncio.wait_for(staged.wait(), timeout=5)
+        clock.now += controller.config.sweep_interval_s + 1
+        await controller.sweep()
+        await controller.wait_for_jobs()
+        assert request_id in training.pending_operation_ids
+        assert await state.get_future(request_id) is None
+
+        resume.set()
+        assert (await submission)['request_id'] == request_id
+        assert (await settle(state, request_id))['status'] == 'completed'
+        assert executed == [True]
+    finally:
+        resume.set()
+        await asyncio.gather(submission, return_exceptions=True)
+        await queue.shutdown_task_queue()
+        await controller.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_lost_finish_notification_is_reconciled_without_stopping_compute():
     controller, state, runtime, clock = await setup()
     identity = await create(controller, state, 'lost-notification')
