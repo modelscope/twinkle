@@ -10,7 +10,7 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from typing import TYPE_CHECKING, Any
 
 from twinkle.protocol.types.errors import QueueState
@@ -71,6 +71,8 @@ class TaskQueueMixin:
         on_backend_timeout: Callable[[], Coroutine[Any, Any, None]] | None = None,
         collect_width: int = 1,
         telemetry_base_model: str | None = None,
+        compute_node: str | None = None,
+        gpu_devices: Sequence[str] = (),
     ) -> None:
         """Initialise the task queue, rate limiter, and compute worker.
 
@@ -127,6 +129,8 @@ class TaskQueueMixin:
             task_metrics=self._task_metrics,
             deployment_name=deployment_name,
             on_backend_timeout=on_backend_timeout,
+            compute_node=compute_node,
+            gpu_devices=gpu_devices,
         )
 
         self._backend_gate = BackendGate(enable_admission_gate=enable_admission_gate)

@@ -62,6 +62,7 @@ class SamplerDriver:
             ),
             placement_group=await asyncio.to_thread(get_placement_group, allocation.name),
             allocation_devices=list(allocation.devices),
+            allocation_node=allocation.node_name,
         )
         await self.runtime.deploy(
             instance.identity,

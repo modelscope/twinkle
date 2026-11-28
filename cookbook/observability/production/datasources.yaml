@@ -41,15 +41,15 @@ datasources:
         spanStartTimeShift: '-2m'
         spanEndTimeShift: '2m'
         tags:
-          - key: twinkle.node
+          - key: twinkle.compute_node
             value: node
         queries:
           - name: Node CPU utilization
             query: 'max by (node) (twinkle_system_cpu_utilization{$${__tags}})'
-          - name: Node GPU utilization
-            query: 'max by (node, gpu_index, gpu_uuid) (twinkle_gpu_utilization{$${__tags}})'
-          - name: Node GPU memory
-            query: 'max by (node, gpu_index, gpu_uuid) (twinkle_gpu_memory_usage_bytes{$${__tags}})'
+          - name: Allocated GPU utilization
+            query: 'max by (node, gpu_index, gpu_uuid) (twinkle_gpu_utilization{$${__tags},gpu_index=~"$${__span.tags["twinkle.compute_gpus"]}"} or twinkle_gpu_utilization{$${__tags},gpu_uuid=~"$${__span.tags["twinkle.compute_gpus"]}"})'
+          - name: Allocated GPU memory
+            query: 'max by (node, gpu_index, gpu_uuid) (twinkle_gpu_memory_usage_bytes{$${__tags},gpu_index=~"$${__span.tags["twinkle.compute_gpus"]}"} or twinkle_gpu_memory_usage_bytes{$${__tags},gpu_uuid=~"$${__span.tags["twinkle.compute_gpus"]}"})'
   - name: Twinkle snapshots
     uid: twinkle-redis
     type: redis-datasource

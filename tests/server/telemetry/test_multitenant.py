@@ -62,7 +62,10 @@ async def test_usage_is_recorded_once_at_admission(
     queue = TaskQueueMixin()
     queue.state = ServerState(backend=FakeBackend())
     queue.replica_id = 'test-replica'
-    queue._init_task_queue(TaskQueueConfig(), deployment_name='Compute', telemetry_base_model='base-model')
+    queue._init_task_queue(
+        TaskQueueConfig(), deployment_name='Compute', telemetry_base_model='base-model',
+        compute_node='gpu-rank-0', gpu_devices=('2', '5'),
+    )
 
     app = FastAPI()
     app.middleware('http')(verify_request_token)
@@ -186,6 +189,8 @@ async def test_usage_is_recorded_once_at_admission(
             assert span.attributes['twinkle.tenant_fingerprint'] == user_id
             assert span.attributes['twinkle.wait_seconds'] >= 0
             assert span.attributes['twinkle.execution_seconds'] > 0
+            assert span.attributes['twinkle.compute_node'] == 'gpu-rank-0'
+            assert span.attributes['twinkle.compute_gpus'] == '2|5'
         for name in ('server_state.register_model', 'processor.call.process'):
             assert next(span.attributes['twinkle.tenant_fingerprint'] for span in spans if span.name == name) == user_id
         assert token not in repr([dict(span.attributes) for span in spans])

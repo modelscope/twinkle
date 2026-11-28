@@ -58,6 +58,7 @@ class InstanceRecord(BaseModel):
     application_name: str | None = None
     placement_group_id: str | None = None
     node_id: str | None = None
+    node_name: str | None = None
     devices: list[str] = Field(default_factory=list)
     incarnation: str | None = None
     dirty: bool = False
